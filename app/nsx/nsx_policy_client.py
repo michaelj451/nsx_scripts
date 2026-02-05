@@ -5,8 +5,6 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from nsx.nsx_constants import nsx_username, nsx_password, nsx_manager2
 
-from nsx.nsx_db_functions.nsx_db_functions_group_members import NsxPolicyGroupMembersSync
-
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
