@@ -3,7 +3,7 @@ import argparse
 import logging
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_manager1
+from nsx.nsx_constants import nsx_lm1
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_file_export_functions.nsx_object_exporter import run_export
 
@@ -35,11 +35,11 @@ def main() -> None:
     # Load .env, logging, etc.
     init_cli()
 
-    if not nsx_manager1:
-        raise RuntimeError("NSX_HOST2 is not set (nsx_manager2). Check your .env.")
+    if not nsx_lm1:
+        raise RuntimeError("NSX_HOST1 is not set (nsx_lm1). Check your .env.")
 
     client = NsxPolicyClient(
-        nsxmanager=nsx_manager1,
+        nsxmanager=nsx_lm1,
         federation_global=args.federation_global,
     )
 

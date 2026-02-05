@@ -10,7 +10,7 @@ import re
 import logging
 
 
-from nsx.nsx_constants import nsx_manager2
+from nsx.nsx_constants import nsx_lm2
 
 from typing import Optional
 

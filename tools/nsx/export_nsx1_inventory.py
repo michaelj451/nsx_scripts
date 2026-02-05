@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_manager1
+from nsx.nsx_constants import nsx_lm1
 from nsx.nsx_policy_client import NsxPolicyClient
 
 from nsx.nsx_file_export_functions.nsx1_vm_file_exporter import (
@@ -43,14 +43,11 @@ def main() -> None:
 
     init_cli()
 
-    if not nsx_manager1:
-        raise RuntimeError("NSX_HOST1 is not set (nsx_manager1). Check your .env.")
-
     # Build client
-    client = NsxPolicyClient(nsxmanager=nsx_manager1, federation_global=args.federation_global)
+    client = NsxPolicyClient(nsxmanager=nsx_lm1, federation_global=args.federation_global)
 
     # Manager-scoped export root (prevents collisions)
-    mgr_dir = _manager_dirname(nsx_manager1)
+    mgr_dir = _manager_dirname(nsx_lm1)
     export_root = Path(args.base_dir) / mgr_dir
 
     # Parse accepted VM types

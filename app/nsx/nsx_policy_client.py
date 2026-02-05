@@ -3,7 +3,7 @@ import logging
 from fastapi import HTTPException
 from typing import Any, Dict, Iterator, List, Optional
 
-from nsx.nsx_constants import nsx_username, nsx_password, nsx_manager2
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_username, nsx_password
 
 import urllib3
 
@@ -18,7 +18,7 @@ class NsxPolicyClient:
     Pass federation_global=True to use Global Manager policy endpoints.
     """
 
-    def __init__(self, nsxmanager: str = nsx_manager2, *, federation_global: bool = False):
+    def __init__(self, nsxmanager: str = nsx_lm2, *, federation_global: bool = False):
         logging.info(f"Creating NSX session for manager: {nsxmanager} (federation_global={federation_global})")
 
         self.NSX_MANAGER = f"https://{nsxmanager}"

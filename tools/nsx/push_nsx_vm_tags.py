@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_manager1, nsx_manager2
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_file_import_functions.nsx_vm_tags_importer import (
     VmTagsImportConfig,
@@ -78,18 +78,17 @@ def main() -> None:
     init_cli()
 
     mgr_map = {
-        "nsx1": nsx_manager1,
-        "nsx2": nsx_manager2,
+        "nsx1": nsx_lm1,
+        "nsx2": nsx_lm2,
     }
 
     src_mgr = mgr_map.get(args.source)
     dst_mgr = mgr_map.get(args.dest)
 
     if not src_mgr:
-        raise RuntimeError(f"Source manager not set for {args.source} (check NSX_HOST1/NSX_HOST2)")
+        raise RuntimeError(f"Source manager not set for {args.source} (check NSX_LM1/NSX_LM2)")
     if not dst_mgr:
-        raise RuntimeError(f"Destination manager not set for {args.dest} (check NSX_HOST1/NSX_HOST2)")
-
+        raise RuntimeError(f"Destination manager not set for {args.dest} (check NSX_LM1/NSX_LM2)")
     source_root = Path(args.base_dir) / _manager_dirname(src_mgr)
     dest_inventory_root = Path(args.base_dir) / _manager_dirname(dst_mgr)
 

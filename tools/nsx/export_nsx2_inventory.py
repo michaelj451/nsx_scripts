@@ -3,7 +3,7 @@ import logging
 import argparse
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_manager2
+from nsx.nsx_constants import nsx_lm2, nsx_gm1
 from nsx.nsx_file_export_functions.nsx2_vm_file_exporter import (
     export_nsx_vm_inventory_to_files,
 )
@@ -28,16 +28,15 @@ def main() -> None:
 
     init_cli()
 
-    if not nsx_manager2:
+    if not nsx_lm2:
         raise RuntimeError(
-            "nsx_manager2 is not set. Check your .env and nsx_constants.py loading."
+            "nsx_lm2 is not set. Check your .env and nsx_constants.py loading."
         )
     
 
-    export_root = Path("nsx_export") / nsx_manager2
-
+    export_root = Path("nsx_export") / nsx_lm2
     export_nsx_vm_inventory_to_files(
-        nsxmanager=nsx_manager2,
+        nsxmanager=nsx_lm2,
         export_root=export_root,
         contains=args.contains,
         case_sensitive=args.case_sensitive,
