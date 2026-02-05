@@ -4,10 +4,10 @@ import argparse
 import logging
 from pathlib import Path
 
-from frontendFastapi.nsx.cli_bootstrap import init_cli
-from frontendFastapi.nsx.nsx_constants import nsx_manager1, nsx_manager2
-from frontendFastapi.nsx.nsx_policy_client import NsxPolicyClient
-from frontendFastapi.nsx.nsx_file_import_functions.nsx_vm_tags_importer import (
+from nsx.cli_bootstrap import init_cli
+from nsx.nsx_constants import nsx_manager1, nsx_manager2
+from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.nsx_file_import_functions.nsx_vm_tags_importer import (
     VmTagsImportConfig,
     NsxVmTagsImporter,
 )

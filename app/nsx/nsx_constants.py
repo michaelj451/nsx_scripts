@@ -1,5 +1,5 @@
 import os
-from frontendFastapi.nsx.cli_bootstrap import load_dotenv
+from nsx.cli_bootstrap import load_dotenv
 
 # Load .env exactly once, early
 load_dotenv()

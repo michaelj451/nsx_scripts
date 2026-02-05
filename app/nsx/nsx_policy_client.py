@@ -3,9 +3,9 @@ import logging
 from fastapi import HTTPException
 from typing import Any, Dict, Iterator, List, Optional
 
-from frontendFastapi.nsx.nsx_constants import nsx_username, nsx_password, nsx_manager2
+from nsx.nsx_constants import nsx_username, nsx_password, nsx_manager2
 
-from frontendFastapi.nsx.nsx_db_functions.nsx_db_functions_group_members import NsxPolicyGroupMembersSync
+from nsx.nsx_db_functions.nsx_db_functions_group_members import NsxPolicyGroupMembersSync
 
 import urllib3
 

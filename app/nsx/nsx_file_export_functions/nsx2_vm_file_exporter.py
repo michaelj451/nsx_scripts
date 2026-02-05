@@ -10,7 +10,7 @@ import re
 import logging
 
 
-from frontendFastapi.nsx.nsx_constants import nsx_manager2
+from nsx.nsx_constants import nsx_manager2
 
 from typing import Optional
 
@@ -174,7 +174,7 @@ def export_nsx_vm_inventory_to_files(
     - Do NOT compute env-dependent defaults at import time.
     - If export_root is not provided, default to nsx_export/<nsxmanager>.
     """
-    from frontendFastapi.nsx.nsx_policy_client import NsxPolicyClient
+    from nsx.nsx_policy_client import NsxPolicyClient
 
     if not nsxmanager:
         raise ValueError("nsxmanager must be provided")

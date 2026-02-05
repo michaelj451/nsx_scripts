@@ -13,7 +13,7 @@ import yaml
 import logging
 
 # If you already have these, import them
-# from frontendFastapi.nsx.nsx_policy_client import NsxPolicyClient
+# from nsx.nsx_policy_client import NsxPolicyClient
 
 DEFAULT_STRIP_KEYS = {
     "revision", "_revision",

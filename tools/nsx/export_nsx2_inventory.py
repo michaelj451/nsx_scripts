@@ -2,9 +2,9 @@ from pathlib import Path
 import logging
 import argparse
 
-from frontendFastapi.nsx.cli_bootstrap import init_cli
-from frontendFastapi.nsx.nsx_constants import nsx_manager2
-from frontendFastapi.nsx.nsx_file_export_functions.nsx2_vm_file_exporter import (
+from nsx.cli_bootstrap import init_cli
+from nsx.nsx_constants import nsx_manager2
+from nsx.nsx_file_export_functions.nsx2_vm_file_exporter import (
     export_nsx_vm_inventory_to_files,
 )
 
