@@ -1,0 +1,61 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: fc-nsx-api
+
+    env_file:
+      - .env
+
+    environment:
+      PYTHONPATH: /srv/fc_nsx/app
+      POSTGRES_HOST: postgres
+      WATCHFILES_FORCE_POLLING: "true"
+
+    volumes:
+      - ./:/srv/fc_nsx
+
+    working_dir: /srv/fc_nsx/app
+
+    ports:
+      - "8000:8000"
+
+    command: >
+      uvicorn frontendFastapi.app:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /srv/fc_nsx/app/frontendFastapi
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: fc-nsx-postgres
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+    restart: unless-stopped
+
+volumes:
+  pgdata:
