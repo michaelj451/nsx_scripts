@@ -10,27 +10,32 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class NsxPolicyClient:
-    """
-    NSX Policy Client that can target either:
-      - Local Manager (LM): /policy/api/v1/infra
-      - Global Manager (GM / Federation): /global-manager/api/v1/global-infra
-
-    Pass federation_global=True to use Global Manager policy endpoints.
-    """
-
     def __init__(self, nsxmanager: str = nsx_lm2, *, federation_global: bool = False):
         logging.info(f"Creating NSX session for manager: {nsxmanager} (federation_global={federation_global})")
 
         self.NSX_MANAGER = f"https://{nsxmanager}"
         self.USERNAME = nsx_username
         self.PASSWORD = nsx_password
-
         self.federation_global = federation_global
 
-        # Policy API root depends on LM vs GM
-        self.POLICY_ROOT = "/global-manager/api/v1/global-infra" if federation_global else "/policy/api/v1/infra"
+        # Decide if this host is a GM endpoint
+        mgr_norm = (nsxmanager or "").strip().removeprefix("https://").removeprefix("http://").rstrip("/").lower()
+        gm_hosts = {  # keep in nsx_constants ideally
+            (nsx_gm1 or "").lower(),
+            # add nsx_gm2 if you have it, etc.
+        }
+        is_gm = mgr_norm in gm_hosts
 
-        # Fabric APIs are LM-oriented (inventory, vifs, etc.)
+        # Policy API root depends on (GM vs LM) and federation mode
+        if federation_global:
+            # Federation "global-infra" view:
+            # - GM uses /global-manager/api/v1/global-infra
+            # - LM exposes a local read-only view at /policy/api/v1/global-infra
+            self.POLICY_ROOT = "/global-manager/api/v1/global-infra" if is_gm else "/policy/api/v1/global-infra"
+        else:
+            # Local manager policy store
+            self.POLICY_ROOT = "/policy/api/v1/infra"
+
         self.FABRIC_ROOT = "/api/v1"
 
         self.session, self.xsrf_token = self.get_nsx_session()
