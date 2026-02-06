@@ -19,7 +19,7 @@ Tag = Dict[str, str]  # {"scope":"...", "tag":"..."}
 
 @dataclass
 class VmTagsImportConfig:
-    # SOURCE export root (where vm-tags/vm_tags_index.yaml lives)
+    # SOURCE export root (where tagged-vms/vm_tags_index.yaml lives)
     export_root: Path
 
     # DEST export root (where vm-inventory/vms.yaml lives)
@@ -214,7 +214,7 @@ class NsxVmTagsImporter:
     """
     Allowlist-driven tagging:
 
-      - Read SOURCE tags from: <export_root>/vm-tags/vm_tags_index.(yaml|json)
+      - Read SOURCE tags from: <export_root>/tagged-vms/vm_tags_index.(yaml|json)
       - Read DEST allowlist from: <dest_inventory_root>/vm-inventory/vms.(yaml|json)
       - For each dest VM:
           dest_name -> src_name (map_dest_name_to_source_name)
@@ -229,7 +229,7 @@ class NsxVmTagsImporter:
         self.cfg = cfg
 
     def _load_source_by_name(self) -> Dict[str, Dict[str, Any]]:
-        vm_tags_dir = self.cfg.export_root / "vm-tags"
+        vm_tags_dir = self.cfg.export_root / "tagged-vms"
         src_path = pick_file(vm_tags_dir, ["vm_tags_index"], self.cfg.input_format)
         raw = _load_any(src_path)
         idx = load_source_index_by_name(raw, src_path)
@@ -340,8 +340,8 @@ class NsxVmTagsImporter:
                     break
 
         # Write report next to SOURCE tags (keeps behavior consistent with your earlier runs)
-        report_yaml = self.cfg.export_root / "vm-tags" / "push_report_allowlist.yaml"
-        report_json = self.cfg.export_root / "vm-tags" / "push_report_allowlist.json"
+        report_yaml = self.cfg.export_root / "tagged-vms" / "push_report_allowlist.yaml"
+        report_json = self.cfg.export_root / "tagged-vms" / "push_report_allowlist.json"
         _write_yaml(report_yaml, {"stats": stats, "rows": rows[:1000]})
         _write_json(report_json, {"stats": stats, "rows": rows[:1000]})
 

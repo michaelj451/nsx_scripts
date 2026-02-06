@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import yaml
 import logging
+from utilities.file_utilities import write_json, write_yaml, manager_dirname
 
 logger = logging.getLogger(__name__)
 
@@ -26,27 +27,27 @@ class VmTagsExportConfig:
     accepted_vm_types: Sequence[str] = ("REGULAR",)
 
 
-# ---------------------------------------------------------------------------
-# IO helpers
-# ---------------------------------------------------------------------------
+# # ---------------------------------------------------------------------------
+# # IO helpers
+# # ---------------------------------------------------------------------------
 
-def _write_yaml(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(
-            data,
-            sort_keys=True,
-            default_flow_style=False,
-            width=120,
-            allow_unicode=True,
-        ),
-        encoding="utf-8",
-    )
+# def _write_yaml(path: Path, data: Any) -> None:
+#     path.parent.mkdir(parents=True, exist_ok=True)
+#     path.write_text(
+#         yaml.safe_dump(
+#             data,
+#             sort_keys=True,
+#             default_flow_style=False,
+#             width=120,
+#             allow_unicode=True,
+#         ),
+#         encoding="utf-8",
+#     )
 
 
-def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+# def _write_json(path: Path, data: Any) -> None:
+#     path.parent.mkdir(parents=True, exist_ok=True)
+#     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +91,11 @@ class NsxVmTagsExporter:
                 return c.strip().upper()
         return None
 
-    def pull_vm_tags(self) -> Dict[str, int]:
+    def pull_tagged_vms(self) -> Dict[str, int]:
         # Ensure base export root exists
         self.cfg.export_root.mkdir(parents=True, exist_ok=True)
 
-        out_dir = self.cfg.export_root / "vm-tags"
+        out_dir = self.cfg.export_root / "tagged-vms"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # IMPORTANT: suffix should NOT include /infra if _policy_path already includes it
@@ -192,8 +193,8 @@ class NsxVmTagsExporter:
         # write index file
         base_name = "vm_tags_index"
         if self.cfg.output_format in ("yaml", "both"):
-            _write_yaml(out_dir / f"{base_name}.yaml", tag_index)
+            write_yaml(out_dir / f"{base_name}.yaml", tag_index)
         if self.cfg.output_format in ("json", "both"):
-            _write_json(out_dir / f"{base_name}.json", tag_index)
+            write_json(out_dir / f"{base_name}.json", tag_index)
 
         return {"exported": exported, "skipped": skipped, "errors": errors}

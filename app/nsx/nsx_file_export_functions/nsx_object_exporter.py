@@ -10,6 +10,8 @@ import json
 import re
 import yaml
 
+from utilities.file_utilities import write_json, write_yaml, manager_dirname
+
 import logging
 
 # If you already have these, import them
@@ -49,18 +51,6 @@ def slugify(name: str) -> str:
     name = re.sub(r"_+", "_", name).strip("_")
     return name or "unnamed"
 
-def manager_dirname(client: Any) -> str:
-    """
-    Returns a stable, filesystem-safe directory name for the NSX manager.
-    Prefers the host (no scheme), falls back to 'unknown_manager'.
-    """
-    mgr = getattr(client, "NSX_MANAGER", None) or ""
-    mgr = mgr.strip()
-
-    mgr = re.sub(r"^https?://", "", mgr)
-    mgr = mgr.rstrip("/")
-
-    return slugify(mgr) if mgr else "unknown_manager"
 
 def yaml_dump(data: Any) -> str:
     """
@@ -75,14 +65,6 @@ def yaml_dump(data: Any) -> str:
         width=120,
         allow_unicode=True,
     )
-
-def write_yaml(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml_dump(data), encoding="utf-8")
-
-def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 @dataclass
 class ExportConfig:
@@ -230,7 +212,7 @@ class NsxExporter:
 
 
 # ---- example runner ----
-def run_export(client: Any, base_dir: str = "nsx_export", domain_id: str = "default") -> Dict[str, int]:
-    cfg = ExportConfig(base_dir=Path(base_dir), domain_id=domain_id)
+def run_export(client: Any, base_dir: str = "nsx_export", domain_id: str = "default", output_format: str = "yaml") -> Dict[str, int]:
+    cfg = ExportConfig(base_dir=Path(base_dir), domain_id=domain_id, output_format=output_format)
     exporter = NsxExporter(client=client, cfg=cfg)
     return exporter.export_all()

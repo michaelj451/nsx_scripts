@@ -30,7 +30,7 @@ def main() -> None:
         "--source",
         choices=["nsx1", "nsx2"],
         default="nsx1",
-        help="Source NSX manager (where vm-tags index lives)",
+        help="Source NSX manager (where tagged-vms index lives)",
     )
     parser.add_argument(
         "--dest",

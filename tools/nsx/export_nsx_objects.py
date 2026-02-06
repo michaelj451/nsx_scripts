@@ -36,6 +36,12 @@ def main() -> None:
         default="nsx-lm1",
         help="Which NSX manager to export from (default: nsx-lm1)",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=["yaml", "json", "both"],
+        default="yaml",
+        help="Output format for exported objects (default: yaml)",
+    )
 
     args = parser.parse_args()
 
