@@ -19,3 +19,11 @@ NSX_DOMAINS = [
         "path": "/infra/domains/default",
     }
 ]
+
+def resolve_manager(choice: str) -> str:
+    mapping = {
+        "nsx-gm1": nsx_gm1,
+        "nsx-lm1": nsx_lm1,
+        "nsx-lm2": nsx_lm2,
+    }
+    return mapping[choice]

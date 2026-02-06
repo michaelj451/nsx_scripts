@@ -5,9 +5,9 @@ import logging
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_lm1
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2
 from nsx.nsx_policy_client import NsxPolicyClient
-
+from nsx.nsx_constants import resolve_manager
 from nsx.nsx_file_export_functions.nsx1_vm_file_exporter import (
     VmTagsExportConfig,
     NsxVmTagsExporter,
@@ -22,9 +22,8 @@ def _manager_dirname(mgr: str) -> str:
     mgr = mgr.removeprefix("https://").removeprefix("http://").rstrip("/")
     return mgr or "unknown_manager"
 
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export NSX1 realized-state VM tags to YAML/JSON")
+    parser = argparse.ArgumentParser(description="Export NSX realized-state VM tags to YAML/JSON")
     parser.add_argument("--base-dir", default="nsx_export", help="Base export directory")
     parser.add_argument("--output-format", choices=["yaml", "json", "both"], default="yaml")
     parser.add_argument("--page-size", type=int, default=500)
@@ -36,18 +35,30 @@ def main() -> None:
     parser.add_argument(
         "--federation-global",
         action="store_true",
-        help="Use global federation endpoints",
+        help="Use global federation endpoints (GM /global-manager/api/...)",
+    )
+    parser.add_argument(
+        "--manager",
+        choices=["nsx-gm1", "nsx-lm1", "nsx-lm2"],
+        default="nsx-lm1",
+        help="Which NSX manager to export from (default: nsx-lm1)",
     )
 
     args = parser.parse_args()
 
     init_cli()
 
+    manager_host = resolve_manager(args.manager)
+
+    # Optional safety note: GM endpoints should usually be used against a GM host
+    if args.federation_global and args.manager != "nsx-gm1":
+        log.warning("You set --federation-global but selected %s; this usually requires a Global Manager host.", args.manager)
+
     # Build client
-    client = NsxPolicyClient(nsxmanager=nsx_lm1, federation_global=args.federation_global)
+    client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)
 
     # Manager-scoped export root (prevents collisions)
-    mgr_dir = _manager_dirname(nsx_lm1)
+    mgr_dir = _manager_dirname(manager_host)
     export_root = Path(args.base_dir) / mgr_dir
 
     # Parse accepted VM types

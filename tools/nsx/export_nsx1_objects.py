@@ -6,6 +6,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_lm1
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_file_export_functions.nsx_object_exporter import run_export
+from nsx.nsx_constants import resolve_manager
 
 log = logging.getLogger(__name__)
 
@@ -29,17 +30,25 @@ def main() -> None:
         action="store_true",
         help="Use global federation endpoints",
     )
+    parser.add_argument(
+        "--manager",
+        choices=["nsx-gm1", "nsx-lm1", "nsx-lm2"],
+        default="nsx-lm1",
+        help="Which NSX manager to export from (default: nsx-lm1)",
+    )
 
     args = parser.parse_args()
 
     # Load .env, logging, etc.
     init_cli()
 
-    if not nsx_lm1:
-        raise RuntimeError("NSX_HOST1 is not set (nsx_lm1). Check your .env.")
+    manager_host = resolve_manager(args.manager)
+
+    if not manager_host:
+        raise RuntimeError(f"NSX manager host is not set for {args.manager}. Check your .env.")
 
     client = NsxPolicyClient(
-        nsxmanager=nsx_lm1,
+        nsxmanager=manager_host,
         federation_global=args.federation_global,
     )
 
