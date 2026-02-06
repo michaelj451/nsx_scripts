@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_file_import_functions.nsx_object_importer import (
     ImportConfig,

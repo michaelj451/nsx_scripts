@@ -41,3 +41,16 @@ def slugify(name: str) -> str:
     name = re.sub(r"[^\w\-\.]+", "_", name)
     name = re.sub(r"_+", "_", name).strip("_")
     return name or "unnamed"
+
+def safe_filename(name: str) -> str:
+    """
+    Convert display_name into a filesystem-safe filename.
+    """
+    if not name:
+        return "unnamed"
+
+    name = name.strip()
+    name = name.replace("/", "_")          # avoid directory traversal
+    name = re.sub(r"[^\w\-.]+", "_", name) # keep sane chars
+    name = re.sub(r"_+", "_", name)        # collapse repeats
+    return name[:255]                      # filesystem-safe length

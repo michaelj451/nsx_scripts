@@ -25,7 +25,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--manager",
-        choices=["nsx-gm1", "nsx-lm1", "nsx-lm2"],
+        choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
         default="nsx-lm2",
         help="Which NSX manager to export from (default: nsx-lm2)",
     )

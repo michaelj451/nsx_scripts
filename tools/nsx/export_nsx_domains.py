@@ -18,17 +18,11 @@ log = logging.getLogger("export_domains")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export NSX domains")
-    parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2"], default="nsx-gm1")
+    parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-gm1")
     parser.add_argument("--federation-global", action="store_true", default=True)
     parser.add_argument("--output-format", choices=["yaml", "json", "both"], default="yaml")
     parser.add_argument("--base-dir", default="nsx_export")
     args = parser.parse_args()
-
-    mgr_map = {
-        "nsx-gm1": nsx_gm1,
-        "nsx-lm1": nsx_lm1,
-        "nsx-lm2": nsx_lm2,
-    }
 
     manager_host = resolve_manager(args.manager)
 

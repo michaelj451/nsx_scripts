@@ -129,12 +129,15 @@ class NsxExporter:
     def export_groups(self) -> int:
         base = self.client._policy_path(f"/domains/{self.cfg.domain_id}/groups")
         out_dir = self.export_root / "domains" / self.cfg.domain_id / "groups"
+        out_dir.mkdir(parents=True, exist_ok=True)
         count = 0
 
         for page in self._get_pages(base):
             for g in page.get("results", []) or []:
-                gid = g.get("id") or g.get("display_name") or "group"
-                fname = f"{slugify(gid)}"
+                gname = g.get("display_name") or g.get("id") or "group"
+                gid = g.get("id") or ""
+                suffix = (gid[:8] if gid else "noid")
+                fname = f"{slugify(gname)}__{suffix}"
                 data = sanitize_payload(g, strip_keys=self.cfg.strip_keys)
                 self.write_object(out_dir, fname, data)
                 count += 1
@@ -143,14 +146,17 @@ class NsxExporter:
     def export_services(self) -> int:
         base = self.client._policy_path(f"/services")
         out_dir = self.export_root / "domains" / self.cfg.domain_id / "services"
+        out_dir.mkdir(parents=True, exist_ok=True)
         count = 0
 
         for page in self._get_pages(base):
             for s in page.get("results", []) or []:
                 if s.get("_system_owned") is True:
                     continue  # skip system services
-                sid = s.get("id") or s.get("display_name") or "service"
-                fname = f"{slugify(sid)}"
+                sname = s.get("display_name") or s.get("id") or "service"
+                sid = s.get("id") or ""
+                suffix = (sid[:8] if sid else "noid")
+                fname = f"{slugify(sname)}__{suffix}"
                 data = sanitize_payload(s, strip_keys=self.cfg.strip_keys)
                 self.write_object(out_dir, fname, data)
                 count += 1

@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 import yaml
 
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient  # uses YOUR class
 
 logging.basicConfig(level=logging.INFO)
@@ -28,16 +28,23 @@ def _write_outputs(out: Dict[str, Any], outdir: Path, fmt: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="List NSX domains using NsxPolicyClient")
-    parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2"], default="nsx-lm1")
+    parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-lm1")
     parser.add_argument("--federation-global", action="store_true", help="Use GM global-infra endpoints")
     parser.add_argument("--output", choices=["none", "json", "yaml", "both"], default="none")
     parser.add_argument("--outdir", default="nsx_export_meta", help="Where to write domains.yaml/domains.json")
     args = parser.parse_args()
 
-    mgr_map = {"nsx-gm1": nsx_gm1, "nsx-lm1": nsx_lm1, "nsx-lm2": nsx_lm2}
-    mgr_host = mgr_map[args.manager]
+    manager_host = resolve_manager(args.manager)
 
-    client = NsxPolicyClient(nsxmanager=mgr_host, federation_global=args.federation_global)
+    if not manager_host:
+        raise RuntimeError(f"NSX manager host is not set for {args.manager}. Check your .env.")
+
+    client = NsxPolicyClient(
+        nsxmanager=manager_host,
+        federation_global=args.federation_global,
+    )
+
+    client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)
 
     # Helpful debug so you KNOW what you're calling
     log.info("NSX_MANAGER=%s", getattr(client, "NSX_MANAGER", None))
@@ -55,7 +62,7 @@ def main() -> None:
         print(f"- id={did}  name={name}  desc={desc}".rstrip())
 
     out = {
-        "manager": mgr_host,
+        "manager": manager_host,
         "federation_global": bool(args.federation_global),
         "policy_root": getattr(client, "POLICY_ROOT", None),
         "domains": [
