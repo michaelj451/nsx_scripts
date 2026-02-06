@@ -7,7 +7,7 @@ from pathlib import Path
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2
 from nsx.nsx_policy_client import NsxPolicyClient
-from nsx.nsx_file_import_functions.nsx_vm_tags_importer import (
+from nsx.nsx_file_import_functions.nsx_tagged_vms_importer import (
     VmTagsImportConfig,
     NsxVmTagsImporter,
 )
@@ -121,7 +121,7 @@ def main() -> None:
     )
 
     importer = NsxVmTagsImporter(client=client, cfg=cfg)
-    result = importer.push_vm_tags()
+    result = importer.push_tagged_vms()
 
     log.info("VM tag import complete: %s", result["stats"])
     print(result)

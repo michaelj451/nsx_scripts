@@ -54,6 +54,10 @@ def main() -> None:
     if args.federation_global and args.manager != "nsx-gm1":
         log.warning("You set --federation-global but selected %s; this usually requires a Global Manager host.", args.manager)
 
+    if args.manager == "nsx-gm1" or args.federation_global:
+        log.error("Exporting from a Global Manager is not supported in this script.")
+        return
+
     # Build client
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)
 

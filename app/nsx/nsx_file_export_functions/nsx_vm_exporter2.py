@@ -10,35 +10,9 @@ import re
 import logging
 
 
-from nsx.nsx_constants import nsx_lm2
+from utilities.file_utilities import write_json, write_yaml, manager_dirname, slugify
 
 from typing import Optional
-
-def slugify(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[^\w\-\.]+", "_", name)
-    name = re.sub(r"_+", "_", name).strip("_")
-    return name or "unnamed"
-
-
-def write_yaml(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(
-            data,
-            sort_keys=True,
-            default_flow_style=False,
-            width=120,
-            allow_unicode=True,
-        ),
-        encoding="utf-8",
-    )
-
-
-def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-
 
 @dataclass
 class VmInventoryExportConfig:

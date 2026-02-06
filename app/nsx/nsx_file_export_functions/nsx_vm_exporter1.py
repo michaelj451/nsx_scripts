@@ -27,29 +27,6 @@ class VmTagsExportConfig:
     accepted_vm_types: Sequence[str] = ("REGULAR",)
 
 
-# # ---------------------------------------------------------------------------
-# # IO helpers
-# # ---------------------------------------------------------------------------
-
-# def _write_yaml(path: Path, data: Any) -> None:
-#     path.parent.mkdir(parents=True, exist_ok=True)
-#     path.write_text(
-#         yaml.safe_dump(
-#             data,
-#             sort_keys=True,
-#             default_flow_style=False,
-#             width=120,
-#             allow_unicode=True,
-#         ),
-#         encoding="utf-8",
-#     )
-
-
-# def _write_json(path: Path, data: Any) -> None:
-#     path.parent.mkdir(parents=True, exist_ok=True)
-#     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-
-
 # ---------------------------------------------------------------------------
 # Exporter
 # ---------------------------------------------------------------------------
@@ -191,7 +168,7 @@ class NsxVmTagsExporter:
         }
 
         # write index file
-        base_name = "vm_tags_index"
+        base_name = "tagged_vms_index"
         if self.cfg.output_format in ("yaml", "both"):
             write_yaml(out_dir / f"{base_name}.yaml", tag_index)
         if self.cfg.output_format in ("json", "both"):

@@ -29,6 +29,17 @@ def main() -> None:
         default="nsx-lm2",
         help="Which NSX manager to export from (default: nsx-lm2)",
     )
+    parser.add_argument(
+        "--export-root",
+        default="nsx_export",
+        help="Root directory for export files",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["yaml", "json", "both"],
+        default="yaml",
+        help="Output file format (default: yaml)",
+    )
 
     args = parser.parse_args()
 
@@ -38,14 +49,18 @@ def main() -> None:
 
     if not manager_host:
         raise RuntimeError(f"NSX manager host is not set for {args.manager}. Check your .env.")
-
     
-    export_root = Path("nsx_export") / nsx_lm2
+    if args.manager == "nsx-gm1" or args.federation_global:
+        log.error("Exporting from a Global Manager is not supported in this script.")
+        return
+
+    export_root = Path(args.export_root) / nsx_lm2
     export_nsx_vm_inventory_to_files(
         nsxmanager=nsx_lm2,
         export_root=export_root,
         contains=args.contains,
         case_sensitive=args.case_sensitive,
+        output_format=args.output_format,
     )
 
 

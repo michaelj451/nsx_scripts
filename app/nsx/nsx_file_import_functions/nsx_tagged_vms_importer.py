@@ -1,4 +1,4 @@
-# frontendFastapi/nsx/nsx_file_import_functions/nsx_vm_tags_importer.py
+# frontendFastapi/nsx/nsx_file_import_functions/nsx_tagged_vms_importer.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,7 +19,7 @@ Tag = Dict[str, str]  # {"scope":"...", "tag":"..."}
 
 @dataclass
 class VmTagsImportConfig:
-    # SOURCE export root (where tagged-vms/vm_tags_index.yaml lives)
+    # SOURCE export root (where tagged-vms/tagged_vms__index.yaml lives)
     export_root: Path
 
     # DEST export root (where vm-inventory/vms.yaml lives)
@@ -133,12 +133,12 @@ def map_dest_name_to_source_name(dest_name: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Parse source tags index (vm_tags_index.yaml)
+# Parse source tags index (tagged_vms_index.yaml)
 # ---------------------------------------------------------------------------
 
 def load_source_index_by_name(data: Any, path: Path) -> Dict[str, Dict[str, Any]]:
     """
-    Your source vm_tags_index.yaml is:
+    Your source tagged_vms_index.yaml is:
       meta: ...
       counts: ...
       vms:
@@ -196,7 +196,7 @@ def load_dest_allowlist(data: Any, path: Path) -> List[Dict[str, Any]]:
 # NSX API write
 # ---------------------------------------------------------------------------
 
-def nsx_add_vm_tags(client: Any, *, vm_external_id: str, tags_to_add: List[Tag]) -> Any:
+def nsx_add_tagged_vms(client: Any, *, vm_external_id: str, tags_to_add: List[Tag]) -> Any:
     """
     POST /api/v1/fabric/virtual-machines?action=add_tags
     payload: {"external_id":"...", "tags":[...]}
@@ -214,7 +214,7 @@ class NsxVmTagsImporter:
     """
     Allowlist-driven tagging:
 
-      - Read SOURCE tags from: <export_root>/tagged-vms/vm_tags_index.(yaml|json)
+      - Read SOURCE tags from: <export_root>/tagged-vms/tagged_vms_index.(yaml|json)
       - Read DEST allowlist from: <dest_inventory_root>/vm-inventory/vms.(yaml|json)
       - For each dest VM:
           dest_name -> src_name (map_dest_name_to_source_name)
@@ -229,8 +229,8 @@ class NsxVmTagsImporter:
         self.cfg = cfg
 
     def _load_source_by_name(self) -> Dict[str, Dict[str, Any]]:
-        vm_tags_dir = self.cfg.export_root / "tagged-vms"
-        src_path = pick_file(vm_tags_dir, ["vm_tags_index"], self.cfg.input_format)
+        tagged_vms_dir = self.cfg.export_root / "tagged-vms"
+        src_path = pick_file(tagged_vms_dir, ["tagged_vms_index"], self.cfg.input_format)
         raw = _load_any(src_path)
         idx = load_source_index_by_name(raw, src_path)
         log.info("Loaded %d source VMs (by name) from %s", len(idx), src_path)
@@ -244,7 +244,7 @@ class NsxVmTagsImporter:
         log.info("Loaded %d dest allowlist VMs from %s", len(vms), inv_path)
         return vms
 
-    def push_vm_tags(self) -> Dict[str, Any]:
+    def push_tagged_vms(self) -> Dict[str, Any]:
         source_by_name = self._load_source_by_name()
         dest_vms = self._load_dest_allowlist()
 
@@ -321,7 +321,7 @@ class NsxVmTagsImporter:
                         "result": "dry_run",
                     })
                 else:
-                    nsx_add_vm_tags(self.client, vm_external_id=str(dest_id), tags_to_add=desired_tags)
+                    nsx_add_tagged_vms(self.client, vm_external_id=str(dest_id), tags_to_add=desired_tags)
                     stats["updated"] += 1
                     rows.append({
                         "dest_name": dest_name,
