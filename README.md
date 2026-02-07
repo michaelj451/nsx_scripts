@@ -7,6 +7,7 @@ This repository provides CLI tooling to **export**, **audit**, and **import (pus
 
 The tooling is designed for **safe, auditable migrations**, with a strong emphasis on:
 - readable exports
+  - exports json & yaml
 - deterministic imports
 - dry-run first workflows
 
