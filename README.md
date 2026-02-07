@@ -15,8 +15,8 @@ The tooling is designed for **safe, auditable migrations**, with a strong emphas
 ## 1) Clone the repository
 
 ```bash
-git clone <YOUR_REPO_URL> fc_nsx
-cd fc_nsx
+git clone <YOUR_REPO_URL> nsx_scripts
+cd nsx_scripts
 ```
 
 ---
