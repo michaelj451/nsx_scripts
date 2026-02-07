@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 nsx_export/
+nsx_domain_meta/
 
 # C extensions
 *.so

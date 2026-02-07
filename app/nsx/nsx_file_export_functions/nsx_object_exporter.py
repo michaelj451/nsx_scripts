@@ -79,7 +79,10 @@ class NsxExporter:
     def __init__(self, client: Any, cfg: ExportConfig):
         self.client = client
         self.cfg = cfg
-        self.export_root = self.cfg.base_dir / manager_dirname(self.client)
+        mgr = manager_dirname(self.client)
+        base = self.cfg.base_dir
+        # If base_dir already ends with the manager folder, don't append again.
+        self.export_root = base if base.name == mgr else (base / mgr)
 
     # ---- paging helper ----
     def _get_pages(self, path: str, params: Optional[Dict[str, Any]] = None) -> Iterator[Dict[str, Any]]:

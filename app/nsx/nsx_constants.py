@@ -27,5 +27,7 @@ def resolve_manager(choice: str) -> str:
         "nsx-gm1": nsx_gm1,
         "nsx-lm1": nsx_lm1,
         "nsx-lm2": nsx_lm2,
+        "nsx-lm3": nsx_lm3,
+        "nsx-lm4": nsx_lm4,
     }
     return mapping[choice]

@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-lm1")
     parser.add_argument("--federation-global", action="store_true", help="Use GM global-infra endpoints")
     parser.add_argument("--output", choices=["none", "json", "yaml", "both"], default="none")
-    parser.add_argument("--outdir", default="nsx_export_meta", help="Where to write domains.yaml/domains.json")
+    parser.add_argument("--outdir", default="nsx_domain_meta", help="Where to write domains.yaml/domains.json")
     args = parser.parse_args()
 
     manager_host = resolve_manager(args.manager)

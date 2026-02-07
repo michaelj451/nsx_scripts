@@ -5,12 +5,9 @@ import logging
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
+from nsx.nsx_constants import nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
-from nsx.nsx_file_import_functions.nsx_object_importer import (
-    ImportConfig,
-    NsxImporter,
-)
+from nsx.nsx_file_import_functions.nsx_object_importer import ImportConfig, NsxImporter
 
 log = logging.getLogger(__name__)
 
@@ -21,51 +18,21 @@ def _manager_dirname(mgr: str) -> str:
     return mgr or "unknown_manager"
 
 
+def _resolve_export_root(base_dir: str, manager_name: str) -> Path:
+    base = Path(base_dir)
+    return base if base.name == manager_name else (base / manager_name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import NSX objects from exported YAML/JSON into a target NSX manager")
-    parser.add_argument(
-        "--source",
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
-        default="nsx-lm1",
-        help="Which exported manager folder to read from (default: nsx-lm1)",
-    )
-    parser.add_argument(
-        "--target",
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
-        default="nsx-lm2",
-        help="Which NSX manager to import into (default: nsx-lm2)",
-    )
-    parser.add_argument(
-        "--base-dir",
-        default="nsx_export",
-        help="Base export directory containing manager subfolders (default: nsx_export)",
-    )
-    parser.add_argument(
-        "--domain-id",
-        default="default",
-        help="NSX Policy domain id (default: default)",
-    )
-    parser.add_argument(
-        "--input-format",
-        choices=["yaml", "json"],
-        default="yaml",
-        help="Input file format to import (default: yaml)",
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually write to NSX (default is dry-run).",
-    )
-    parser.add_argument(
-        "--stop-on-error",
-        action="store_true",
-        help="Stop on first error (default continues).",
-    )
-    parser.add_argument(
-        "--federation-global",
-        action="store_true",
-        help="Use global federation endpoints",
-    )
+    parser.add_argument("--source", choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-lm1")
+    parser.add_argument("--target", choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-lm2")
+    parser.add_argument("--base-dir", default="nsx_export")
+    parser.add_argument("--domain-id", default="default")
+    parser.add_argument("--input-format", choices=["yaml", "json"], default="yaml")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--stop-on-error", action="store_true")
+    parser.add_argument("--federation-global", action="store_true")
 
     args = parser.parse_args()
 
@@ -86,7 +53,8 @@ def main() -> None:
     if not dst_mgr:
         raise RuntimeError(f"Target manager env var not set for {args.target} (check NSX_LM1/NSX_LM2).")
 
-    export_root = Path(args.base_dir) / _manager_dirname(src_mgr)
+    src_folder = _manager_dirname(src_mgr)
+    export_root = _resolve_export_root(args.base_dir, src_folder)
 
     if not export_root.exists():
         raise RuntimeError(f"Export root does not exist: {export_root}")
