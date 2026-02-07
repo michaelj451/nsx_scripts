@@ -170,3 +170,4 @@ curl -k -u 'admin:*'   "https://nsx-gm1.lab.local/policy/api/v1/global-infra/dom
 export PYTHONPATH="$PWD/app"
 python tools/nsx/export_nsx_objects.py --domain-id nsx-gm1 --federation-global --output-format both --all-domains --manager nsx-gm1
 
+python tools/nsx/create_new_groups.py --csv data/subnet_map.csv
