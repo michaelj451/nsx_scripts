@@ -18,10 +18,12 @@ from utilities.subnet_conversation import (
 
 
 # ---- Defaults (override via CLI flags if you want) ----
-REPO_ROOT = Path(__file__).resolve().parents[1]  # adjust if needed
+
+REPO_ROOT = Path(__file__).resolve().parents[2]  
+
 NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
 NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_converted"
-
+CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
 def group_has_any_ip_or_cidr(group: dict) -> bool:
     """
@@ -102,10 +104,19 @@ def main() -> None:
         description="Convert all NSX group files from nsx_export to nsx_converted using subnet CSV mappings."
     )
     ap.add_argument("--csv", dest="csv_path", required=True, help="CSV with headers old_subnet,new_subnet,vlan,description")
-    ap.add_argument("--nsx-export", dest="nsx_export_dir", default=str(NSX_EXPORT_DIR_DEFAULT),
-                    help=f"Input directory (default: {NSX_EXPORT_DIR_DEFAULT})")
-    ap.add_argument("--nsx-converted", dest="nsx_converted_dir", default=str(NSX_CONVERTED_DIR_DEFAULT),
-                    help=f"Output directory (default: {NSX_CONVERTED_DIR_DEFAULT})")
+    ap.add_argument(
+        "--nsx-export",
+        dest="nsx_export_dir",
+        default=str(NSX_EXPORT_DIR_DEFAULT),
+        help=f"Input directory (default: {NSX_EXPORT_DIR_DEFAULT})"
+    )
+
+    ap.add_argument(
+        "--nsx-converted",
+        dest="nsx_converted_dir",
+        default=str(NSX_CONVERTED_DIR_DEFAULT),
+        help=f"Output directory (default: {NSX_CONVERTED_DIR_DEFAULT})"
+    )
     ap.add_argument("--dry-run", action="store_true", help="Show what would be converted without writing files")
     args = ap.parse_args()
 
