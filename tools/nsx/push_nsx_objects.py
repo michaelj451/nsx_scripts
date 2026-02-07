@@ -25,15 +25,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Import NSX objects from exported YAML/JSON into a target NSX manager")
     parser.add_argument(
         "--source",
-        choices=["nsx1", "nsx2"],
-        default="nsx1",
-        help="Which exported manager folder to read from (default: nsx1)",
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        default="nsx-lm1",
+        help="Which exported manager folder to read from (default: nsx-lm1)",
     )
     parser.add_argument(
         "--target",
-        choices=["nsx1", "nsx2"],
-        default="nsx2",
-        help="Which NSX manager to import into (default: nsx2)",
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        default="nsx-lm2",
+        help="Which NSX manager to import into (default: nsx-lm2)",
     )
     parser.add_argument(
         "--base-dir",
@@ -72,8 +72,10 @@ def main() -> None:
     init_cli()
 
     mgr_map = {
-        "nsx1": nsx_lm1,
-        "nsx2": nsx_lm2,
+        "nsx-lm1": nsx_lm1,
+        "nsx-lm2": nsx_lm2,
+        "nsx-lm3": nsx_lm3,
+        "nsx-lm4": nsx_lm4,
     }
 
     src_mgr = mgr_map.get(args.source)

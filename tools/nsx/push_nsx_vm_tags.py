@@ -28,14 +28,14 @@ def main() -> None:
 
     parser.add_argument(
         "--source",
-        choices=["nsx1", "nsx2"],
-        default="nsx1",
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        default="nsx-lm1",
         help="Source NSX manager (where tagged-vms index lives)",
     )
     parser.add_argument(
         "--dest",
-        choices=["nsx1", "nsx2"],
-        default="nsx2",
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        default="nsx-lm2",
         help="Destination NSX manager (where tags are applied)",
     )
     parser.add_argument(
@@ -78,17 +78,19 @@ def main() -> None:
     init_cli()
 
     mgr_map = {
-        "nsx1": nsx_lm1,
-        "nsx2": nsx_lm2,
+        "nsx-lm1": nsx_lm1,
+        "nsx-lm2": nsx_lm2,
+        "nsx-lm3": nsx_lm3,
+        "nsx-lm4": nsx_lm4,
     }
 
     src_mgr = mgr_map.get(args.source)
     dst_mgr = mgr_map.get(args.dest)
 
     if not src_mgr:
-        raise RuntimeError(f"Source manager not set for {args.source} (check NSX_LM1/NSX_LM2)")
+        raise RuntimeError(f"Source manager not set for {args.source} (check NSX_LM1/NSX_LM2/NSX_LM3/NSX_LM4)")
     if not dst_mgr:
-        raise RuntimeError(f"Destination manager not set for {args.dest} (check NSX_LM1/NSX_LM2)")
+        raise RuntimeError(f"Destination manager not set for {args.dest} (check NSX_LM1/NSX_LM2/NSX_LM3/NSX_LM4)")
     source_root = Path(args.base_dir) / _manager_dirname(src_mgr)
     dest_inventory_root = Path(args.base_dir) / _manager_dirname(dst_mgr)
 
