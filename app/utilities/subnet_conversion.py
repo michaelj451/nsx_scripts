@@ -87,24 +87,6 @@ def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
     maps.sort(key=lambda m: (m.old.version, -m.old.prefixlen))
     return maps
 
-
-def find_groups_container(doc: Any) -> Tuple[Any, list[dict[str, Any]]]:
-    """
-    Returns (container, groups_list).
-    - container is the root object to mutate when replacing results/etc.
-    """
-    if isinstance(doc, list):
-        return doc, doc
-    if isinstance(doc, dict):
-        if "results" in doc and isinstance(doc["results"], list):
-            return doc, doc["results"]
-        # dict keyed by name -> group dict
-        if all(isinstance(v, dict) for v in doc.values()):
-            # treat values as groups; re-emit as dict unchanged structure
-            return doc, list(doc.values())
-    raise SystemExit("Unrecognized groups document shape (expected list, {results:[...]}, or {name: {...}}).")
-
-
 def looks_like_ip_or_cidr(s: str) -> bool:
     try:
         ipaddress.ip_address(s)
@@ -218,3 +200,58 @@ def append_new_to_group_name(group: dict[str, Any]) -> None:
         group["name"] = f"{group['name']} new"
         return
     # fallback: do nothing if no name fields found
+
+def find_groups_container(doc: Any) -> Tuple[Any, list[dict]]:
+    """
+    Return (container, groups_list).
+
+    Supported shapes:
+      A) [ {...}, {...} ]
+      B) { "results": [ {...}, ... ] }
+      C) { "groups":  [ {...}, ... ] }
+      D) { "objects": { "groups": [ {...}, ... ] } }
+      E) { "<domain>": { "groups": [ {...}, ... ] }, ... }   (or values contain groups)
+      F) { "<name>": {...}, ... }  (dict keyed by group name -> group dict)
+    """
+    # A) list of groups
+    if isinstance(doc, list):
+        if all(isinstance(x, dict) for x in doc):
+            return doc, doc
+
+    # dict shapes
+    if isinstance(doc, dict):
+        # B) results
+        if isinstance(doc.get("results"), list) and all(isinstance(x, dict) for x in doc["results"]):
+            return doc, doc["results"]
+
+        # C) groups at top level
+        if isinstance(doc.get("groups"), list) and all(isinstance(x, dict) for x in doc["groups"]):
+            return doc, doc["groups"]
+
+        # D) objects.groups
+        obj = doc.get("objects")
+        if isinstance(obj, dict) and isinstance(obj.get("groups"), list) and all(isinstance(x, dict) for x in obj["groups"]):
+            return obj, obj["groups"]
+
+        # E) nested per-domain/per-manager wrappers
+        # look for any dict value that contains a 'groups' list
+        for v in doc.values():
+            if isinstance(v, dict) and isinstance(v.get("groups"), list) and all(isinstance(x, dict) for x in v["groups"]):
+                return v, v["groups"]
+
+        # F) keyed dict of group objects
+        if doc and all(isinstance(v, dict) for v in doc.values()):
+            # avoid false positives like {"meta": {...}, "data": {...}}
+            # If at least one entry looks like a group (has display_name/name/path/expression), accept.
+            def looks_like_group(g: dict) -> bool:
+                keys = set(g.keys())
+                return bool(keys & {"display_name", "name", "path", "expression", "id"})
+            values = list(doc.values())
+            if any(looks_like_group(v) for v in values):
+                return doc, values
+
+    raise SystemExit(
+        "Unrecognized groups document shape. "
+        "Expected list, {results:[...]}, {groups:[...]}, {objects:{groups:[...]}}, "
+        "or nested dict containing groups."
+    )
