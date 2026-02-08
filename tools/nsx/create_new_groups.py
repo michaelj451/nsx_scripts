@@ -9,21 +9,27 @@ import re
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 try:
     import yaml  # PyYAML
 except ImportError as e:
     raise SystemExit("Missing dependency: PyYAML. Install with: pip install pyyaml") from e
 
+
+# =============================================================================
+# Logging
+# =============================================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # Defaults
 # =============================================================================
 
-REPO_ROOT = Path(__file__).resolve().parents[2]  # nsx_scripts/
+REPO_ROOT = Path(__file__).resolve().parents[2]
 NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
 NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_new_groups"
 CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
@@ -49,6 +55,7 @@ def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
             raise SystemExit("CSV has no headers.")
+
         missing = required - set(h.strip() for h in reader.fieldnames)
         if missing:
             raise SystemExit(f"CSV missing required headers: {sorted(missing)}")
@@ -74,13 +81,12 @@ def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
                 )
             )
 
-    # Prefer more specific first
     maps.sort(key=lambda m: (m.old.version, -m.old.prefixlen))
     return maps
 
 
 # =============================================================================
-# YAML/JSON IO
+# YAML / JSON IO
 # =============================================================================
 
 def load_doc(path: Path) -> Any:
@@ -89,127 +95,112 @@ def load_doc(path: Path) -> Any:
         return json.loads(text)
     if path.suffix.lower() in {".yml", ".yaml"}:
         return yaml.safe_load(text)
-    raise SystemExit(f"Unsupported input extension: {path.suffix} (use .yaml/.yml/.json)")
+    raise SystemExit(f"Unsupported input extension: {path.suffix}")
 
 
 def write_output(path: Path, obj: Any) -> None:
     if path.suffix.lower() == ".json":
-        path.write_text(json.dumps(obj, indent=2, sort_keys=False), encoding="utf-8")
+        path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
         return
     if path.suffix.lower() in {".yml", ".yaml"}:
         path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding="utf-8")
         return
-    raise SystemExit(f"Unsupported output extension: {path.suffix} (use .yaml/.yml/.json)")
+    raise SystemExit(f"Unsupported output extension: {path.suffix}")
 
 
 # =============================================================================
-# Group doc shape handling
+# Group document shape handling
 # =============================================================================
 
 def find_groups_container(doc: Any) -> Tuple[Any, list[dict]]:
-    """
-    Return (container, groups_list).
-
-    Supported shapes:
-      A) [ {...}, {...} ]
-      B) { "results": [ {...}, ... ] }
-      C) { "groups":  [ {...}, ... ] }
-      D) { "objects": { "groups": [ {...}, ... ] } }
-      E) { "<domain>": { "groups": [ {...}, ... ] }, ... }
-      F) { "<name>": {...}, ... } (dict keyed by group name -> group dict)
-      G) { ...single group object... } (one group per file)
-      H) { "items"/"data"/"resources"/"children": [ {...}, ... ] }
-    """
-
     def looks_like_group(g: dict) -> bool:
-        keys = set(g.keys())
-        return bool(keys & {"display_name", "name", "expression", "id", "path"}) and (
-            "expression" in keys or "path" in keys or "id" in keys
-        )
+        return bool(set(g) & {"display_name", "name", "expression", "id", "path"})
 
-    # A) list
     if isinstance(doc, list) and all(isinstance(x, dict) for x in doc):
         return doc, doc
 
     if isinstance(doc, dict):
-        # G) single group object
         if looks_like_group(doc):
             return doc, [doc]
 
-        # B) results
-        if isinstance(doc.get("results"), list) and all(isinstance(x, dict) for x in doc["results"]):
-            return doc, doc["results"]
-
-        # H) common wrapper lists
-        for key in ("items", "data", "resources", "children"):
+        for key in ("results", "groups", "items", "data", "resources", "children"):
             if isinstance(doc.get(key), list) and all(isinstance(x, dict) for x in doc[key]):
                 return doc, doc[key]
 
-        # C) groups
-        if isinstance(doc.get("groups"), list) and all(isinstance(x, dict) for x in doc["groups"]):
-            return doc, doc["groups"]
-
-        # D) objects.groups
-        obj = doc.get("objects")
-        if isinstance(obj, dict) and isinstance(obj.get("groups"), list) and all(isinstance(x, dict) for x in obj["groups"]):
-            return obj, obj["groups"]
-
-        # E) nested wrappers
         for v in doc.values():
-            if isinstance(v, dict) and isinstance(v.get("groups"), list) and all(isinstance(x, dict) for x in v["groups"]):
+            if isinstance(v, dict) and isinstance(v.get("groups"), list):
                 return v, v["groups"]
 
-        # F) keyed dict of group objects
-        if doc and all(isinstance(v, dict) for v in doc.values()):
+        if all(isinstance(v, dict) for v in doc.values()):
             values = list(doc.values())
             if any(looks_like_group(v) for v in values):
                 return doc, values
 
-    raise SystemExit(
-        "Unrecognized groups document shape. "
-        "Expected list, {results:[...]}, {groups:[...]}, {objects:{groups:[...]}}, "
-        "nested dict containing groups, wrapper lists (items/data/resources/children), "
-        "or a single group object."
-    )
+    raise SystemExit("Unrecognized group document shape")
 
 
 def append_new_to_group_name(group: dict[str, Any]) -> None:
-    if "display_name" in group and isinstance(group["display_name"], str):
+    if "display_name" in group:
         group["display_name"] = f"{group['display_name']} new"
-        return
-    if "name" in group and isinstance(group["name"], str):
+    elif "name" in group:
         group["name"] = f"{group['name']} new"
-        return
 
 
 # =============================================================================
-# Token detection + remap (IP, CIDR, range)
+# Path / identity helpers
+# =============================================================================
+
+def derive_new_group_path(new_domain_path: str, new_group_id: str) -> str:
+    """
+    /global-infra/domains/<domain> + group id
+    """
+    return f"{new_domain_path.rstrip('/')}/groups/{new_group_id}"
+
+
+def apply_new_identity(group: dict, new_group_id: str, new_domain_path: str) -> None:
+    group["_source_id"] = group.get("id")
+    group["_source_path"] = group.get("path")
+
+    group["id"] = new_group_id
+    group["relative_path"] = new_group_id
+
+    group["parent_path"] = new_domain_path
+    group["path"] = derive_new_group_path(new_domain_path, new_group_id)
+
+
+def rebuild_expression_paths(expr: dict, new_group_path: str) -> None:
+    expr_id = expr.get("id") or expr.get("relative_path")
+    if not expr_id:
+        raise SystemExit("Expression missing id / relative_path")
+
+    expr["parent_path"] = new_group_path
+    expr["relative_path"] = expr_id
+
+    rt = expr.get("resource_type", "")
+    segment = "expressions"
+    if rt == "IPAddressExpression":
+        segment = "ip-address-expressions"
+
+    expr["path"] = f"{new_group_path}/{segment}/{expr_id}"
+
+
+# =============================================================================
+# IP / CIDR / Range remapping
 # =============================================================================
 
 _RANGE_RE = re.compile(r"^\s*([0-9a-fA-F\.:]+)\s*-\s*([0-9a-fA-F\.:]+)\s*$")
 
 
 def looks_like_ip_token(s: str) -> bool:
-    s = s.strip()
     if not s:
         return False
-
-    m = _RANGE_RE.match(s)
-    if m:
-        a, b = m.groups()
-        try:
-            ipaddress.ip_address(a)
-            ipaddress.ip_address(b)
-            return True
-        except ValueError:
-            return False
-
+    if _RANGE_RE.match(s):
+        return True
     try:
         ipaddress.ip_address(s)
         return True
     except ValueError:
         pass
-
     try:
         ipaddress.ip_network(s, strict=False)
         return True
@@ -219,187 +210,144 @@ def looks_like_ip_token(s: str) -> bool:
 
 def _find_mapping_for_ip(ip: ipaddress._BaseAddress, maps: list[SubnetMap]) -> Optional[SubnetMap]:
     for m in maps:
-        if ip.version != m.old.version:
-            continue
-        if ip in m.old:
+        if ip.version == m.old.version and ip in m.old:
             return m
     return None
 
 
 def _remap_ip(ip: ipaddress._BaseAddress, m: SubnetMap) -> ipaddress._BaseAddress:
-    old_root = int(m.old.network_address)
-    new_root = int(m.new.network_address)
-    offset = int(ip) - old_root
-    return ipaddress.ip_address(new_root + offset)
+    offset = int(ip) - int(m.old.network_address)
+    return ipaddress.ip_address(int(m.new.network_address) + offset)
 
 
 def remap_token(token: str, maps: list[SubnetMap]) -> str:
-    s = token.strip()
-    if not s:
-        return token
+    token = token.strip()
 
-    # Range: ip-ip
-    mrange = _RANGE_RE.match(s)
+    mrange = _RANGE_RE.match(token)
     if mrange:
-        a_s, b_s = mrange.groups()
-        a = ipaddress.ip_address(a_s)
-        b = ipaddress.ip_address(b_s)
-
+        a = ipaddress.ip_address(mrange.group(1))
+        b = ipaddress.ip_address(mrange.group(2))
         ma = _find_mapping_for_ip(a, maps)
         mb = _find_mapping_for_ip(b, maps)
+        if ma and mb and ma.old == mb.old:
+            return f"{_remap_ip(a, ma)}-{_remap_ip(b, ma)}"
+        return token
 
-        # remap only if both endpoints map to same old subnet
-        if ma is None or mb is None or ma.old != mb.old:
-            return token
-
-        a2 = _remap_ip(a, ma)
-        b2 = _remap_ip(b, ma)
-        return f"{a2}-{b2}"
-
-    # CIDR
     try:
-        net = ipaddress.ip_network(s, strict=False)
-
-        # exact old->new
-        for mp in maps:
-            if net == mp.old:
-                return str(mp.new)
-
-        # subnet inside old->shift
-        for mp in maps:
-            if net.version != mp.old.version:
-                continue
-            if net.subnet_of(mp.old):
-                old_base = int(net.network_address)
-                old_root = int(mp.old.network_address)
-                new_root = int(mp.new.network_address)
-                offset = old_base - old_root
-                new_base_ip = ipaddress.ip_address(new_root + offset)
-                new_net = ipaddress.ip_network(f"{new_base_ip}/{net.prefixlen}", strict=False)
-                return str(new_net)
-
+        net = ipaddress.ip_network(token, strict=False)
+        for m in maps:
+            if net == m.old:
+                return str(m.new)
+            if net.subnet_of(m.old):
+                offset = int(net.network_address) - int(m.old.network_address)
+                new_base = ipaddress.ip_address(int(m.new.network_address) + offset)
+                return str(ipaddress.ip_network(f"{new_base}/{net.prefixlen}", strict=False))
         return token
     except ValueError:
         pass
 
-    # Single IP
     try:
-        ip = ipaddress.ip_address(s)
-        mp = _find_mapping_for_ip(ip, maps)
-        if mp is None:
+        ip = ipaddress.ip_address(token)
+        m = _find_mapping_for_ip(ip, maps)
+        if not m:
             return token
-        return str(_remap_ip(ip, mp))
+        new_ip = _remap_ip(ip, m)
+        logger.info("Remapping IP: %s -> %s", ip, new_ip)
+        return str(new_ip)
     except ValueError:
         return token
 
 
-def deep_remap(obj: Any, maps: list[SubnetMap]) -> Any:
+def deep_remap(obj: Any, maps: list[SubnetMap]) -> tuple[Any, int]:
     if isinstance(obj, dict):
-        return {k: deep_remap(v, maps) for k, v in obj.items()}
+        out, n = {}, 0
+        for k, v in obj.items():
+            v2, dn = deep_remap(v, maps)
+            out[k] = v2
+            n += dn
+        return out, n
+
     if isinstance(obj, list):
-        return [deep_remap(v, maps) for v in obj]
+        out, n = [], 0
+        for v in obj:
+            v2, dn = deep_remap(v, maps)
+            out.append(v2)
+            n += dn
+        return out, n
+
     if isinstance(obj, str) and looks_like_ip_token(obj):
-        return remap_token(obj, maps)
-    return obj
+        new_s = remap_token(obj, maps)
+        return new_s, int(new_s != obj)
+
+    return obj, 0
 
 
 # =============================================================================
 # Conversion logic
 # =============================================================================
 
-def group_has_any_ip_token(group: dict) -> bool:
-    def walk(o: Any) -> bool:
-        if isinstance(o, dict):
-            return any(walk(v) for v in o.values())
-        if isinstance(o, list):
-            return any(walk(v) for v in o)
-        if isinstance(o, str):
-            return looks_like_ip_token(o)
-        return False
-    return walk(group)
+def convert_groups_in_doc(
+    doc: Any,
+    maps: list[SubnetMap],
+    new_domain_path: str,
+) -> tuple[Any, int, int]:
 
-
-def convert_groups_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int]:
-    container, groups_list = find_groups_container(doc)
+    _, groups = find_groups_container(doc)
 
     converted: list[dict] = []
-    for g in groups_list:
-        if not isinstance(g, dict):
-            continue
-        if not group_has_any_ip_token(g):
+    replaced_total = 0
+
+    for g in groups:
+        new_g, replaced = deep_remap(g, maps)
+        if replaced == 0:
             continue
 
-        new_g = deep_remap(g, maps)
-        if not isinstance(new_g, dict):
-            continue
+        old_id = new_g.get("id")
+        if not old_id:
+            raise SystemExit("Group missing id")
+
+        new_group_id = f"{old_id}__new"
+        apply_new_identity(new_g, new_group_id, new_domain_path)
+
+        for expr in new_g.get("expression", []) or []:
+            if isinstance(expr, dict):
+                rebuild_expression_paths(expr, new_g["path"])
 
         append_new_to_group_name(new_g)
+
         converted.append(new_g)
+        replaced_total += replaced
 
-    # If input is a single-group file, keep single-group output
-    if isinstance(doc, dict) and len(groups_list) == 1 and groups_list[0] is doc:
-        if converted:
-            return converted[0], 1
-        return doc, 0
+    if isinstance(doc, dict) and len(groups) == 1 and groups[0] is doc:
+        return (converted[0], 1, replaced_total) if converted else (doc, 0, 0)
 
-    # Keep original doc shape but only with converted groups
     if isinstance(doc, list):
-        return converted, len(converted)
+        return converted, len(converted), replaced_total
 
-    if isinstance(doc, dict) and "results" in doc and isinstance(doc["results"], list):
-        out_doc = dict(doc)
-        out_doc["results"] = converted
-        return out_doc, len(converted)
+    out = dict(doc)
+    for key in ("results", "groups"):
+        if key in out:
+            out[key] = converted
+            return out, len(converted), replaced_total
 
-    if isinstance(doc, dict) and "groups" in doc and isinstance(doc["groups"], list):
-        out_doc = dict(doc)
-        out_doc["groups"] = converted
-        return out_doc, len(converted)
-
-    if isinstance(doc, dict):
-        out_doc: dict[str, Any] = {}
-        for cg in converted:
-            key = cg.get("display_name") or cg.get("name") or cg.get("id") or "group_new"
-            out_doc[str(key)] = cg
-        return out_doc, len(converted)
-
-    return converted, len(converted)
+    return converted, len(converted), replaced_total
 
 
 # =============================================================================
-# File iteration + output paths
+# File handling
 # =============================================================================
 
 def iter_group_files(nsx_export_dir: Path) -> list[Path]:
-    """
-    Only pick files likely to be group exports.
-    This matches your exporter structure where groups are often under a 'groups/' directory.
-    """
-    exts = {".yml", ".yaml", ".json"}
-    files: list[Path] = []
-
-    for p in nsx_export_dir.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in exts:
-            continue
-        ps = p.as_posix().lower()
-        if "/groups/" in ps or p.name.lower().startswith("groups."):
-            files.append(p)
-
-    return sorted(files)
+    return sorted(
+        p for p in nsx_export_dir.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in {".yml", ".yaml", ".json"}
+        and "/groups/" in p.as_posix().lower()
+    )
 
 
-def out_path_for(in_file: Path, nsx_export_dir: Path, nsx_converted_dir: Path) -> Path:
-    rel = in_file.relative_to(nsx_export_dir)
-    return nsx_converted_dir / rel
-
-
-def debug_doc_shape(file_path: Path, doc: Any) -> None:
-    print("\n=== FILE ===", file_path)
-    print("TOP LEVEL TYPE:", type(doc))
-    if isinstance(doc, dict):
-        print("TOP LEVEL KEYS:", list(doc.keys())[:60])
+def out_path_for(in_file: Path, src: Path, dst: Path) -> Path:
+    return dst / in_file.relative_to(src)
 
 
 # =============================================================================
@@ -407,91 +355,48 @@ def debug_doc_shape(file_path: Path, doc: Any) -> None:
 # =============================================================================
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Convert NSX groups from nsx_export to nsx_converted using subnet CSV mappings."
-    )
+    ap = argparse.ArgumentParser(description="Create new NSX groups with remapped IPs")
+    ap.add_argument("--csv", default=str(CSV_DEFAULT))
+    ap.add_argument("--nsx-export", default=str(NSX_EXPORT_DIR_DEFAULT))
+    ap.add_argument("--nsx-converted", default=str(NSX_CONVERTED_DIR_DEFAULT))
     ap.add_argument(
-        "--csv",
-        dest="csv_path",
-        default=str(CSV_DEFAULT),
-        help=f"CSV with headers old_subnet,new_subnet,vlan,description (default: {CSV_DEFAULT})",
+        "--new-domain-path",
+        required=True,
+        help="Target domain path (e.g. /global-infra/domains/default)",
     )
-    ap.add_argument(
-        "--nsx-export",
-        dest="nsx_export_dir",
-        default=str(NSX_EXPORT_DIR_DEFAULT),
-        help=f"Input directory (default: {NSX_EXPORT_DIR_DEFAULT})",
-    )
-    ap.add_argument(
-        "--nsx-converted",
-        dest="nsx_converted_dir",
-        default=str(NSX_CONVERTED_DIR_DEFAULT),
-        help=f"Output directory (default: {NSX_CONVERTED_DIR_DEFAULT})",
-    )
-    ap.add_argument("--dry-run", action="store_true", help="Show what would be converted without writing files")
-    ap.add_argument("--debug", action="store_true", help="Print detected YAML/JSON shapes for troubleshooting")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    csv_path = Path(args.csv_path)
-    nsx_export_dir = Path(args.nsx_export_dir)
-    nsx_converted_dir = Path(args.nsx_converted_dir)
+    maps = read_csv_mappings(Path(args.csv))
+    in_files = iter_group_files(Path(args.nsx_export))
 
-    # Fail loudly if paths are wrong
-    if not nsx_export_dir.exists():
-        raise SystemExit(f"nsx_export_dir does not exist: {nsx_export_dir}")
-    if not csv_path.exists():
-        raise SystemExit(f"CSV does not exist: {csv_path}")
-
-    maps = read_csv_mappings(csv_path)
-
-    in_files = iter_group_files(nsx_export_dir)
-    if not in_files:
-        print(f"No group YAML/JSON files found under: {nsx_export_dir}")
-        return
-
-    total_files = 0
-    total_groups = 0
-    written_files = 0
-    skipped_unrecognized = 0
+    total_groups = total_replacements = written = 0
 
     for f in in_files:
         doc = load_doc(f)
-        if args.debug:
-            debug_doc_shape(f, doc)
-
-        try:
-            out_doc, converted_count = convert_groups_in_doc(doc, maps)
-        except SystemExit as e:
-            if args.debug:
-                print(f"[skip] {f} -> {e}")
-            skipped_unrecognized += 1
+        out_doc, groups, replaced = convert_groups_in_doc(
+            doc,
+            maps,
+            args.new_domain_path,
+        )
+        if groups == 0:
             continue
 
-        total_files += 1
-        total_groups += converted_count
+        out_f = out_path_for(f, Path(args.nsx_export), Path(args.nsx_converted))
+        print(f"[convert] {f} -> {out_f}  (groups={groups}, replacements={replaced})")
 
-        if converted_count == 0:
-            continue
+        total_groups += groups
+        total_replacements += replaced
 
-        out_f = out_path_for(f, nsx_export_dir, nsx_converted_dir)
-        print(f"[convert] {f} -> {out_f}  (groups converted: {converted_count})")
-
-        if args.dry_run:
-            continue
-
-        out_f.parent.mkdir(parents=True, exist_ok=True)
-        write_output(out_f, out_doc)
-        written_files += 1
+        if not args.dry_run:
+            out_f.parent.mkdir(parents=True, exist_ok=True)
+            write_output(out_f, out_doc)
+            written += 1
 
     print("\nDone.")
-    print(f"- Candidate group files found: {len(in_files)}")
-    print(f"- Files parsed as group documents: {total_files}")
-    print(f"- Unrecognized/Skipped: {skipped_unrecognized}")
     print(f"- Groups converted: {total_groups}")
-    if args.dry_run:
-        print("- Dry run: no files written")
-    else:
-        print(f"- Files written: {written_files}")
+    print(f"- Replacements made: {total_replacements}")
+    print(f"- Files written: {written}")
 
 
 if __name__ == "__main__":
