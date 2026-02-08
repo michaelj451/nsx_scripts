@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 nsx_export/
 nsx_domain_meta/
+nsx_new_groups/
 
 # C extensions
 *.so

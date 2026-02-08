@@ -21,7 +21,6 @@ DEFAULT_STRIP_KEYS = {
     "revision", "_revision",
     "unique_id", "realization_id",
     "marked_for_delete", "overridden",
-    "relative_path", "parent_path", "path",
     "create_time", "create_time_ms",
     "last_modified_time", "last_modified_time_ms",
     "create_user", "last_modified_user",

@@ -18,8 +18,8 @@ log = logging.getLogger("export_domains")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export NSX domains")
-    parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-gm1")
-    parser.add_argument("--federation-global", action="store_true", default=True)
+    parser.add_argument("--manager", choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"], default="nsx-lm1")
+    parser.add_argument("--federation-global", action="store_true", default=False)
     parser.add_argument("--output-format", choices=["yaml", "json", "both"], default="yaml")
     parser.add_argument("--base-dir", default="nsx_export")
     args = parser.parse_args()
@@ -36,7 +36,7 @@ def main() -> None:
 
     domains = client.list_domains(page_size=1000)
 
-    export_root = Path(args.base_dir) / manager_dirname(client)
+    export_root = Path(args.base_dir) / manager_dirname(manager_host)
     out_dir = export_root / "domains"
 
     payload = {
