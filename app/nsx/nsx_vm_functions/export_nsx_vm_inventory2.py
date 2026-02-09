@@ -3,7 +3,7 @@ import logging
 import argparse
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_lm2, nsx_gm1
-from nsx.not_needed_now.nsx_vm_exporter2 import (
+from nsx.nsx_vm_functions.nsx_vm_exporter2 import (
     export_nsx_vm_inventory_to_files,
 )
 from nsx.nsx_constants import resolve_manager

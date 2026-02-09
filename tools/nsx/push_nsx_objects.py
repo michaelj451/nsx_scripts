@@ -7,7 +7,7 @@ from pathlib import Path
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
-from nsx.nsx_functions.nsx_object_importer import ImportConfig, NsxImporter
+from nsx.nsx_object_functions.nsx_object_importer import ImportConfig, NsxImporter
 
 log = logging.getLogger(__name__)
 
