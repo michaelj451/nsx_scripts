@@ -170,5 +170,6 @@ curl -k -u 'admin:*'   "https://nsx-gm1.lab.local/policy/api/v1/global-infra/dom
 1)  export PYTHONPATH="$PWD/app"
 
 2)  python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --all-domains --manager nsx-gm1
+    python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --manager nsx-gm1 --domain default  
 
 3)  python tools/nsx/build_new_group_files.py --csv data/subnet_map.csv --new-domain-path nsx-lm4.lab.local
