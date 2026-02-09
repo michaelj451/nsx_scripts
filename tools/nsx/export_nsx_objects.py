@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# tools/nsx/export_nsx_objects.py
 from pathlib import Path
 import argparse
 import logging

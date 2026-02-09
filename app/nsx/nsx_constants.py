@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# app/nsx/nsx_constants.py
 import os
 from nsx.cli_bootstrap import load_dotenv
 

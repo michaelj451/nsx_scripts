@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# tools/nsx/push_nsx_objects.py
+
 from __future__ import annotations
 
 import argparse
