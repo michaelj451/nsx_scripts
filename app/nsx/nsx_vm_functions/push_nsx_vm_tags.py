@@ -7,7 +7,7 @@ from pathlib import Path
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
-from nsx.not_needed_now.nsx_tagged_vms_importer import (
+from nsx.nsx_vm_functions.nsx_tagged_vms_importer import (
     VmTagsImportConfig,
     NsxVmTagsImporter,
 )

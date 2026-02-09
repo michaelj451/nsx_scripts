@@ -24,6 +24,19 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: list[str]) -> None:             # TODO write these to disk (json)
+    removed = [x for x in before if x not in after]
+    added = [x for x in after if x not in before]
+    if removed or added:
+        logger.info(
+            "Group %s expr %s IP cleanup: -%d +%d",
+            group_id, expr_id, len(removed), len(added)
+        )
+        if removed:
+            logger.info("  removed: %s", removed)
+        if added:
+            logger.info("  added: %s", added)
+
 # =============================================================================
 # CSV mapping model
 # =============================================================================
@@ -414,6 +427,36 @@ def convert_groups_in_doc(
         new_g, replaced = deep_remap(g, maps)
         if replaced == 0:
             continue
+
+        # --- CLEANUP GOES HERE (after remap, before identity/path changes)
+        for expr in new_g.get("expression", []) or []:
+            if not isinstance(expr, dict):
+                continue
+            if expr.get("resource_type") != "IPAddressExpression":
+                continue
+
+            ips = expr.get("ip_addresses") or []
+            if not isinstance(ips, list) or not ips:
+                continue
+
+            # snapshot BEFORE cleanup (for logging)
+            before = [str(x).strip() for x in ips if str(x).strip()]
+
+            # cleanup
+            ips = _dedupe_preserve_order(before)
+            ips = _drop_contained_hosts(ips)
+            ips = _drop_supernets_when_more_specific_exists(ips)
+
+            # log what changed
+            _log_ip_list_changes(
+                group_id=str(new_g.get("id", "unknown")),
+                expr_id=str(expr.get("id", expr.get("relative_path", "unknown"))),
+                before=before,
+                after=ips,
+            )
+
+            expr["ip_addresses"] = ips
+        # --- END CLEANUP
 
         old_id = new_g.get("id")
         if not old_id:
