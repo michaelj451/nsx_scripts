@@ -34,6 +34,8 @@ NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
 NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_new_groups"
 CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
+APPEND_TO_GROUP_NAME = "_migrated"
+
 
 # =============================================================================
 # CSV mapping model
@@ -141,9 +143,9 @@ def find_groups_container(doc: Any) -> Tuple[Any, list[dict]]:
 
 def append_new_to_group_name(group: dict[str, Any]) -> None:
     if "display_name" in group:
-        group["display_name"] = f"{group['display_name']} new"
+        group["display_name"] = f"{group['display_name']}{APPEND_TO_GROUP_NAME}"
     elif "name" in group:
-        group["name"] = f"{group['name']} new"
+        group["name"] = f"{group['name']}{APPEND_TO_GROUP_NAME}"
 
 
 # =============================================================================
@@ -281,6 +283,74 @@ def deep_remap(obj: Any, maps: list[SubnetMap]) -> tuple[Any, int]:
 
     return obj, 0
 
+## ============================================================================
+# Deduplication / Containment logic FOLLOWING BLOCK NOT USED YET
+# =============================================================================
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _drop_contained_hosts(tokens: list[str]) -> list[str]:
+    """
+    Removes entries that are fully contained by another CIDR entry.
+    Example: drop 10.7.1.5/32 if 10.7.1.0/24 exists.
+    Does NOT try to reason about ranges (keeps ranges as-is).
+    """
+    nets: list[ipaddress._BaseNetwork] = []
+    ranges: list[str] = []
+
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if "-" in t and "/" not in t:
+            ranges.append(t)
+            continue
+
+        # Normalize: "1.2.3.4" -> /32, "net" stays "net"
+        if "/" not in t:
+            t = f"{t}/32"
+
+        try:
+            nets.append(ipaddress.ip_network(t, strict=False))
+        except ValueError:
+            # keep weird tokens untouched
+            ranges.append(t)
+
+    kept: list[ipaddress._BaseNetwork] = []
+    for i, n in enumerate(nets):
+        if any(i != j and n.subnet_of(other) for j, other in enumerate(nets)):
+            continue
+        kept.append(n)
+
+    kept_str = {str(n) for n in kept}
+
+    out: list[str] = []
+    for t in tokens:
+        tt = t.strip()
+        if not tt:
+            continue
+        if "-" in tt and "/" not in tt:
+            if tt not in out:
+                out.append(tt)
+            continue
+
+        if "/" not in tt:
+            tt_norm = str(ipaddress.ip_network(f"{tt}/32", strict=False))
+        else:
+            tt_norm = str(ipaddress.ip_network(tt, strict=False))
+
+        if tt_norm in kept_str and tt_norm not in out:
+            out.append(tt_norm)
+
+    return out
 
 # =============================================================================
 # Conversion logic
@@ -306,7 +376,7 @@ def convert_groups_in_doc(
         if not old_id:
             raise SystemExit("Group missing id")
 
-        new_group_id = f"{old_id}__new"
+        new_group_id = f"{old_id}{APPEND_TO_GROUP_NAME}"
         apply_new_identity(new_g, new_group_id, new_domain_path)
 
         for expr in new_g.get("expression", []) or []:
