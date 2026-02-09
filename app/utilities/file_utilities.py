@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # ./app/utilities/file_utilities.py
 # Utilities for file operations
 

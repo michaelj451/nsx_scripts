@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# tools/nsx/export_nsx_domains.py
 from __future__ import annotations
 
 import argparse

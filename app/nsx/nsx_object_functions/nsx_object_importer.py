@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # app/nsx/nsx_file_import_functions/nsx_object_importer.py
 from __future__ import annotations
 

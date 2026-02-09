@@ -167,7 +167,8 @@ PYTHONPATH=app python tools/nsx/push_nsx_objects.py --apply
 curl -k -u 'admin:*'   "https://nsx-gm1.lab.local/policy/api/v1/global-infra/domains"
 ```
 
-export PYTHONPATH="$PWD/app"
-python tools/nsx/export_nsx_objects.py --domain-id nsx-gm1 --federation-global --output-format both --all-domains --manager nsx-gm1
+1)  export PYTHONPATH="$PWD/app"
 
-python tools/nsx/create_new_groups.py --csv data/subnet_map.csv
+2)  python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --all-domains --manager nsx-gm1
+
+3)  python tools/nsx/build_new_group_files.py --csv data/subnet_map.csv --new-domain-path nsx-lm4.lab.local

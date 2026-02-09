@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# tools/nsx/export_nsx_objects.py
 from pathlib import Path
 import argparse
 import logging
@@ -5,7 +7,7 @@ import json
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_policy_client import NsxPolicyClient
-from nsx.nsx_file_export_functions.nsx_object_exporter import run_export
+from nsx.nsx_object_functions.nsx_object_exporter import run_export
 from nsx.nsx_constants import resolve_manager
 
 log = logging.getLogger(__name__)

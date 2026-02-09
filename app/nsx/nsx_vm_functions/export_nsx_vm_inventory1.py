@@ -8,7 +8,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_constants import resolve_manager
-from nsx.nsx_file_export_functions.nsx_vm_exporter1 import (
+from nsx.nsx_vm_functions.nsx_vm_exporter1 import (
     VmTagsExportConfig,
     NsxVmTagsExporter,
 )

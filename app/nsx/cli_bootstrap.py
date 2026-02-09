@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# app/nsx/cli_bootstrap.py
+
 from __future__ import annotations
 
 import logging

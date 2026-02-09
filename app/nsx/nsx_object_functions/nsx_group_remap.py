@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+# app/nsx/nsx_object_functions/nsx_group_remap.py
 from __future__ import annotations
 
-import argparse
 import csv
 import ipaddress
 import json
@@ -24,16 +24,18 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Defaults
-# =============================================================================
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
-NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_new_groups"
-CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
-
+def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: list[str]) -> None:             # TODO write these to disk (json)
+    removed = [x for x in before if x not in after]
+    added = [x for x in after if x not in before]
+    if removed or added:
+        logger.info(
+            "Group %s expr %s IP cleanup: -%d +%d",
+            group_id, expr_id, len(removed), len(added)
+        )
+        if removed:
+            logger.info("  removed: %s", removed)
+        if added:
+            logger.info("  added: %s", added)
 
 # =============================================================================
 # CSV mapping model
@@ -139,11 +141,11 @@ def find_groups_container(doc: Any) -> Tuple[Any, list[dict]]:
     raise SystemExit("Unrecognized group document shape")
 
 
-def append_new_to_group_name(group: dict[str, Any]) -> None:
+def append_new_to_group_name(group: dict[str, Any], group_name_append: str) -> None:
     if "display_name" in group:
-        group["display_name"] = f"{group['display_name']} new"
+        group["display_name"] = f"{group['display_name']}{group_name_append}"
     elif "name" in group:
-        group["name"] = f"{group['name']} new"
+        group["name"] = f"{group['name']}{group_name_append}"
 
 
 # =============================================================================
@@ -281,6 +283,129 @@ def deep_remap(obj: Any, maps: list[SubnetMap]) -> tuple[Any, int]:
 
     return obj, 0
 
+## ============================================================================
+# Deduplication / Containment logic FOLLOWING BLOCK NOT USED YET
+# =============================================================================
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _drop_contained_hosts(tokens: list[str]) -> list[str]:
+    """
+    Removes entries that are fully contained by another CIDR entry.
+    Example: drop 10.7.1.5/32 if 10.7.1.0/24 exists.
+    Does NOT try to reason about ranges (keeps ranges as-is).
+    """
+    nets: list[ipaddress._BaseNetwork] = []
+    ranges: list[str] = []
+
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if "-" in t and "/" not in t:
+            ranges.append(t)
+            continue
+
+        # Normalize: "1.2.3.4" -> /32, "net" stays "net"
+        if "/" not in t:
+            t = f"{t}/32"
+
+        try:
+            nets.append(ipaddress.ip_network(t, strict=False))
+        except ValueError:
+            # keep weird tokens untouched
+            ranges.append(t)
+
+    kept: list[ipaddress._BaseNetwork] = []
+    for i, n in enumerate(nets):
+        if any(i != j and n.subnet_of(other) for j, other in enumerate(nets)):
+            continue
+        kept.append(n)
+
+    kept_str = {str(n) for n in kept}
+
+    out: list[str] = []
+    for t in tokens:
+        tt = t.strip()
+        if not tt:
+            continue
+        if "-" in tt and "/" not in tt:
+            if tt not in out:
+                out.append(tt)
+            continue
+
+        if "/" not in tt:
+            tt_norm = str(ipaddress.ip_network(f"{tt}/32", strict=False))
+        else:
+            tt_norm = str(ipaddress.ip_network(tt, strict=False))
+
+        if tt_norm in kept_str and tt_norm not in out:
+            out.append(tt_norm)
+
+    return out
+
+def _drop_supernets_when_more_specific_exists(tokens: list[str]) -> list[str]:
+    """
+    Drops CIDRs that are supernets of other CIDRs in the same list.
+    Example: drop 10.4.0.0/12 if 10.4.0.0/16 or 10.4.1.0/24 exists.
+    Keeps ranges as-is.
+    """
+    nets: list[ipaddress._BaseNetwork] = []
+    ranges: list[str] = []
+
+    for t in tokens:
+        tt = str(t).strip()
+        if not tt:
+            continue
+        if "-" in tt and "/" not in tt:
+            ranges.append(tt)
+            continue
+
+        # Normalize plain IPs to /32 so comparisons work
+        if "/" not in tt:
+            tt = f"{tt}/32"
+
+        try:
+            nets.append(ipaddress.ip_network(tt, strict=False))
+        except ValueError:
+            ranges.append(tt)
+
+    kept: list[ipaddress._BaseNetwork] = []
+    for i, n in enumerate(nets):
+        # If n contains ANY other network, drop it (it's a broad catch-all)
+        if any(i != j and other.subnet_of(n) for j, other in enumerate(nets)):
+            continue
+        kept.append(n)
+
+    kept_str = {str(n) for n in kept}
+
+    out: list[str] = []
+    for t in tokens:
+        tt = str(t).strip()
+        if not tt:
+            continue
+        if "-" in tt and "/" not in tt:
+            if tt not in out:
+                out.append(tt)
+            continue
+
+        if "/" not in tt:
+            tt_norm = str(ipaddress.ip_network(f"{tt}/32", strict=False))
+        else:
+            tt_norm = str(ipaddress.ip_network(tt, strict=False))
+
+        if tt_norm in kept_str and tt_norm not in out:
+            out.append(tt_norm)
+
+    return out
 
 # =============================================================================
 # Conversion logic
@@ -290,6 +415,7 @@ def convert_groups_in_doc(
     doc: Any,
     maps: list[SubnetMap],
     new_domain_path: str,
+    group_name_append: str,
 ) -> tuple[Any, int, int]:
 
     _, groups = find_groups_container(doc)
@@ -302,18 +428,48 @@ def convert_groups_in_doc(
         if replaced == 0:
             continue
 
+        # --- CLEANUP GOES HERE (after remap, before identity/path changes)
+        for expr in new_g.get("expression", []) or []:
+            if not isinstance(expr, dict):
+                continue
+            if expr.get("resource_type") != "IPAddressExpression":
+                continue
+
+            ips = expr.get("ip_addresses") or []
+            if not isinstance(ips, list) or not ips:
+                continue
+
+            # snapshot BEFORE cleanup (for logging)
+            before = [str(x).strip() for x in ips if str(x).strip()]
+
+            # cleanup
+            ips = _dedupe_preserve_order(before)
+            ips = _drop_contained_hosts(ips)
+            ips = _drop_supernets_when_more_specific_exists(ips)
+
+            # log what changed
+            _log_ip_list_changes(
+                group_id=str(new_g.get("id", "unknown")),
+                expr_id=str(expr.get("id", expr.get("relative_path", "unknown"))),
+                before=before,
+                after=ips,
+            )
+
+            expr["ip_addresses"] = ips
+        # --- END CLEANUP
+
         old_id = new_g.get("id")
         if not old_id:
             raise SystemExit("Group missing id")
 
-        new_group_id = f"{old_id}__new"
+        new_group_id = f"{old_id}{group_name_append}"
         apply_new_identity(new_g, new_group_id, new_domain_path)
 
         for expr in new_g.get("expression", []) or []:
             if isinstance(expr, dict):
                 rebuild_expression_paths(expr, new_g["path"])
 
-        append_new_to_group_name(new_g)
+        append_new_to_group_name(new_g, group_name_append)
 
         converted.append(new_g)
         replaced_total += replaced
@@ -348,56 +504,3 @@ def iter_group_files(nsx_export_dir: Path) -> list[Path]:
 
 def out_path_for(in_file: Path, src: Path, dst: Path) -> Path:
     return dst / in_file.relative_to(src)
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Create new NSX groups with remapped IPs")
-    ap.add_argument("--csv", default=str(CSV_DEFAULT))
-    ap.add_argument("--nsx-export", default=str(NSX_EXPORT_DIR_DEFAULT))
-    ap.add_argument("--nsx-converted", default=str(NSX_CONVERTED_DIR_DEFAULT))
-    ap.add_argument(
-        "--new-domain-path",
-        required=True,
-        help="Target domain path (e.g. /global-infra/domains/default)",
-    )
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
-
-    maps = read_csv_mappings(Path(args.csv))
-    in_files = iter_group_files(Path(args.nsx_export))
-
-    total_groups = total_replacements = written = 0
-
-    for f in in_files:
-        doc = load_doc(f)
-        out_doc, groups, replaced = convert_groups_in_doc(
-            doc,
-            maps,
-            args.new_domain_path,
-        )
-        if groups == 0:
-            continue
-
-        out_f = out_path_for(f, Path(args.nsx_export), Path(args.nsx_converted))
-        print(f"[convert] {f} -> {out_f}  (groups={groups}, replacements={replaced})")
-
-        total_groups += groups
-        total_replacements += replaced
-
-        if not args.dry_run:
-            out_f.parent.mkdir(parents=True, exist_ok=True)
-            write_output(out_f, out_doc)
-            written += 1
-
-    print("\nDone.")
-    print(f"- Groups converted: {total_groups}")
-    print(f"- Replacements made: {total_replacements}")
-    print(f"- Files written: {written}")
-
-
-if __name__ == "__main__":
-    main()

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # nsx_yaml_functions/nsx_object_exporter.py
 from __future__ import annotations
 
