@@ -4,7 +4,10 @@ __pycache__/
 *$py.class
 nsx_export/
 nsx_domain_meta/
-nsx_new_groups/
+nsx_remapped_groups/
+modified-config.xml
+pano_export*
+changelog.json
 
 # C extensions
 *.so

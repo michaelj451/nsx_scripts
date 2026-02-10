@@ -7,6 +7,7 @@ Features:
  - Adds mapped objects into rules and groups
  - Timezone-aware timestamps in changelog
  - Bulk CSV processing
+ - (NEW) Remap ip-range address objects when mapping net->net (CIDR->CIDR)
 """
 from __future__ import annotations
 import argparse
@@ -176,13 +177,27 @@ def create_address_object(root: ET.Element, ip_text: str, preferred_name: str, d
             ET.SubElement(tag_elem, 'member').text = t
     return e
 
-def ensure_object_and_reuse_if_present(root: ET.Element, ip_text: str, preferred_name: Optional[str], description: Optional[str], tags: Optional[str], changelog: list, based_on: Optional[str]=None) -> str:
+def ensure_object_and_reuse_if_present(
+    root: ET.Element,
+    ip_text: str,
+    preferred_name: Optional[str],
+    description: Optional[str],
+    tags: Optional[str],
+    changelog: list,
+    based_on: Optional[str]=None
+) -> str:
     existing_entry, match_type, match_text = find_existing_object_for_ip(root, ip_text)
     if existing_entry is not None:
         name = entry_name(existing_entry)
-        changelog.append({'timestamp': ts(), 'action': 'reuse_existing_object', 'ip': ip_text,
-                          'existing_object': name, 'match_type': match_type, 'match_text': match_text,
-                          'based_on': based_on})
+        changelog.append({
+            'timestamp': ts(),
+            'action': 'reuse_existing_object',
+            'ip': ip_text,
+            'existing_object': name,
+            'match_type': match_type,
+            'match_text': match_text,
+            'based_on': based_on
+        })
         return name
 
     if preferred_name:
@@ -208,7 +223,17 @@ def ensure_object_and_reuse_if_present(root: ET.Element, ip_text: str, preferred
     return entry_name(new_e)
 
 # ---------- rule & group helpers ----------
-def update_section(root: ET.Element, parent: ET.Element, section_tag: str, literal_val: str, obj_name: Optional[str], new_name: str, changelog: list, context: Optional[str]=None, is_group: bool=False) -> bool:
+def update_section(
+    root: ET.Element,
+    parent: ET.Element,
+    section_tag: str,
+    literal_val: str,
+    obj_name: Optional[str],
+    new_name: str,
+    changelog: list,
+    context: Optional[str]=None,
+    is_group: bool=False
+) -> bool:
     """
     parent is the rule element or group element.
     - If literal_val is present, transform literal -> object (ensure object exists) and also add new_name
@@ -229,14 +254,17 @@ def update_section(root: ET.Element, parent: ET.Element, section_tag: str, liter
             to_add.append(new_name)
         elif obj_name and m.text == obj_name:
             to_add.append(new_name)
+
     if to_remove or to_add:
         before = [m.text for m in sec.findall('member') if m.text]
         for rem in to_remove:
             sec.remove(rem)
+
         existing = [m.text for m in sec.findall('member') if m.text]
         for a in dict.fromkeys(to_add):  # preserve order, remove dups
             if a not in existing:
                 ET.SubElement(sec, 'member').text = a
+
         after = [m.text for m in sec.findall('member') if m.text]
         if is_group:
             action = 'update_group'
@@ -244,17 +272,33 @@ def update_section(root: ET.Element, parent: ET.Element, section_tag: str, liter
         else:
             action = 'update_rule'
             key = 'rule'
-        changelog.append({'timestamp': ts(), 'action': action, key: entry_name(parent),
-                          'section': section_tag, 'removed': [r.text for r in to_remove],
-                          'added': list(dict.fromkeys(to_add)), 'before': before, 'after': after, 'context': context})
+        changelog.append({
+            'timestamp': ts(),
+            'action': action,
+            key: entry_name(parent),
+            'section': section_tag,
+            'removed': [r.text for r in to_remove],
+            'added': list(dict.fromkeys(to_add)),
+            'before': before,
+            'after': after,
+            'context': context
+        })
         return True
     return False
 
 # ---------- CSV row processing ----------
-def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferred_name: Optional[str], tags: Optional[str], description: Optional[str], changelog: list):
+def process_row(
+    root: ET.Element,
+    search_ip_text: str,
+    new_ip_text: str,
+    preferred_name: Optional[str],
+    tags: Optional[str],
+    description: Optional[str],
+    changelog: list
+):
     """
-    - search_ip_text may be host or network (CIDR)
-    - new_ip_text may be host or network (CIDR)
+    - search_ip_text may be host, range, or network (CIDR)
+    - new_ip_text may be host, range, or network (CIDR)
     - preferred_name optional (for created objects)
     """
     try:
@@ -262,6 +306,7 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
         is_search_range = '-' in search_ip_text or ' ' in search_ip_text
         is_new_net = '/' in new_ip_text
         is_new_range = '-' in new_ip_text or ' ' in new_ip_text
+
         search_net = ipaddress.ip_network(search_ip_text, strict=False) if is_search_net else None
         search_range_start = None
         search_range_end = None
@@ -269,6 +314,7 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
             parts = search_ip_text.replace(' - ', '-').split('-')
             search_range_start = ipaddress.ip_address(parts[0].strip())
             search_range_end = ipaddress.ip_address(parts[1].strip())
+
         new_net = ipaddress.ip_network(new_ip_text, strict=False) if is_new_net else None
         new_range_start = None
         new_range_end = None
@@ -276,6 +322,7 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
             parts = new_ip_text.replace(' - ', '-').split('-')
             new_range_start = ipaddress.ip_address(parts[0].strip())
             new_range_end = ipaddress.ip_address(parts[1].strip())
+
         search_host = ipaddress.ip_address(search_ip_text) if not is_search_net and not is_search_range else None
         new_host = ipaddress.ip_address(new_ip_text) if not is_new_net and not is_new_range else None
     except Exception as e:
@@ -285,11 +332,20 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
     search_version = search_net.version if is_search_net else search_range_start.version if is_search_range else search_host.version
     new_version = new_net.version if is_new_net else new_range_start.version if is_new_range else new_host.version
     if search_version != new_version:
-        changelog.append({'timestamp': ts(), 'action': 'version_mismatch', 'search_ip': search_ip_text, 'new_ip': new_ip_text, 'search_version': search_version, 'new_version': new_version})
+        changelog.append({
+            'timestamp': ts(),
+            'action': 'version_mismatch',
+            'search_ip': search_ip_text,
+            'new_ip': new_ip_text,
+            'search_version': search_version,
+            'new_version': new_version
+        })
         return
 
     entries = collect_address_entries(root)
-    host_to_obj: Dict[str,str] = {}
+
+    # Map host IP -> object name for existing host objects
+    host_to_obj: Dict[str, str] = {}
     for e, ipvals in entries:
         for iv in ipvals:
             if iv['type'] == 'host':
@@ -327,7 +383,15 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
     # If new_ip is a network or range, ensure network/range object exists (reuse if found)
     new_container_name = None
     if is_new_net or is_new_range:
-        new_container_name = ensure_object_and_reuse_if_present(root, new_ip_text, preferred_name, description, tags, changelog, based_on=f"{search_ip_text}->{new_ip_text}")
+        new_container_name = ensure_object_and_reuse_if_present(
+            root,
+            new_ip_text,
+            preferred_name,
+            description,
+            tags,
+            changelog,
+            based_on=f"{search_ip_text}->{new_ip_text}"
+        )
 
     # Find search network/range object name if exists
     search_obj_name = None
@@ -350,6 +414,8 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
 
     # Determine matched hosts
     matched_hosts = set()
+
+    # 1) Host objects in config that fall in the search container (net/range/host)
     for ip_str, obj_name in host_to_obj.items():
         try:
             ip_obj = ipaddress.ip_address(ip_str)
@@ -362,6 +428,7 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
         except Exception:
             continue
 
+    # 2) Literal IPs in rules that fall in the search container
     for r_elem in rules_elems:
         for side in ('source', 'destination'):
             sec = r_elem.find(side)
@@ -385,6 +452,7 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
     # Process each matched host
     for host_ip in sorted(matched_hosts, key=lambda x: int(x)):
         host_str = str(host_ip)
+
         if is_search_net and is_new_net:
             offset = int(host_ip) - int(search_net.network_address)
             mapped_ip = str(ipaddress.ip_address(int(new_net.network_address) + offset))
@@ -398,26 +466,148 @@ def process_row(root: ET.Element, search_ip_text: str, new_ip_text: str, preferr
 
         # Use default name for hosts unless a preferred name is provided
         host_preferred_name = preferred_name if preferred_name else gen_default_name_for_ip(mapped_ip)
-        used_obj_name = ensure_object_and_reuse_if_present(root, mapped_ip, host_preferred_name, description, tags, changelog, based_on=f"{host_str}->{mapped_ip}")
+        used_obj_name = ensure_object_and_reuse_if_present(
+            root,
+            mapped_ip,
+            host_preferred_name,
+            description,
+            tags,
+            changelog,
+            based_on=f"{host_str}->{mapped_ip}"
+        )
 
         orig_obj_name = host_to_obj.get(host_str)
+
         for r_elem in rules_elems:
-            update_section(root, r_elem, 'source', host_str, orig_obj_name, used_obj_name, changelog, context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}")
-            update_section(root, r_elem, 'destination', host_str, orig_obj_name, used_obj_name, changelog, context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}")
+            update_section(
+                root, r_elem, 'source',
+                host_str, orig_obj_name, used_obj_name,
+                changelog,
+                context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}"
+            )
+            update_section(
+                root, r_elem, 'destination',
+                host_str, orig_obj_name, used_obj_name,
+                changelog,
+                context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}"
+            )
 
         for g in groups:
-            update_section(root, g, 'static', host_str, orig_obj_name, used_obj_name, changelog, context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}", is_group=True)
+            update_section(
+                root, g, 'static',
+                host_str, orig_obj_name, used_obj_name,
+                changelog,
+                context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}",
+                is_group=True
+            )
+
+    # (NEW) Remap ip-range address objects when mapping net->net.
+    # We only remap ranges that are fully contained in the search subnet (safe behavior).
+    if is_search_net and is_new_net:
+        for e, ipvals in entries:
+            for iv in ipvals:
+                if iv['type'] != 'range':
+                    continue
+
+                rs, rt = iv['value']  # start/end as ipaddress objects
+                old_range_text = iv['text']
+                old_range_obj = entry_name(e)
+
+                # only handle ranges fully inside the search_net
+                if not (rs in search_net and rt in search_net):
+                    changelog.append({
+                        'timestamp': ts(),
+                        'action': 'skip_range_not_fully_in_search_net',
+                        'range': old_range_text,
+                        'range_object': old_range_obj,
+                        'search_net': str(search_net),
+                        'new_net': str(new_net),
+                    })
+                    continue
+
+                start_off = int(rs) - int(search_net.network_address)
+                end_off = int(rt) - int(search_net.network_address)
+
+                new_rs = ipaddress.ip_address(int(new_net.network_address) + start_off)
+                new_rt = ipaddress.ip_address(int(new_net.network_address) + end_off)
+                new_range_text = f"{new_rs}-{new_rt}"
+
+                new_range_obj = ensure_object_and_reuse_if_present(
+                    root,
+                    new_range_text,
+                    preferred_name=None,  # let it generate svb_m2_... for ranges
+                    description=description,
+                    tags=tags,
+                    changelog=changelog,
+                    based_on=f"range_in_{search_ip_text}->{new_ip_text}:{old_range_text}"
+                )
+
+                for r_elem in rules_elems:
+                    update_section(
+                        root, r_elem, 'source',
+                        old_range_text, old_range_obj, new_range_obj,
+                        changelog,
+                        context=f"range_mapping_{old_range_text}->{new_range_text}"
+                    )
+                    update_section(
+                        root, r_elem, 'destination',
+                        old_range_text, old_range_obj, new_range_obj,
+                        changelog,
+                        context=f"range_mapping_{old_range_text}->{new_range_text}"
+                    )
+
+                for g in groups:
+                    update_section(
+                        root, g, 'static',
+                        old_range_text, old_range_obj, new_range_obj,
+                        changelog,
+                        context=f"range_mapping_{old_range_text}->{new_range_text}",
+                        is_group=True
+                    )
+
+                changelog.append({
+                    'timestamp': ts(),
+                    'action': 'range_remapped',
+                    'search_net': str(search_net),
+                    'new_net': str(new_net),
+                    'old_range': old_range_text,
+                    'old_range_object': old_range_obj,
+                    'new_range': new_range_text,
+                    'new_range_object': new_range_obj,
+                })
 
     # Container-level mapping: add mapped network/range object to rules/groups
     if (is_search_net or is_search_range) and new_container_name:
         search_container_str = search_ip_text
         for r_elem in rules_elems:
-            update_section(root, r_elem, 'source', search_container_str, search_obj_name, new_container_name, changelog, context=f"container_mapping_{search_ip_text}->{new_ip_text}")
-            update_section(root, r_elem, 'destination', search_container_str, search_obj_name, new_container_name, changelog, context=f"container_mapping_{search_ip_text}->{new_ip_text}")
+            update_section(
+                root, r_elem, 'source',
+                search_container_str, search_obj_name, new_container_name,
+                changelog,
+                context=f"container_mapping_{search_ip_text}->{new_ip_text}"
+            )
+            update_section(
+                root, r_elem, 'destination',
+                search_container_str, search_obj_name, new_container_name,
+                changelog,
+                context=f"container_mapping_{search_ip_text}->{new_ip_text}"
+            )
         for g in groups:
-            update_section(root, g, 'static', search_container_str, search_obj_name, new_container_name, changelog, context=f"container_mapping_{search_ip_text}->{new_ip_text}", is_group=True)
+            update_section(
+                root, g, 'static',
+                search_container_str, search_obj_name, new_container_name,
+                changelog,
+                context=f"container_mapping_{search_ip_text}->{new_ip_text}",
+                is_group=True
+            )
 
-    changelog.append({'timestamp': ts(), 'action': 'processed_csv_row', 'search_ip': search_ip_text, 'new_ip': new_ip_text, 'preferred_name': preferred_name})
+    changelog.append({
+        'timestamp': ts(),
+        'action': 'processed_csv_row',
+        'search_ip': search_ip_text,
+        'new_ip': new_ip_text,
+        'preferred_name': preferred_name
+    })
 
 # ---------- Main ----------
 def main():
@@ -462,4 +652,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

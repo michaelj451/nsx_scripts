@@ -1,0 +1,4 @@
+search_ip,new_ip,new_object_name,tags,desc
+10.1.1.0/24,10.1.2.0/24,,,something1
+10.2.1.0/24,10.2.2.0/24,,,something2
+10.3.1.0/24,10.3.2.0/24,,,something
