@@ -40,7 +40,7 @@ NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
 NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_remapped_groups"
 CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
-APPEND_TO_GROUP_NAME = "_migrated"
+APPEND_TO_GROUP_NAME = "_m2"
 
 
 # # =============================================================================
