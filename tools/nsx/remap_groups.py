@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/nsx/build_new_group_files.py
+# tools/nsx/remap_groups.py
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
-NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_new_groups"
+NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_remapped_groups"
 CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
 APPEND_TO_GROUP_NAME = "_migrated"
