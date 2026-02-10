@@ -54,7 +54,8 @@ def main() -> None:
     ap.add_argument("--nsx-converted", default=str(NSX_CONVERTED_DIR_DEFAULT))
     ap.add_argument(
         "--new-domain-path",
-        required=True,
+        required=False,
+        default="/global-infra/domains/default",
         help="Target domain path (e.g. /global-infra/domains/default)",
     )
     ap.add_argument("--dry-run", action="store_true")
