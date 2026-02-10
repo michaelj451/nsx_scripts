@@ -13,8 +13,44 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def sanitize_group_payload_for_put(raw: dict) -> dict:
+    """
+    Remove keys that NSX Policy API rejects on PUT/PATCH.
+
+    Keep only the fields we actually want to define for a Group.
+    """
+    if not isinstance(raw, dict):
+        return raw
+
+    # Hard remove: anything clearly read-only / export metadata
+    DROP_EXACT = {
+        "_source_id", "_source_path",
+        "_create_time", "_create_user",
+        "_last_modified_time", "_last_modified_user",
+        "_revision", "revision",
+        "unique_id", "realization_id",
+        "owner_id", "source",
+        "marked_for_delete", "overridden",
+        "path", "relative_path", "parent_path",
+    }
+
+    out = {}
+    for k, v in raw.items():
+        # Drop explicit bad keys
+        if k in DROP_EXACT:
+            continue
+
+        # Drop any other leading-underscore metadata keys (safe default)
+        # If you later find a legitimate "_" key you need, whitelist it here.
+        if k.startswith("_"):
+            continue
+
+        out[k] = v
+
+    return out
+
 @dataclass
-class ImportConfig:
+class GroupImportConfig:
     export_root: Path
     domain_id: str = "default"
     input_format: Literal["yaml", "json"] = "yaml"
@@ -31,8 +67,8 @@ class ImportConfig:
     new_groups_allowlist_file: Optional[Path] = None
 
 
-class NsxImporter:
-    def __init__(self, client: Any, cfg: ImportConfig):
+class NsxGroupImporter:
+    def __init__(self, client: Any, cfg: GroupImportConfig):
         self.client = client
         self.cfg = cfg
 
@@ -118,6 +154,8 @@ class NsxImporter:
 
         raise ValueError(f"Allowlist file {f} must be a list or dict with a 'groups' list")
 
+
+
     def _is_new_group(self, group_payload: Dict[str, Any]) -> bool:
         gid = str(group_payload.get("id") or "")
         name = str(group_payload.get("display_name") or "")
@@ -154,7 +192,8 @@ class NsxImporter:
                     continue
 
                 path = self._policy_path(f"/domains/{self.cfg.domain_id}/groups/{gid}")
-                self._put_or_patch(path, data)
+                payload = sanitize_group_payload_for_put(data)
+                self._put_or_patch(path, payload)
                 self.stats["groups"] += 1
 
             except Exception as e:

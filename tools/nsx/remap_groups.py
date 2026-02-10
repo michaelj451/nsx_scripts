@@ -40,7 +40,7 @@ NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
 NSX_CONVERTED_DIR_DEFAULT = REPO_ROOT / "nsx_remapped_groups"
 CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
-APPEND_TO_GROUP_NAME = "_migrated"
+APPEND_TO_GROUP_NAME = "_m2"
 
 
 # # =============================================================================
@@ -54,7 +54,8 @@ def main() -> None:
     ap.add_argument("--nsx-converted", default=str(NSX_CONVERTED_DIR_DEFAULT))
     ap.add_argument(
         "--new-domain-path",
-        required=True,
+        required=False,
+        default="/global-infra/domains/default",
         help="Target domain path (e.g. /global-infra/domains/default)",
     )
     ap.add_argument("--dry-run", action="store_true")
