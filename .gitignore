@@ -5,6 +5,9 @@ __pycache__/
 nsx_export/
 nsx_domain_meta/
 nsx_remapped_groups/
+modified-config.xml
+pano_export*
+changelog.json
 
 # C extensions
 *.so
