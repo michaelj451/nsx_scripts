@@ -209,8 +209,8 @@ def parse_rule_target(src: Path, in_root: Path, payload: dict) -> Optional[RuleT
 
 
 def push_rule(client: NsxPolicyClient, target: RuleTarget, payload: dict) -> None:
-    # Uses your client method (policy_root already set to global-infra in federation mode)
-    client.put_security_rule(
+    # PATCH is "create if missing, replace if exists" for GM policy rules
+    client.patch_security_rule(
         security_policy_id=target.policy_id,
         rule_id=target.rule_id,
         payload=payload,
