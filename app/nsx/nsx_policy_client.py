@@ -12,7 +12,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class NsxPolicyClient:
-    def __init__(self, nsxmanager: str = nsx_lm2, *, federation_global: bool = False):
+    def __init__(self, nsxmanager: str = nsx_gm1, *, federation_global: bool = False):
         logging.info(f"Creating NSX session for manager: {nsxmanager} (federation_global={federation_global})")
 
         self.NSX_MANAGER = f"https://{nsxmanager}"

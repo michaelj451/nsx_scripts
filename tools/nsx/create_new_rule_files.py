@@ -2,23 +2,30 @@
 """
 tools/nsx/create_new_rule_files.py
 
-Add existing NEW groups to GM policy rules whenever the OLD group appears
-in source_groups or destination_groups.
+Create updated rule files: add existing NEW groups to GM policy rules whenever the OLD group
+appears in source_groups or destination_groups.
 
 ADD-ONLY. Old groups are never removed.
-Writes modified copies to ./nsx_updated_rules
 
-Supports:
-- Input:  YAML (.yml/.yaml) and JSON (.json)
-- Output: YAML or JSON (same as input by default)
+Inputs:
+- YAML (.yml/.yaml) and JSON (.json) files anywhere under --in-dir
+
+Outputs:
+- Writes modified copies to ./nsx_updated_rules (fixed)
+- Supports output format: same as input (default), or force yaml/json
+
+Logging:
+- Always logs to ./nsx_logs/create_new_rule_files.log
+- Also logs to console
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List
 
 import yaml
 
@@ -28,8 +35,49 @@ import yaml
 # ============================================================
 
 OUTPUT_DIR_NAME = "nsx_updated_rules"
-NEW_GROUP_SUFFIX = "-dc2"   # change if naming ever changes
+LOG_DIR_NAME = "nsx_logs"
+LOG_FILE_NAME = "create_new_rule_files.log"
 
+NEW_GROUP_SUFFIX = "-dc2"  # change if naming ever changes
+
+
+# ============================================================
+# Logging (always-on)
+# ============================================================
+
+def setup_logging() -> logging.Logger:
+    log_dir = Path(LOG_DIR_NAME)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_FILE_NAME
+
+    logger = logging.getLogger("create_new_rule_files")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # avoid double logging if root logger configured elsewhere
+
+    # If re-run in same interpreter (rare), avoid duplicate handlers
+    if not logger.handlers:
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(fmt)
+
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+
+    return logger
+
+
+log = setup_logging()
+
+
+# ============================================================
+# Naming convention
+# ============================================================
 
 def derive_new_group(old_group_path: str) -> str:
     """Derive the new group path from the old group path."""
@@ -58,14 +106,14 @@ def out_path_for(src: Path, in_root: Path, out_root: Path, out_format: str) -> P
     Otherwise convert suffix based on requested format.
     """
     rel = src.relative_to(in_root)
+
     if out_format == "same":
         return out_root / rel
 
-    # Convert suffix
     if out_format == "json":
         return (out_root / rel).with_suffix(".json")
+
     if out_format == "yaml":
-        # Preserve .yaml (choose one)
         return (out_root / rel).with_suffix(".yaml")
 
     raise ValueError(f"Invalid out_format: {out_format}")
@@ -190,9 +238,17 @@ def main() -> None:
     if not in_dir.exists():
         raise SystemExit(f"--in-dir not found: {in_dir}")
 
-    total_changes = 0
+    log.info("Starting create_new_rule_files")
+    log.info("Input directory:  %s", in_dir)
+    log.info("Output directory: %s", out_root.resolve())
+    log.info("Output format:    %s", args.out_format)
+    log.info("Dry run:          %s", args.dry_run)
+    log.info("New group suffix: %s", NEW_GROUP_SUFFIX)
+
+    total_additions = 0
     processed = 0
     written = 0
+    skipped_parse = 0
 
     for src in iter_docs(in_dir):
         processed += 1
@@ -201,7 +257,8 @@ def main() -> None:
         try:
             doc = load_doc(src)
         except Exception as e:
-            print(f"SKIP (parse error): {rel} -> {e}")
+            skipped_parse += 1
+            log.warning("SKIP parse error: %s (%s)", rel, e)
             continue
 
         changes: List[str] = []
@@ -209,27 +266,36 @@ def main() -> None:
 
         # Determine output path + format for this file
         out_path = out_path_for(src, in_dir, out_root, args.out_format)
-        out_fmt = detect_format(out_path) if args.out_format != "same" else detect_format(src)
+        out_fmt = detect_format(src) if args.out_format == "same" else args.out_format
 
         if changes:
-            total_changes += len(changes)
-            print(f"\n== {rel} ==")
+            total_additions += len(changes)
+            log.info("CHANGES %s (%d additions)", rel, len(changes))
             for c in changes:
-                print(f"  {c}")
+                log.info("  %s", c)
+        else:
+            log.debug("NOCHANGE %s", rel)
 
         if args.dry_run:
             continue
 
-        write_doc(out_path, doc, out_fmt)
-        written += 1
+        try:
+            write_doc(out_path, doc, out_fmt)
+            written += 1
+        except Exception as e:
+            log.error("FAIL write: %s -> %s (%s)", rel, out_path, e)
+            raise
 
-    print(f"\nProcessed files:        {processed}")
-    print(f"Total group additions:  {total_changes}")
+    log.info("Finished create_new_rule_files")
+    log.info("Processed files:        %d", processed)
+    log.info("Skipped (parse errors): %d", skipped_parse)
+    log.info("Total group additions:  %d", total_additions)
     if args.dry_run:
-        print("Dry-run only. No files written.")
+        log.info("Dry-run only. No files written.")
     else:
-        print(f"Written files:          {written}")
-        print(f"Output directory:       ./{OUTPUT_DIR_NAME}")
+        log.info("Written files:          %d", written)
+        log.info("Output directory:       %s", out_root.resolve())
+        log.info("Log file:               %s", (Path(LOG_DIR_NAME) / LOG_FILE_NAME).resolve())
 
 
 if __name__ == "__main__":
