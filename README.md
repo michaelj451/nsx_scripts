@@ -1,90 +1,31 @@
-# NSX Scripts – Export, Audit, and Import Guide
+# NSX Global Manager – Parallel Datacenter Migration Runbook
 
-This repository provides CLI tooling to **export**, **audit**, and **import (push)** NSX Policy objects and inventory across:
+This runbook documents the **safe, additive migration process** for introducing a new datacenter
+(IP space) into NSX using **Global Manager**, while keeping the existing datacenter active.
 
-- **Local Managers (LM)**
-- **Global Manager (GM / Federation)**
-
-The tooling is designed for **safe, auditable migrations**, with a strong emphasis on:
-- readable exports
-  - exports json & yaml
-- deterministic imports
-- dry-run first workflows
-
----
-
-## 1) Clone the repository
-
-```bash
-git clone <YOUR_REPO_URL> nsx_scripts
-cd nsx_scripts
-```
+Key principles:
+- **Groups are duplicated, not modified**
+- **Rules are updated additively (old_group + new_group)**
+- **No Local Manager–only objects are pushed**
+- **Only the Global Manager default domain is modified**
+- **Changes can be planned (dry-run) or committed**
+- **Rules are updated using PATCH (not PUT) to avoid conflicts**
+- **Publishing/enforcement can be done manually in the UI if required**
 
 ---
 
-## 2) Create and activate a virtual environment
+## Directory Overview
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-```
-
----
-
-## 3) Upgrade pip tooling
-
-```bash
-pip install --upgrade pip setuptools wheel
-```
+| Directory | Purpose |
+|---------|--------|
+| `nsx_export/` | Read-only export from Global Manager |
+| `nsx_remapped_groups/` | Newly created IP-based groups (e.g. `_m2`) |
+| `nsx_updated_rules/` | Updated rule files referencing both old and new groups |
+| `nsx_logs/` | Log output from all scripts |
 
 ---
 
-## 4) Install Python dependencies
-
-```bash
-pip install -r docker/requirements-pip.txt
-```
-
----
-
-## 5) Create the `.env` file
-
-```bash
-cp .env.example .env
-```
-
-### Example `.env`
-
-```bash
-# Local Managers
-NSX_LM1=https://nsx-lm1.lab.local
-NSX_LM2=https://nsx-lm2.lab.local
-NSX_LM3=https://nsx-lm3.lab.local
-NSX_LM4=https://nsx-lm4.lab.local
-
-# Global Manager
-NSX_GM1=https://nsx-gm1.lab.local
-```
-
----
-
-## 6) Ensure required directories exist
-
-```bash
-mkdir -p app/frontendFastapi/static
-```
-
----
-
-## CLI Execution Requirements
-
-All CLI scripts **must be run from the repo root** with:
-
-```bash
-PYTHONPATH=app
-```
-
-You may export this once per shell session:
+## 1) Set Python Path (repo root)
 
 ```bash
 export PYTHONPATH="$PWD/app"
@@ -92,126 +33,156 @@ export PYTHONPATH="$PWD/app"
 
 ---
 
-# Federation vs Local Policy (CRITICAL)
+## 2) Export NSX Objects from Global Manager (YAML)
 
-Understanding **which policy API you are targeting** is essential.
-
----
-
-## Local Manager (LM) Policy
-
-- **API Root**
-  ```
-  /policy/api/v1/infra
-  ```
-- Objects are local to a single NSX Manager
-
----
-
-## Global Manager / Federation Policy
-
-- **API Root**
-  ```
-  /policy/api/v1/global-infra
-  ```
-
----
-
-## The `--federation-global` Flag
-
-Use this flag when interacting with **Global Manager** policy.
-
+### Export everything (all domains)
 ```bash
---federation-global
+python tools/nsx/export_nsx_objects.py   --federation-global   --output-format yaml   --all-domains   --manager nsx-gm1
+```
+
+### OR export only the default domain
+```bash
+python tools/nsx/export_nsx_objects.py   --federation-global   --output-format yaml   --manager nsx-gm1   --domain default
 ```
 
 ---
 
-# Export Commands
+## 3) Create New (Remapped) IP-Based Groups
 
-## Local Manager export
+Generate new IP-based groups from a subnet mapping CSV.
+These groups represent the **new datacenter IP space**.
 
 ```bash
-PYTHONPATH=app python tools/nsx/export_nsx1_objects.py --manager nsx-lm1
+python tools/nsx/create_new_group_files.py   --csv data/subnet_map.csv
 ```
+
+Output:
+- `nsx_remapped_groups/`
+- New groups use a deterministic suffix (example: `_m2`)
+- Original groups are untouched
 
 ---
 
-## Global Manager export (all domains)
+## 4) Plan Group Push to Global Manager (Dry Run)
 
 ```bash
-PYTHONPATH=app python tools/nsx/export_nsx1_objects.py   --manager nsx-gm1   --all-domains   --federation-global
+python tools/nsx/push_nsx_groups.py   --target nsx-gm1   --domain-id default   --federation-global
 ```
+
+No changes are applied.
 
 ---
 
-# Import / Push Commands
-
-## DRY-RUN (default)
+## 5) Apply Group Push to Global Manager
 
 ```bash
-PYTHONPATH=app python tools/nsx/push_nsx_objects.py
+python tools/nsx/push_nsx_groups.py   --target nsx-gm1   --domain-id default   --federation-global   --apply
 ```
 
-## APPLY (explicit)
-
-```bash
-PYTHONPATH=app python tools/nsx/push_nsx_objects.py --apply
-```
+At this point:
+- New `_m2` groups exist in GM
+- No rules reference them yet
 
 ---
 
-## Reference: Federation domains
+## 6) Create Updated Rule Files (Dry Run)
 
-```bash
-curl -k -u 'admin:*'   "https://nsx-gm1.lab.local/policy/api/v1/global-infra/domains"
+This step **adds new groups to rules only when the new group actually exists**.
+Rules are updated additively:
+
+```
+old_group  →  old_group + new_group
 ```
 
-1) export PYTHONPATH="$PWD/app"
+Dry run:
+```bash
+python tools/nsx/create_new_rule_files.py   --in-dir nsx_export/nsx-gm1.lab.local   --remapped-groups-dir nsx_remapped_groups   --dry-run
+```
 
-2) Export NSX objects from Global Manager (YAML)
-   # export everything (all domains)
-   python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --all-domains --manager nsx-gm1
+Review output in console and logs:
+- `nsx_logs/create_new_rule_files.log`
 
-   # OR export only default domain
-   python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --manager nsx-gm1 --domain default
+---
 
-3) Create new (remapped) IP-based Group YAML files from subnet_map.csv
-   python tools/nsx/create_new_group_files.py --csv data/subnet_map.csv
+## 7) Create Updated Rule Files (Write Output)
 
-4) Plan group push to GM (no changes applied)
-   python tools/nsx/push_nsx_groups.py \
-     --target nsx-gm1 \
-     --domain-id default \
-     --federation-global
+```bash
+python tools/nsx/create_new_rule_files.py   --in-dir nsx_export/nsx-gm1.lab.local   --remapped-groups-dir nsx_remapped_groups
+```
 
-5) Apply group push to GM
-   python tools/nsx/push_nsx_groups.py \
-     --target nsx-gm1 \
-     --domain-id default \
-     --federation-global \
-     --apply
+Output:
+- `nsx_updated_rules/`
 
+Only rules that reference existing new groups are modified.
 
-6) Create new rule files (additive: old_group + new_group) - dry run 
+---
 
-  python tools/nsx/create_new_rule_files.py \
-    --in-dir nsx_export/nsx-gm1.lab.local \
-    --remapped-groups-dir nsx_remapped_groups \
-    --dry-run
+## 8) Plan Rule Push to Global Manager (PLAN)
 
-7) Create new rule files (write output to ./nsx_updated_rules)
-    python tools/nsx/create_new_rule_files.py \
-    --in-dir nsx_export/nsx-gm1.lab.local \
-    --remapped-groups-dir nsx_remapped_groups
+Reads from `nsx_updated_rules` by default.
 
-8) python tools/nsx/push_nsx_rules.py \
-    --target nsx-gm1 \
-    --federation-global \
-    --strip-keys
+```bash
+python tools/nsx/push_nsx_rules.py   --target nsx-gm1   --federation-global   --strip-keys
+```
 
-9)  python tools/nsx/push_nsx_rules.py \
-    --target nsx-gm1 \
-    --federation-global \
-    --strip-keys \
-    --commit
+This prints exactly which rules **would** be updated.
+
+---
+
+## 9) Commit Rule Push to Global Manager (PATCH)
+
+```bash
+python tools/nsx/push_nsx_rules.py   --target nsx-gm1   --federation-global   --strip-keys   --commit
+```
+
+Important behavior:
+- Uses **PATCH**, not PUT
+- Existing rules are **updated in place**
+- No duplicate rule creation errors
+- Only default-domain GM rules are touched
+
+---
+
+## Enforcement / Publish Notes
+
+Depending on your NSX GM configuration:
+- Changes may remain in **Draft** state
+- A manual **Publish** action in the UI may be required
+- This is intentional and allows controlled rollout
+
+---
+
+## Safety Guarantees
+
+- ❌ No Local Manager–only objects pushed
+- ❌ No group IDs reused
+- ❌ No phantom groups referenced
+- ❌ No rule deletions
+- ✅ Fully additive
+- ✅ Deterministic and repeatable
+- ✅ Auditable via logs and YAML diffs
+
+---
+
+## Logs
+
+All scripts log to:
+```
+nsx_logs/
+```
+
+Key files:
+- `create_new_rule_files.log`
+- `push_nsx_groups.log`
+- `push_nsx_rules.log`
+
+---
+
+## Summary
+
+This workflow enables a **parallel datacenter migration** in NSX Global Manager with:
+- zero downtime
+- zero destructive changes
+- full rollback capability (simply stop publishing)
+
+This runbook is safe to repeat and suitable for CAB-reviewed production execution.
