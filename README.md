@@ -167,21 +167,36 @@ PYTHONPATH=app python tools/nsx/push_nsx_objects.py --apply
 curl -k -u 'admin:*'   "https://nsx-gm1.lab.local/policy/api/v1/global-infra/domains"
 ```
 
-1)  export PYTHONPATH="$PWD/app"
+1) export PYTHONPATH="$PWD/app"
 
-2)  python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --all-domains --manager nsx-gm1
-    python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --manager nsx-gm1 --domain default  
+2) Export NSX objects from Global Manager (YAML)
+   # export everything (all domains)
+   python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --all-domains --manager nsx-gm1
 
-3)  python tools/nsx/remap_groups.py --csv data/subnet_map.csv
+   # OR export only default domain
+   python tools/nsx/export_nsx_objects.py --federation-global --output-format yaml --manager nsx-gm1 --domain default
 
-4)  python tools/nsx/push_nsx_groups.py \
-    --target nsx-gm1 \
-    --domain-id default \
-    --federation-global \
+3) Create new (remapped) IP-based Group YAML files from subnet_map.csv
+   python tools/nsx/create_new_group_files.py --csv data/subnet_map.csv
 
+4) Plan group push to GM (no changes applied)
+   python tools/nsx/push_nsx_groups.py \
+     --target nsx-gm1 \
+     --domain-id default \
+     --federation-global
 
-5)  python tools/nsx/push_nsx_groups.py \
-    --target nsx-gm1 \
-    --domain-id default \
-    --federation-global \
-    --apply
+5) Apply group push to GM
+   python tools/nsx/push_nsx_groups.py \
+     --target nsx-gm1 \
+     --domain-id default \
+     --federation-global \
+     --apply
+
+6) Create new rule files (additive: old_group + new_group) - dry run
+   python tools/nsx/create_new_rule_files.py \
+     --in-dir nsx_export/nsx-gm1.lab.local \
+     --dry-run
+
+7) Create new rule files (write output to ./nsx_updated_rules)
+   python tools/nsx/create_new_rule_files.py \
+     --in-dir nsx_export/nsx-gm1.lab.local
