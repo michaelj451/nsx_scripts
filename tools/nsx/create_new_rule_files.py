@@ -7,6 +7,10 @@ appears in source_groups or destination_groups.
 
 ADD-ONLY. Old groups are never removed.
 
+CRITICAL SAFETY:
+- Only add "<old_group> + NEW_GROUP_SUFFIX" if that NEW group actually exists in the
+  remapped-groups output. This prevents dependency errors (phantom groups).
+
 Inputs:
 - YAML (.yml/.yaml) and JSON (.json) files anywhere under --in-dir
 
@@ -25,20 +29,24 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Set
 
 import yaml
 
 
 # ============================================================
-# GLOBAL DEFAULTS (intentionally fixed)
+# GLOBAL DEFAULTS
 # ============================================================
 
 OUTPUT_DIR_NAME = "nsx_updated_rules"
+REMAPPED_GROUPS_DIR_NAME = "nsx_remapped_groups"
+
 LOG_DIR_NAME = "nsx_logs"
 LOG_FILE_NAME = "create_new_rule_files.log"
 
-NEW_GROUP_SUFFIX = "-dc2"  # change if naming ever changes
+NEW_GROUP_SUFFIX = "_m2"  # must match create_new_group_files.py output
+
+DEFAULT_GROUP_PREFIX = "/global-infra/domains/default/groups/"
 
 
 # ============================================================
@@ -52,9 +60,8 @@ def setup_logging() -> logging.Logger:
 
     logger = logging.getLogger("create_new_rule_files")
     logger.setLevel(logging.INFO)
-    logger.propagate = False  # avoid double logging if root logger configured elsewhere
+    logger.propagate = False
 
-    # If re-run in same interpreter (rare), avoid duplicate handlers
     if not logger.handlers:
         fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -73,6 +80,19 @@ def setup_logging() -> logging.Logger:
 
 
 log = setup_logging()
+
+
+# ============================================================
+# Defaults
+# ============================================================
+
+def _repo_root() -> Path:
+    # repo_root = .../nsx_scripts (because this file is repo/tools/nsx/create_new_rule_files.py)
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_remapped_groups_dir() -> Path:
+    return _repo_root() / REMAPPED_GROUPS_DIR_NAME
 
 
 # ============================================================
@@ -100,22 +120,15 @@ def detect_format(path: Path) -> str:
 
 
 def out_path_for(src: Path, in_root: Path, out_root: Path, out_format: str) -> Path:
-    """
-    Compute output path preserving relative structure.
-    If out_format == "same", keep original suffix.
-    Otherwise convert suffix based on requested format.
-    """
+    """Preserve relative structure; optionally convert suffix."""
     rel = src.relative_to(in_root)
 
     if out_format == "same":
         return out_root / rel
-
     if out_format == "json":
         return (out_root / rel).with_suffix(".json")
-
     if out_format == "yaml":
         return (out_root / rel).with_suffix(".yaml")
-
     raise ValueError(f"Invalid out_format: {out_format}")
 
 
@@ -133,11 +146,9 @@ def load_doc(path: Path) -> Any:
 
 def write_doc(path: Path, data: Any, fmt: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
     if fmt == "json":
         path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
         return
-
     if fmt == "yaml":
         path.write_text(
             yaml.safe_dump(
@@ -149,7 +160,6 @@ def write_doc(path: Path, data: Any, fmt: str) -> None:
             encoding="utf-8",
         )
         return
-
     raise ValueError(f"Unsupported output format: {fmt}")
 
 
@@ -162,18 +172,80 @@ def iter_docs(root: Path):
 
 
 # ============================================================
+# Remapped-groups discovery (what NEW groups actually exist)
+# ============================================================
+
+def _find_domain_root(export_root: Path) -> Path:
+    """
+    Support either:
+      <export_root>/domains/...
+    or:
+      <export_root>/<manager>/domains/...
+    Returns the directory that directly contains 'domains/'.
+    """
+    if (export_root / "domains").is_dir():
+        return export_root
+
+    for mgr_dir in export_root.iterdir():
+        if mgr_dir.is_dir() and (mgr_dir / "domains").is_dir():
+            return mgr_dir
+
+    raise SystemExit(
+        "Could not find a 'domains' directory. Expected either:\n"
+        f"  1) {export_root}/domains/<domain-id>/groups\n"
+        f"  2) {export_root}/<manager>/domains/<domain-id>/groups"
+    )
+
+
+def load_existing_new_group_paths(remapped_root: Path) -> Set[str]:
+    """
+    Scan remapped group files and return a set of full DEFAULT-domain group paths that exist.
+    Record objects where resource_type == 'Group' and 'id' is present.
+    """
+    domain_root = _find_domain_root(remapped_root)
+
+    paths: Set[str] = set()
+    for p in iter_docs(domain_root):
+        try:
+            doc = load_doc(p)
+        except Exception:
+            continue
+
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("resource_type") != "Group":
+            continue
+
+        gid = doc.get("id")
+        if isinstance(gid, str) and gid:
+            # Only default domain per project scope
+            paths.add(f"{DEFAULT_GROUP_PREFIX}{gid}")
+
+    return paths
+
+
+# ============================================================
 # Mutation logic
 # ============================================================
 
-def add_group_if_needed(group_list: List[Any], old_group: str) -> bool:
+def add_group_if_needed(group_list: List[Any], old_group: str, existing_new_paths: Set[str]) -> bool:
     """
-    If old_group exists in group_list, add derived new group if missing.
-    Returns True if list changed.
+    If old_group is a DEFAULT-domain group path, add derived new group if missing.
+    BUT: only add if that derived new group actually exists in existing_new_paths.
     """
-    if old_group not in group_list:
+    if not old_group.startswith(DEFAULT_GROUP_PREFIX):
         return False
 
     new_group = derive_new_group(old_group)
+
+    # old group already suffixed
+    if new_group == old_group:
+        return False
+
+    # Safety: only reference new groups that exist
+    if new_group not in existing_new_paths:
+        return False
+
     if new_group in group_list:
         return False
 
@@ -181,27 +253,25 @@ def add_group_if_needed(group_list: List[Any], old_group: str) -> bool:
     return True
 
 
-def walk(obj: Any, changed: List[str], context: str = "$") -> None:
+def walk(obj: Any, changed: List[str], existing_new_paths: Set[str], context: str = "$") -> None:
     """
-    Recursively walk the document, and whenever a dict contains source_groups
-    or destination_groups list fields, add derived new group paths.
+    Walk doc; when dict contains source_groups or destination_groups lists,
+    add derived new group paths (additive only), but only when those new groups exist.
     """
     if isinstance(obj, dict):
         for field in ("source_groups", "destination_groups"):
             groups = obj.get(field)
             if isinstance(groups, list):
-                # Iterate over a snapshot so we don't loop on newly appended values
                 for g in list(groups):
-                    if isinstance(g, str):
-                        if add_group_if_needed(groups, g):
-                            changed.append(f"{context}.{field}: added {derive_new_group(g)}")
+                    if isinstance(g, str) and add_group_if_needed(groups, g, existing_new_paths):
+                        changed.append(f"{context}.{field}: added {derive_new_group(g)}")
 
         for k, v in obj.items():
-            walk(v, changed, f"{context}.{k}")
+            walk(v, changed, existing_new_paths, f"{context}.{k}")
 
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
-            walk(item, changed, f"{context}[{i}]")
+            walk(item, changed, existing_new_paths, f"{context}[{i}]")
 
 
 # ============================================================
@@ -219,6 +289,12 @@ def main() -> None:
         help="Directory containing exported GM policy/rule YAML/JSON",
     )
     ap.add_argument(
+        "--remapped-groups-dir",
+        type=Path,
+        default=_default_remapped_groups_dir(),
+        help=f"Directory containing newly created group files (default: <repo>/{REMAPPED_GROUPS_DIR_NAME}).",
+    )
+    ap.add_argument(
         "--out-format",
         choices=["same", "yaml", "json"],
         default="same",
@@ -234,16 +310,23 @@ def main() -> None:
 
     in_dir: Path = args.in_dir
     out_root: Path = Path(OUTPUT_DIR_NAME)
+    remapped_dir: Path = args.remapped_groups_dir
 
     if not in_dir.exists():
         raise SystemExit(f"--in-dir not found: {in_dir}")
+    if not remapped_dir.exists():
+        raise SystemExit(f"--remapped-groups-dir not found: {remapped_dir}")
+
+    existing_new_paths = load_existing_new_group_paths(remapped_dir)
 
     log.info("Starting create_new_rule_files")
-    log.info("Input directory:  %s", in_dir)
-    log.info("Output directory: %s", out_root.resolve())
-    log.info("Output format:    %s", args.out_format)
-    log.info("Dry run:          %s", args.dry_run)
-    log.info("New group suffix: %s", NEW_GROUP_SUFFIX)
+    log.info("Input directory:        %s", in_dir)
+    log.info("Remapped groups dir:    %s", remapped_dir)
+    log.info("Loaded new group paths: %d", len(existing_new_paths))
+    log.info("Output directory:       %s", out_root.resolve())
+    log.info("Output format:          %s", args.out_format)
+    log.info("Dry run:                %s", args.dry_run)
+    log.info("New group suffix:       %s", NEW_GROUP_SUFFIX)
 
     total_additions = 0
     processed = 0
@@ -262,9 +345,8 @@ def main() -> None:
             continue
 
         changes: List[str] = []
-        walk(doc, changes)
+        walk(doc, changes, existing_new_paths)
 
-        # Determine output path + format for this file
         out_path = out_path_for(src, in_dir, out_root, args.out_format)
         out_fmt = detect_format(src) if args.out_format == "same" else args.out_format
 
@@ -273,18 +355,12 @@ def main() -> None:
             log.info("CHANGES %s (%d additions)", rel, len(changes))
             for c in changes:
                 log.info("  %s", c)
-        else:
-            log.debug("NOCHANGE %s", rel)
 
         if args.dry_run:
             continue
 
-        try:
-            write_doc(out_path, doc, out_fmt)
-            written += 1
-        except Exception as e:
-            log.error("FAIL write: %s -> %s (%s)", rel, out_path, e)
-            raise
+        write_doc(out_path, doc, out_fmt)
+        written += 1
 
     log.info("Finished create_new_rule_files")
     log.info("Processed files:        %d", processed)

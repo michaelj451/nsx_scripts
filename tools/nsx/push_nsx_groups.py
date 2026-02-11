@@ -12,9 +12,43 @@ from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_object_functions.nsx_group_importer import GroupImportConfig, NsxGroupImporter
 
-log = logging.getLogger(__name__)
-
 DEFAULT_INPUT_DIR = "nsx_remapped_groups"
+
+LOG_DIR_NAME = "nsx_logs"
+LOG_FILE_NAME = "push_nsx_groups.log"
+
+
+def setup_logging() -> logging.Logger:
+    """
+    Log to BOTH console and nsx_logs/push_nsx_groups.log (always).
+    Avoid double-handlers on repeated imports/runs.
+    """
+    log_dir = Path(LOG_DIR_NAME)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_FILE_NAME
+
+    logger = logging.getLogger("push_nsx_groups")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if not logger.handlers:
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(fmt)
+
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+
+    return logger
+
+
+log = setup_logging()
 
 
 def _build_mgr_map() -> Dict[str, str]:
@@ -69,7 +103,6 @@ def main() -> None:
         raise RuntimeError(f"Target manager env var not set for {args.target}. Check your .env / constants.")
 
     export_root: Path = args.input_dir
-
     if not export_root.exists():
         raise RuntimeError(f"Input directory does not exist: {export_root}")
 
@@ -98,11 +131,23 @@ def main() -> None:
             f"  2) {export_root}/<manager>/domains/<domain-id>/groups"
         )
 
-    log.info("Using domain root: %s", domain_root)
+    log.info("Starting push_nsx_groups")
+    log.info("Target:           %s (%s)", args.target, dst_mgr)
+    log.info("Federation GM:    %s", args.federation_global)
+    log.info("Mode:             %s", "APPLY" if args.apply else "DRY-RUN")
+    log.info("Input dir:        %s", export_root.resolve())
+    log.info("Using domain root:%s", domain_root.resolve())
+    log.info("Domain ID:        %s", args.domain_id)
+    log.info("Input format:     %s", args.input_format)
+    log.info("Suffix filter:    %s", args.new_group_suffix or "(none)")
+    log.info("Allowlist:        %s", args.new_groups_allowlist or "(none)")
+    log.info("Stop on error:    %s", args.stop_on_error)
+    log.info("Log file:         %s", (Path(LOG_DIR_NAME) / LOG_FILE_NAME).resolve())
+
     client = NsxPolicyClient(nsxmanager=dst_mgr, federation_global=args.federation_global)
 
     cfg = GroupImportConfig(
-        export_root=domain_root,   # <-- IMPORTANT: use domain_root, not export_root
+        export_root=domain_root,   # IMPORTANT: use domain_root, not export_root
         domain_id=args.domain_id,
         input_format=args.input_format,
         dry_run=(not args.apply),
@@ -115,7 +160,7 @@ def main() -> None:
     importer = NsxGroupImporter(client=client, cfg=cfg)
     result = importer.import_all()
 
-    log.info("Push complete. Stats=%s Errors=%d", result["stats"], len(result["errors"]))
+    log.info("Push complete. Stats=%s Errors=%d", result.get("stats"), len(result.get("errors", [])))
     print(result)
 
 

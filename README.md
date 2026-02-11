@@ -192,11 +192,26 @@ curl -k -u 'admin:*'   "https://nsx-gm1.lab.local/policy/api/v1/global-infra/dom
      --federation-global \
      --apply
 
-6) Create new rule files (additive: old_group + new_group) - dry run
-   python tools/nsx/create_new_rule_files.py \
-     --in-dir nsx_export/nsx-gm1.lab.local \
-     --dry-run
+
+6) Create new rule files (additive: old_group + new_group) - dry run 
+
+  python tools/nsx/create_new_rule_files.py \
+    --in-dir nsx_export/nsx-gm1.lab.local \
+    --remapped-groups-dir nsx_remapped_groups \
+    --dry-run
 
 7) Create new rule files (write output to ./nsx_updated_rules)
-   python tools/nsx/create_new_rule_files.py \
-     --in-dir nsx_export/nsx-gm1.lab.local
+    python tools/nsx/create_new_rule_files.py \
+    --in-dir nsx_export/nsx-gm1.lab.local \
+    --remapped-groups-dir nsx_remapped_groups
+
+8) python tools/nsx/push_nsx_rules.py \
+    --target nsx-gm1 \
+    --federation-global \
+    --strip-keys
+
+9)  python tools/nsx/push_nsx_rules.py \
+    --target nsx-gm1 \
+    --federation-global \
+    --strip-keys \
+    --commit
