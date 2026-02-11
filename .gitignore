@@ -2,9 +2,18 @@
 __pycache__/
 *.py[codz]
 *$py.class
+
+
+# NSX export intermediate files
 nsx_export/
 nsx_domain_meta/
 nsx_remapped_groups/
+nsx_updated_rules/
+nsx_logs/
+
+
+
+# Palo Alto Networks Panorama configuration exports
 modified-config.xml
 pano_export*
 changelog.json

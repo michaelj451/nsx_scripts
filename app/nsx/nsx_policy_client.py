@@ -12,7 +12,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class NsxPolicyClient:
-    def __init__(self, nsxmanager: str = nsx_lm2, *, federation_global: bool = False):
+    def __init__(self, nsxmanager: str = nsx_gm1, *, federation_global: bool = False):
         logging.info(f"Creating NSX session for manager: {nsxmanager} (federation_global={federation_global})")
 
         self.NSX_MANAGER = f"https://{nsxmanager}"
@@ -26,7 +26,7 @@ class NsxPolicyClient:
             (nsx_gm1 or "").lower(),
             # add nsx_gm2 if you have it, etc.
         }
-        is_gm = mgr_norm in gm_hosts
+        is_gm = any(mgr_norm == h or mgr_norm.startswith(h + ".") or h.startswith(mgr_norm + ".") for h in gm_hosts if h)
 
         # Policy API root depends on (GM vs LM) and federation mode
         if federation_global:
