@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-pa_xml_zone_optimized.py
-
 Usage:
-  python pa_xml_zone_optimized.py --config running-config.xml --csv ip_map.csv --dg dg_zone.txt --out modified-config.xml --changelog changelog.json
+  python pa_xml_zone_optimized.py --config running-config.xml --csv ip_map.txt --out modified-config.xml --dg dg_zone.txt --changelog changelog.jsonl
 
 CSV format (header required):
   search_ip,new_ip,new_object_name,tags,desc
 
-DG->Zone mapping file (--dg) supports lines like:
+dg_zone.txt format (one per line; comments allowed):
   dg-3: zone-3
   dg-3,zone-3
   dg-3 zone-3
-Comments (# ...) and blanks ignored.
-
-Key behavior:
-  - Updates SHARED + selected DEVICE-GROUP pre-rulebase security rules
-  - Adds mapped address objects and adds mapped members into source/destination lists
-  - If a DG rule changed src/dst, injects zone into <from>/<to>
 """
 
 from __future__ import annotations
@@ -26,11 +18,13 @@ import argparse
 import csv
 import ipaddress
 import json
+import re
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 # -------------------------
@@ -95,7 +89,7 @@ class SubnetMapper:
     to the corresponding value in the new network by preserving host offsets.
 
     - Most specific old subnet wins (sort by prefixlen desc)
-    - Ranges map ONLY if both endpoints are inside the SAME mapped old subnet
+    - Ranges only map if both endpoints are inside the SAME mapped old subnet
     """
 
     def __init__(self, rows: List[CsvMapRow]) -> None:
@@ -159,7 +153,7 @@ class SubnetMapper:
 
 
 # -------------------------
-# Parsing files
+# Parsing CSV
 # -------------------------
 
 def read_csv_mappings(path: str) -> List[CsvMapRow]:
@@ -193,7 +187,21 @@ def read_csv_mappings(path: str) -> List[CsvMapRow]:
     return rows
 
 
+# -------------------------
+# DG -> Zone mapping
+# -------------------------
+
 def read_dg_zone_map(path: str) -> dict[str, str]:
+    """
+    Reads a dg->zone mapping file.
+
+    Supported lines:
+      dg-3: zone-3
+      dg-3,zone-3
+      dg-3 zone-3
+
+    Ignores blanks and comments (# ...).
+    """
     mapping: dict[str, str] = {}
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
@@ -217,107 +225,16 @@ def read_dg_zone_map(path: str) -> dict[str, str]:
                 raise ValueError(f"Bad dg->zone line: {raw!r}")
 
             mapping[dg] = zone
+
     return mapping
-
-
-# -------------------------
-# Panorama XML traversal
-# -------------------------
-
-@dataclass
-class Scope:
-    scope_name: str         # "shared" or "dg:<name>"
-    root_elem: ET.Element
-    address_elem: ET.Element
-
-
-def find_dg_entries(cfg: ET.Element) -> List[ET.Element]:
-    dgs = cfg.findall("./devices/entry[@name='localhost.localdomain']/device-group/entry")
-    if not dgs:
-        dgs = cfg.findall("./devices/entry/device-group/entry")
-    return dgs
-
-
-def build_scopes(cfg: ET.Element, dg_filter: Set[str]) -> List[Scope]:
-    scopes: List[Scope] = []
-
-    shared = cfg.find("./shared")
-    if shared is not None:
-        scopes.append(Scope("shared", shared, ensure_child(shared, "address")))
-
-    for dg in find_dg_entries(cfg):
-        dg_name = dg.attrib.get("name")
-        if not dg_name or dg_name not in dg_filter:
-            continue
-        scopes.append(Scope(f"dg:{dg_name}", dg, ensure_child(dg, "address")))
-
-    return scopes
-
-
-def index_address_objects(address_elem: ET.Element) -> Dict[str, ET.Element]:
-    out: Dict[str, ET.Element] = {}
-    for e in address_elem.findall("./entry"):
-        n = entry_name(e)
-        if n:
-            out[n] = e
-    return out
-
-
-def iter_rule_member_lists(scope_root: ET.Element) -> Iterable[Tuple[str, ET.Element]]:
-    for rule in scope_root.findall(".//pre-rulebase/security/rules/entry"):
-        rname = rule.attrib.get("name", "")
-        src = rule.find("./source")
-        dst = rule.find("./destination")
-        if src is not None:
-            yield f"{rname}:source", src
-        if dst is not None:
-            yield f"{rname}:destination", dst
-
-
-def iter_security_rule_entries(root: ET.Element, device_groups: Optional[Set[str]] = None):
-    for rule in root.findall("./shared/pre-rulebase/security/rules/entry"):
-        yield ("shared", None, rule)
-
-    for dg in find_dg_entries(root):
-        dg_name = dg.attrib.get("name")
-        if not dg_name:
-            continue
-        if device_groups is not None and dg_name not in device_groups:
-            continue
-        for rule in dg.findall("./pre-rulebase/security/rules/entry"):
-            yield ("device-group", dg_name, rule)
-
-
-def inject_zones_if_needed(
-    rule: ET.Element,
-    dg_name: str | None,
-    dg_to_zone: dict[str, str],
-    changed_src: bool,
-    changed_dst: bool,
-) -> None:
-    if not dg_name:
-        return
-    zone = dg_to_zone.get(dg_name)
-    if not zone:
-        return
-
-    def ensure_member(parent_tag: str, member_value: str) -> None:
-        node = rule.find(parent_tag)
-        if node is None:
-            node = ET.SubElement(rule, parent_tag)
-        members = [m.text for m in node.findall("member")]
-        if member_value not in members:
-            ET.SubElement(node, "member").text = member_value
-
-    if changed_src:
-        ensure_member("from", zone)
-    if changed_dst:
-        ensure_member("to", zone)
 
 
 # -------------------------
 # Address value parsing / creation
 # -------------------------
+
+_RANGE_RE = re.compile(r"^\s*([0-9a-fA-F\.:]+)\s*-\s*([0-9a-fA-F\.:]+)\s*$")
+
 
 def parse_ip_netmask_text(text: str) -> Tuple[str, ipaddress._BaseAddress | ipaddress._BaseNetwork]:
     t = text.strip()
@@ -327,11 +244,40 @@ def parse_ip_netmask_text(text: str) -> Tuple[str, ipaddress._BaseAddress | ipad
 
 
 def parse_ip_range_text(text: str) -> Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]:
-    t = text.strip()
-    if "-" not in t:
-        raise ValueError(f"Invalid ip-range (missing '-'): {t}")
-    a, b = [p.strip() for p in t.split("-", 1)]
-    return ipaddress.ip_address(a), ipaddress.ip_address(b)
+    m = _RANGE_RE.match(text.strip())
+    if not m:
+        raise ValueError(f"Invalid ip-range: {text!r}")
+    return ipaddress.ip_address(m.group(1)), ipaddress.ip_address(m.group(2))
+
+
+def classify_literal_member(text: str) -> Optional[Tuple[str, object]]:
+    """
+    Return ("host", ip), ("network", net), ("range", (start,end)) if the member text is a raw literal.
+    Otherwise return None.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    if "-" in t:
+        try:
+            a, b = parse_ip_range_text(t)
+            return "range", (a, b)
+        except ValueError:
+            return None
+
+    if "/" in t:
+        try:
+            net = ipaddress.ip_network(t, strict=False)
+            return "network", net
+        except ValueError:
+            return None
+
+    try:
+        ip = ipaddress.ip_address(t)
+        return "host", ip
+    except ValueError:
+        return None
 
 
 def build_address_entry(name: str, kind: str, value: str, desc: Optional[str]) -> ET.Element:
@@ -344,127 +290,266 @@ def build_address_entry(name: str, kind: str, value: str, desc: Optional[str]) -
     return e
 
 
+def index_address_objects(address_elem: ET.Element) -> Dict[str, ET.Element]:
+    out: Dict[str, ET.Element] = {}
+    for e in address_elem.findall("./entry"):
+        n = entry_name(e)
+        if n:
+            out[n] = e
+    return out
+
+
 # -------------------------
-# Main conversion logic
+# Rule iteration (shared + DG, pre + post)
 # -------------------------
 
-def convert_scope(
-    scope: Scope,
-    mapper: SubnetMapper,
-    changes: List[dict],
-    shared_addr_elem: Optional[ET.Element],
-) -> None:
+def iter_security_rule_entries(root: ET.Element):
     """
-    FIX: DG scopes often reference SHARED address objects.
-    So for lookups we use: local_index + shared_index (fallback).
-    For creating new objects, we create them in the scope where the original object was found;
-    if the original was only in shared, we create new object in shared (safe + avoids empty DG address containers).
+    Yield tuples:
+      (scope, dg_name, dg_entry, rule_entry)
+
+    scope:
+      - "shared"
+      - "device-group"
+    dg_name:
+      - None for shared
+      - DG name for device-group
+    dg_entry:
+      - None for shared
+      - The DG <entry> element for DG
     """
-    local_index = index_address_objects(scope.address_elem)
-    shared_index = index_address_objects(shared_addr_elem) if shared_addr_elem is not None else {}
+    # Shared pre/post security rules
+    for rule in root.findall("./shared/pre-rulebase/security/rules/entry"):
+        yield ("shared", None, None, rule)
+    for rule in root.findall("./shared/post-rulebase/security/rules/entry"):
+        yield ("shared", None, None, rule)
 
-    def lookup_addr(name: str) -> Tuple[Optional[ET.Element], str]:
-        if name in local_index:
-            return local_index[name], "local"
-        if name in shared_index:
-            return shared_index[name], "shared"
-        return None, "missing"
+    # Device-group pre/post security rules
+    for dg in root.findall("./devices/entry/device-group/entry"):
+        dg_name = dg.attrib.get("name")
+        if not dg_name:
+            continue
 
-    def ensure_object_in(target: str, name: str, kind: str, value: str, desc: Optional[str], src_obj: Optional[str]) -> None:
-        if target == "local":
-            idx = local_index
-            addr_elem = scope.address_elem
-            scope_name = scope.scope_name
-        else:
-            idx = shared_index
-            if shared_addr_elem is None:
-                return
-            addr_elem = shared_addr_elem
-            scope_name = "shared"
+        for rule in dg.findall("./pre-rulebase/security/rules/entry"):
+            yield ("device-group", dg_name, dg, rule)
+        for rule in dg.findall("./post-rulebase/security/rules/entry"):
+            yield ("device-group", dg_name, dg, rule)
 
-        if name in idx:
+
+# -------------------------
+# Zone injection (DG only)
+# -------------------------
+
+def ensure_zone_members(rule: ET.Element, zone: str) -> bool:
+    """
+    For DG rules:
+      - If <from>/<to> is missing -> create it with zone
+      - If it contains 'any' -> remove 'any' and set zone
+      - Ensure zone is present
+    Returns True if modified.
+    """
+    changed = False
+
+    def fix(tag: str) -> None:
+        nonlocal changed
+        node = rule.find(tag)
+        if node is None:
+            node = ET.SubElement(rule, tag)
+            ET.SubElement(node, "member").text = zone
+            changed = True
             return
 
-        new_entry = build_address_entry(name, kind, value, desc)
-        addr_elem.append(new_entry)
-        idx[name] = new_entry
-        changes.append({
-            "ts": ts(),
-            "scope": scope_name,
-            "action": "add_address_object",
-            "name": name,
-            "kind": kind,
-            "value": value,
-            "desc": desc,
-            "source_object": src_obj,
-        })
+        members = [m for m in node.findall("member")]
+        texts = [m.text.strip() for m in members if m.text and m.text.strip()]
 
-    def mapped_name_for(row: CsvMapRow, value_str: str) -> str:
-        if row.new_object_name and value_str == str(row.new):
-            return row.new_object_name
-        return gen_default_name_for_value(value_str)
+        # remove 'any' if present
+        any_members = [m for m in members if (m.text or "").strip() == "any"]
+        if any_members:
+            for m in any_members:
+                node.remove(m)
+            changed = True
+            texts = [t for t in texts if t != "any"]
 
-    # 1) Pre-create mapped objects from LOCAL objects (and shared if we are in shared scope)
-    #    This is mostly for convenience; the rule-driven phase will also ensure objects.
-    seed_elems: List[Tuple[ET.Element, str]] = [(e, "local") for e in scope.address_elem.findall("./entry")]
-    if scope.scope_name == "shared" and shared_addr_elem is not None:
-        seed_elems = [(e, "shared") for e in shared_addr_elem.findall("./entry")]
+        if zone not in texts:
+            ET.SubElement(node, "member").text = zone
+            changed = True
 
-    for entry, origin in seed_elems:
-        obj_name = entry_name(entry)
-        if not obj_name:
-            continue
+    fix("from")
+    fix("to")
+    return changed
 
-        ipnet = entry.find("./ip-netmask")
-        iprng = entry.find("./ip-range")
 
-        if ipnet is not None and ipnet.text:
-            try:
-                which, parsed = parse_ip_netmask_text(ipnet.text)
-            except ValueError:
-                continue
+# -------------------------
+# Conversion logic per scope (shared and DG)
+# -------------------------
 
-            if which == "host":
-                mapped = mapper.map_ip(parsed)  # type: ignore[arg-type]
-                if not mapped:
-                    continue
-                row, new_ip = mapped
-                new_value = str(new_ip)
-                new_name = mapped_name_for(row, new_value)
-                ensure_object_in(origin, new_name, "ip-netmask", new_value, row.desc, obj_name)
-            else:
-                mapped = mapper.map_network(parsed)  # type: ignore[arg-type]
-                if not mapped:
-                    continue
-                row, new_net = mapped
-                new_value = str(new_net)
-                new_name = mapped_name_for(row, new_value)
-                ensure_object_in(origin, new_name, "ip-netmask", new_value, row.desc, obj_name)
+def ensure_address_container_for_scope(root: ET.Element, scope: str, dg_entry: Optional[ET.Element]) -> ET.Element:
+    if scope == "shared":
+        shared = root.find("./shared")
+        if shared is None:
+            shared = ET.SubElement(root, "shared")
+        return ensure_child(shared, "address")
+    else:
+        assert dg_entry is not None
+        return ensure_child(dg_entry, "address")
 
-        elif iprng is not None and iprng.text:
-            try:
-                start, end = parse_ip_range_text(iprng.text)
-            except ValueError:
-                continue
-            mapped = mapper.map_range(start, end)
-            if not mapped:
-                continue
-            row, new_start, new_end = mapped
-            new_value = f"{new_start}-{new_end}"
-            new_name = mapped_name_for(row, new_value)
-            ensure_object_in(origin, new_name, "ip-range", new_value, row.desc, obj_name)
 
-    # 2) Update rules: add mapped members (this is what drives changed_src/dst)
-    for hint, member_parent in iter_rule_member_lists(scope.root_elem):
-        members = member_parent.findall("./member")
+def mapped_name_for(row: CsvMapRow, value_str: str) -> str:
+    if row.new_object_name and value_str == str(row.new):
+        return row.new_object_name
+    return gen_default_name_for_value(value_str)
+
+
+def ensure_object(
+    address_elem: ET.Element,
+    addr_index: Dict[str, ET.Element],
+    changes: List[dict],
+    scope_name: str,
+    name: str,
+    kind: str,
+    value: str,
+    desc: Optional[str],
+    source_object: Optional[str],
+) -> None:
+    if name in addr_index:
+        return
+    new_entry = build_address_entry(name, kind, value, desc)
+    address_elem.append(new_entry)
+    addr_index[name] = new_entry
+    changes.append({
+        "ts": ts(),
+        "scope": scope_name,
+        "action": "add_address_object",
+        "name": name,
+        "kind": kind,
+        "value": value,
+        "desc": desc,
+        "source_object": source_object,
+    })
+
+
+def map_or_create_from_literal(
+    mapper: SubnetMapper,
+    literal_kind: str,
+    literal_obj: object,
+    default_desc: Optional[str],
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Given a literal (host/net/range), return (addr_kind, addr_value, desc) to create/use.
+    If it maps, use mapped value & CSV desc.
+    Otherwise, use original literal value & default_desc.
+    """
+    if literal_kind == "host":
+        ip = literal_obj  # type: ignore[assignment]
+        mapped = mapper.map_ip(ip)  # type: ignore[arg-type]
+        if mapped:
+            row, new_ip = mapped
+            return "ip-netmask", str(new_ip), row.desc
+        return "ip-netmask", str(ip), default_desc
+
+    if literal_kind == "network":
+        net = literal_obj  # type: ignore[assignment]
+        mapped = mapper.map_network(net)  # type: ignore[arg-type]
+        if mapped:
+            row, new_net = mapped
+            return "ip-netmask", str(new_net), row.desc
+        return "ip-netmask", str(net), default_desc
+
+    # range
+    start, end = literal_obj  # type: ignore[misc]
+    mapped = mapper.map_range(start, end)
+    if mapped:
+        row, ns, ne = mapped
+        return "ip-range", f"{ns}-{ne}", row.desc
+    return "ip-range", f"{start}-{end}", default_desc
+
+
+def process_rule_members(
+    root: ET.Element,
+    scope: str,
+    dg_name: Optional[str],
+    dg_entry: Optional[ET.Element],
+    mapper: SubnetMapper,
+    changes: List[dict],
+    rule: ET.Element,
+) -> Tuple[bool, bool]:
+    """
+    Update a rule's <source> and <destination> members:
+      - For object references: if referenced object maps -> add mapped object reference
+      - For raw literals in rules: create object (mapped if possible) and REPLACE literal with object name
+
+    Returns (changed_src, changed_dst).
+    """
+    address_elem = ensure_address_container_for_scope(root, scope, dg_entry)
+    addr_index = index_address_objects(address_elem)
+    scope_name = "shared" if scope == "shared" else f"dg:{dg_name}"
+
+    changed_src = False
+    changed_dst = False
+
+    def handle_block(block_tag: str) -> bool:
+        nonlocal addr_index
+        block = rule.find(block_tag)
+        if block is None:
+            return False
+
+        members = block.findall("member")
         if not members:
-            continue
+            return False
 
-        existing_names = [m.text.strip() for m in members if m.text and m.text.strip()]
-        existing_set = set(existing_names)
+        existing_texts = [(m.text or "").strip() for m in members]
+        existing_set = set([t for t in existing_texts if t])
 
-        for old_ref in list(existing_names):
-            src_entry, origin = lookup_addr(old_ref)
+        modified = False
+
+        # pass 1: convert raw literals to objects (replace member text)
+        for m in members:
+            txt = (m.text or "").strip()
+            if not txt:
+                continue
+
+            lit = classify_literal_member(txt)
+            if not lit:
+                continue
+
+            lit_kind, lit_obj = lit
+            addr_kind, addr_value, desc = map_or_create_from_literal(mapper, lit_kind, lit_obj, default_desc=None)
+            obj_name = gen_default_name_for_value(addr_value)
+
+            ensure_object(
+                address_elem=address_elem,
+                addr_index=addr_index,
+                changes=changes,
+                scope_name=scope_name,
+                name=obj_name,
+                kind=addr_kind,
+                value=addr_value,
+                desc=desc,
+                source_object=None,
+            )
+
+            if txt != obj_name:
+                m.text = obj_name
+                modified = True
+                changes.append({
+                    "ts": ts(),
+                    "scope": scope_name,
+                    "action": "replace_literal_with_object",
+                    "rule": rule.attrib.get("name"),
+                    "field": block_tag,
+                    "literal": txt,
+                    "object": obj_name,
+                    "value": addr_value,
+                })
+
+        # refresh after replacements
+        members = block.findall("member")
+        existing_texts = [(m.text or "").strip() for m in members]
+        existing_set = set([t for t in existing_texts if t])
+
+        # pass 2: for existing object references, if object maps -> add mapped object member
+        for ref in list(existing_set):
+            src_entry = addr_index.get(ref)
             if src_entry is None:
                 continue
 
@@ -472,6 +557,9 @@ def convert_scope(
             iprng = src_entry.find("./ip-range")
 
             new_ref: Optional[str] = None
+            new_kind: Optional[str] = None
+            new_value: Optional[str] = None
+            new_desc: Optional[str] = None
 
             if ipnet is not None and ipnet.text:
                 try:
@@ -484,15 +572,17 @@ def convert_scope(
                     if mapped:
                         row, new_ip = mapped
                         new_value = str(new_ip)
+                        new_desc = row.desc
                         new_ref = mapped_name_for(row, new_value)
-                        ensure_object_in(origin, new_ref, "ip-netmask", new_value, row.desc, old_ref)
+                        new_kind = "ip-netmask"
                 else:
                     mapped = mapper.map_network(parsed)  # type: ignore[arg-type]
                     if mapped:
                         row, new_net = mapped
                         new_value = str(new_net)
+                        new_desc = row.desc
                         new_ref = mapped_name_for(row, new_value)
-                        ensure_object_in(origin, new_ref, "ip-netmask", new_value, row.desc, old_ref)
+                        new_kind = "ip-netmask"
 
             elif iprng is not None and iprng.text:
                 try:
@@ -501,22 +591,45 @@ def convert_scope(
                     continue
                 mapped = mapper.map_range(start, end)
                 if mapped:
-                    row, new_start, new_end = mapped
-                    new_value = f"{new_start}-{new_end}"
+                    row, ns, ne = mapped
+                    new_value = f"{ns}-{ne}"
+                    new_desc = row.desc
                     new_ref = mapped_name_for(row, new_value)
-                    ensure_object_in(origin, new_ref, "ip-range", new_value, row.desc, old_ref)
+                    new_kind = "ip-range"
 
-            if new_ref and new_ref not in existing_set:
-                ET.SubElement(member_parent, "member").text = new_ref
+            if new_ref and new_ref not in existing_set and new_kind and new_value:
+                ensure_object(
+                    address_elem=address_elem,
+                    addr_index=addr_index,
+                    changes=changes,
+                    scope_name=scope_name,
+                    name=new_ref,
+                    kind=new_kind,
+                    value=new_value,
+                    desc=new_desc,
+                    source_object=ref,
+                )
+                ET.SubElement(block, "member").text = new_ref
                 existing_set.add(new_ref)
+                modified = True
                 changes.append({
                     "ts": ts(),
-                    "scope": scope.scope_name,
+                    "scope": scope_name,
                     "action": "add_rule_member",
-                    "rule_field": hint,
+                    "rule": rule.attrib.get("name"),
+                    "field": block_tag,
                     "added_member": new_ref,
-                    "because_of": old_ref,
+                    "because_of": ref,
                 })
+
+        return modified
+
+    if handle_block("source"):
+        changed_src = True
+    if handle_block("destination"):
+        changed_dst = True
+
+    return changed_src, changed_dst
 
 
 def write_changelog(path: str, changes: List[dict]) -> None:
@@ -531,71 +644,55 @@ def write_changelog(path: str, changes: List[dict]) -> None:
 
 
 # -------------------------
-# CLI / main
+# Main
 # -------------------------
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Input Panorama running-config.xml")
     ap.add_argument("--csv", required=True, help="CSV mapping file")
-    ap.add_argument("--dg", required=True, help="Device Group to Zone mapping file (dg: zone per line)")
+    ap.add_argument("--dg", required=True, help="Device Group to Zone mapping file (dg: zone)")
     ap.add_argument("--out", required=True, help="Output modified XML file")
     ap.add_argument("--changelog", required=True, help="Changelog file (.json or .jsonl)")
+
     args = ap.parse_args(argv)
 
-    rows = read_csv_mappings(args.csv)
-    mapper = SubnetMapper(rows)
+    mapper = SubnetMapper(read_csv_mappings(args.csv))
     dg_to_zone = read_dg_zone_map(args.dg)
-    dg_filter = set(dg_to_zone.keys())
 
     tree = ET.parse(args.config)
     cfg = tree.getroot()
 
-    shared_elem = cfg.find("./shared")
-    shared_addr_elem = ensure_child(shared_elem, "address") if shared_elem is not None else None
-
     changes: List[dict] = []
 
-    scopes = build_scopes(cfg, dg_filter)
-    for scope in scopes:
-        convert_scope(scope, mapper, changes, shared_addr_elem)
-
-    # Determine which DG rules changed (src/dst) from changes list
-    touched: Dict[Tuple[str, str], Dict[str, bool]] = {}
-    for ch in changes:
-        if ch.get("action") != "add_rule_member":
-            continue
-        scope_name = ch.get("scope")
-        rule_field = ch.get("rule_field")
-        if not isinstance(scope_name, str) or not scope_name.startswith("dg:"):
-            continue
-        if not isinstance(rule_field, str) or ":" not in rule_field:
-            continue
-
-        dg_name = scope_name.split(":", 1)[1]
-        rule_name, which = rule_field.rsplit(":", 1)
-        key = (dg_name, rule_name)
-        flags = touched.setdefault(key, {"src": False, "dst": False})
-        if which == "source":
-            flags["src"] = True
-        elif which == "destination":
-            flags["dst"] = True
-
-    # Inject zones only where rules were modified
-    for scope, dg_name, rule in iter_security_rule_entries(cfg, device_groups=dg_filter):
-        if scope != "device-group" or not dg_name:
-            continue
-        rule_name = rule.attrib.get("name", "")
-        flags = touched.get((dg_name, rule_name))
-        if not flags:
-            continue
-        inject_zones_if_needed(
-            rule=rule,
+    for scope, dg_name, dg_entry, rule in iter_security_rule_entries(cfg):
+        # Always do address processing (shared + DG)
+        changed_src, changed_dst = process_rule_members(
+            root=cfg,
+            scope=scope,
             dg_name=dg_name,
-            dg_to_zone=dg_to_zone,
-            changed_src=flags["src"],
-            changed_dst=flags["dst"],
+            dg_entry=dg_entry,
+            mapper=mapper,
+            changes=changes,
+            rule=rule,
         )
+
+        # Zone injection:
+        # - ONLY for device-group rules
+        # - ONLY if DG is mapped in dg_zone.txt
+        if scope == "device-group" and dg_name and dg_name in dg_to_zone:
+            zone = dg_to_zone[dg_name]
+            z_changed = ensure_zone_members(rule, zone)
+            if z_changed:
+                changes.append({
+                    "ts": ts(),
+                    "scope": f"dg:{dg_name}",
+                    "action": "ensure_zones",
+                    "rule": rule.attrib.get("name"),
+                    "zone": zone,
+                })
+
+        # Shared rules: never touch zones (by design)
 
     pretty_indent(cfg)
     tree.write(args.out, encoding="utf-8", xml_declaration=True)
