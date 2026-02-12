@@ -3,4 +3,4 @@ search_ip,new_ip,new_object_name,tags,desc
 10.2.1.0/24,10.2.2.0/24,,,something2
 10.3.1.0/24,10.3.2.0/24,,,something3
 10.4.1.0/24,10.4.2.0/24,,,something4
-4.2.0.0/16,10.4.0.0/16,,,something5
+4.2.0.0/16,4.4.0.0/16,,,something5
