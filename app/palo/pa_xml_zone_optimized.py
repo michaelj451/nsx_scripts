@@ -1,31 +1,46 @@
 #!/usr/bin/env python3
 """
 Usage:
-  python pa_xml_zone.py --config running-config.xml --csv ip_map.txt --dg dg_zone.txt --out modified-config.xml --changelog changelog.json [--resolve-fqdn]
+  python pa_xml_zone.py --config running-config.xml --csv ip_map.txt --dg dg_zone.txt --out modified-config.xml --changelog changelog.json
 
-Drop-in replacement focused on speed:
-- Builds indexes ONCE (addresses, rules, groups, member references)
-- Avoids repeated .findall('.//...') scans per CSV row
-- Updates the indexes incrementally as it creates objects / adds members
+CSV format (header required):
+  search_ip,new_ip,new_object_name,tags,desc
+
+Example:
+  10.1.1.0/24,10.1.2.0/24,,,something1
+  10.2.1.0/24,10.2.2.0/24,,,something2
+  10.3.1.0/24,10.3.2.0/24,,,something
 """
+
 from __future__ import annotations
 
 import argparse
-import bisect
 import csv
 import ipaddress
 import json
-import socket
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional, Iterable
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Iterable
 
 
-# ---------- Utilities ----------
+# -------------------------
+# Helpers
+# -------------------------
+
 def ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def underscored(s: str) -> str:
+    return s.replace('.', '_').replace('/', '_').replace(':', '_').replace('-', '_')
+
+
+def gen_default_name_for_value(value: str) -> str:
+    # Keep your original naming vibe but safe for PA object names.
+    return f"svb_m1_{underscored(value)}"
 
 
 def entry_name(elem: Optional[ET.Element]) -> Optional[str]:
@@ -34,903 +49,458 @@ def entry_name(elem: Optional[ET.Element]) -> Optional[str]:
     return elem.attrib.get("name")
 
 
-def underscored(s: str) -> str:
-    return s.replace(".", "_").replace("/", "_").replace(":", "_")
+def ensure_child(parent: ET.Element, tag: str) -> ET.Element:
+    c = parent.find(tag)
+    if c is None:
+        c = ET.SubElement(parent, tag)
+    return c
 
 
-def gen_default_name_for_ip(ip_text: str) -> str:
-    return f"svb_m1_{underscored(ip_text)}"
+def pretty_indent(elem: ET.Element, level: int = 0) -> None:
+    # ElementTree doesn't preserve original formatting.
+    # This makes the output readable; Panorama does not care about whitespace.
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        for child in elem:
+            pretty_indent(child, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    else:
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
 
 
-def find_shared_address_parent(root: ET.Element) -> ET.Element:
-    """Return <shared>/<address> parent or create one."""
-    candidate = root.find(".//shared/address")
-    if candidate is not None:
-        return candidate
-    any_addr = root.find(".//address")
-    if any_addr is not None:
-        return any_addr
-    cfg = root.find("devices") or root
-    shared = cfg.find("shared")
-    if shared is None:
-        shared = ET.SubElement(cfg, "shared")
-    address = shared.find("address")
-    if address is None:
-        address = ET.SubElement(shared, "address")
-    return address
+# -------------------------
+# Mapping model
+# -------------------------
 
-
-# ---------- Parsing helpers ----------
-_RANGE_SEPS = [" - ", "-", ",", " "]
-
-
-def parse_range_text(s: str) -> Optional[Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]]:
-    s = s.strip()
-    for sep in _RANGE_SEPS:
-        if sep in s:
-            parts = [p.strip() for p in s.split(sep) if p.strip()]
-            if len(parts) >= 2:
-                try:
-                    start = ipaddress.ip_address(parts[0])
-                    end = ipaddress.ip_address(parts[-1])
-                    return (start, end)
-                except Exception:
-                    return None
-    return None
-
-
-def normalize_ip_kind(ip_text: str) -> Tuple[str, object]:
-    """
-    Returns (kind, parsed)
-      kind: 'net' | 'host' | 'range' | 'raw'
-      parsed: ip_network | ip_address | (start,end) | raw_str
-    """
-    ip_text = (ip_text or "").strip()
-    if not ip_text:
-        return ("raw", "")
-    rg = parse_range_text(ip_text)
-    if rg is not None:
-        return ("range", rg)
-    try:
-        if "/" in ip_text:
-            return ("net", ipaddress.ip_network(ip_text, strict=False))
-        return ("host", ipaddress.ip_address(ip_text))
-    except Exception:
-        return ("raw", ip_text)
-
-
-def ip_int(addr: ipaddress._BaseAddress) -> int:
-    return int(addr)
-
-
-# ---------- Context / Indexes ----------
 @dataclass(frozen=True)
-class MemberLoc:
-    parent: ET.Element          # rule entry or group entry
-    section_tag: str            # 'source','destination','static'
-    dg_name: str                # device-group name or 'shared'
-    is_group: bool              # group vs rule
+class CsvMapRow:
+    old: ipaddress.IPv4Network | ipaddress.IPv6Network
+    new: ipaddress.IPv4Network | ipaddress.IPv6Network
+    new_object_name: Optional[str]
+    tags: Optional[str]
+    desc: Optional[str]
 
 
-@dataclass
-class RangeRec:
-    start_i: int
-    end_i: int
-    obj_name: str
-    text: str                   # original text (for changelog)
-    entry_elem: ET.Element
+class SubnetMapper:
+    """
+    Maps any IP / subnet / range that is *contained within* one of the old networks
+    to the corresponding value in the new network by preserving host offsets.
 
+    Key behavior:
+      - Most specific old subnet wins (sort by prefixlen desc)
+      - Ranges are ONLY mapped if both endpoints are inside the same mapped old subnet
+    """
 
-@dataclass
-class Context:
-    root: ET.Element
+    def __init__(self, rows: List[CsvMapRow]) -> None:
+        # most-specific-first avoids accidental matches when you have nested mappings
+        self.rows = sorted(rows, key=lambda r: r.old.prefixlen, reverse=True)
 
-    # Address object indexes
-    name_to_entry: Dict[str, ET.Element]
-    host_to_obj: Dict[str, str]                               # "1.2.3.4" -> obj_name
-    net_to_obj: Dict[ipaddress._BaseNetwork, str]             # ip_network -> obj_name
-    raw_to_obj: Dict[str, str]                                # raw literal -> obj_name
-    ranges_v4: List[RangeRec]                                 # sorted by start_i
-    ranges_v6: List[RangeRec]                                 # sorted by start_i
-
-    # Rules/groups
-    dg_rule_map: List[Tuple[ET.Element, str]]                 # (rule_elem, dg_name)
-    groups: List[ET.Element]                                  # address-group/entry elems
-
-    # Member references index: member text -> list of locations where it appears
-    member_index: Dict[str, List[MemberLoc]]
-
-    # Literal-IP members (from rules/groups) for fast range search
-    literal_ips_v4: List[Tuple[int, str]]                     # sorted by int
-    literal_ips_v6: List[Tuple[int, str]]                     # sorted by int
-
-    # fqdn address objects (entry_elem, fqdn_text)
-    fqdn_entries: List[Tuple[ET.Element, str]]
-
-
-def build_context(root: ET.Element) -> Context:
-    # Collect address entries once
-    name_to_entry: Dict[str, ET.Element] = {}
-    host_to_obj: Dict[str, str] = {}
-    net_to_obj: Dict[ipaddress._BaseNetwork, str] = {}
-    raw_to_obj: Dict[str, str] = {}
-    ranges_v4: List[RangeRec] = []
-    ranges_v6: List[RangeRec] = []
-    fqdn_entries: List[Tuple[ET.Element, str]] = []
-
-    for e in root.findall(".//address/entry"):
-        nm = entry_name(e)
-        if not nm:
-            continue
-        name_to_entry[nm] = e
-
-        ipnm = e.find("ip-netmask")
-        if ipnm is not None and ipnm.text and ipnm.text.strip():
-            txt = ipnm.text.strip()
-            kind, parsed = normalize_ip_kind(txt)
-            if kind == "host":
-                host_to_obj[str(parsed)] = nm
-            elif kind == "net":
-                net_to_obj[parsed] = nm
-            elif kind == "raw":
-                raw_to_obj[txt] = nm
-
-        ipr = e.find("ip-range")
-        if ipr is not None and ipr.text and ipr.text.strip():
-            txt = ipr.text.strip()
-            kind, parsed = normalize_ip_kind(txt)
-            if kind == "range":
-                s, t = parsed  # type: ignore[misc]
-                rec = RangeRec(ip_int(s), ip_int(t), nm, txt, e)
-                (ranges_v4 if s.version == 4 else ranges_v6).append(rec)
-            else:
-                raw_to_obj[txt] = nm
-
-        fq = e.find("fqdn")
-        if fq is not None and fq.text and fq.text.strip():
-            fqdn_entries.append((e, fq.text.strip()))
-
-    ranges_v4.sort(key=lambda r: r.start_i)
-    ranges_v6.sort(key=lambda r: r.start_i)
-
-    # Build list of rules grouped by device-group (once)
-    dg_rule_map: List[Tuple[ET.Element, str]] = []
-    seen_rule_ids = set()
-
-    for dg in root.findall(".//devices/entry/device-group/entry"):
-        dg_name = dg.attrib.get("name")
-        if not dg_name:
-            continue
-
-        # pre-rulebase security
-        for r in dg.findall(".//pre-rulebase//security//rules/entry"):
-            rid = id(r)
-            if rid not in seen_rule_ids:
-                dg_rule_map.append((r, dg_name))
-                seen_rule_ids.add(rid)
-
-        # post-rulebase application-override
-        for r in dg.findall(".//post-rulebase//application-override//rules/entry"):
-            rid = id(r)
-            if rid not in seen_rule_ids:
-                dg_rule_map.append((r, dg_name))
-                seen_rule_ids.add(rid)
-
-        # conservative: any security rules under this dg
-        for r in dg.findall(".//security//rules/entry"):
-            rid = id(r)
-            if rid not in seen_rule_ids:
-                dg_rule_map.append((r, dg_name))
-                seen_rule_ids.add(rid)
-
-    # shared/global rules
-    for path in [
-        ".//shared//pre-rulebase//security//rules/entry",
-        ".//shared//post-rulebase//security//rules/entry",
-        ".//shared//post-rulebase//application-override//rules/entry",
-    ]:
-        for r in root.findall(path):
-            rid = id(r)
-            if rid not in seen_rule_ids:
-                dg_rule_map.append((r, "shared"))
-                seen_rule_ids.add(rid)
-
-    groups = root.findall(".//address-group/entry")
-
-    # Build member_index once
-    member_index: Dict[str, List[MemberLoc]] = {}
-
-    def index_members(parent: ET.Element, section_tag: str, dg_name: str, is_group: bool) -> None:
-        sec = parent.find(section_tag)
-        if sec is None:
-            return
-        for m in sec.findall("member"):
-            if not (m.text and m.text.strip()):
+    def find_row_for_ip(self, ip: ipaddress._BaseAddress) -> Optional[CsvMapRow]:
+        for r in self.rows:
+            if ip.version != r.old.version:
                 continue
-            txt = m.text.strip()
-            member_index.setdefault(txt, []).append(MemberLoc(parent, section_tag, dg_name, is_group))
-
-    for r, dg_name in dg_rule_map:
-        index_members(r, "source", dg_name, is_group=False)
-        index_members(r, "destination", dg_name, is_group=False)
-
-    for g in groups:
-        index_members(g, "static", dg_name="(group)", is_group=True)
-
-    # Build literal IP lists for quick range matching in member_index keys
-    literal_ips_v4: List[Tuple[int, str]] = []
-    literal_ips_v6: List[Tuple[int, str]] = []
-    for txt in member_index.keys():
-        try:
-            ip_obj = ipaddress.ip_address(txt)
-            pair = (ip_int(ip_obj), txt)
-            (literal_ips_v4 if ip_obj.version == 4 else literal_ips_v6).append(pair)
-        except Exception:
-            continue
-    literal_ips_v4.sort(key=lambda x: x[0])
-    literal_ips_v6.sort(key=lambda x: x[0])
-
-    return Context(
-        root=root,
-        name_to_entry=name_to_entry,
-        host_to_obj=host_to_obj,
-        net_to_obj=net_to_obj,
-        raw_to_obj=raw_to_obj,
-        ranges_v4=ranges_v4,
-        ranges_v6=ranges_v6,
-        dg_rule_map=dg_rule_map,
-        groups=groups,
-        member_index=member_index,
-        literal_ips_v4=literal_ips_v4,
-        literal_ips_v6=literal_ips_v6,
-        fqdn_entries=fqdn_entries,
-    )
-
-
-# ---------- Fast lookup helpers ----------
-def find_range_containing(ctx: Context, host: ipaddress._BaseAddress) -> Optional[Tuple[ET.Element, str, str]]:
-    """Return (entry_elem, match_type, match_text) if host is contained in any known range."""
-    ranges = ctx.ranges_v4 if host.version == 4 else ctx.ranges_v6
-    if not ranges:
+            if ip in r.old:
+                return r
         return None
-    h = ip_int(host)
-    starts = [r.start_i for r in ranges]
-    i = bisect.bisect_right(starts, h) - 1
-    # scan backward a bit (ranges may overlap / same start)
-    for j in range(i, max(-1, i - 32), -1):
-        if j < 0:
-            break
-        rr = ranges[j]
-        if rr.start_i <= h <= rr.end_i:
-            return (rr.entry_elem, "range_contains", rr.text)
-        if rr.start_i < 0 or rr.start_i > h:
+
+    def find_row_for_net(self, net: ipaddress._BaseNetwork) -> Optional[CsvMapRow]:
+        # containment: only if this net is fully inside the mapping old net
+        for r in self.rows:
+            if net.version != r.old.version:
+                continue
+            if net.subnet_of(r.old):
+                return r
+        return None
+
+    def map_ip(self, ip: ipaddress._BaseAddress) -> Optional[Tuple[CsvMapRow, ipaddress._BaseAddress]]:
+        r = self.find_row_for_ip(ip)
+        if not r:
+            return None
+        # offset within old -> same offset within new
+        offset = int(ip) - int(r.old.network_address)
+        mapped = ipaddress.ip_address(int(r.new.network_address) + offset)
+        # safety: must land inside r.new
+        if mapped not in r.new:
+            return None
+        return r, mapped
+
+    def map_network(self, net: ipaddress._BaseNetwork) -> Optional[Tuple[CsvMapRow, ipaddress._BaseNetwork]]:
+        r = self.find_row_for_net(net)
+        if not r:
+            return None
+        # preserve the *network address offset* and keep prefixlen the same
+        offset = int(net.network_address) - int(r.old.network_address)
+        new_net_addr = ipaddress.ip_address(int(r.new.network_address) + offset)
+        mapped = ipaddress.ip_network(f"{new_net_addr}/{net.prefixlen}", strict=False)
+        # safety: must remain inside r.new
+        if not mapped.subnet_of(r.new):
+            return None
+        return r, mapped
+
+    def map_range(self, start: ipaddress._BaseAddress, end: ipaddress._BaseAddress) -> Optional[Tuple[CsvMapRow, ipaddress._BaseAddress, ipaddress._BaseAddress]]:
+        # FIX: range only maps if BOTH endpoints are inside the SAME old subnet mapping
+        r1 = self.find_row_for_ip(start)
+        r2 = self.find_row_for_ip(end)
+        if not r1 or not r2 or r1.old != r2.old:
+            return None
+        m1 = self.map_ip(start)
+        m2 = self.map_ip(end)
+        if not m1 or not m2:
+            return None
+        _, ms = m1
+        _, me = m2
+        if int(ms) > int(me):
+            ms, me = me, ms
+        return r1, ms, me
+
+
+# -------------------------
+# Parsing CSV
+# -------------------------
+
+def read_csv_mappings(path: str) -> List[CsvMapRow]:
+    rows: List[CsvMapRow] = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"search_ip", "new_ip"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise SystemExit(f"CSV must include headers: {sorted(required)} (got: {reader.fieldnames})")
+
+        for i, row in enumerate(reader, start=2):
+            search_ip = (row.get("search_ip") or "").strip()
+            new_ip = (row.get("new_ip") or "").strip()
+            if not search_ip or not new_ip:
+                continue
+
+            try:
+                old_net = ipaddress.ip_network(search_ip, strict=False)
+                new_net = ipaddress.ip_network(new_ip, strict=False)
+            except ValueError as e:
+                raise SystemExit(f"CSV line {i}: invalid network: {e}") from e
+
+            if old_net.version != new_net.version:
+                raise SystemExit(f"CSV line {i}: IP version mismatch: {old_net} -> {new_net}")
+
+            new_object_name = (row.get("new_object_name") or "").strip() or None
+            tags = (row.get("tags") or "").strip() or None
+            desc = (row.get("desc") or "").strip() or None
+
+            rows.append(CsvMapRow(old=old_net, new=new_net, new_object_name=new_object_name, tags=tags, desc=desc))
+    return rows
+
+
+def read_dg_list(path: str) -> List[str]:
+    # Your file name might say dg_zone.txt but it’s a list; we’ll treat it as “device groups to process”.
+    dgs: List[str] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            dgs.append(line)
+    return dgs
+
+
+# -------------------------
+# Panorama XML traversal
+# -------------------------
+
+@dataclass
+class Scope:
+    scope_name: str   # "shared" or "dg:<name>"
+    root_elem: ET.Element          # the element within which we update rules
+    address_elem: ET.Element       # the <address> container we add objects into
+
+
+def find_scopes(cfg: ET.Element, device_groups: List[str]) -> List[Scope]:
+    scopes: List[Scope] = []
+
+    shared = cfg.find("./shared")
+    if shared is not None:
+        addr = ensure_child(shared, "address")
+        scopes.append(Scope(scope_name="shared", root_elem=shared, address_elem=addr))
+
+    # Device groups live under /config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='DG']
+    localhost = cfg.find("./devices/entry[@name='localhost.localdomain']")
+    if localhost is None:
+        return scopes
+
+    dg_root = localhost.find("./device-group")
+    if dg_root is None:
+        return scopes
+
+    for dg_name in device_groups:
+        dg_entry = dg_root.find(f"./entry[@name='{dg_name}']")
+        if dg_entry is None:
+            # Ignore missing DGs silently (keeps it drop-in friendly)
             continue
-        # if this range starts way before but doesn't contain, keep scanning a bit
-    return None
+        addr = ensure_child(dg_entry, "address")
+        scopes.append(Scope(scope_name=f"dg:{dg_name}", root_elem=dg_entry, address_elem=addr))
+
+    return scopes
 
 
-def find_existing_object_for_ip(ctx: Context, ip_text: str) -> Tuple[Optional[ET.Element], Optional[str], Optional[str]]:
+def index_address_objects(address_elem: ET.Element) -> Dict[str, ET.Element]:
+    out: Dict[str, ET.Element] = {}
+    for e in address_elem.findall("./entry"):
+        n = entry_name(e)
+        if n:
+            out[n] = e
+    return out
+
+
+def iter_rule_member_lists(scope_root: ET.Element) -> Iterable[Tuple[str, ET.Element]]:
     """
-    Returns (entry_elem, match_type, match_text) or (None,None,None)
-      match_type: exact_net, exact_host, exact_range, range_contains, raw_match
+    Yield (path_hint, member_parent_elem) for <source> and <destination> blocks.
+
+    We target Security rules under:
+      - shared/pre-rulebase/security/rules/entry
+      - <dg>/pre-rulebase/security/rules/entry
+    (You can extend later for post-rulebase/nat/etc if needed.)
     """
-    kind, parsed = normalize_ip_kind(ip_text)
-    if kind == "host":
-        host = parsed  # type: ignore[assignment]
-        nm = ctx.host_to_obj.get(str(host))
-        if nm:
-            return (ctx.name_to_entry.get(nm), "exact_host", str(host))
-        cont = find_range_containing(ctx, host)  # type: ignore[arg-type]
-        if cont:
-            return cont
-        return (None, None, None)
-
-    if kind == "net":
-        net = parsed  # type: ignore[assignment]
-        nm = ctx.net_to_obj.get(net)
-        if nm:
-            return (ctx.name_to_entry.get(nm), "exact_net", str(net))
-        return (None, None, None)
-
-    if kind == "range":
-        s, t = parsed  # type: ignore[misc]
-        ranges = ctx.ranges_v4 if s.version == 4 else ctx.ranges_v6
-        for rr in ranges:
-            if rr.start_i == ip_int(s) and rr.end_i == ip_int(t):
-                return (rr.entry_elem, "exact_range", rr.text)
-        return (None, None, None)
-
-    # raw
-    raw = str(parsed)
-    nm = ctx.raw_to_obj.get(raw)
-    if nm:
-        return (ctx.name_to_entry.get(nm), "raw_match", raw)
-    return (None, None, None)
+    for rule in scope_root.findall(".//pre-rulebase/security/rules/entry"):
+        rname = rule.attrib.get("name", "")
+        src = rule.find("./source")
+        dst = rule.find("./destination")
+        if src is not None:
+            yield f"{rname}:source", src
+        if dst is not None:
+            yield f"{rname}:destination", dst
 
 
-def name_conflict_exists(ctx: Context, preferred_name: str) -> Optional[ET.Element]:
-    return ctx.name_to_entry.get(preferred_name)
+# -------------------------
+# Address value parsing / creation
+# -------------------------
+
+def parse_ip_netmask_text(text: str) -> Tuple[str, ipaddress._BaseAddress | ipaddress._BaseNetwork]:
+    """
+    Palo Alto stores host and subnet both in <ip-netmask>.
+
+    - If it contains '/', treat as network (e.g. 10.1.1.0/24)
+    - Else treat as host IP (e.g. 10.1.1.1)
+    """
+    t = text.strip()
+    if "/" in t:
+        return "network", ipaddress.ip_network(t, strict=False)
+    return "host", ipaddress.ip_address(t)
 
 
-def create_address_object(ctx: Context, ip_text: str, preferred_name: str, description: Optional[str] = None, tags: Optional[str] = None) -> ET.Element:
-    parent = find_shared_address_parent(ctx.root)
+def parse_ip_range_text(text: str) -> Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]:
+    t = text.strip()
+    if "-" not in t:
+        raise ValueError(f"Invalid ip-range (missing '-'): {t}")
+    a, b = [p.strip() for p in t.split("-", 1)]
+    return ipaddress.ip_address(a), ipaddress.ip_address(b)
 
-    name = preferred_name
-    base = name
-    i = 0
-    while name in ctx.name_to_entry:
-        i += 1
-        name = f"{base}_auto{i}"
 
-    e = ET.SubElement(parent, "entry", {"name": name})
-
-    kind, parsed = normalize_ip_kind(ip_text)
-    if kind == "net" or kind == "host":
-        ipnm = ET.SubElement(e, "ip-netmask")
-        ipnm.text = ip_text
-    elif kind == "range":
-        ipr = ET.SubElement(e, "ip-range")
-        ipr.text = ip_text
-    else:
-        # keep original behavior: raw goes into ip-netmask
-        ipnm = ET.SubElement(e, "ip-netmask")
-        ipnm.text = ip_text
-
-    if description:
+def build_address_entry(name: str, kind: str, value: str, desc: Optional[str]) -> ET.Element:
+    e = ET.Element("entry", {"name": name})
+    child = ET.SubElement(e, kind)
+    child.text = value
+    if desc:
         d = ET.SubElement(e, "description")
-        d.text = description
-    if tags:
-        tag_elem = ET.SubElement(e, "tag")
-        for t in [x.strip() for x in tags.split(",") if x.strip()]:
-            ET.SubElement(tag_elem, "member").text = t
-
-    # update indexes
-    ctx.name_to_entry[name] = e
-    if kind == "host":
-        ctx.host_to_obj[str(parsed)] = name  # type: ignore[arg-type]
-    elif kind == "net":
-        ctx.net_to_obj[parsed] = name  # type: ignore[index]
-    elif kind == "range":
-        s, t = parsed  # type: ignore[misc]
-        rec = RangeRec(ip_int(s), ip_int(t), name, ip_text.strip(), e)
-        if s.version == 4:
-            ctx.ranges_v4.append(rec)
-            ctx.ranges_v4.sort(key=lambda r: r.start_i)
-        else:
-            ctx.ranges_v6.append(rec)
-            ctx.ranges_v6.sort(key=lambda r: r.start_i)
-    else:
-        ctx.raw_to_obj[ip_text.strip()] = name
-
+        d.text = desc
     return e
 
 
-def ensure_object_and_reuse_if_present(
-    ctx: Context,
-    ip_text: str,
-    preferred_name: Optional[str],
-    description: Optional[str],
-    tags: Optional[str],
-    changelog: list,
-    based_on: Optional[str] = None,
-) -> str:
-    existing_entry, match_type, match_text = find_existing_object_for_ip(ctx, ip_text)
-    if existing_entry is not None:
-        name = entry_name(existing_entry) or ""
-        changelog.append(
-            {
-                "timestamp": ts(),
-                "action": "reuse_existing_object",
-                "ip": ip_text,
-                "existing_object": name,
-                "match_type": match_type,
-                "match_text": match_text,
-                "based_on": based_on,
-            }
-        )
-        return name
+# -------------------------
+# Main conversion logic
+# -------------------------
 
-    if preferred_name:
-        conflict = name_conflict_exists(ctx, preferred_name)
-        if conflict is None:
-            create_address_object(ctx, ip_text, preferred_name, description, tags)
-            changelog.append({"timestamp": ts(), "action": "create_object", "ip": ip_text, "name": preferred_name, "based_on": based_on})
-            return preferred_name
-        else:
-            # name exists; if it already matches this ip_text, reuse it; otherwise create auto-suffixed
-            existing_ipvals = [n.text.strip() for n in conflict.findall("ip-netmask") if n.text and n.text.strip()]
-            existing_ipranges = [n.text.strip() for n in conflict.findall("ip-range") if n.text and n.text.strip()]
-            if ip_text in existing_ipvals or ip_text in existing_ipranges:
-                changelog.append(
-                    {
-                        "timestamp": ts(),
-                        "action": "reuse_existing_object_by_name_match",
-                        "ip": ip_text,
-                        "existing_object": preferred_name,
-                        "based_on": based_on,
-                    }
-                )
-                return preferred_name
+def convert_scope(scope: Scope, mapper: SubnetMapper, changes: List[dict]) -> None:
+    addr_index = index_address_objects(scope.address_elem)
 
-            new_e = create_address_object(ctx, ip_text, preferred_name, description, tags)
-            new_name = entry_name(new_e) or preferred_name
-            changelog.append(
-                {
-                    "timestamp": ts(),
-                    "action": "create_object_name_conflict",
-                    "requested_name": preferred_name,
-                    "created_name": new_name,
-                    "ip": ip_text,
-                    "based_on": based_on,
-                }
-            )
-            return new_name
+    def ensure_object(name: str, kind: str, value: str, desc: Optional[str], src_obj: Optional[str]) -> None:
+        if name in addr_index:
+            return
+        new_entry = build_address_entry(name, kind, value, desc)
+        scope.address_elem.append(new_entry)
+        addr_index[name] = new_entry
+        changes.append({
+            "ts": ts(),
+            "scope": scope.scope_name,
+            "action": "add_address_object",
+            "name": name,
+            "kind": kind,
+            "value": value,
+            "desc": desc,
+            "source_object": src_obj,
+        })
 
-    default_name = gen_default_name_for_ip(ip_text)
-    new_e = create_address_object(ctx, ip_text, default_name, description, tags)
-    nm = entry_name(new_e) or default_name
-    changelog.append({"timestamp": ts(), "action": "create_object", "ip": ip_text, "name": nm, "based_on": based_on})
-    return nm
+    def mapped_name_for(row: CsvMapRow, value_str: str) -> str:
+        # If CSV explicitly provides new_object_name, use it ONLY for the “base mapping object”
+        # (i.e., when value_str exactly equals row.new for networks).
+        # Otherwise derive from the new value string.
+        if row.new_object_name and value_str == str(row.new):
+            return row.new_object_name
+        return gen_default_name_for_value(value_str)
 
-
-# ---------- Rule/group update helpers ----------
-def update_zone_if_needed(rule_elem: ET.Element, dg_name: str, dg_zone_map: Dict[str, str], changelog: list, sections: List[str]) -> None:
-    if dg_name not in dg_zone_map:
-        return
-    zone_to_add = dg_zone_map[dg_name]
-    for section_tag in sections:
-        sec = rule_elem.find(section_tag)
-        if sec is None:
-            sec = ET.SubElement(rule_elem, section_tag)
-        existing = [m.text for m in sec.findall("member") if m.text]
-        if zone_to_add not in existing:
-            ET.SubElement(sec, "member").text = zone_to_add
-            changelog.append(
-                {
-                    "timestamp": ts(),
-                    "action": "update_zone",
-                    "rule": entry_name(rule_elem),
-                    "device_group": dg_name,
-                    "section": section_tag,
-                    "added_zone": zone_to_add,
-                }
-            )
-
-
-def ensure_object_for_literal(ctx: Context, literal_val: str, changelog: list) -> None:
-    # Create object for literal IP if no object exists; keep original behavior: ensure exists, but don't add it.
-    _ = ensure_object_and_reuse_if_present(ctx, literal_val, None, None, None, changelog, based_on=f"literal_{literal_val}")
-
-
-def add_members_and_index(ctx: Context, sec: ET.Element, parent: ET.Element, section_tag: str, dg_name: str, is_group: bool, to_add: Iterable[str]) -> List[str]:
-    existing = [m.text for m in sec.findall("member") if m.text]
-    added: List[str] = []
-    for a in dict.fromkeys([x for x in to_add if x]):  # stable unique
-        if a not in existing:
-            ET.SubElement(sec, "member").text = a
-            existing.append(a)
-            added.append(a)
-            ctx.member_index.setdefault(a, []).append(MemberLoc(parent, section_tag, dg_name, is_group))
-    return added
-
-
-def update_locations_for_match(
-    ctx: Context,
-    dg_zone_map: Dict[str, str],
-    match_literal: str,
-    match_obj_name: Optional[str],
-    new_names: List[str],
-    changelog: list,
-    context: Optional[str] = None,
-) -> Tuple[bool, bool]:
-    """
-    Find every location where match_literal OR match_obj_name appears (via member_index),
-    then add new_names to that same section.
-    Returns (any_source_updated, any_dest_updated) for zone injection.
-    """
-    locs: List[MemberLoc] = []
-    if match_literal in ctx.member_index:
-        locs.extend(ctx.member_index[match_literal])
-    if match_obj_name and match_obj_name in ctx.member_index:
-        locs.extend(ctx.member_index[match_obj_name])
-
-    any_source = False
-    any_dest = False
-
-    # De-dupe locations (same parent/section/dg/is_group)
-    seen = set()
-    for loc in locs:
-        key = (id(loc.parent), loc.section_tag, loc.dg_name, loc.is_group)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        sec = loc.parent.find(loc.section_tag)
-        if sec is None:
+    # 1) Walk existing address objects and pre-create mapped objects for anything inside mapped subnets
+    for entry in list(scope.address_elem.findall("./entry")):
+        obj_name = entry_name(entry)
+        if not obj_name:
             continue
 
-        before = [m.text for m in sec.findall("member") if m.text]
-        added = add_members_and_index(ctx, sec, loc.parent, loc.section_tag, loc.dg_name, loc.is_group, new_names)
-        after = [m.text for m in sec.findall("member") if m.text]
+        ipnet = entry.find("./ip-netmask")
+        iprng = entry.find("./ip-range")
 
-        if not added:
-            continue
-
-        if loc.is_group:
-            action = "add_group_member"
-            keyname = "group"
-        else:
-            action = "add_member"
-            keyname = "rule"
-            if loc.section_tag == "source":
-                any_source = True
-            if loc.section_tag == "destination":
-                any_dest = True
-
-        changelog.append(
-            {
-                "timestamp": ts(),
-                "action": action,
-                keyname: entry_name(loc.parent),
-                "section": loc.section_tag,
-                "added": added,
-                "before": before,
-                "after": after,
-                "context": context,
-            }
-        )
-
-        # zone injection for rules
-        if not loc.is_group:
-            sections: List[str] = []
-            if loc.section_tag == "source":
-                sections.append("from")
-            if loc.section_tag == "destination":
-                sections.append("to")
-            if sections and loc.dg_name in dg_zone_map:
-                update_zone_if_needed(loc.parent, loc.dg_name, dg_zone_map, changelog, sections)
-
-    return any_source, any_dest
-
-
-# ---------- FQDN resolution ----------
-def resolve_fqdn(fqdn: str, changelog: list) -> List[str]:
-    try:
-        ips: List[str] = []
-        for res in socket.getaddrinfo(fqdn, None):
-            ip = res[4][0]
-            if ip not in ips:
-                ips.append(ip)
-        changelog.append({"timestamp": ts(), "action": "fqdn_resolution", "fqdn": fqdn, "ips": ips})
-        return ips
-    except Exception as e:
-        changelog.append({"timestamp": ts(), "action": "fqdn_resolution_failed", "fqdn": fqdn, "error": str(e)})
-        return []
-
-
-# ---------- Matching helpers (fast) ----------
-def ips_in_network_from_literal_list(net: ipaddress._BaseNetwork, literal_list: List[Tuple[int, str]]) -> List[str]:
-    start = int(net.network_address)
-    end = int(net.broadcast_address) if hasattr(net, "broadcast_address") else int(net[-1])  # IPv6 ok with [-1]
-    left = bisect.bisect_left(literal_list, (start, ""))
-    right = bisect.bisect_right(literal_list, (end, "\uffff"))
-    return [s for _, s in literal_list[left:right]]
-
-
-def process_row(
-    ctx: Context,
-    dg_zone_map: Dict[str, str],
-    search_ip_text: str,
-    new_ip_text: str,
-    preferred_name: Optional[str],
-    tags: Optional[str],
-    description: Optional[str],
-    changelog: list,
-    resolve_fqdn_flag: bool = False,
-) -> None:
-    search_ip_text = search_ip_text.strip()
-    new_ip_text = new_ip_text.strip()
-
-    s_kind, s_parsed = normalize_ip_kind(search_ip_text)
-    n_kind, n_parsed = normalize_ip_kind(new_ip_text)
-
-    # version sanity when both are valid IP constructs
-    def get_version(kind: str, parsed: object) -> Optional[int]:
-        if kind == "host":
-            return parsed.version  # type: ignore[attr-defined]
-        if kind == "net":
-            return parsed.version  # type: ignore[attr-defined]
-        if kind == "range":
-            return parsed[0].version  # type: ignore[index]
-        return None
-
-    sv = get_version(s_kind, s_parsed)
-    nv = get_version(n_kind, n_parsed)
-    if sv is not None and nv is not None and sv != nv:
-        changelog.append(
-            {
-                "timestamp": ts(),
-                "action": "version_mismatch",
-                "search_ip": search_ip_text,
-                "new_ip": new_ip_text,
-                "search_version": sv,
-                "new_version": nv,
-            }
-        )
-        return
-
-    # If new_ip is network/range, ensure object exists once
-    new_container_name: Optional[str] = None
-    if n_kind in ("net", "range"):
-        new_container_name = ensure_object_and_reuse_if_present(
-            ctx, new_ip_text, preferred_name, description, tags, changelog, based_on=f"{search_ip_text}->{new_ip_text}"
-        )
-
-    # Find existing object name for search net/range if present
-    search_obj_name: Optional[str] = None
-    if s_kind == "net":
-        search_obj_name = ctx.net_to_obj.get(s_parsed)  # type: ignore[arg-type]
-    elif s_kind == "range":
-        s0, s1 = s_parsed  # type: ignore[misc]
-        rr_list = ctx.ranges_v4 if s0.version == 4 else ctx.ranges_v6
-        for rr in rr_list:
-            if rr.start_i == ip_int(s0) and rr.end_i == ip_int(s1):
-                search_obj_name = rr.obj_name
-                break
-
-    # Determine matched hosts (address objects + literal members)
-    matched_host_strs: set[str] = set()
-
-    if s_kind == "net":
-        net = s_parsed  # type: ignore[assignment]
-        # from address objects
-        for ip_str in ctx.host_to_obj.keys():
+        if ipnet is not None and ipnet.text:
             try:
-                ip_obj = ipaddress.ip_address(ip_str)
-                if ip_obj in net:
-                    matched_host_strs.add(ip_str)
-            except Exception:
+                which, parsed = parse_ip_netmask_text(ipnet.text)
+            except ValueError:
                 continue
-        # from literal members (fast via bisect)
-        ll = ctx.literal_ips_v4 if net.version == 4 else ctx.literal_ips_v6
-        for ip_str in ips_in_network_from_literal_list(net, ll):
-            matched_host_strs.add(ip_str)
 
-        # fqdn resolve optional (still potentially expensive)
-        if resolve_fqdn_flag and ctx.fqdn_entries:
-            for entry_elem, fqdn in ctx.fqdn_entries:
-                ips = resolve_fqdn(fqdn, changelog)
-                if not ips:
-                    changelog.append({"timestamp": ts(), "action": "fqdn_reference_unresolved", "fqdn": fqdn, "object": entry_name(entry_elem)})
+            if which == "host":
+                mapped = mapper.map_ip(parsed)  # type: ignore[arg-type]
+                if not mapped:
                     continue
-                for ipstr in ips:
-                    try:
-                        ip_obj = ipaddress.ip_address(ipstr)
-                        if ip_obj in net:
-                            matched_host_strs.add(ipstr)
-                            # treat fqdn object as host object for mapping lookups
-                            ename = entry_name(entry_elem)
-                            if ename:
-                                ctx.host_to_obj[ipstr] = ename
-                    except Exception:
-                        continue
+                row, new_ip = mapped
+                new_value = str(new_ip)
+                new_name = mapped_name_for(row, new_value)
+                ensure_object(new_name, "ip-netmask", new_value, row.desc, obj_name)
 
-    elif s_kind == "host":
-        host = s_parsed  # type: ignore[assignment]
-        matched_host_strs.add(str(host))
-    else:
-        # search is range or raw: host-level match list is hard/undefined; we rely on network/range-level update below.
-        matched_host_strs = set()
+            else:
+                mapped = mapper.map_network(parsed)  # type: ignore[arg-type]
+                if not mapped:
+                    continue
+                row, new_net = mapped
+                new_value = str(new_net)
+                new_name = mapped_name_for(row, new_value)
+                ensure_object(new_name, "ip-netmask", new_value, row.desc, obj_name)
 
-    # ---- Process each matched host ----
-    # sort by int to keep stable, original-ish behavior
-    def sort_key(ip_str: str) -> int:
-        try:
-            return int(ipaddress.ip_address(ip_str))
-        except Exception:
-            return 0
-
-    for host_str in sorted(matched_host_strs, key=sort_key):
-        # compute mapped ip for host
-        mapped_ip = new_ip_text
-        if s_kind == "net" and n_kind == "net":
-            s_net = s_parsed  # type: ignore[assignment]
-            n_net = n_parsed  # type: ignore[assignment]
+        elif iprng is not None and iprng.text:
+            # Range mapping (bugfix: only map if both endpoints in SAME old subnet mapping)
             try:
-                host_ip = ipaddress.ip_address(host_str)
-                offset = int(host_ip) - int(s_net.network_address)
-                mapped_ip = str(ipaddress.ip_address(int(n_net.network_address) + offset))
-            except Exception:
-                mapped_ip = new_ip_text
+                start, end = parse_ip_range_text(iprng.text)
+            except ValueError:
+                continue
+            mapped = mapper.map_range(start, end)
+            if not mapped:
+                continue
+            row, new_start, new_end = mapped
+            new_value = f"{new_start}-{new_end}"
+            new_name = mapped_name_for(row, new_value)
+            ensure_object(new_name, "ip-range", new_value, row.desc, obj_name)
 
-        used_obj_name = ensure_object_and_reuse_if_present(
-            ctx, mapped_ip, preferred_name, description, tags, changelog, based_on=f"{host_str}->{mapped_ip}"
-        )
-        orig_obj_name = ctx.host_to_obj.get(host_str)
+    # 2) Update rules: for every referenced object that is “inside mapping”, add the mapped object name.
+    #    We do this by looking up the referenced address object, reading its value, mapping it, and adding member.
+    for hint, member_parent in iter_rule_member_lists(scope.root_elem):
+        members = member_parent.findall("./member")
+        if not members:
+            continue
 
-        # Update rules/groups where host literal OR orig object name appears
-        update_locations_for_match(
-            ctx,
-            dg_zone_map,
-            match_literal=host_str,
-            match_obj_name=orig_obj_name,
-            new_names=[used_obj_name],
-            changelog=changelog,
-            context=f"mapped_from_{host_str}_based_on_{orig_obj_name or 'literal'}",
-        )
+        existing_names = [m.text.strip() for m in members if m.text and m.text.strip()]
+        existing_set = set(existing_names)
 
-    # ---- Network/Range-level mapping: add mapped network/range object to rules/groups referencing original net/range ----
-    if s_kind in ("net", "range") and new_container_name:
-        # ensure object for literal if rules reference the literal CIDR/range string
-        # (original behavior only ensured object for host literal; keeping it light here)
-        update_locations_for_match(
-            ctx,
-            dg_zone_map,
-            match_literal=search_ip_text,
-            match_obj_name=search_obj_name,
-            new_names=[new_container_name],
-            changelog=changelog,
-            context=f"network_mapping_{search_ip_text}->{new_ip_text}",
-        )
+        for old_ref in list(existing_names):
+            src_entry = addr_index.get(old_ref)
+            if src_entry is None:
+                continue
 
-    # ---- For host search, handle containing networks/ranges in address objects ----
-    if s_kind == "host" and n_kind in ("host", "net", "range"):
-        try:
-            search_host = s_parsed  # type: ignore[assignment]
-            new_host = n_parsed if n_kind == "host" else None
-        except Exception:
-            search_host = None
-            new_host = None
+            ipnet = src_entry.find("./ip-netmask")
+            iprng = src_entry.find("./ip-range")
 
-        if search_host is not None and new_host is not None:
-            # find containers that contain search_host (nets + ranges from address objects)
-            containing: List[Tuple[str, str]] = []  # (container_text, container_obj_name)
-            for net, objn in ctx.net_to_obj.items():
+            new_ref: Optional[str] = None
+            if ipnet is not None and ipnet.text:
                 try:
-                    if search_host in net:
-                        containing.append((str(net), objn))
-                except Exception:
+                    which, parsed = parse_ip_netmask_text(ipnet.text)
+                except ValueError:
                     continue
 
-            rr_list = ctx.ranges_v4 if search_host.version == 4 else ctx.ranges_v6
-            for rr in rr_list:
-                if rr.start_i <= ip_int(search_host) <= rr.end_i:
-                    containing.append((rr.text, rr.obj_name))
+                if which == "host":
+                    mapped = mapper.map_ip(parsed)  # type: ignore[arg-type]
+                    if mapped:
+                        row, new_ip = mapped
+                        new_value = str(new_ip)
+                        new_ref = mapped_name_for(row, new_value)
+                        ensure_object(new_ref, "ip-netmask", new_value, row.desc, old_ref)
 
-            # derive mapped containers and update references
-            used_obj_name = ensure_object_and_reuse_if_present(
-                ctx, str(new_host), preferred_name, description, tags, changelog, based_on=f"{search_ip_text}->{new_ip_text}"
-            )
-
-            for cont_text, cont_obj_name in containing:
-                c_kind, c_parsed = normalize_ip_kind(cont_text)
-                mapped_cont_name: Optional[str] = None
-
-                if c_kind == "net":
-                    cont_net = c_parsed  # type: ignore[assignment]
-                    offset = int(search_host) - int(cont_net.network_address)
-                    new_cont_addr_int = int(new_host) - offset
-                    new_cont_net_str = f"{ipaddress.ip_address(new_cont_addr_int)}/{cont_net.prefixlen}"
-                    mapped_cont_name = ensure_object_and_reuse_if_present(
-                        ctx,
-                        new_cont_net_str,
-                        preferred_name,
-                        description,
-                        tags,
-                        changelog,
-                        based_on=f"derived_net_from_{search_ip_text}_in_{cont_text}",
-                    )
-                elif c_kind == "range":
-                    s0, t0 = c_parsed  # type: ignore[misc]
-                    host_offset = int(search_host) - int(s0)
-                    new_s_int = int(new_host) - host_offset
-                    range_size = int(t0) - int(s0)
-                    new_t_int = new_s_int + range_size
-                    new_range_str = f"{ipaddress.ip_address(new_s_int)} - {ipaddress.ip_address(new_t_int)}"
-                    mapped_cont_name = ensure_object_and_reuse_if_present(
-                        ctx,
-                        new_range_str,
-                        preferred_name,
-                        description,
-                        tags,
-                        changelog,
-                        based_on=f"derived_range_from_{search_ip_text}_in_{cont_text}",
-                    )
-
-                if not mapped_cont_name:
-                    continue
-
-                update_locations_for_match(
-                    ctx,
-                    dg_zone_map,
-                    match_literal=cont_text,
-                    match_obj_name=cont_obj_name,
-                    new_names=[mapped_cont_name, used_obj_name],
-                    changelog=changelog,
-                    context=f"containing_mapping_{search_ip_text}_in_{cont_text}->{new_ip_text}",
-                )
-
-    changelog.append(
-        {
-            "timestamp": ts(),
-            "action": "processed_csv_row",
-            "search_ip": search_ip_text,
-            "new_ip": new_ip_text,
-            "preferred_name": preferred_name,
-        }
-    )
-
-
-# ---------- Main ----------
-def load_dg_zone_map(path: str) -> Dict[str, str]:
-    dg_zone_map: Dict[str, str] = {}
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if ":" in line:
-                    dg, zone = line.split(":", 1)
-                    dg_zone_map[dg.strip()] = zone.strip()
                 else:
-                    parts = line.split()
-                    if len(parts) == 2:
-                        dg_zone_map[parts[0].strip()] = parts[1].strip()
-    except FileNotFoundError:
-        print(f"Warning: dg mapping file {path} not found — zone injection skipped.")
-    except Exception as e:
-        print("Warning: failed parsing dg mapping file:", e)
-    return dg_zone_map
+                    mapped = mapper.map_network(parsed)  # type: ignore[arg-type]
+                    if mapped:
+                        row, new_net = mapped
+                        new_value = str(new_net)
+                        new_ref = mapped_name_for(row, new_value)
+                        ensure_object(new_ref, "ip-netmask", new_value, row.desc, old_ref)
+
+            elif iprng is not None and iprng.text:
+                try:
+                    start, end = parse_ip_range_text(iprng.text)
+                except ValueError:
+                    continue
+                mapped = mapper.map_range(start, end)
+                if mapped:
+                    row, new_start, new_end = mapped
+                    new_value = f"{new_start}-{new_end}"
+                    new_ref = mapped_name_for(row, new_value)
+                    ensure_object(new_ref, "ip-range", new_value, row.desc, old_ref)
+
+            if new_ref and new_ref not in existing_set:
+                ET.SubElement(member_parent, "member").text = new_ref
+                existing_set.add(new_ref)
+                changes.append({
+                    "ts": ts(),
+                    "scope": scope.scope_name,
+                    "action": "add_rule_member",
+                    "rule_field": hint,
+                    "added_member": new_ref,
+                    "because_of": old_ref,
+                })
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Palo Alto XML IP mapping with zone injection (fast indexed)")
-    parser.add_argument("--config", default="running-config.xml")
-    parser.add_argument("--csv", default="ip_map.txt")
-    parser.add_argument("--dg", default="dg_zone.txt", help="Device-group to zone mapping file (dg: zone)")
-    parser.add_argument("--out", default="modified-config.xml")
-    parser.add_argument("--changelog", default="changelog.json")
-    parser.add_argument("--resolve-fqdn", action="store_true", help="Resolve fqdn address objects via DNS")
-    args = parser.parse_args()
+def write_changelog(path: str, changes: List[dict]) -> None:
+    p = Path(path)
+    if p.suffix.lower() == ".jsonl":
+        with p.open("w", encoding="utf-8") as f:
+            for obj in changes:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    else:
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(changes, f, indent=2, ensure_ascii=False)
 
-    try:
-        tree = ET.parse(args.config)
-        root = tree.getroot()
-    except Exception as e:
-        print("Failed to parse config:", e)
-        sys.exit(1)
 
-    dg_zone_map = load_dg_zone_map(args.dg)
-    changelog: List[dict] = []
+# -------------------------
+# CLI
+# -------------------------
 
-    # Build indexes ONCE
-    ctx = build_context(root)
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, help="Input Panorama running-config.xml")
+    ap.add_argument("--csv", required=True, help="CSV mapping file")
+    ap.add_argument("--dg", required=True, help="Text file listing device-group names (one per line)")
+    ap.add_argument("--out", required=True, help="Output modified XML file")
+    ap.add_argument("--changelog", required=True, help="Changelog file (.json or .jsonl)")
 
-    # Process CSV rows
-    with open(args.csv, newline="") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            search_ip = (row.get("Search_ip") or row.get("search_ip") or row.get("search IP") or "").strip()
-            new_ip = (row.get("new_ip") or row.get("New_ip") or row.get("new IP") or "").strip()
-            preferred = (row.get("new_object_name") or row.get("Object_name") or row.get("new_object") or "").strip() or None
-            tags = (row.get("tags") or row.get("tag") or "").strip() or None
-            desc = (row.get("description") or row.get("desc") or "").strip() or None
+    args = ap.parse_args(argv)
 
-            if not search_ip or not new_ip:
-                changelog.append({"timestamp": ts(), "action": "skipped_row_missing_required", "row": row})
-                continue
+    rows = read_csv_mappings(args.csv)
+    mapper = SubnetMapper(rows)
 
-            changelog.append({"timestamp": ts(), "action": "processing_row", "search_ip": search_ip, "new_ip": new_ip, "preferred_name": preferred})
-            process_row(ctx, dg_zone_map, search_ip, new_ip, preferred, tags, desc, changelog, resolve_fqdn_flag=args.resolve_fqdn)
+    device_groups = read_dg_list(args.dg)
+
+    tree = ET.parse(args.config)
+    cfg = tree.getroot()
+
+    scopes = find_scopes(cfg, device_groups)
+
+    changes: List[dict] = []
+    for s in scopes:
+        convert_scope(s, mapper, changes)
+
+    # Pretty output (Panorama does not care about whitespace, but humans do)
+    pretty_indent(cfg)
 
     tree.write(args.out, encoding="utf-8", xml_declaration=True)
-    with open(args.changelog, "w") as cfh:
-        json.dump(changelog, cfh, indent=2)
+    write_changelog(args.changelog, changes)
 
-    print(f"Modified config written to {args.out}")
-    print(f"Changelog written to {args.changelog}")
+    print(f"Wrote: {args.out}")
+    print(f"Changelog: {args.changelog} ({len(changes)} changes)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
