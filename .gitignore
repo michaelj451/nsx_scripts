@@ -15,6 +15,7 @@ nsx_logs/
 
 # Palo Alto Networks Panorama configuration exports
 modified-config.xml
+# running-config*.xml
 pano_export*
 changelog.json
 

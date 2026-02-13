@@ -1,0 +1,5 @@
+# Device Group to Zone Mapping
+dg-3: zone-3-new
+dg-4: zone-4-new
+dg-5: zone-5-new
+dg-6: zone-6-new

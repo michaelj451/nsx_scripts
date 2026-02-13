@@ -8,8 +8,9 @@ import json
 import re
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Iterable
 
 try:
     import yaml  # PyYAML
@@ -21,21 +22,81 @@ except ImportError as e:
 # Logging
 # =============================================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+LOG_DIR_NAME = "nsx_logs"
+LOG_FILE_NAME = "nsx_group_remap.log"
+CHANGES_FILE_NAME = "nsx_group_remap_changes.jsonl"
 
-def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: list[str]) -> None:             # TODO write these to disk (json)
+
+def setup_logging() -> logging.Logger:
+    repo_root = Path(__file__).resolve().parents[3]  # .../app/nsx/nsx_object_functions -> repo root
+    log_dir = repo_root / LOG_DIR_NAME
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_FILE_NAME
+
+    logger = logging.getLogger("nsx_group_remap")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.handlers:
+        return logger
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+
+    logger.info("Log file: %s", log_file)
+    return logger
+
+
+logger = setup_logging()
+
+
+def _changes_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[3]
+    p = repo_root / LOG_DIR_NAME / CHANGES_FILE_NAME
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _write_change_record(record: dict) -> None:
+    p = _changes_path()
+    record = dict(record)
+    record.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: list[str]) -> None:
     removed = [x for x in before if x not in after]
     added = [x for x in after if x not in before]
-    if removed or added:
-        logger.info(
-            "Group %s expr %s IP cleanup: -%d +%d",
-            group_id, expr_id, len(removed), len(added)
-        )
-        if removed:
-            logger.info("  removed: %s", removed)
-        if added:
-            logger.info("  added: %s", added)
+    if not removed and not added:
+        return
+
+    logger.info("Group %s expr %s ip_addresses changed: -%d +%d", group_id, expr_id, len(removed), len(added))
+    if removed:
+        logger.info("  removed: %s", removed)
+    if added:
+        logger.info("  added: %s", added)
+
+    _write_change_record(
+        {
+            "kind": "ip_addresses_change",
+            "group_id": group_id,
+            "expr_id": expr_id,
+            "removed": removed,
+            "added": added,
+        }
+    )
+
 
 # =============================================================================
 # CSV mapping model
@@ -84,6 +145,7 @@ def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
             )
 
     maps.sort(key=lambda m: (m.old.version, -m.old.prefixlen))
+    logger.info("Loaded %d subnet mappings from %s", len(maps), csv_path)
     return maps
 
 
@@ -101,6 +163,7 @@ def load_doc(path: Path) -> Any:
 
 
 def write_output(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() == ".json":
         path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
         return
@@ -153,9 +216,6 @@ def append_new_to_group_name(group: dict[str, Any], group_name_append: str) -> N
 # =============================================================================
 
 def derive_new_group_path(new_domain_path: str, new_group_id: str) -> str:
-    """
-    /global-infra/domains/<domain> + group id
-    """
     return f"{new_domain_path.rstrip('/')}/groups/{new_group_id}"
 
 
@@ -223,7 +283,9 @@ def _remap_ip(ip: ipaddress._BaseAddress, m: SubnetMap) -> ipaddress._BaseAddres
 
 
 def remap_token(token: str, maps: list[SubnetMap]) -> str:
-    token = token.strip()
+    token = str(token).strip()
+    if not token:
+        return token
 
     mrange = _RANGE_RE.match(token)
     if mrange:
@@ -253,38 +315,42 @@ def remap_token(token: str, maps: list[SubnetMap]) -> str:
         m = _find_mapping_for_ip(ip, maps)
         if not m:
             return token
-        new_ip = _remap_ip(ip, m)
-        logger.info("Remapping IP: %s -> %s", ip, new_ip)
-        return str(new_ip)
+        return str(_remap_ip(ip, m))
     except ValueError:
         return token
 
 
-def deep_remap(obj: Any, maps: list[SubnetMap]) -> tuple[Any, int]:
-    if isinstance(obj, dict):
-        out, n = {}, 0
-        for k, v in obj.items():
-            v2, dn = deep_remap(v, maps)
-            out[k] = v2
-            n += dn
-        return out, n
+def remap_ip_addresses_new_only(tokens: Iterable[Any], maps: list[SubnetMap]) -> tuple[list[str], int]:
+    """
+    NEW-ONLY mode:
+      - If token maps => keep the mapped value
+      - If token doesn't map => drop it
+    Returns (new_tokens, changed_count)
+    """
+    out: list[str] = []
+    changes = 0
 
-    if isinstance(obj, list):
-        out, n = [], 0
-        for v in obj:
-            v2, dn = deep_remap(v, maps)
-            out.append(v2)
-            n += dn
-        return out, n
+    for t in tokens:
+        s = str(t).strip()
+        if not s:
+            continue
+        if not looks_like_ip_token(s):
+            # ip_addresses should only contain IP-ish tokens; if it doesn't, keep it? safer to drop.
+            continue
 
-    if isinstance(obj, str) and looks_like_ip_token(obj):
-        new_s = remap_token(obj, maps)
-        return new_s, int(new_s != obj)
+        new_s = remap_token(s, maps)
+        if new_s != s:
+            out.append(new_s)
+            changes += 1
+        else:
+            # unchanged means "no mapping found" -> drop
+            continue
 
-    return obj, 0
+    return out, changes
 
-## ============================================================================
-# Deduplication / Containment logic FOLLOWING BLOCK NOT USED YET
+
+# =============================================================================
+# Cleanup helpers
 # =============================================================================
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -297,116 +363,6 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
-def _drop_contained_hosts(tokens: list[str]) -> list[str]:
-    """
-    Removes entries that are fully contained by another CIDR entry.
-    Example: drop 10.7.1.5/32 if 10.7.1.0/24 exists.
-    Does NOT try to reason about ranges (keeps ranges as-is).
-    """
-    nets: list[ipaddress._BaseNetwork] = []
-    ranges: list[str] = []
-
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        if "-" in t and "/" not in t:
-            ranges.append(t)
-            continue
-
-        # Normalize: "1.2.3.4" -> /32, "net" stays "net"
-        if "/" not in t:
-            t = f"{t}/32"
-
-        try:
-            nets.append(ipaddress.ip_network(t, strict=False))
-        except ValueError:
-            # keep weird tokens untouched
-            ranges.append(t)
-
-    kept: list[ipaddress._BaseNetwork] = []
-    for i, n in enumerate(nets):
-        if any(i != j and n.subnet_of(other) for j, other in enumerate(nets)):
-            continue
-        kept.append(n)
-
-    kept_str = {str(n) for n in kept}
-
-    out: list[str] = []
-    for t in tokens:
-        tt = t.strip()
-        if not tt:
-            continue
-        if "-" in tt and "/" not in tt:
-            if tt not in out:
-                out.append(tt)
-            continue
-
-        if "/" not in tt:
-            tt_norm = str(ipaddress.ip_network(f"{tt}/32", strict=False))
-        else:
-            tt_norm = str(ipaddress.ip_network(tt, strict=False))
-
-        if tt_norm in kept_str and tt_norm not in out:
-            out.append(tt_norm)
-
-    return out
-
-def _drop_supernets_when_more_specific_exists(tokens: list[str]) -> list[str]:
-    """
-    Drops CIDRs that are supernets of other CIDRs in the same list.
-    Example: drop 10.4.0.0/12 if 10.4.0.0/16 or 10.4.1.0/24 exists.
-    Keeps ranges as-is.
-    """
-    nets: list[ipaddress._BaseNetwork] = []
-    ranges: list[str] = []
-
-    for t in tokens:
-        tt = str(t).strip()
-        if not tt:
-            continue
-        if "-" in tt and "/" not in tt:
-            ranges.append(tt)
-            continue
-
-        # Normalize plain IPs to /32 so comparisons work
-        if "/" not in tt:
-            tt = f"{tt}/32"
-
-        try:
-            nets.append(ipaddress.ip_network(tt, strict=False))
-        except ValueError:
-            ranges.append(tt)
-
-    kept: list[ipaddress._BaseNetwork] = []
-    for i, n in enumerate(nets):
-        # If n contains ANY other network, drop it (it's a broad catch-all)
-        if any(i != j and other.subnet_of(n) for j, other in enumerate(nets)):
-            continue
-        kept.append(n)
-
-    kept_str = {str(n) for n in kept}
-
-    out: list[str] = []
-    for t in tokens:
-        tt = str(t).strip()
-        if not tt:
-            continue
-        if "-" in tt and "/" not in tt:
-            if tt not in out:
-                out.append(tt)
-            continue
-
-        if "/" not in tt:
-            tt_norm = str(ipaddress.ip_network(f"{tt}/32", strict=False))
-        else:
-            tt_norm = str(ipaddress.ip_network(tt, strict=False))
-
-        if tt_norm in kept_str and tt_norm not in out:
-            out.append(tt_norm)
-
-    return out
-
 # =============================================================================
 # Conversion logic
 # =============================================================================
@@ -417,18 +373,24 @@ def convert_groups_in_doc(
     new_domain_path: str,
     group_name_append: str,
 ) -> tuple[Any, int, int]:
-
+    """
+    Creates NEW group docs ONLY when at least one IP token maps.
+    For IPAddressExpression.ip_addresses: keep ONLY mapped (new) tokens.
+    """
     _, groups = find_groups_container(doc)
 
     converted: list[dict] = []
-    replaced_total = 0
+    changed_total = 0
 
     for g in groups:
-        new_g, replaced = deep_remap(g, maps)
-        if replaced == 0:
+        if not isinstance(g, dict):
             continue
 
-        # --- CLEANUP GOES HERE (after remap, before identity/path changes)
+        # Work on a deep-copied-ish structure via JSON roundtrip (safe for dict/list/scalars)
+        new_g = json.loads(json.dumps(g))
+        group_changed = 0
+
+        # Only mutate IPAddressExpression.ip_addresses (not arbitrary strings elsewhere)
         for expr in new_g.get("expression", []) or []:
             if not isinstance(expr, dict):
                 continue
@@ -439,24 +401,26 @@ def convert_groups_in_doc(
             if not isinstance(ips, list) or not ips:
                 continue
 
-            # snapshot BEFORE cleanup (for logging)
             before = [str(x).strip() for x in ips if str(x).strip()]
+            after, changes = remap_ip_addresses_new_only(before, maps)
 
-            # cleanup
-            ips = _dedupe_preserve_order(before)
-            ips = _drop_contained_hosts(ips)
-            ips = _drop_supernets_when_more_specific_exists(ips)
+            # Dedupe after mapping (common when ranges/cidrs overlap)
+            after = _dedupe_preserve_order(after)
 
-            # log what changed
+            # Log before/after (even if it becomes empty)
             _log_ip_list_changes(
                 group_id=str(new_g.get("id", "unknown")),
                 expr_id=str(expr.get("id", expr.get("relative_path", "unknown"))),
                 before=before,
-                after=ips,
+                after=after,
             )
 
-            expr["ip_addresses"] = ips
-        # --- END CLEANUP
+            expr["ip_addresses"] = after
+            group_changed += changes
+
+        # If nothing mapped anywhere in this group, DO NOT create a new group.
+        if group_changed == 0:
+            continue
 
         old_id = new_g.get("id")
         if not old_id:
@@ -472,21 +436,22 @@ def convert_groups_in_doc(
         append_new_to_group_name(new_g, group_name_append)
 
         converted.append(new_g)
-        replaced_total += replaced
+        changed_total += group_changed
 
+    # Rebuild output doc shape
     if isinstance(doc, dict) and len(groups) == 1 and groups[0] is doc:
-        return (converted[0], 1, replaced_total) if converted else (doc, 0, 0)
+        return (converted[0], 1, changed_total) if converted else (doc, 0, 0)
 
     if isinstance(doc, list):
-        return converted, len(converted), replaced_total
+        return converted, len(converted), changed_total
 
-    out = dict(doc)
+    out = dict(doc) if isinstance(doc, dict) else {"results": converted}
     for key in ("results", "groups"):
-        if key in out:
+        if isinstance(out, dict) and key in out:
             out[key] = converted
-            return out, len(converted), replaced_total
+            return out, len(converted), changed_total
 
-    return converted, len(converted), replaced_total
+    return converted, len(converted), changed_total
 
 
 # =============================================================================

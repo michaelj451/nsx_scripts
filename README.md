@@ -186,3 +186,13 @@ This workflow enables a **parallel datacenter migration** in NSX Global Manager 
 - full rollback capability (simply stop publishing)
 
 This runbook is safe to repeat and suitable for CAB-reviewed production execution.
+
+1)  Export All Objects
+python tools/nsx/export_nsx_objects.py   --federation-global   --output-format yaml   --manager nsx-gm1   --domain default
+
+2)  Remap Groups
+python tools/nsx/create_new_group_files.py   --csv data/subnet_map.csv
+
+3)  Push Groups
+
+4)  
