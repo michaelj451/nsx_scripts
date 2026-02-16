@@ -10,6 +10,11 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+class NsxApiError(Exception):
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(f"[HTTP {status_code}] {message}")
+
 class NsxPolicyClient:
     def __init__(self, nsxmanager: str = nsx_gm1, *, federation_global: bool = False):
         logging.info(f"Creating NSX session for manager: {nsxmanager} (federation_global={federation_global})")
@@ -61,10 +66,7 @@ class NsxPolicyClient:
         )
 
         if not login_resp.ok:
-            raise HTTPException(
-                status_code=401,
-                detail=f"NSX login failed: {login_resp.status_code} {login_resp.text}",
-            )
+            raise NsxApiError(login_resp.status_code, f"Login failed: {login_resp.status_code} {login_resp.text}")
 
         xsrf_token = (
             login_resp.headers.get("X-XSRF-TOKEN")
@@ -100,10 +102,7 @@ class NsxPolicyClient:
     # ---------------------------
     def _raise_for_resp(self, resp, method: str, path: str):
         if not resp.ok:
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"NSX {method} failed {path}: {resp.status_code} {resp.text}",
-            )
+            raise NsxApiError(resp.status_code, f"{method} {path} failed: {resp.status_code} {resp.text}")
 
     def _json_or_empty(self, resp) -> Dict[str, Any]:
         if not resp.text:
@@ -240,7 +239,7 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> List[Dict[str, Any]]:
         # NOTE: This endpoint exists on LM. On GM, group membership is evaluated per site and may not be directly listable the same way.
-        # We'll still attempt it; if GM rejects it, you’ll get a clear HTTPException.
+        # We'll still attempt it; if GM rejects it, you’ll get a clear NsxApiError.
         path = self._policy_path(f"/domains/{domain_id}/groups/{group_id}/members/virtual-machines")
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
@@ -276,9 +275,9 @@ class NsxPolicyClient:
     # ---------------------------
     def _require_lm(self, feature: str):
         if self.federation_global:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{feature} is a Local Manager fabric API. Use federation_global=False and point at an LM.",
+            raise NsxApiError(
+                400,
+                f"{feature} is a Local Manager fabric API. Use federation_global=False and point at an LM.",
             )
 
     def list_virtual_machines(self, *, page_size: int = 1000, timeout: int = 60) -> List[Dict[str, Any]]:
