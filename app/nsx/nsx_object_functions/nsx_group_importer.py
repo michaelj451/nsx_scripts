@@ -187,13 +187,14 @@ class NsxGroupImporter:
                 if not gid:
                     raise ValueError("Group missing id")
 
-                if not self._is_new_group(data):
-                    self.stats["skipped"] += 1
-                    continue
-
                 path = self._policy_path(f"/domains/{self.cfg.domain_id}/groups/{gid}")
                 payload = sanitize_group_payload_for_put(data)
-                self._put_or_patch(path, payload)
+
+                if self.cfg.dry_run:
+                    log.info("[DRY-RUN] PATCH %s (id=%s)", path, gid)
+                else:
+                    self.client._patch(path, payload)
+
                 self.stats["groups"] += 1
 
             except Exception as e:

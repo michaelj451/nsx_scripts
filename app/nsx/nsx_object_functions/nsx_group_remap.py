@@ -453,6 +453,93 @@ def convert_groups_in_doc(
 
     return converted, len(converted), changed_total
 
+# =============================================================================
+# ADDITIVE mapping logic (keep old + add new)
+# =============================================================================
+
+def add_mapped_ip_addresses_additive(tokens: Iterable[Any], maps: list[SubnetMap]) -> tuple[list[str], int]:
+    """
+    ADDITIVE mode:
+      - Keep all original IP-ish tokens
+      - If a token maps => add the mapped value (if not already present)
+      - Never remove anything
+    Returns (new_tokens, added_count)
+    """
+    original: list[str] = []
+    for t in tokens:
+        s = str(t).strip()
+        if not s:
+            continue
+        # ip_addresses should only contain IP-ish tokens; ignore junk safely
+        if not looks_like_ip_token(s):
+            continue
+        original.append(s)
+
+    # Preserve original order; then append newly derived mapped tokens.
+    out = list(original)
+    seen = set(original)
+    added = 0
+
+    for s in original:
+        mapped = remap_token(s, maps)
+        if mapped != s and mapped not in seen:
+            out.append(mapped)
+            seen.add(mapped)
+            added += 1
+
+    return out, added
+
+
+def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, int]:
+    """
+    Mutates group docs in-place (additive):
+      - Only modifies IPAddressExpression.ip_addresses
+      - Keeps original tokens and appends mapped tokens
+    Returns (doc, groups_touched, tokens_added_total)
+    """
+    _, groups = find_groups_container(doc)
+
+    groups_touched = 0
+    tokens_added_total = 0
+
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+
+        group_added = 0
+
+        for expr in g.get("expression", []) or []:
+            if not isinstance(expr, dict):
+                continue
+            if expr.get("resource_type") != "IPAddressExpression":
+                continue
+
+            ips = expr.get("ip_addresses") or []
+            if not isinstance(ips, list) or not ips:
+                continue
+
+            before = [str(x).strip() for x in ips if str(x).strip()]
+            after, added = add_mapped_ip_addresses_additive(before, maps)
+            after = _dedupe_preserve_order(after)
+
+            # Log the delta
+            _log_ip_list_changes(
+                group_id=str(g.get("id", "unknown")),
+                expr_id=str(expr.get("id", expr.get("relative_path", "unknown"))),
+                before=before,
+                after=after,
+            )
+
+            if added > 0:
+                expr["ip_addresses"] = after
+                group_added += added
+
+        if group_added > 0:
+            groups_touched += 1
+            tokens_added_total += group_added
+
+    return doc, groups_touched, tokens_added_total
+
 
 # =============================================================================
 # File handling
