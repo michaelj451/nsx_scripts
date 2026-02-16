@@ -2,7 +2,6 @@
 # app/nsx/nsx_policy_client.py
 import requests
 import logging
-from fastapi import HTTPException
 from typing import Any, Dict, Iterator, List, Optional
 
 from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_username, nsx_password

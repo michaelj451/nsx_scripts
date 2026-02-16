@@ -17,7 +17,6 @@ def init_cli(level: int = logging.INFO) -> None:
     - Configure logging
     """
     # Find repo root as: tools/nsx/<script>.py -> parents[2] == repo root
-    # But this file lives in app/frontendFastapi/nsx/, so go up 3: nsx -> frontendFastapi -> app -> repo
     repo_root = Path(__file__).resolve().parents[3]
     env_path = repo_root / ".env"
 

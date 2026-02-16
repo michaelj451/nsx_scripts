@@ -1,4 +1,4 @@
-# frontendFastapi/nsx/nsx_file_import_functions/nsx_tagged_vms_importer.py
+# This file contains a simplified version of your NSX VM tags importer.
 from __future__ import annotations
 
 from dataclasses import dataclass
