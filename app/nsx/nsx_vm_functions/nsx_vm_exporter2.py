@@ -1,4 +1,3 @@
-# frontendFastapi/nsx/nsx2_vm_file_exporter.py
 from __future__ import annotations
 
 from dataclasses import dataclass
