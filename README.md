@@ -188,11 +188,22 @@ This workflow enables a **parallel datacenter migration** in NSX Global Manager 
 This runbook is safe to repeat and suitable for CAB-reviewed production execution.
 
 1)  Export All Objects
-python tools/nsx/export_nsx_objects.py   --federation-global   --output-format yaml   --manager nsx-gm1   --domain default
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains
 
 2)  Remap Groups
-python tools/nsx/create_new_group_files.py   --csv data/subnet_map.csv
+python tools/nsx/add_mapped_ips_to_groups_files.py      
 
-3)  Push Groups
+3)  Push Groups to GM
 
-4)  
+python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1
+
+python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1 --apply
+
+4) Push Groups to LM
+
+python tools/nsx/push_nsx_groups.py \
+  --target nsx-gm1 \
+  --federation-global \
+  --input-dir nsx_groups_additive \
+  --domain-id nsx-lm1.lab.local \
+  --apply

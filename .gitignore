@@ -10,14 +10,15 @@ nsx_domain_meta/
 nsx_remapped_groups/
 nsx_updated_rules/
 nsx_logs/
+nsx_groups_additive/
 
 
 
-# Palo Alto Networks Panorama configuration exports
-modified-config.xml
-# running-config*.xml
-pano_export*
-changelog.json
+# # Palo Alto Networks Panorama configuration exports
+# modified-config.xml
+# # running-config*.xml
+# pano_export*
+# changelog.json
 
 # C extensions
 *.so

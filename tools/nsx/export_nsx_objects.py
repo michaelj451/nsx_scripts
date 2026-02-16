@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # tools/nsx/export_nsx_objects.py
+from __future__ import annotations
+
 from pathlib import Path
 import argparse
 import logging
 import json
+import shutil
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_policy_client import NsxPolicyClient
@@ -11,6 +14,7 @@ from nsx.nsx_object_functions.nsx_object_exporter import run_export
 from nsx.nsx_constants import resolve_manager
 
 log = logging.getLogger(__name__)
+
 
 def _resolve_manager_base(base_dir: str, manager_name: str) -> Path:
     """
@@ -23,6 +27,7 @@ def _resolve_manager_base(base_dir: str, manager_name: str) -> Path:
     if base.name == manager_name:
         return base
     return base / manager_name
+
 
 def _manager_dirname(manager_host: str) -> str:
     # Normalize "https://nsx-gm1.lab.local" -> "nsx-gm1.lab.local"
@@ -40,7 +45,6 @@ def _extract_domain_ids(domains_payload) -> list[str]:
     if domains_payload is None:
         return []
 
-    # Shape: {"domains": [...]}
     if isinstance(domains_payload, dict) and "domains" in domains_payload:
         domains_payload = domains_payload.get("domains", [])
 
@@ -51,7 +55,6 @@ def _extract_domain_ids(domains_payload) -> list[str]:
         elif isinstance(d, dict) and "id" in d:
             domain_ids.append(d["id"])
         else:
-            # Last-resort: object with attribute "id"
             domain_ids.append(getattr(d, "id"))
     return domain_ids
 
@@ -65,9 +68,6 @@ def _write_manager_manifest(
     """
     Writes a small manifest at:
       <base-dir>/<manager>/_manifest.json
-
-    This preserves the authoritative NSX 'path' values without forcing
-    them into the on-disk directory structure.
     """
     try:
         manifest = {
@@ -75,7 +75,6 @@ def _write_manager_manifest(
             "federation_global": federation_global,
         }
 
-        # If domains_payload is your dict shape, keep some helpful fields
         if isinstance(domains_payload, dict):
             for key in ("policy_root", "manager", "federation_global"):
                 if key in domains_payload:
@@ -89,8 +88,28 @@ def _write_manager_manifest(
             encoding="utf-8",
         )
     except Exception as e:
-        # Non-fatal: export should still succeed if manifest fails
         log.warning("Failed to write manager manifest: %s", e)
+
+
+def _purge_groups_output_dirs(manager_base: Path, domain_id: str) -> None:
+    """
+    Always delete pre-existing exported GROUP files for the target domain,
+    for both supported layouts:
+
+      NEW: <manager_base>/<domain_id>/groups
+      OLD: <manager_base>/domains/<domain_id>/groups
+
+    This prevents stale group files from lingering across exports.
+    """
+    candidates = [
+        manager_base / domain_id / "groups",
+        manager_base / "domains" / domain_id / "groups",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            log.info("Deleting pre-existing groups directory: %s", p)
+            shutil.rmtree(p)
 
 
 def main() -> None:
@@ -132,7 +151,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Load .env, logging, etc.
     init_cli()
 
     manager_host = resolve_manager(args.manager)
@@ -155,14 +173,14 @@ def main() -> None:
 
         log.info("Found %d domains on %s", len(domain_ids), manager_name)
 
-        # Write a manifest so you can see domain 'path' etc. later
         _write_manager_manifest(manager_base, manager_host, args.federation_global, domains_payload)
 
         for domain_id in domain_ids:
             log.info("Exporting domain: %s (manager: %s)", domain_id, manager_name)
 
-            # IMPORTANT:
-            # base_dir is the MANAGER folder. Let run_export decide where domain goes.
+            # NEW: purge group output dirs for this domain before exporting
+            _purge_groups_output_dirs(manager_base, domain_id)
+
             stats = run_export(
                 client=client,
                 base_dir=str(manager_base),
@@ -172,6 +190,9 @@ def main() -> None:
             all_stats[domain_id] = stats
 
     else:
+        # NEW: purge group output dirs for this domain before exporting
+        _purge_groups_output_dirs(manager_base, args.domain_id)
+
         stats = run_export(
             client=client,
             base_dir=str(manager_base),
