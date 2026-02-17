@@ -7,7 +7,7 @@ Usage:
     --out modified-config.xml --changelog changelog.jsonl
 
 What it does (additive-only):
-- Containment-based IP remap (host/range/subnet inside a larger mapped subnet).
+- Containment-based IP remap (host/subnet inside a larger mapped subnet).
 - Adds mapped IPs to ALL security rules found in:
     * /config/shared/pre-rulebase/security/rules
     * /config/shared/post-rulebase/security/rules
@@ -23,9 +23,12 @@ What it does (additive-only):
 
 Important notes / assumptions:
 - This script updates STATIC address-groups only. Dynamic groups (with <dynamic>) are skipped.
+- IP RANGES ARE IGNORED everywhere:
+    - literal members like "10.1.1.1-10.1.1.10" are skipped
+    - address objects with <ip-range> are skipped
 - For address-group members that are:
-    - literal IP/CIDR/range: we map them directly
-    - address-object name: we look up its ip-netmask/ip-range in the address book and map that
+    - literal IP/CIDR: we map them directly
+    - address-object name: we look up its ip-netmask in the address book and map that
     - address-group name: we do NOT expand nested groups here (to avoid surprise explosion).
       If you need nested expansion, we can add it safely (with loop detection) later.
 - Additive-only: we never remove anything, only add new mapped object members.
@@ -65,28 +68,27 @@ def underscored(s: str) -> str:
     return s.replace(".", "_").replace("/", "_").replace(":", "_").replace("-", "_")
 
 def gen_default_name_for_value(value_text: str) -> str:
-    # value_text is like "10.1.2.0/24" or "4.4.2.2" or "10.4.2.5-10.4.2.20"
-    return f"svb_m1_{underscored(value_text)}"
+    # value_text is like "10.1.2.0/24" or "4.4.2.2"
+    return f"svb_m2_{underscored(value_text)}"
 
 def is_ip_literal_member(text: str) -> bool:
     """
-    Supports:
+    Supports (RANGES intentionally ignored):
       - single IP: "1.2.3.4"
       - CIDR: "1.2.3.0/24"
-      - range: "1.2.3.4-1.2.3.10"
-    Rejects object names like "h-10.1.1.1" or "test-address-4.2.2.2"
+    Rejects:
+      - ranges: "1.2.3.4-1.2.3.10"
+      - object names like "h-10.1.1.1" or "test-address-4.2.2.2"
     """
     if not text or not isinstance(text, str):
         return False
     t = text.strip()
     if any(c.isalpha() for c in t):
         return False
+    # ignore ranges
+    if "-" in t and "/" not in t:
+        return False
     try:
-        if "-" in t and "/" not in t:
-            a, b = t.split("-", 1)
-            ipaddress.ip_address(a.strip())
-            ipaddress.ip_address(b.strip())
-            return True
         if "/" in t:
             ipaddress.ip_network(t, strict=False)
             return True
@@ -148,7 +150,7 @@ def parse_ip_map_csv(path: Path) -> List[MapRow]:
 # Mapping logic (containment-based)
 # --------------------------------------------------------------------------------------
 
-MappedValue = Tuple[str, str]  # (kind, new_value_text) where kind in {"ip","cidr","range"}
+MappedValue = Tuple[str, str]  # (kind, new_value_text) where kind in {"ip","cidr"}
 
 def map_ip(ip: ipaddress._BaseAddress, m: MapRow) -> Optional[ipaddress._BaseAddress]:
     if ip not in m.search_net:
@@ -180,45 +182,16 @@ def map_cidr(net: ipaddress._BaseNetwork, m: MapRow) -> Optional[ipaddress._Base
         return None
     return new_net
 
-def map_range(
-    start: ipaddress._BaseAddress,
-    end: ipaddress._BaseAddress,
-    m: MapRow
-) -> Optional[Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]]:
-    if start not in m.search_net or end not in m.search_net:
-        return None
-    ns = map_ip(start, m)
-    ne = map_ip(end, m)
-    if not ns or not ne:
-        return None
-    if int(ns) > int(ne):
-        ns, ne = ne, ns
-    return ns, ne
-
 def map_value_text(value_text: str, mappings: List[MapRow]) -> Optional[Tuple[MapRow, MappedValue]]:
     """
-    value_text is a literal: "4.2.2.2" or "4.2.0.0/16" or "10.4.1.5-10.4.1.20"
-    Returns (maprow_used, ("ip"/"cidr"/"range", new_value_text))
+    value_text is a literal: "4.2.2.2" or "4.2.0.0/16"
+    RANGES are intentionally ignored.
+    Returns (maprow_used, ("ip"/"cidr", new_value_text))
     """
     t = value_text.strip()
 
-    # range
+    # ignore ranges
     if "-" in t and "/" not in t:
-        a, b = t.split("-", 1)
-        try:
-            start = ipaddress.ip_address(a.strip())
-            end = ipaddress.ip_address(b.strip())
-        except Exception:
-            return None
-        if int(start) > int(end):
-            start, end = end, start
-        for m in mappings:
-            if start.version != m.search_net.version:
-                continue
-            mapped = map_range(start, end, m)
-            if mapped:
-                ns, ne = mapped
-                return m, ("range", f"{ns}-{ne}")
         return None
 
     # cidr
@@ -286,7 +259,8 @@ def get_entry_by_name(parent: ET.Element, name: str) -> Optional[ET.Element]:
 def ensure_shared_address_entry(root: ET.Element, name: str, kind: str, value_text: str, desc: Optional[str]) -> ET.Element:
     """
     Ensures /config/shared/address/entry[@name=name] exists with correct value.
-    kind: ip|cidr|range (stored as ip-netmask for ip/cidr, ip-range for range)
+    kind: ip|cidr (stored as ip-netmask)
+    NOTE: RANGES are ignored by caller; we do not create ip-range objects here.
     """
     shared = root.find("./shared")
     if shared is None:
@@ -299,20 +273,13 @@ def ensure_shared_address_entry(root: ET.Element, name: str, kind: str, value_te
     if entry is None:
         entry = ET.SubElement(addr, "entry", {"name": name})
 
-    if kind == "range":
-        for n in entry.findall("ip-netmask"):
-            entry.remove(n)
-        node = entry.find("ip-range")
-        if node is None:
-            node = ET.SubElement(entry, "ip-range")
-        node.text = value_text
-    else:
-        for n in entry.findall("ip-range"):
-            entry.remove(n)
-        node = entry.find("ip-netmask")
-        if node is None:
-            node = ET.SubElement(entry, "ip-netmask")
-        node.text = value_text
+    # force ip-netmask representation
+    for n in entry.findall("ip-range"):
+        entry.remove(n)
+    node = entry.find("ip-netmask")
+    if node is None:
+        node = ET.SubElement(entry, "ip-netmask")
+    node.text = value_text
 
     if desc:
         d = entry.find("description")
@@ -327,6 +294,8 @@ def build_address_book(root: ET.Element) -> Dict[str, Tuple[str, str]]:
     name -> (kind, value_text) from:
       - /config/shared/address
       - /config/devices/entry/device-group/entry/.../address
+
+    NOTE: address objects with <ip-range> are included as kind="range" so callers can SKIP them.
     """
     out: Dict[str, Tuple[str, str]] = {}
 
@@ -424,6 +393,8 @@ def process_rule_member_list(
     """
     Adds mapped members (address object names) to rule/<list_tag>.
     Returns True if any addition occurred.
+
+    NOTE: IP ranges are ignored (literal ranges and ip-range address objects).
     """
     any_added = False
     node = ensure_member_list(rule, list_tag)
@@ -439,7 +410,9 @@ def process_rule_member_list(
         if is_ip_literal_member(mem):
             value_text = mem
         elif mem in addr_book:
-            _, val = addr_book[mem]
+            kind, val = addr_book[mem]
+            if kind == "range":
+                continue  # ignore ip-range address objects
             value_text = val
         else:
             # unknown object name (often: address-group). We skip here by design.
@@ -453,11 +426,11 @@ def process_rule_member_list(
 
         obj_name = gen_default_name_for_value(new_value_text)
 
-        # Ensure shared address object exists
+        # Ensure shared address object exists (ip-netmask only)
         ensure_shared_address_entry(
             root,
             obj_name,
-            "range" if kind == "range" else "ip",
+            "ip",
             new_value_text,
             used_map.desc
         )
@@ -517,9 +490,11 @@ def process_address_group_static_members(
     For an address-group entry, look at ./static/member values and add mapped *address object names*.
 
     Member cases:
-    - literal ip/cidr/range: map directly
-    - address object name: look up its literal in addr_book and map that
+    - literal ip/cidr: map directly
+    - address object name: look up its ip-netmask in addr_book and map that
     - address-group name or unknown: skip (no nested expansion here)
+
+    NOTE: IP ranges are ignored (literal ranges and ip-range address objects).
     """
     static = _get_static_member_node(group_entry)
     if static is None:
@@ -537,7 +512,9 @@ def process_address_group_static_members(
         if is_ip_literal_member(mem):
             value_text = mem
         elif mem in addr_book:
-            _, val = addr_book[mem]
+            kind, val = addr_book[mem]
+            if kind == "range":
+                continue  # ignore ip-range address objects
             value_text = val
         else:
             # could be a nested group name or unknown token; skip
@@ -553,7 +530,7 @@ def process_address_group_static_members(
         ensure_shared_address_entry(
             root,
             obj_name,
-            "range" if kind == "range" else "ip",
+            "ip",
             new_value_text,
             used_map.desc
         )
@@ -584,14 +561,18 @@ def main() -> int:
     ap.add_argument("--csv", required=True, help="CSV mapping file: search_ip,new_ip,...")
     ap.add_argument("--dg", required=True, help="Device-group to zone mapping file (dg: zone)")
     ap.add_argument("--out", required=True, help="Output XML file")
-    ap.add_argument("--changelog", required=True, help="Output changelog JSONL file")
+    ap.add_argument("--changelog", required=True, help="Output changelog JSONL file ('.jsonl' will be appended if missing)")
     args = ap.parse_args()
 
     config_path = Path(args.config)
     csv_path = Path(args.csv)
     dg_path = Path(args.dg)
     out_path = Path(args.out)
+
+    # Always append ".jsonl" if it doesn't already end with it
     changes_path = Path(args.changelog)
+    if not str(changes_path).lower().endswith(".jsonl"):
+        changes_path = Path(str(changes_path) + ".jsonl")
 
     tree = ET.parse(str(config_path))
     root = tree.getroot()
