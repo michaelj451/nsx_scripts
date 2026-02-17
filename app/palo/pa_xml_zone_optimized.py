@@ -10,7 +10,9 @@ What it does (additive-only):
 - Containment-based IP remap (host/range/subnet inside a larger mapped subnet).
 - Adds mapped IPs to ALL security rules found in:
     * /config/shared/pre-rulebase/security/rules
+    * /config/shared/post-rulebase/security/rules
     * /config/devices/entry/device-group/entry/.../pre-rulebase/security/rules
+    * /config/devices/entry/device-group/entry/.../post-rulebase/security/rules
 - Adds zones ONLY to device-group rules (not shared/global):
     If a DG rule gets any mapped IP added, add that DG's zone to the rule's <from> and <to>
     (unless 'any' is present, in which case we do not modify the zone list).
@@ -49,7 +51,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 # --------------------------------------------------------------------------------------
@@ -369,6 +371,7 @@ class Change:
     field: str                # "source"/"destination"/"from"/"to"/"static"
     added: List[str]
     reason: str
+    rulebase: Optional[str] = None   # "pre", "post", or None (non-rule changes)
 
 
 # --------------------------------------------------------------------------------------
@@ -378,10 +381,19 @@ class Change:
 def iter_security_rules_shared(root: ET.Element) -> Iterable[ET.Element]:
     yield from root.findall("./shared/pre-rulebase/security/rules/entry")
 
+def iter_security_rules_shared_post(root: ET.Element) -> Iterable[ET.Element]:
+    yield from root.findall("./shared/post-rulebase/security/rules/entry")
+
 def iter_security_rules_device_groups(root: ET.Element) -> Iterable[Tuple[str, ET.Element]]:
     for dg_entry in root.findall("./devices/entry/device-group/entry"):
         dg_name = dg_entry.get("name") or ""
         for rule in dg_entry.findall("./pre-rulebase/security/rules/entry"):
+            yield dg_name, rule
+
+def iter_security_rules_device_groups_post(root: ET.Element) -> Iterable[Tuple[str, ET.Element]]:
+    for dg_entry in root.findall("./devices/entry/device-group/entry"):
+        dg_name = dg_entry.get("name") or ""
+        for rule in dg_entry.findall("./post-rulebase/security/rules/entry"):
             yield dg_name, rule
 
 def iter_address_groups_shared(root: ET.Element) -> Iterable[ET.Element]:
@@ -407,6 +419,7 @@ def process_rule_member_list(
     changes: List[Change],
     scope: str,
     dg_name: Optional[str],
+    rulebase: str,                       # "pre" or "post"
 ) -> bool:
     """
     Adds mapped members (address object names) to rule/<list_tag>.
@@ -459,6 +472,7 @@ def process_rule_member_list(
                 field=list_tag,
                 added=[obj_name],
                 reason=f"rule {list_tag}: mapped {mem} ({value_text}) via {used_map.search_net} -> {used_map.new_net} to {new_value_text}",
+                rulebase=rulebase,
             ))
 
     return any_added
@@ -477,7 +491,7 @@ def add_zone_to_rule_if_needed(rule: ET.Element, zone: str, field_tag: str) -> b
 
 
 # --------------------------------------------------------------------------------------
-# Core processing: address-groups (NEW)
+# Core processing: address-groups
 # --------------------------------------------------------------------------------------
 
 def _get_static_member_node(group_entry: ET.Element) -> Optional[ET.Element]:
@@ -554,6 +568,7 @@ def process_address_group_static_members(
                 field="static",
                 added=[obj_name],
                 reason=f"address-group static: mapped {mem} ({value_text}) via {used_map.search_net} -> {used_map.new_net} to {new_value_text}",
+                # rulebase left as None intentionally
             ))
 
     return any_added
@@ -588,7 +603,7 @@ def main() -> int:
     changes: List[Change] = []
 
     # -------------------------
-    # NEW: Address-groups first (so rules that reference individual objects remain consistent)
+    # Address-groups first
     # -------------------------
 
     # Shared address-groups
@@ -609,22 +624,29 @@ def main() -> int:
     addr_book = build_address_book(root)
 
     # -------------------------
-    # Shared rules: add mapped IPs ONLY (no zone changes here)
+    # Shared rules (pre): add mapped IPs ONLY (no zone changes here)
     # -------------------------
     for rule in iter_security_rules_shared(root):
-        process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="shared", dg_name=None)
-        process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="shared", dg_name=None)
+        process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="shared", dg_name=None, rulebase="pre")
+        process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="shared", dg_name=None, rulebase="pre")
+
+    # -------------------------
+    # Shared rules (post): add mapped IPs ONLY (no zone changes here)
+    # -------------------------
+    for rule in iter_security_rules_shared_post(root):
+        process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="shared", dg_name=None, rulebase="post")
+        process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="shared", dg_name=None, rulebase="post")
 
     # refresh addr book (not strictly needed, but harmless)
     addr_book = build_address_book(root)
 
     # -------------------------
-    # Device-group rules: add mapped IPs + add zone if rule changed
+    # Device-group rules (pre): add mapped IPs + add zone if rule changed
     # -------------------------
     for dg_name, rule in iter_security_rules_device_groups(root):
         changed = False
-        changed |= process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="device-group", dg_name=dg_name)
-        changed |= process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="device-group", dg_name=dg_name)
+        changed |= process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="device-group", dg_name=dg_name, rulebase="pre")
+        changed |= process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="device-group", dg_name=dg_name, rulebase="pre")
 
         if changed:
             zone = dg_zone.get(dg_name)
@@ -634,14 +656,44 @@ def main() -> int:
                         time=ts(), scope="device-group", dg=dg_name,
                         target=rule.get("name", "<unnamed-rule>"),
                         field="from", added=[zone],
-                        reason="added DG zone because mapped IPs were added to rule"
+                        reason="added DG zone because mapped IPs were added to rule",
+                        rulebase="pre",
                     ))
                 if add_zone_to_rule_if_needed(rule, zone, "to"):
                     changes.append(Change(
                         time=ts(), scope="device-group", dg=dg_name,
                         target=rule.get("name", "<unnamed-rule>"),
                         field="to", added=[zone],
-                        reason="added DG zone because mapped IPs were added to rule"
+                        reason="added DG zone because mapped IPs were added to rule",
+                        rulebase="pre",
+                    ))
+
+    # -------------------------
+    # Device-group rules (post): add mapped IPs + add zone if rule changed
+    # -------------------------
+    for dg_name, rule in iter_security_rules_device_groups_post(root):
+        changed = False
+        changed |= process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="device-group", dg_name=dg_name, rulebase="post")
+        changed |= process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="device-group", dg_name=dg_name, rulebase="post")
+
+        if changed:
+            zone = dg_zone.get(dg_name)
+            if zone:
+                if add_zone_to_rule_if_needed(rule, zone, "from"):
+                    changes.append(Change(
+                        time=ts(), scope="device-group", dg=dg_name,
+                        target=rule.get("name", "<unnamed-rule>"),
+                        field="from", added=[zone],
+                        reason="added DG zone because mapped IPs were added to rule",
+                        rulebase="post",
+                    ))
+                if add_zone_to_rule_if_needed(rule, zone, "to"):
+                    changes.append(Change(
+                        time=ts(), scope="device-group", dg=dg_name,
+                        target=rule.get("name", "<unnamed-rule>"),
+                        field="to", added=[zone],
+                        reason="added DG zone because mapped IPs were added to rule",
+                        rulebase="post",
                     ))
 
     # Write outputs
