@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
 """
+pa_xml_zone.py
+
 Usage:
   python pa_xml_zone.py --config running-config.xml --csv ip_map.csv --dg dg_zone.txt \
     --out modified-config.xml --changelog changelog.jsonl
 
-What it does:
+What it does (additive-only):
 - Containment-based IP remap (host/range/subnet inside a larger mapped subnet).
-- Additive only: never removes existing members from rules.
 - Adds mapped IPs to ALL security rules found in:
     * /config/shared/pre-rulebase/security/rules
     * /config/devices/entry/device-group/entry/.../pre-rulebase/security/rules
 - Adds zones ONLY to device-group rules (not shared/global):
     If a DG rule gets any mapped IP added, add that DG's zone to the rule's <from> and <to>
     (unless 'any' is present, in which case we do not modify the zone list).
-- Creates any needed address objects under /config/shared/address.
+- Creates any needed *address objects* under /config/shared/address.
+- ALSO updates *address-groups* (static groups only):
+    * /config/shared/address-group/entry/.../static/member
+    * /config/devices/entry/device-group/entry/.../address-group/entry/.../static/member
+
+Important notes / assumptions:
+- This script updates STATIC address-groups only. Dynamic groups (with <dynamic>) are skipped.
+- For address-group members that are:
+    - literal IP/CIDR/range: we map them directly
+    - address-object name: we look up its ip-netmask/ip-range in the address book and map that
+    - address-group name: we do NOT expand nested groups here (to avoid surprise explosion).
+      If you need nested expansion, we can add it safely (with loop detection) later.
+- Additive-only: we never remove anything, only add new mapped object members.
 
 Input formats:
 - CSV header expected: search_ip,new_ip,new_object_name,tags,desc
   * search_ip: CIDR only (e.g., 4.2.0.0/16, 10.4.1.0/24)
   * new_ip: CIDR only (same prefixlen recommended)
-  * new_object_name optional (if empty, script generates svb_m1_* name)
+  * new_object_name optional (currently not used for contained items; deterministic names used)
 
 - DG mapping file format (one per line):
     dg-3: zone-3-new
@@ -32,7 +45,6 @@ import argparse
 import csv
 import ipaddress
 import json
-import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,19 +67,18 @@ def gen_default_name_for_value(value_text: str) -> str:
     return f"svb_m1_{underscored(value_text)}"
 
 def is_ip_literal_member(text: str) -> bool:
-    # Supports:
-    #   - single IP: "1.2.3.4"
-    #   - CIDR: "1.2.3.0/24"
-    #   - range: "1.2.3.4-1.2.3.10"
-    # Rejects object names like "h-10.1.1.1" or "test-address-4.2.2.2"
-    # (those are handled as object refs if present in address book)
+    """
+    Supports:
+      - single IP: "1.2.3.4"
+      - CIDR: "1.2.3.0/24"
+      - range: "1.2.3.4-1.2.3.10"
+    Rejects object names like "h-10.1.1.1" or "test-address-4.2.2.2"
+    """
     if not text or not isinstance(text, str):
         return False
     t = text.strip()
-    # quick cheap checks
     if any(c.isalpha() for c in t):
         return False
-    # now parse
     try:
         if "-" in t and "/" not in t:
             a, b = t.split("-", 1)
@@ -144,7 +155,6 @@ def map_ip(ip: ipaddress._BaseAddress, m: MapRow) -> Optional[ipaddress._BaseAdd
     candidate = int(m.new_net.network_address) + offset
     new_ip = ipaddress.ip_address(candidate)
     if new_ip not in m.new_net:
-        # This would be weird, but protect anyway.
         return None
     return new_ip
 
@@ -152,34 +162,33 @@ def map_cidr(net: ipaddress._BaseNetwork, m: MapRow) -> Optional[ipaddress._Base
     # only map if this subnet is fully inside the search subnet
     if net.network_address not in m.search_net:
         return None
-    # ensure whole net contained:
     if net.broadcast_address not in m.search_net:
         return None
 
-    # We preserve prefixlen. This is the typical expectation for 1:1 remaps.
-    # If your search/new prefixlens differ, this still "tries" but may not match what you want.
     offset = int(net.network_address) - int(m.search_net.network_address)
     new_net_addr_int = int(m.new_net.network_address) + offset
     new_net_addr = ipaddress.ip_address(new_net_addr_int)
-    # Build new network with same prefixlen
+
     try:
         new_net = ipaddress.ip_network(f"{new_net_addr}/{net.prefixlen}", strict=False)
     except Exception:
         return None
-    # Ensure contained within new supernet
+
     if new_net.network_address not in m.new_net or new_net.broadcast_address not in m.new_net:
         return None
     return new_net
 
-def map_range(start: ipaddress._BaseAddress, end: ipaddress._BaseAddress, m: MapRow) -> Optional[Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]]:
-    # Only map if entire range is inside search net
+def map_range(
+    start: ipaddress._BaseAddress,
+    end: ipaddress._BaseAddress,
+    m: MapRow
+) -> Optional[Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]]:
     if start not in m.search_net or end not in m.search_net:
         return None
     ns = map_ip(start, m)
     ne = map_ip(end, m)
     if not ns or not ne:
         return None
-    # keep ordering
     if int(ns) > int(ne):
         ns, ne = ne, ns
     return ns, ne
@@ -199,7 +208,6 @@ def map_value_text(value_text: str, mappings: List[MapRow]) -> Optional[Tuple[Ma
             end = ipaddress.ip_address(b.strip())
         except Exception:
             return None
-        # Ensure start<=end for containment check
         if int(start) > int(end):
             start, end = end, start
         for m in mappings:
@@ -243,14 +251,7 @@ def map_value_text(value_text: str, mappings: List[MapRow]) -> Optional[Tuple[Ma
 # XML helpers
 # --------------------------------------------------------------------------------------
 
-def find_or_create(parent: ET.Element, tag: str) -> ET.Element:
-    child = parent.find(tag)
-    if child is None:
-        child = ET.SubElement(parent, tag)
-    return child
-
 def ensure_member_list(parent: ET.Element, tag: str) -> ET.Element:
-    # parent/<tag>/<member>...
     node = parent.find(tag)
     if node is None:
         node = ET.SubElement(parent, tag)
@@ -296,9 +297,7 @@ def ensure_shared_address_entry(root: ET.Element, name: str, kind: str, value_te
     if entry is None:
         entry = ET.SubElement(addr, "entry", {"name": name})
 
-    # Set value
     if kind == "range":
-        # remove ip-netmask if present
         for n in entry.findall("ip-netmask"):
             entry.remove(n)
         node = entry.find("ip-range")
@@ -323,7 +322,9 @@ def ensure_shared_address_entry(root: ET.Element, name: str, kind: str, value_te
 
 def build_address_book(root: ET.Element) -> Dict[str, Tuple[str, str]]:
     """
-    name -> (kind, value_text) from /config/shared/address and also device-group address stores if present.
+    name -> (kind, value_text) from:
+      - /config/shared/address
+      - /config/devices/entry/device-group/entry/.../address
     """
     out: Dict[str, Tuple[str, str]] = {}
 
@@ -337,10 +338,9 @@ def build_address_book(root: ET.Element) -> Dict[str, Tuple[str, str]]:
         if ipr and ipr.strip():
             out[name] = ("range", ipr.strip())
         elif ipn and ipn.strip():
-            # could be ip or cidr; we treat it as literal text and let mapper parse
             out[name] = ("ip_or_cidr", ipn.strip())
 
-    # device-group local address (optional)
+    # device-group local address
     for dg in root.findall("./devices/entry/device-group/entry"):
         for e in dg.findall("./address/entry"):
             name = e.get("name")
@@ -357,7 +357,7 @@ def build_address_book(root: ET.Element) -> Dict[str, Tuple[str, str]]:
 
 
 # --------------------------------------------------------------------------------------
-# Core rule processing
+# Change logging
 # --------------------------------------------------------------------------------------
 
 @dataclass
@@ -365,10 +365,15 @@ class Change:
     time: str
     scope: str                # "shared" or "device-group"
     dg: Optional[str]         # device-group name if applicable
-    rule: str
-    field: str                # "source"/"destination"/"from"/"to"
+    target: str               # rule name or address-group name
+    field: str                # "source"/"destination"/"from"/"to"/"static"
     added: List[str]
     reason: str
+
+
+# --------------------------------------------------------------------------------------
+# Iterators for rules and groups
+# --------------------------------------------------------------------------------------
 
 def iter_security_rules_shared(root: ET.Element) -> Iterable[ET.Element]:
     yield from root.findall("./shared/pre-rulebase/security/rules/entry")
@@ -379,7 +384,21 @@ def iter_security_rules_device_groups(root: ET.Element) -> Iterable[Tuple[str, E
         for rule in dg_entry.findall("./pre-rulebase/security/rules/entry"):
             yield dg_name, rule
 
-def process_member_list(
+def iter_address_groups_shared(root: ET.Element) -> Iterable[ET.Element]:
+    yield from root.findall("./shared/address-group/entry")
+
+def iter_address_groups_device_groups(root: ET.Element) -> Iterable[Tuple[str, ET.Element]]:
+    for dg_entry in root.findall("./devices/entry/device-group/entry"):
+        dg_name = dg_entry.get("name") or ""
+        for grp in dg_entry.findall("./address-group/entry"):
+            yield dg_name, grp
+
+
+# --------------------------------------------------------------------------------------
+# Core processing: rules
+# --------------------------------------------------------------------------------------
+
+def process_rule_member_list(
     root: ET.Element,
     rule: ET.Element,
     list_tag: str,                       # "source" or "destination"
@@ -397,7 +416,6 @@ def process_member_list(
     node = ensure_member_list(rule, list_tag)
     existing_members = get_members(node)
 
-    # We'll compute additions based on each existing member.
     for mem in existing_members:
         mem = mem.strip()
         if not mem or mem == "any":
@@ -408,10 +426,10 @@ def process_member_list(
         if is_ip_literal_member(mem):
             value_text = mem
         elif mem in addr_book:
-            kind, val = addr_book[mem]
+            _, val = addr_book[mem]
             value_text = val
         else:
-            # unknown object name; skip
+            # unknown object name (often: address-group). We skip here by design.
             continue
 
         mapped = map_value_text(value_text, mappings)
@@ -420,37 +438,34 @@ def process_member_list(
 
         used_map, (kind, new_value_text) = mapped
 
-        # Determine object name to add (use CSV name only if mapping row provided it AND it's a clean fit for literals)
-        # If CSV new_object_name is present, that is typically meant for the whole mapped network, but we are mapping
-        # contained items (host/range/subnet). So we generate a deterministic name from the mapped value.
         obj_name = gen_default_name_for_value(new_value_text)
 
         # Ensure shared address object exists
-        ensure_shared_address_entry(root, obj_name, "range" if kind == "range" else "ip", new_value_text, used_map.desc)
+        ensure_shared_address_entry(
+            root,
+            obj_name,
+            "range" if kind == "range" else "ip",
+            new_value_text,
+            used_map.desc
+        )
 
-        # Add object name into the rule list (additive)
         if add_member(node, obj_name):
             any_added = True
             changes.append(Change(
                 time=ts(),
                 scope=scope,
                 dg=dg_name,
-                rule=rule.get("name", "<unnamed>"),
+                target=rule.get("name", "<unnamed-rule>"),
                 field=list_tag,
                 added=[obj_name],
-                reason=f"mapped {mem} ({value_text}) via {used_map.search_net} -> {used_map.new_net} to {new_value_text}",
+                reason=f"rule {list_tag}: mapped {mem} ({value_text}) via {used_map.search_net} -> {used_map.new_net} to {new_value_text}",
             ))
 
     return any_added
 
-def add_zone_to_rule_if_needed(
-    rule: ET.Element,
-    zone: str,
-    field_tag: str,               # "from" or "to"
-) -> bool:
+def add_zone_to_rule_if_needed(rule: ET.Element, zone: str, field_tag: str) -> bool:
     """
     Add zone to rule/<from|to> if:
-    - field exists (created if missing)
     - does NOT contain 'any'
     - zone not already present
     """
@@ -459,6 +474,94 @@ def add_zone_to_rule_if_needed(
     if "any" in members:
         return False
     return add_member(node, zone)
+
+
+# --------------------------------------------------------------------------------------
+# Core processing: address-groups (NEW)
+# --------------------------------------------------------------------------------------
+
+def _get_static_member_node(group_entry: ET.Element) -> Optional[ET.Element]:
+    """
+    Returns the <static> node if present, else None.
+    If <dynamic> present (or no <static>), we do not modify.
+    """
+    if group_entry.find("dynamic") is not None:
+        return None
+    static = group_entry.find("static")
+    return static
+
+def process_address_group_static_members(
+    root: ET.Element,
+    group_entry: ET.Element,
+    mappings: List[MapRow],
+    addr_book: Dict[str, Tuple[str, str]],
+    changes: List[Change],
+    scope: str,
+    dg_name: Optional[str],
+) -> bool:
+    """
+    For an address-group entry, look at ./static/member values and add mapped *address object names*.
+
+    Member cases:
+    - literal ip/cidr/range: map directly
+    - address object name: look up its literal in addr_book and map that
+    - address-group name or unknown: skip (no nested expansion here)
+    """
+    static = _get_static_member_node(group_entry)
+    if static is None:
+        return False  # dynamic or no static; skip
+
+    existing = get_members(static)
+    any_added = False
+
+    for mem in existing:
+        mem = mem.strip()
+        if not mem or mem == "any":
+            continue
+
+        value_text: Optional[str] = None
+        if is_ip_literal_member(mem):
+            value_text = mem
+        elif mem in addr_book:
+            _, val = addr_book[mem]
+            value_text = val
+        else:
+            # could be a nested group name or unknown token; skip
+            continue
+
+        mapped = map_value_text(value_text, mappings)
+        if not mapped:
+            continue
+
+        used_map, (kind, new_value_text) = mapped
+        obj_name = gen_default_name_for_value(new_value_text)
+
+        ensure_shared_address_entry(
+            root,
+            obj_name,
+            "range" if kind == "range" else "ip",
+            new_value_text,
+            used_map.desc
+        )
+
+        if add_member(static, obj_name):
+            any_added = True
+            changes.append(Change(
+                time=ts(),
+                scope=scope,
+                dg=dg_name,
+                target=group_entry.get("name", "<unnamed-address-group>"),
+                field="static",
+                added=[obj_name],
+                reason=f"address-group static: mapped {mem} ({value_text}) via {used_map.search_net} -> {used_map.new_net} to {new_value_text}",
+            ))
+
+    return any_added
+
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -485,14 +588,34 @@ def main() -> int:
     changes: List[Change] = []
 
     # -------------------------
+    # NEW: Address-groups first (so rules that reference individual objects remain consistent)
+    # -------------------------
+
+    # Shared address-groups
+    for grp in iter_address_groups_shared(root):
+        process_address_group_static_members(
+            root, grp, mappings, addr_book, changes,
+            scope="shared", dg_name=None
+        )
+
+    # DG address-groups
+    for dg_name, grp in iter_address_groups_device_groups(root):
+        process_address_group_static_members(
+            root, grp, mappings, addr_book, changes,
+            scope="device-group", dg_name=dg_name
+        )
+
+    # Refresh address book so newly created shared objects are recognized later
+    addr_book = build_address_book(root)
+
+    # -------------------------
     # Shared rules: add mapped IPs ONLY (no zone changes here)
     # -------------------------
     for rule in iter_security_rules_shared(root):
-        # update address book view each rule? not necessary; we create new shared entries with deterministic names
-        process_member_list(root, rule, "source", mappings, addr_book, changes, scope="shared", dg_name=None)
-        process_member_list(root, rule, "destination", mappings, addr_book, changes, scope="shared", dg_name=None)
+        process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="shared", dg_name=None)
+        process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="shared", dg_name=None)
 
-    # refresh addr book so newly created shared objects can be recognized if referenced later
+    # refresh addr book (not strictly needed, but harmless)
     addr_book = build_address_book(root)
 
     # -------------------------
@@ -500,24 +623,26 @@ def main() -> int:
     # -------------------------
     for dg_name, rule in iter_security_rules_device_groups(root):
         changed = False
-        changed |= process_member_list(root, rule, "source", mappings, addr_book, changes, scope="device-group", dg_name=dg_name)
-        changed |= process_member_list(root, rule, "destination", mappings, addr_book, changes, scope="device-group", dg_name=dg_name)
+        changed |= process_rule_member_list(root, rule, "source", mappings, addr_book, changes, scope="device-group", dg_name=dg_name)
+        changed |= process_rule_member_list(root, rule, "destination", mappings, addr_book, changes, scope="device-group", dg_name=dg_name)
 
-        # Only if we actually added mapped IPs to THIS RULE, add DG zone (additive)
         if changed:
             zone = dg_zone.get(dg_name)
             if zone:
-                added_any = False
                 if add_zone_to_rule_if_needed(rule, zone, "from"):
-                    added_any = True
-                    changes.append(Change(time=ts(), scope="device-group", dg=dg_name, rule=rule.get("name","<unnamed>"),
-                                          field="from", added=[zone], reason="added DG zone because mapped IPs were added to rule"))
+                    changes.append(Change(
+                        time=ts(), scope="device-group", dg=dg_name,
+                        target=rule.get("name", "<unnamed-rule>"),
+                        field="from", added=[zone],
+                        reason="added DG zone because mapped IPs were added to rule"
+                    ))
                 if add_zone_to_rule_if_needed(rule, zone, "to"):
-                    added_any = True
-                    changes.append(Change(time=ts(), scope="device-group", dg=dg_name, rule=rule.get("name","<unnamed>"),
-                                          field="to", added=[zone], reason="added DG zone because mapped IPs were added to rule"))
-                # If 'any' existed, we do nothing (by design, to avoid removing/rewriting).
-                _ = added_any
+                    changes.append(Change(
+                        time=ts(), scope="device-group", dg=dg_name,
+                        target=rule.get("name", "<unnamed-rule>"),
+                        field="to", added=[zone],
+                        reason="added DG zone because mapped IPs were added to rule"
+                    ))
 
     # Write outputs
     tree.write(str(out_path), encoding="utf-8", xml_declaration=True)
