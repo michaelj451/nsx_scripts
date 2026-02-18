@@ -27,7 +27,7 @@ def underscored(s: str) -> str:
     return s.replace('.', '_').replace('/', '_').replace(':', '_')
 
 def gen_default_name_for_ip(ip_text: str) -> str:
-    return f"svb_m1_{underscored(ip_text)}"
+    return f"svb_m2_{underscored(ip_text)}"
 
 def find_shared_address_parent(root: ET.Element) -> ET.Element:
     """Return <shared>/<address> parent or create one."""
