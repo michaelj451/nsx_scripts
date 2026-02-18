@@ -176,3 +176,6 @@ python pa_xml_zone_optimized.py --config test_cases/test9.xml --csv ip_map.txt -
 python pa_xml_zone.py --config test_cases/test9.xml --csv ip_map.txt --dg dg_zone.txt --out bharat_config.xml --changelog bharac_changelog.json 
 
 python pa_xml_zone-orig.py --config test_cases/test9.xml --csv ip_map.txt --dg dg_zone.txt --out bharat-orig.xml  
+
+
+python pa_xml_zone_range_optimized.py --config test_cases/test9.xml --csv ip_map.txt --dg dg_zone.txt --out mike_range_config.xml --changelog mike_range_changelog.jsonl
