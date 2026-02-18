@@ -210,11 +210,9 @@
             </from>
             <source>
               <member>h-10.1.1.1</member>
-              <member>r-10.1.1.1-10.2.1.1</member>
-              <member>svb_m2_10_1_2_1</member>
+              <member>r-10.1.1.10-10.2.1.10</member>
             </source>
             <destination>
-              <member>svb_m2_4_4_2_2</member>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
@@ -259,13 +257,11 @@
             </from>
             <source>
               <member>n-10.1.1.0-24</member>
-              <member>svb_m2_10_1_2_0_24</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -309,11 +305,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>h-10.1.1.1</member>
-              <member>svb_m2_10_1_2_1</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -357,11 +351,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>n-10.1.1.0-24</member>
-              <member>svb_m2_10_1_2_0_24</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -403,13 +395,11 @@
             </from>
             <source>
               <member>h-10.2.1.1</member>
-              <member>svb_m2_10_2_2_1</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -451,13 +441,11 @@
             </from>
             <source>
               <member>n-10.2.1.0-24</member>
-              <member>svb_m2_10_2_2_0_24</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -501,11 +489,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>h-10.2.1.1</member>
-              <member>svb_m2_10_2_2_1</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -549,11 +535,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>n-10.2.1.0-24</member>
-              <member>svb_m2_10_2_2_0_24</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -595,13 +579,11 @@
             </from>
             <source>
               <member>h-10.3.1.1</member>
-              <member>svb_m2_10_3_2_1</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -643,13 +625,11 @@
             </from>
             <source>
               <member>n-10.3.1.0-24</member>
-              <member>svb_m2_10_3_2_0_24</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -693,11 +673,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>h-10.3.1.1</member>
-              <member>svb_m2_10_3_2_1</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -741,11 +719,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>n-10.3.1.0-24</member>
-              <member>svb_m2_10_3_2_0_24</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -788,13 +764,11 @@
             <source>
               <member>10.4.1.1</member>
               <member>10.4.1.5-10.4.1.20</member>
-              <member>svb_m2_10_4_2_1</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -836,13 +810,11 @@
             </from>
             <source>
               <member>10.4.1.0/24</member>
-              <member>svb_m2_10_4_2_0_24</member>
             </source>
             <destination>
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -886,12 +858,10 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>10.4.1.1</member>
               <member>10.4.1.5-10.4.1.50</member>
-              <member>svb_m2_10_4_2_1</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -935,11 +905,9 @@
               <member>test-address-4.2.2.2</member>
               <member>test-address-8.8.8.8</member>
               <member>test-address-10.6.0.0-24</member>
-              <member>svb_m2_4_4_2_2</member>
             </source>
             <destination>
               <member>10.4.1.0/24</member>
-              <member>svb_m2_10_4_2_0_24</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -988,12 +956,6 @@
           <member>r-10.1.1.5-10.1.1.20</member>
           <member>r-10.2.1.20-10.2.1.50</member>
           <member>r-10.3.1.101-10.3.2.5</member>
-          <member>svb_m2_10_1_2_1</member>
-          <member>svb_m2_10_2_2_1</member>
-          <member>svb_m2_10_3_2_1</member>
-          <member>svb_m2_10_1_2_0_24</member>
-          <member>svb_m2_10_2_2_0_24</member>
-          <member>svb_m2_10_3_2_0_24</member>
         </static>
       </entry>
     </address-group>
@@ -1034,44 +996,8 @@
       <entry name="test-address-10.6.0.0-24">
         <ip-netmask>10.6.0.0/24</ip-netmask>
       </entry>
-      <entry name="svb_m2_10_1_2_1">
-        <ip-netmask>10.1.2.1</ip-netmask>
-        <description>something1</description>
-      </entry>
-      <entry name="svb_m2_10_2_2_1">
-        <ip-netmask>10.2.2.1</ip-netmask>
-        <description>something2</description>
-      </entry>
-      <entry name="svb_m2_10_3_2_1">
-        <ip-netmask>10.3.2.1</ip-netmask>
-        <description>something3</description>
-      </entry>
-      <entry name="svb_m2_10_1_2_0_24">
-        <ip-netmask>10.1.2.0/24</ip-netmask>
-        <description>something1</description>
-      </entry>
-      <entry name="svb_m2_10_2_2_0_24">
-        <ip-netmask>10.2.2.0/24</ip-netmask>
-        <description>something2</description>
-      </entry>
-      <entry name="svb_m2_10_3_2_0_24">
-        <ip-netmask>10.3.2.0/24</ip-netmask>
-        <description>something3</description>
-      </entry>
-      <entry name="svb_m2_4_4_2_2">
-        <ip-netmask>4.4.2.2</ip-netmask>
-        <description>something5</description>
-      </entry>
-      <entry name="svb_m2_10_4_2_1">
-        <ip-netmask>10.4.2.1</ip-netmask>
-        <description>something4</description>
-      </entry>
-      <entry name="svb_m2_10_4_2_0_24">
-        <ip-netmask>10.4.2.0/24</ip-netmask>
-        <description>something4</description>
-      </entry>
-      <entry name="r-10.1.1.1-10.2.1.1">
-        <ip-range>10.1.1.1-10.2.1.5</ip-range>
+      <entry name="r-10.1.1.10-10.2.1.10">
+        <ip-range>10.1.1.10-10.2.1.10</ip-range>
       </entry>
     </address>
     <service>
@@ -1123,16 +1049,11 @@
               <member>h-10.2.1.1</member>
               <member>h-10.3.1.1</member>
               <member>n-10.2.1.0-24</member>
-              <member>svb_m2_10_2_2_1</member>
-              <member>svb_m2_10_3_2_1</member>
-              <member>svb_m2_10_2_2_0_24</member>
             </source>
             <destination>
               <member>h-10.1.1.1</member>
               <member>n-10.2.1.0-24</member>
               <member>r-10.1.1.5-10.1.1.20</member>
-              <member>svb_m2_10_1_2_1</member>
-              <member>svb_m2_10_2_2_0_24</member>
             </destination>
             <source-user>
               <member>any</member>
@@ -1271,7 +1192,7 @@
                     <member>zone-3</member>
                   </from>
                   <source>
-                    <member>10.1.0.0-10.2.0.0</member>
+                    <member>10.2.1.5-10.2.3.5</member>
                     <member>h-10.1.1.1</member>
                   </source>
                   <destination>
