@@ -205,7 +205,7 @@ python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1
 
 python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1 --apply
 
-4) Push Groups to LM
+4) Push Groups to LM (OPTIONAL)
 
 python tools/nsx/push_nsx_groups.py \
   --target nsx-gm1 \
