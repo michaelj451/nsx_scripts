@@ -23,6 +23,10 @@ Rule update logic (IMPORTANT):
     - OR endswith "/groups/<old_id>" match
 - If --replace: replaces old reference(s) with new_path
 - Else (default add-only): adds new_path only when an old reference is present
+
+Change log:
+- Writes JSONL to (default): <repo>/nsx_logs/nsx_group_promotion_changes.jsonl
+- JSONL = one JSON object per line (long lines are expected), but each record ends with \\n.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -52,7 +57,7 @@ DEFAULT_SRC_DOMAIN = "nsx-lm1.lab.local"  # where LM-scoped objects live on GM i
 DEFAULT_DST_DOMAIN = "default"            # shared/global domain you want to promote INTO
 DEFAULT_SUFFIX = "_to_gm"
 
-# Input groups default: additive/remapped groups (THIS is the important change)
+# Input groups default: additive/remapped groups
 DEFAULT_GROUPS_ROOT = REPO_ROOT / "nsx_groups_additive" / DEFAULT_GM_NAME / "domains"
 
 # Rules default: still from export (unless you override)
@@ -61,6 +66,9 @@ DEFAULT_RULES_ROOT = REPO_ROOT / "nsx_export" / DEFAULT_GM_NAME / "domains"
 # Outputs
 DEFAULT_GM_OUT_DIR = REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / "groups"
 DEFAULT_RULES_OUT_ROOT = REPO_ROOT / "nsx_updated_rules" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN
+
+# change log
+DEFAULT_CHANGES_JSONL = REPO_ROOT / "nsx_logs" / "nsx_group_promotion_changes.jsonl"
 
 
 # -----------------------------
@@ -75,13 +83,16 @@ def load_doc(path: Path) -> Any:
         return json.loads(text)
     raise ValueError(f"Unsupported file type: {path}")
 
+
 def write_yaml(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
 
 def iter_docs(root: Path, exts: Tuple[str, ...] = (".yaml", ".yml", ".json")) -> Iterator[Path]:
     if not root.exists():
@@ -89,6 +100,18 @@ def iter_docs(root: Path, exts: Tuple[str, ...] = (".yaml", ".yml", ".json")) ->
     for p in sorted(root.rglob("*")):
         if p.is_file() and p.suffix.lower() in exts:
             yield p
+
+
+def safe_filename(name: str, *, max_len: int = 180) -> str:
+    """
+    Convert a display_name into a filesystem-safe filename (no path separators, etc.).
+    """
+    name = name.strip()
+    name = re.sub(r"[\\/:\*\?\"<>\|\n\r\t]+", "_", name)  # illegal-ish chars
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name.replace(" ", "_")
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name[:max_len] if len(name) > max_len else name
 
 
 # -----------------------------
@@ -101,10 +124,10 @@ def is_group_payload(doc: Any) -> bool:
     rt = doc.get("resource_type")
     if rt == "Group":
         return True
-    # Heuristic: group-ish payloads often have these keys
     if "expression" in doc and "display_name" in doc and "id" in doc:
         return True
     return False
+
 
 def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
     """
@@ -139,8 +162,10 @@ def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
 
     return groups
 
+
 def is_rule_container(doc: Any) -> bool:
     return isinstance(doc, dict) and isinstance(doc.get("rules"), list)
+
 
 def is_rule_payload(doc: Any) -> bool:
     if not isinstance(doc, dict):
@@ -151,6 +176,7 @@ def is_rule_payload(doc: Any) -> bool:
     if "action" in doc and ("source_groups" in doc or "destination_groups" in doc):
         return True
     return False
+
 
 def iter_rules_from_doc(doc: Any) -> Iterator[Tuple[str, Dict[str, Any], Optional[int]]]:
     """
@@ -176,11 +202,13 @@ def get_group_id(doc: Dict[str, Any]) -> str:
         return gid
     raise ValueError("Group missing id")
 
+
 def get_group_name(doc: Dict[str, Any]) -> str:
     name = doc.get("display_name")
     if isinstance(name, str) and name.strip():
         return name
     return get_group_id(doc)
+
 
 def get_group_path(doc: Dict[str, Any]) -> Optional[str]:
     p = doc.get("path")
@@ -188,8 +216,10 @@ def get_group_path(doc: Dict[str, Any]) -> Optional[str]:
         return p
     return None
 
+
 def build_gm_group_path(domain: str, group_id: str) -> str:
     return f"/global-infra/domains/{domain}/groups/{group_id}"
+
 
 def group_ref_matches(ref: str, *, old_path: Optional[str], old_id: str) -> bool:
     """
@@ -240,7 +270,7 @@ def promote_group_payload(
     if not keep_expression:
         new_group.pop("expression", None)
 
-    # Strip volatile/read-only keys (keep diffs sane)
+    # Strip volatile/read-only keys
     for k in (
         "revision", "_revision",
         "unique_id", "realization_id",
@@ -279,11 +309,13 @@ GROUP_REF_KEYS = {
     "destinations",
 }
 
+
 def add_unique_str(lst: List[Any], item: str) -> bool:
     if item in lst:
         return False
     lst.append(item)
     return True
+
 
 def update_group_refs_in_rule(
     rule: Dict[str, Any],
@@ -307,7 +339,10 @@ def update_group_refs_in_rule(
             continue
 
         before = list(val)
-        matches = [i for i, x in enumerate(val) if isinstance(x, str) and group_ref_matches(x, old_path=old_path, old_id=old_id)]
+        matches = [
+            i for i, x in enumerate(val)
+            if isinstance(x, str) and group_ref_matches(x, old_path=old_path, old_id=old_id)
+        ]
         if not matches:
             continue
 
@@ -362,10 +397,16 @@ def main() -> None:
         help="Output root for updated rules. Default computed from gm-name/dst-domain.",
     )
 
+    ap.add_argument(
+        "--changes-jsonl",
+        type=Path,
+        default=DEFAULT_CHANGES_JSONL,
+        help=f"JSONL change log path (default: {DEFAULT_CHANGES_JSONL})",
+    )
+
     ap.add_argument("--suffix", type=str, default=DEFAULT_SUFFIX, help="Suffix appended to new group id and display_name.")
     ap.add_argument("--replace", action="store_true", help="Replace old group refs with new group refs (default is add-only).")
     ap.add_argument("--dry-run", action="store_true", help="Do not write outputs; only log what would change.")
-    ap.add_argument("--changes-jsonl", type=Path, default=Path("nsx_group_promotion_changes.jsonl"), help="JSONL change log path.")
     ap.add_argument("--log-level", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING...).")
 
     args = ap.parse_args()
@@ -381,29 +422,30 @@ def main() -> None:
     suffix: str = args.suffix
 
     # Derived dirs
-    lm_groups_dir = args.groups_root / src_domain / "groups"
-    rules_dir = args.rules_root / src_domain / "security-policies"
+    groups_in_dir = args.groups_root / src_domain / "groups"
+    rules_in_dir = args.rules_root / src_domain / "security-policies"
 
     gm_out = args.gm_out_dir or (REPO_ROOT / "nsx_promoted_groups" / gm_name / "domains" / dst_domain / "groups")
     rules_out_root = args.rules_out_root or (REPO_ROOT / "nsx_updated_rules" / gm_name / "domains" / dst_domain)
     rules_out = rules_out_root / src_domain / "security-policies"
 
-    log.info("Groups input dir: %s", lm_groups_dir)
-    log.info("Rules input dir:  %s", rules_dir)
+    log.info("Groups input dir: %s", groups_in_dir)
+    log.info("Rules input dir:  %s", rules_in_dir)
     log.info("Groups output dir:%s", gm_out)
     log.info("Rules output dir: %s", rules_out)
+    log.info("Change log file:  %s", args.changes_jsonl)
 
-    if not lm_groups_dir.exists():
-        raise SystemExit(f"Groups input directory not found: {lm_groups_dir}")
+    if not groups_in_dir.exists():
+        raise SystemExit(f"Groups input directory not found: {groups_in_dir}")
 
-    if not rules_dir.exists():
-        log.warning("Rules directory not found (will still promote groups): %s", rules_dir)
+    if not rules_in_dir.exists():
+        log.warning("Rules directory not found (will still promote groups): %s", rules_in_dir)
 
     promotions: List[Promotion] = []
     promoted_groups: List[Tuple[Path, Dict[str, Any], Promotion]] = []
 
     # 1) Read groups and create promotions
-    for f in iter_docs(lm_groups_dir):
+    for f in iter_docs(groups_in_dir):
         try:
             doc = load_doc(f)
         except Exception as e:
@@ -427,11 +469,19 @@ def main() -> None:
                 source_file=str(f),
             )
 
-            out_file = gm_out / f"{promo.new_id}.yaml"
+            # (1) filename should be display_name (you asked for this)
+            base = safe_filename(promo.new_name)
+            out_file = gm_out / f"{base}.yaml"
+
+            # collision handling
+            if any(existing_path == out_file for existing_path, _, _ in promoted_groups):
+                out_file = gm_out / f"{base}__{promo.new_id}.yaml"
+
+            # ✅ IMPORTANT FIX: actually append
             promotions.append(promo)
             promoted_groups.append((out_file, new_group, promo))
 
-    log.info("Found %d group(s) to promote from %s.", len(promotions), lm_groups_dir)
+    log.info("Found %d group(s) to promote from %s.", len(promotions), groups_in_dir)
 
     # 2) Write promoted groups
     if not args.dry_run:
@@ -441,17 +491,21 @@ def main() -> None:
     else:
         log.info("Dry-run: not writing promoted group files.")
 
-    # 3) Update rules
+    # 3) Update rules + write change log records
     changes_fh = None
     if not args.dry_run:
         args.changes_jsonl.parent.mkdir(parents=True, exist_ok=True)
-        changes_fh = args.changes_jsonl.open("w", encoding="utf-8")
+        # force unix newlines (doesn't change "one json object per line", but ensures newline behavior)
+        changes_fh = args.changes_jsonl.open("w", encoding="utf-8", newline="\n")
+    else:
+        log.info("Dry-run: not writing change log file.")
 
     updated_rule_files = 0
     touched_rules_total = 0
+    change_records_written = 0
 
-    if rules_dir.exists():
-        for rf in iter_docs(rules_dir):
+    if rules_in_dir.exists():
+        for rf in iter_docs(rules_in_dir):
             try:
                 rdoc = load_doc(rf)
             except Exception as e:
@@ -497,7 +551,7 @@ def main() -> None:
 
             if any_change_in_file:
                 updated_rule_files += 1
-                out_path = rules_out / rf.relative_to(rules_dir)
+                out_path = rules_out / rf.relative_to(rules_in_dir)
 
                 if not args.dry_run:
                     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,17 +561,20 @@ def main() -> None:
                         write_json(out_path, rdoc)
 
                     if changes_fh:
-                        changes_fh.write(json.dumps({
+                        payload = {
                             "gm_name": gm_name,
                             "src_domain": src_domain,
                             "dst_domain": dst_domain,
-                            "groups_dir": str(lm_groups_dir),
-                            "rules_dir": str(rules_dir),
+                            "groups_dir": str(groups_in_dir),
+                            "rules_dir": str(rules_in_dir),
                             "file": str(rf),
                             "out_file": str(out_path),
                             "replace_mode": bool(args.replace),
                             "changes": file_changes,
-                        }) + "\n")
+                        }
+                        changes_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                        changes_fh.flush()
+                        change_records_written += 1
                 else:
                     log.info("Dry-run: would update rules file %s", rf)
 
@@ -526,7 +583,7 @@ def main() -> None:
 
     log.info("Rule update complete. Updated files=%d, touched rules=%d", updated_rule_files, touched_rules_total)
     if not args.dry_run:
-        log.info("Change log: %s", args.changes_jsonl)
+        log.info("Change log: %s (records=%d)", args.changes_jsonl, change_records_written)
 
 
 if __name__ == "__main__":
