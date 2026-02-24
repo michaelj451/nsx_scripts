@@ -167,3 +167,15 @@ Example:
 
 10.1.1.5 → 10.1.2.5\
 10.4.1.5-10.4.1.20 → 10.4.2.5-10.4.2.20
+
+
+
+python pa_xml_zone_optimized.py --config test_cases/test10.xml --csv ip_map.txt --dg dg_zone.txt --out mike_config.xml --changelog mike_changelog.jsonl
+
+
+python pa_xml_zone.py --config test_cases/test10.xml --csv ip_map.txt --dg dg_zone.txt --out bharat_config.xml --changelog bharac_changelog.json 
+
+python pa_xml_zone-orig.py --config test_cases/test10.xml --csv ip_map.txt --dg dg_zone.txt --out bharat-orig.xml  
+
+
+python pa_xml_zone_range_optimized.py --config test_cases/test10.xml --csv ip_map.txt --dg dg_zone.txt --out mike_range_config.xml --changelog mike_range_changelog.jsonl
