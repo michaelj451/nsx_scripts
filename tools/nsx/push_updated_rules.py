@@ -2,35 +2,22 @@
 """
 tools/nsx/push_updated_rules.py
 
-Push UPDATED Global-Manager rules (and their parent security-policies) from disk to NSX.
+Push UPDATED Global-Manager security policies + rules from disk to NSX (UPSERT).
 
-This script is the “deployment” step for the output of:
-    tools/nsx/update_rules_from_promoted_groups.py
+Key behavior:
+- For each object:
+    - GET it first:
+        - if 404 -> PUT (create)
+        - else   -> PATCH (update)
+- Policies are pushed first, then rules.
+- Dry-run by default. Use --apply to actually push.
+- Uses federation_global=True so GM writes go to /global-manager/api/v1/global-infra on a GM.
 
-Directory layout expected (matches your repo convention):
+Expected directory layout (matches nsx_updated_rules convention):
 
   nsx_updated_rules/<gm-name>/domains/<dst-domain>/<rules-domain>/security-policies/
     <policy-id>.yaml
     <policy-id>/rules/<rule-id>.yaml
-
-Behavior:
-- Pushes Security Policies first (PUT), then Rules (PUT).
-- Uses federation_global=True so GM writes go to /global-manager/api/v1/global-infra on a GM.
-- Dry-run by default (no writes). Use --apply to actually push.
-
-Examples:
-
-Dry-run:
-  python tools/nsx/push_updated_rules.py --manager gm1 --federation-global
-
-Apply:
-  python tools/nsx/push_updated_rules.py --manager gm1 --federation-global --apply
-
-Point at a specific output tree:
-  python tools/nsx/push_updated_rules.py --manager gm1 --federation-global \
-    --rules-domain default --dst-domain default \
-    --input-root nsx_updated_rules/nsx-gm1.lab.local/domains/default/default/security-policies \
-    --apply
 """
 
 from __future__ import annotations
@@ -40,7 +27,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 try:
     import yaml  # PyYAML
@@ -48,7 +35,7 @@ except ImportError as e:
     raise SystemExit("Missing dependency: PyYAML. Install with: pip install pyyaml") from e
 
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4  # adjust if you have fewer/more
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4  # adjust to your env
 
 log = logging.getLogger("push_updated_rules")
 
@@ -58,7 +45,6 @@ DEFAULT_GM_NAME = "nsx-gm1.lab.local"
 DEFAULT_DST_DOMAIN = "default"
 DEFAULT_RULES_DOMAIN = "default"
 
-# Default location for updated rules produced by update_rules_from_promoted_groups.py
 DEFAULT_INPUT_ROOT = (
     REPO_ROOT
     / "nsx_updated_rules"
@@ -68,7 +54,6 @@ DEFAULT_INPUT_ROOT = (
     / DEFAULT_RULES_DOMAIN
     / "security-policies"
 )
-
 
 # -----------------------------
 # IO helpers
@@ -99,7 +84,6 @@ def safe_id_from_doc(doc: Dict[str, Any], kind: str, path: Path) -> str:
     rid = doc.get("id")
     if isinstance(rid, str) and rid.strip():
         return rid
-    # fall back to filename stem
     stem = path.stem
     if stem:
         return stem
@@ -181,13 +165,34 @@ def discover_policies_and_rules(input_root: Path) -> Tuple[List[PolicyFile], Lis
 
     return policies, rules
 
+# -----------------------------
+# UPSERT helpers
+# -----------------------------
+
+def exists_security_policy(client: NsxPolicyClient, policy_id: str, domain_id: str) -> bool:
+    try:
+        client.get_security_policy(policy_id, domain_id=domain_id)
+        return True
+    except NsxApiError as e:
+        if e.status_code == 404:
+            return False
+        raise
+
+def exists_security_rule(client: NsxPolicyClient, policy_id: str, rule_id: str, domain_id: str) -> bool:
+    try:
+        client.get_security_rule(policy_id, rule_id, domain_id=domain_id)
+        return True
+    except NsxApiError as e:
+        if e.status_code == 404:
+            return False
+        raise
 
 # -----------------------------
 # Main
 # -----------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Push UPDATED GM security policies + rules from nsx_updated_rules directory.")
+    ap = argparse.ArgumentParser(description="Push UPDATED GM security policies + rules from nsx_updated_rules (UPSERT).")
 
     ap.add_argument("--manager", type=str, default="gm1",
                     help="Manager alias (gm1/lm1/...) or FQDN. Default: gm1")
@@ -199,7 +204,7 @@ def main() -> None:
     ap.add_argument("--dst-domain", type=str, default=DEFAULT_DST_DOMAIN,
                     help="Destination domain for default input-root computation (usually 'default').")
     ap.add_argument("--rules-domain", type=str, default=DEFAULT_RULES_DOMAIN,
-                    help="Rules domain being pushed (prod: 'default'). This is the NSX domain_id for PUTs.")
+                    help="Rules domain being pushed (prod: 'default'). This is the NSX domain_id for API paths.")
 
     ap.add_argument("--input-root", type=Path, default=None,
                     help=f"Directory containing security-policies tree. Default: {DEFAULT_INPUT_ROOT}")
@@ -225,53 +230,60 @@ def main() -> None:
 
     domain_id = args.rules_domain  # domain_id in NSX API paths
 
-    log.info("Manager:      %s", manager_fqdn)
-    log.info("Mode:         %s", "APPLY" if args.apply else "DRY-RUN")
-    log.info("Input root:   %s", input_root)
-    log.info("Domain ID:    %s", domain_id)
-    log.info("Federation:   %s", True)
+    log.info("Manager:    %s", manager_fqdn)
+    log.info("Mode:       %s", "APPLY" if args.apply else "DRY-RUN")
+    log.info("Input root: %s", input_root)
+    log.info("Domain ID:  %s", domain_id)
 
     if not input_root.exists():
         raise SystemExit(f"Input root not found: {input_root}")
 
-    # Discover
     policies, rules = discover_policies_and_rules(input_root)
     log.info("Discovered: %d policy file(s), %d rule file(s)", len(policies), len(rules))
 
-    # Create client
     client = NsxPolicyClient(manager_fqdn, federation_global=True)
 
     pushed_policies = 0
     pushed_rules = 0
     errors: List[str] = []
 
-    # Push policies first
+    # 1) Policies first (UPSERT)
     for p in policies:
         msg = f"SecurityPolicy {p.policy_id} (domain={domain_id}) from {p.file_path}"
         if not args.apply:
-            log.info("[DRY-RUN] Would push %s", msg)
+            log.info("[DRY-RUN] Would upsert %s", msg)
             continue
+
         try:
-            client.put_security_policy(p.policy_id, p.payload, domain_id=domain_id)
+            if exists_security_policy(client, p.policy_id, domain_id=domain_id):
+                client.patch_security_policy(p.policy_id, p.payload, domain_id=domain_id)
+                log.info("PATCH %s", msg)
+            else:
+                client.put_security_policy(p.policy_id, p.payload, domain_id=domain_id)
+                log.info("PUT %s", msg)
             pushed_policies += 1
-            log.info("Pushed %s", msg)
         except (NsxApiError, Exception) as e:
-            err = f"Failed pushing policy {p.file_path}: {e}"
+            err = f"Failed upserting policy {p.file_path}: {e}"
             log.error(err)
             errors.append(err)
 
-    # Push rules
+    # 2) Rules (UPSERT)
     for r in rules:
         msg = f"Rule {r.rule_id} under policy {r.policy_id} (domain={domain_id}) from {r.file_path}"
         if not args.apply:
-            log.info("[DRY-RUN] Would push %s", msg)
+            log.info("[DRY-RUN] Would upsert %s", msg)
             continue
+
         try:
-            client.put_security_rule(r.policy_id, r.rule_id, r.payload, domain_id=domain_id)
+            if exists_security_rule(client, r.policy_id, r.rule_id, domain_id=domain_id):
+                client.patch_security_rule(r.policy_id, r.rule_id, r.payload, domain_id=domain_id)
+                log.info("PATCH %s", msg)
+            else:
+                client.put_security_rule(r.policy_id, r.rule_id, r.payload, domain_id=domain_id)
+                log.info("PUT %s", msg)
             pushed_rules += 1
-            log.info("Pushed %s", msg)
         except (NsxApiError, Exception) as e:
-            err = f"Failed pushing rule {r.file_path}: {e}"
+            err = f"Failed upserting rule {r.file_path}: {e}"
             log.error(err)
             errors.append(err)
 
