@@ -22,9 +22,9 @@ DEFAULT_INPUT_DIR = REPO_ROOT / "nsx_promoted_groups"
 
 
 def iter_group_files(root: Path) -> Iterator[Path]:
-    for path in root.rglob("*"):
-        if path.suffix.lower() in {".yaml", ".yml", ".json"}:
-            yield path
+    for p in root.rglob("*"):
+        if p.suffix.lower() in {".yaml", ".yml", ".json"}:
+            yield p
 
 
 def load_doc(path: Path) -> Dict[str, Any]:
@@ -34,42 +34,43 @@ def load_doc(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def client_put(client: NsxPolicyClient, path: str, payload: Dict[str, Any]) -> None:
+def derive_domain_and_group_id(file_path: Path, doc: Dict[str, Any], default_domain: str) -> tuple[str, str]:
     """
-    Support different client implementations:
-      - client.put(path, payload)
-      - client._put(path, payload)   (positional; no json=)
+    Prefer IDs from the document, fall back to parsing the promoted directory structure:
+      .../domains/<domain_id>/groups/<group_file>.yaml
     """
-    if hasattr(client, "put") and callable(getattr(client, "put")):
-        client.put(path, payload)
-        return
+    group_id = doc.get("id") or doc.get("display_name")
+    domain_id = default_domain
 
-    if hasattr(client, "_put") and callable(getattr(client, "_put")):
-        client._put(path, payload)  # IMPORTANT: no json= keyword
-        return
+    parts = [x for x in file_path.parts]
+    if "domains" in parts:
+        i = parts.index("domains")
+        if i + 1 < len(parts):
+            domain_id = parts[i + 1]
 
-    raise AttributeError("NsxPolicyClient has neither put() nor _put()")
+    if not group_id:
+        raise ValueError("Group document missing 'id' (and no display_name fallback)")
 
-
-def push_group(client: NsxPolicyClient, domain_id: str, group_id: str, payload: Dict[str, Any]) -> None:
-    path = f"/policy/api/v1/infra/domains/{domain_id}/groups/{group_id}"
-    log.info("Pushing group %s to %s", group_id, path)
-    client_put(client, path, payload)
+    return domain_id, group_id
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Push ONLY NSX Groups from promoted artifacts")
+    parser = argparse.ArgumentParser(description="Push ONLY NSX Groups from nsx_promoted_groups")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR,
-                        help="Directory containing promoted group files")
+                        help="Directory containing promoted group files (default: nsx_promoted_groups)")
     parser.add_argument("--manager", required=True, choices=["gm1", "lm1", "lm2", "lm3", "lm4"],
                         help="NSX manager target")
-    parser.add_argument("--domain", default="default", help="NSX domain ID (default: default)")
+    parser.add_argument("--domain", default="default",
+                        help="Default domain ID if not derivable from path (default: default)")
 
-    # Federation flag: default True for gm1, False otherwise
+    # Federation behavior: you said GM must be federation_global=True
     parser.add_argument("--federation-global", action="store_true",
-                        help="Use federation global mode (recommended for GM pushes)")
+                        help="Force federation_global=True")
     parser.add_argument("--no-federation-global", action="store_true",
-                        help="Force federation global mode off")
+                        help="Force federation_global=False")
+
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Do not push, only print what would be pushed")
 
     args = parser.parse_args()
 
@@ -81,42 +82,45 @@ def main() -> None:
         "lm4": nsx_lm4,
     }
 
-    # Decide federation_global:
+    # Default federation_global True for GM, False otherwise (overrideable)
     if args.no_federation_global:
         federation_global = False
     elif args.federation_global:
         federation_global = True
     else:
-        federation_global = (args.manager == "gm1")  # sensible default
+        federation_global = (args.manager == "gm1")
 
-    # Instantiate client correctly
     client = NsxPolicyClient(manager_map[args.manager], federation_global=federation_global)
 
     input_dir = args.input_dir
-    domain_id = args.domain
-
-    # Allow passing either:
-    # - nsx_promoted_groups (root)
-    # - nsx_promoted_groups/nsx-gm1.lab.local/domains/default/groups (leaf)
-    # We’ll just walk whatever you provide.
     if not input_dir.exists():
         raise SystemExit(f"Input directory does not exist: {input_dir}")
 
     total = 0
-    errors = 0
     skipped = 0
+    errors = 0
 
     for file_path in iter_group_files(input_dir):
         try:
             doc = load_doc(file_path)
 
-            group_id = doc.get("id") or doc.get("display_name")
-            if not group_id:
-                log.warning("Skipping %s (missing id/display_name)", file_path)
+            # Only push actual group objects (cheap guardrail)
+            # Typical group docs include 'expression' and 'resource_type'
+            if "expression" not in doc and doc.get("resource_type") != "Group":
+                # Some exports omit resource_type; expression is a good indicator for IP groups
+                log.debug("Skipping non-group-ish file: %s", file_path)
                 skipped += 1
                 continue
 
-            push_group(client, domain_id, group_id, doc)
+            domain_id, group_id = derive_domain_and_group_id(file_path, doc, args.domain)
+
+            if args.dry_run:
+                log.info("[DRY-RUN] Would push group %s in domain %s from %s", group_id, domain_id, file_path)
+            else:
+                # IMPORTANT: use client.put_group so POLICY_ROOT is applied correctly
+                log.info("Pushing group %s (domain=%s) from %s", group_id, domain_id, file_path)
+                client.put_group(group_id=group_id, payload=doc, domain_id=domain_id)
+
             total += 1
 
         except Exception as e:
