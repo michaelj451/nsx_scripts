@@ -44,7 +44,7 @@ DEFAULT_GM_NAME = "nsx-gm1.lab.local"
 DEFAULT_DOMAIN = "default"
 DEFAULT_LM_NAME = "nsx-lm1.lab.local"
 
-DEFAULT_EXPORT_ROOT = REPO_ROOT / "nsx_export" / DEFAULT_GM_NAME / "domains" / DEFAULT_DOMAIN
+DEFAULT_EXPORT_ROOT = REPO_ROOT / "nsx_export" / DEFAULT_GM_NAME / "domains"
 
 DEFAULT_GM_OUT_DIR = REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DOMAIN / "groups"
 DEFAULT_RULES_OUT_DIR = REPO_ROOT / "nsx_updated_rules" / DEFAULT_GM_NAME / "domains" / DEFAULT_DOMAIN
@@ -274,6 +274,40 @@ def update_group_refs_in_rule(
 
     return {"touched": bool(changes), "changes": changes}
 
+def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
+    """
+    Normalize loaded YAML/JSON into a list of group dict payloads.
+    Handles:
+      - single group dict
+      - list of group dicts
+      - container dicts with common keys
+    """
+    groups: List[Dict[str, Any]] = []
+
+    if isinstance(doc, dict):
+        if is_group_payload(doc):
+            return [doc]
+
+        # Common container keys seen in exports
+        for key in ("results", "children", "items", "data", "objects"):
+            val = doc.get(key)
+            if isinstance(val, list):
+                for x in val:
+                    if isinstance(x, dict) and is_group_payload(x):
+                        groups.append(x)
+            elif isinstance(val, dict) and is_group_payload(val):
+                groups.append(val)
+
+        return groups
+
+    if isinstance(doc, list):
+        for x in doc:
+            if isinstance(x, dict) and is_group_payload(x):
+                groups.append(x)
+        return groups
+
+    return groups
+
 
 def iter_rules_from_doc(doc: Any) -> Iterator[Tuple[str, Dict[str, Any], Optional[int]]]:
     """
@@ -357,6 +391,8 @@ def main() -> None:
     domain: str = args.domain
     gm_name: str = args.gm_name
 
+    logging.info(f"path to lm groups: {export_root}/{lm_name}/groups")
+
     lm_groups_dir = export_root / lm_name / "groups"
 
     if args.rules_dir is None:
@@ -390,32 +426,54 @@ def main() -> None:
     for f in iter_docs(lm_groups_dir):
         try:
             doc = load_doc(f)
+            log.info(
+                "Loaded %s: type=%s keys=%s",
+                f.name,
+                type(doc).__name__,
+                list(doc.keys())[:10] if isinstance(doc, dict) else "",
+            )
         except Exception as e:
             log.warning("Skip unreadable file %s: %s", f, e)
             continue
 
-        if not is_group_payload(doc):
+        group_docs = extract_group_payloads(doc)
+        if not group_docs:
+            log.debug("No group payloads found in file %s (top type=%s)", f, type(doc).__name__)
             continue
 
-        old_path = get_group_path(doc) or ""
-        if old_path and not looks_local_path(old_path):
-            continue
+        for gdoc in group_docs:
+            old_path = get_group_path(gdoc)
 
-        new_group, promo = promote_group_payload(doc, suffix=suffix, domain=domain)
-        promo = Promotion(
-            old_id=promo.old_id,
-            old_name=promo.old_name,
-            old_path=promo.old_path,
-            new_id=promo.new_id,
-            new_name=promo.new_name,
-            new_path=promo.new_path,
-            source_file=str(f),
+            # Skip only if clearly already global
+            # if isinstance(old_path, str) and old_path.startswith("/global-infra/"):
+            #     log.debug("Skipping group %s (already global): path=%s", get_group_name(gdoc), old_path)
+            #     continue
+
+            new_group, promo0 = promote_group_payload(gdoc, suffix=suffix, domain=domain)
+
+            promo = Promotion(
+                old_id=promo0.old_id,
+                old_name=promo0.old_name,
+                old_path=promo0.old_path,
+                new_id=promo0.new_id,
+                new_name=promo0.new_name,
+                new_path=promo0.new_path,
+                source_file=str(f),
+            )
+
+            # IMPORTANT: avoid overwrite if a file contains multiple groups
+            out_file = gm_out / f"{promo.new_id}.yaml"
+
+            promotions.append(promo)
+            promoted_groups.append((out_file, new_group, promo))
+
+        log.info(
+            "Group candidate: display_name=%s id=%s path=%s",
+            gdoc.get("display_name"),
+            gdoc.get("id"),
+            gdoc.get("path"),
         )
 
-        out_file = gm_out / (f.stem + f"{suffix}.yaml")
-
-        promotions.append(promo)
-        promoted_groups.append((out_file, new_group, promo))
 
     log.info("Found %d LM groups to promote from %s.", len(promotions), lm_groups_dir)
 

@@ -207,3 +207,8 @@ python tools/nsx/push_nsx_groups.py \
   --input-dir nsx_groups_additive \
   --domain-id nsx-lm1.lab.local \
   --apply
+
+
+5) Promote Local groups to Global
+
+python tools/nsx/promote_local_groups.py
