@@ -223,3 +223,12 @@ python tools/nsx/promote_local_groups.py
 6) Push Promoted Groups
 
 python tools/nsx/push_groups_only.py --manager gm1 --federation-global  
+
+
+7) Create Updated Rule Fiels
+
+python tools/nsx/update_rules_from_promoted_groups.py \
+  --gm-name nsx-gm1.lab.local \
+  --rules-domain default \
+  --dst-domain default \
+  --suffix _to_gm
