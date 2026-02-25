@@ -110,7 +110,7 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --gm-name nsx-gm1.lab.local \
   --rules-domain default \
   --dst-domain default \
-  --suffix _to_gm \
+  --suffix _svb_m3 \
   --dry-run
 ```
 
@@ -121,7 +121,7 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --gm-name nsx-gm1.lab.local \
   --rules-domain default \
   --dst-domain default \
-  --suffix _to_gm
+  --suffix _svb_m3
 ```
 
 Write Complete Ruleset Tree:
@@ -134,6 +134,15 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --suffix _to_gm \
   --write-all --copy-unchanged
 ```
+
+Push Updated Ruleset Tree:
+
+python tools/nsx/update_rules_from_promoted_groups.py \
+  --gm-name nsx-gm1.lab.local \
+  --rules-domain default \
+  --dst-domain default \
+  --suffix _svb_m3
+
 
 ------------------------------------------------------------------------
 

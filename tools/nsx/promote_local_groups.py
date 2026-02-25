@@ -49,7 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_GM_NAME = "nsx-gm1.lab.local"
 DEFAULT_SRC_DOMAIN = "nsx-lm1.lab.local"  # where LM-scoped objects live on GM in your env
 DEFAULT_DST_DOMAIN = "default"            # shared/global domain you want to promote INTO
-DEFAULT_SUFFIX = "_to_gm"
+DEFAULT_SUFFIX = "_svb_m3"
 
 # Input groups default: additive/remapped groups
 DEFAULT_GROUPS_ROOT = REPO_ROOT / "nsx_groups_additive" / DEFAULT_GM_NAME / "domains"
