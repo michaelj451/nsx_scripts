@@ -58,7 +58,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Push ONLY NSX Groups from nsx_promoted_groups")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR,
                         help="Directory containing promoted group files (default: nsx_promoted_groups)")
-    parser.add_argument("--manager", required=True, choices=["gm1", "lm1", "lm2", "lm3", "lm4"],
+    parser.add_argument("--manager", 
+                        default="gm1",
+                        choices=["gm1", "lm1", "lm2", "lm3", "lm4"],
                         help="NSX manager target")
     parser.add_argument("--domain", default="default",
                         help="Default domain ID if not derivable from path (default: default)")
