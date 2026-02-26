@@ -1,10 +1,19 @@
-#!/usr/bin/env python3
 # app/nsx/nsx_constants.py
 import os
+from pathlib import Path
 from nsx.cli_bootstrap import load_dotenv
 
 # Load .env exactly once, early
 load_dotenv()
+
+def _expand_path(raw: str | None) -> str | None:
+    """
+    Expand $VARS and ~ in paths, and normalize to an absolute path.
+    """
+    if not raw:
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    return str(Path(expanded).resolve())
 
 # ---- NSX ----
 nsx_lm1 = os.getenv("NSX_LM1")
@@ -14,6 +23,15 @@ nsx_lm4 = os.getenv("NSX_LM4")
 nsx_gm1 = os.getenv("NSX_GM1")
 nsx_username = os.getenv("NSX_USERNAME")
 nsx_password = os.getenv("NSX_PASSWORD")
+object_appendix = os.getenv("OBJECT_APPENDIX")
+
+# Expand nested vars like $ROOT_DIR and $HOME
+nsx_log_dir = _expand_path(os.getenv("NSX_LOG_DIR"))
+
+# optional: safe fallback if NSX_LOG_DIR isn't set
+if not nsx_log_dir:
+    # repo-relative default, but don't import REPO_ROOT here if you want to keep constants lean
+    nsx_log_dir = str(Path("nsx_logs").resolve())
 
 # ---- domains ----
 NSX_DOMAINS = [

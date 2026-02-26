@@ -11,10 +11,10 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_object_functions.nsx_group_importer import GroupImportConfig, NsxGroupImporter
+from nsx.nsx_constants import nsx_log_dir
 
 DEFAULT_INPUT_DIR = "nsx_groups_additive"
-
-LOG_DIR_NAME = "nsx_logs"
+LOG_DIR_NAME = nsx_log_dir
 LOG_FILE_NAME = "push_nsx_groups.log"
 
 
