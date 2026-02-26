@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
+from nsx.nsx_constants import nsx_gm1
 
 try:
     import yaml  # PyYAML
@@ -41,7 +42,7 @@ log = logging.getLogger("push_updated_rules")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_GM_NAME = "nsx-gm1.lab.local"
+DEFAULT_GM_NAME = nsx_gm1               # used for default paths, not critical
 DEFAULT_DST_DOMAIN = "default"
 DEFAULT_RULES_DOMAIN = "default"
 
