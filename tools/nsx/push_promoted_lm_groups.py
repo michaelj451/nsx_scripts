@@ -114,6 +114,7 @@ def is_valid_group(doc: Dict[str, Any]) -> bool:
 
 def derive_domain_and_group_id(file_path: Path, doc: Dict[str, Any], default_domain: str) -> Tuple[str, str]:
     group_id = doc["id"]
+    display_name = doc.get("display_name", "<no name>")
     domain_id = default_domain
 
     parts = list(file_path.parts)
@@ -122,7 +123,7 @@ def derive_domain_and_group_id(file_path: Path, doc: Dict[str, Any], default_dom
         if i + 1 < len(parts):
             domain_id = parts[i + 1]
 
-    return domain_id, group_id
+    return domain_id, group_id, display_name
 
 
 # =============================================================================
@@ -203,12 +204,12 @@ def main() -> None:
                 log.debug("Skipping non-Group file: %s", file_path)
                 continue
 
-            domain_id, group_id = derive_domain_and_group_id(file_path, doc, args.domain)
+            domain_id, group_id, display_name = derive_domain_and_group_id(file_path, doc, args.domain)
 
             if args.dry_run:
-                log.info("[DRY-RUN] Would push group %s (domain=%s)", group_id, domain_id)
+                log.info("[DRY-RUN] Would push group display name %s group id %s (domain=%s)", display_name, group_id, domain_id)
             else:
-                log.info("Pushing group %s (domain=%s)", group_id, domain_id)
+                log.info("Pushing groupdisplay name %s group id %s (domain=%s)", display_name, group_id, domain_id)
                 client.put_group(group_id=group_id, payload=doc, domain_id=domain_id)
 
             total += 1
