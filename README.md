@@ -132,6 +132,27 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --suffix _svb_m3
 ```
 
+
+
+------------------------------------------------------------------------
+
+## 9) Push Rules
+
+``` bash
+python tools/nsx/push_updated_rules.py \
+  --manager gm1 \
+  --federation-global \
+  --rules-domain default
+```
+
+``` bash
+python tools/nsx/push_updated_rules.py \
+  --manager gm1 \
+  --federation-global \
+  --rules-domain default \
+  --apply
+```
+
 ------------------------------------------------------------------------
 
 Write Complete Ruleset Tree:
