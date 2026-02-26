@@ -64,10 +64,10 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --
 
 ------------------------------------------------------------------------
 
-## 5) Export All Objects
+## 5) Export All Local Manager Objects (LM1 example)
 
 ``` bash
-python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains --base-dir nsx_export_promote
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --base-dir nsx_export_promote --domain-id nsx-lm1.lab.local
 ```
 
 ------------------------------------------------------------------------
@@ -77,7 +77,7 @@ python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --o
 Dry Run:
 
 ``` bash
-python tools/nsx/push_promoted_lm_groups.py  --all-lm-domains --dry-run
+python tools/nsx/promote_local_groups.py
 ```
 
 Apply:
