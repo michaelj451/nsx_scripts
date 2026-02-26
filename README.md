@@ -77,13 +77,13 @@ python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --o
 Dry Run:
 
 ``` bash
-python tools/nsx/promote_local_groups.py --all-lm-domains --dry-run
+python tools/nsx/push_promoted_lm_groups.py  --all-lm-domains --dry-run
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/promote_local_groups.py --all-lm-domains
+python tools/nsx/push_promoted_lm_groups.py  --all-lm-domains
 ```
 
 ------------------------------------------------------------------------
@@ -93,13 +93,13 @@ python tools/nsx/promote_local_groups.py --all-lm-domains
 Dry Run:
 
 ``` bash
-python tools/nsx/push_new_global_groups.py --manager gm1 --federation-global --dry-run
+python tools/nsx/push_promoted_lm_groups.py --manager gm1 --federation-global --dry-run
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/push_new_global_groups.py --manager gm1 --federation-global
+python tools/nsx/push_promoted_lm_groups.py --manager gm1 --federation-global
 ```
 
 ------------------------------------------------------------------------
