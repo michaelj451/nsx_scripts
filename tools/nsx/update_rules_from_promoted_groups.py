@@ -21,6 +21,18 @@ when that promoted group exists.
 Modes:
   - default add-only: add promoted ref alongside LM ref
   - --replace: replace LM ref with promoted ref
+
+Logging:
+  - Runtime log file: <LOG_DIR>/update_rules_from_promoted_groups_YYYYMMDD_HHMMSS.log
+  - JSONL changes (one per changed rule file): <LOG_DIR>/nsx_rule_updates_from_promoted_groups.jsonl
+  - Pretty combined JSON: <LOG_DIR>/nsx_rule_updates_from_promoted_groups.pretty.json
+  - Pretty per-rule-file JSON: <LOG_DIR>/rule_updates_from_promoted/<relative/path>.json
+
+Dry-run behavior:
+  - Does NOT write updated rule files to nsx_updated_rules
+  - DOES write logs/JSONL/pretty/per-rule records the same as non-dry-run
+  - Uses a separate log directory with "_dry_run" appended to the directory name
+    (e.g., ".../nsx_logs_dry_run")
 """
 
 from __future__ import annotations
@@ -28,13 +40,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from nsx.nsx_constants import nsx_lm1, nsx_log_dir  # <- use env-backed values
+from nsx.nsx_constants import nsx_lm1, nsx_log_dir  # env-backed values
 
 try:
     import yaml  # PyYAML
@@ -49,64 +63,64 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES_EXPORT_BASE = REPO_ROOT / "nsx_export_promote"
 
 DEFAULT_GM_NAME = "nsx-gm1.lab.local"
-DEFAULT_RULES_DOMAIN = nsx_lm1 or "nsx-lm1.lab.local"   # <- default to LM1 domain exports
+DEFAULT_RULES_DOMAIN = nsx_lm1 or "nsx-lm1.lab.local"  # default to LM1 domain exports
 DEFAULT_DST_DOMAIN = "default"
 DEFAULT_SUFFIX = "_svb_m3"
 
-DEFAULT_PROMOTED_GROUPS_DIR = (
-    REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / "groups"
-)
-
-DEFAULT_RULES_DIR = (
-    RULES_EXPORT_BASE / DEFAULT_GM_NAME / "domains" / DEFAULT_RULES_DOMAIN / "security-policies"
-)
-
-DEFAULT_RULES_OUT_DIR = (
-    REPO_ROOT / "nsx_updated_rules" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / DEFAULT_RULES_DOMAIN / "security-policies"
-)
-
-# ---- Logging defaults ----
+# ---- Logging defaults (directory only; files are computed later) ----
 DEFAULT_LOG_DIR = Path(nsx_log_dir) if nsx_log_dir else (REPO_ROOT / "nsx_logs")
-DEFAULT_CHANGES_JSONL = DEFAULT_LOG_DIR / "nsx_rule_updates_from_promoted_groups.jsonl"
-DEFAULT_CHANGES_PRETTY = DEFAULT_LOG_DIR / "nsx_rule_updates_from_promoted_groups.pretty.json"
-DEFAULT_RULE_LOG_DIR = DEFAULT_LOG_DIR / "rule_updates_from_promoted"
 
 
-# -----------------------------
-# Log Helpers
-# -----------------------------
+# =============================================================================
+# Logging helpers
+# =============================================================================
 
-import os
-from datetime import datetime
-
-def _resolve_log_dir(log_dir_arg: Path | None) -> Path:
+def _append_dry_run_suffix(dir_path: Path) -> Path:
     """
-    Resolve log dir with env-backed nsx_log_dir support.
-    - If --log-dir is passed, use that
-    - Else use nsx_log_dir from nsx_constants (already expanded in your Option A fix)
-    - Else fallback to repo/nsx_logs
-    Always mkdir.
+    Append '_dry_run' to the directory name (not as a subdir).
+    Example: /a/b/nsx_logs -> /a/b/nsx_logs_dry_run
     """
-    if log_dir_arg:
-        p = Path(os.path.expandvars(os.path.expanduser(str(log_dir_arg)))).resolve()
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    if nsx_log_dir:
-        p = Path(os.path.expandvars(os.path.expanduser(str(nsx_log_dir)))).resolve()
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    p = (REPO_ROOT / "nsx_logs").resolve()
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return dir_path.with_name(dir_path.name + "_dry_run")
 
 
-def _setup_logging(tool_name: str, log_dir_arg: Path | None, level: str) -> Path:
+def _resolve_log_dir(log_dir_arg: Path | None, *, dry_run: bool) -> Path:
     """
-    Configure console + file logging. Returns log file path.
+    Resolve base log directory:
+      - If --log-dir is passed: use it
+      - Else use env-backed nsx_log_dir
+      - Else fallback to repo/nsx_logs
+
+    For dry-run: logs go under <base>/dry_run
+    For normal run: logs go under <base>
     """
-    log_dir = _resolve_log_dir(log_dir_arg)
+    if log_dir_arg is not None:
+        raw = str(log_dir_arg)
+    elif nsx_log_dir:
+        raw = str(nsx_log_dir)
+    else:
+        raw = str(REPO_ROOT / "nsx_logs")
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    base = Path(expanded)
+
+    if not base.is_absolute():
+        base = (REPO_ROOT / base)
+
+    base = base.resolve()
+    base.mkdir(parents=True, exist_ok=True)
+
+    if dry_run:
+        effective = base / "rule_updates_from_promoted_dry_run"
+        effective.mkdir(parents=True, exist_ok=True)
+        return effective
+
+    return base
+
+
+def _setup_logging(tool_name: str, log_dir: Path, level: str) -> Path:
+    """
+    Configure console + file logging. Returns runtime log file path.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = (log_dir / f"{tool_name}_{ts}.log").resolve()
 
@@ -137,9 +151,15 @@ def _setup_logging(tool_name: str, log_dir_arg: Path | None, level: str) -> Path
     return log_file
 
 
-# -----------------------------
+def write_jsonl_record(fh, record: Dict[str, Any]) -> None:
+    fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+    fh.flush()
+
+
+# =============================================================================
 # IO helpers
-# -----------------------------
+# =============================================================================
+
 def load_doc(path: Path) -> Any:
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() in (".yaml", ".yml"):
@@ -148,13 +168,16 @@ def load_doc(path: Path) -> Any:
         return json.loads(text)
     raise ValueError(f"Unsupported file type: {path}")
 
+
 def write_yaml(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
+
 def write_json(path: Path, data: Any, *, indent: int = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=indent), encoding="utf-8")
+
 
 def iter_docs(root: Path, exts: Tuple[str, ...] = (".yaml", ".yml", ".json")) -> Iterator[Path]:
     if not root.exists():
@@ -163,17 +186,15 @@ def iter_docs(root: Path, exts: Tuple[str, ...] = (".yaml", ".yml", ".json")) ->
         if p.is_file() and p.suffix.lower() in exts:
             yield p
 
-def write_jsonl_record(fh, record: Dict[str, Any]) -> None:
-    fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-    fh.flush()
 
-
-# -----------------------------
+# =============================================================================
 # Group detection / normalization
-# -----------------------------
+# =============================================================================
+
 def is_group_payload(doc: Any) -> bool:
-    # re-added strict requirement
+    # STRICT requirement (as requested)
     return isinstance(doc, dict) and doc.get("resource_type") == "Group"
+
 
 def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
     groups: List[Dict[str, Any]] = []
@@ -196,11 +217,13 @@ def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
     return groups
 
 
-# -----------------------------
+# =============================================================================
 # Rule detection
-# -----------------------------
+# =============================================================================
+
 def is_rule_container(doc: Any) -> bool:
     return isinstance(doc, dict) and isinstance(doc.get("rules"), list)
+
 
 def is_rule_payload(doc: Any) -> bool:
     if not isinstance(doc, dict):
@@ -212,7 +235,9 @@ def is_rule_payload(doc: Any) -> bool:
         return True
     return False
 
+
 def iter_rules_from_doc(doc: Any) -> Iterator[Tuple[str, Dict[str, Any], Optional[int]]]:
+    """Yields (kind, rule_dict, index)."""
     if is_rule_container(doc):
         for i, r in enumerate(doc["rules"]):
             if isinstance(r, dict):
@@ -221,9 +246,10 @@ def iter_rules_from_doc(doc: Any) -> Iterator[Tuple[str, Dict[str, Any], Optiona
         yield ("single", doc, None)
 
 
-# -----------------------------
+# =============================================================================
 # Rule updating logic
-# -----------------------------
+# =============================================================================
+
 GROUP_REF_KEYS = {
     "source_groups",
     "destination_groups",
@@ -235,12 +261,14 @@ GROUP_REF_KEYS = {
 
 LM_GROUP_PATH_RE = re.compile(r"^/global-infra/domains/(?P<domain>[^/]+)/groups/(?P<gid>[^/]+)$")
 
+
 @dataclass(frozen=True)
 class PromotedIndex:
     suffix: str
     dst_domain: str
-    oldid_to_newid: Dict[str, str]
-    newid_to_path: Dict[str, str]
+    oldid_to_newid: Dict[str, str]  # old_id -> new_id
+    newid_to_path: Dict[str, str]   # new_id -> full path
+
 
 def build_promoted_index(promoted_groups_dir: Path, *, suffix: str, dst_domain: str) -> PromotedIndex:
     oldid_to_newid: Dict[str, str] = {}
@@ -268,9 +296,19 @@ def build_promoted_index(promoted_groups_dir: Path, *, suffix: str, dst_domain: 
             oldid_to_newid[old_id] = gid
             newid_to_path[gid] = new_path
 
-    return PromotedIndex(suffix=suffix, dst_domain=dst_domain, oldid_to_newid=oldid_to_newid, newid_to_path=newid_to_path)
+    return PromotedIndex(
+        suffix=suffix,
+        dst_domain=dst_domain,
+        oldid_to_newid=oldid_to_newid,
+        newid_to_path=newid_to_path,
+    )
+
 
 def remap_lm_ref_to_promoted(ref: str, *, promoted: PromotedIndex) -> Optional[Tuple[str, str, str]]:
+    """
+    If ref looks like /global-infra/domains/<domain>/groups/<gid> AND <domain> != dst_domain,
+    and we have a promoted group for that gid, return (old_ref, new_ref, old_domain).
+    """
     if not isinstance(ref, str) or not ref:
         return None
     m = LM_GROUP_PATH_RE.match(ref)
@@ -280,6 +318,7 @@ def remap_lm_ref_to_promoted(ref: str, *, promoted: PromotedIndex) -> Optional[T
     old_domain = m.group("domain")
     old_id = m.group("gid")
 
+    # ignore refs already in dst domain
     if old_domain == promoted.dst_domain:
         return None
 
@@ -288,6 +327,7 @@ def remap_lm_ref_to_promoted(ref: str, *, promoted: PromotedIndex) -> Optional[T
         return None
 
     return (ref, promoted.newid_to_path[new_id], old_domain)
+
 
 def update_rule_refs_from_promoted(rule: Dict[str, Any], *, promoted: PromotedIndex, replace: bool) -> Dict[str, Any]:
     changes: List[Dict[str, Any]] = []
@@ -334,15 +374,16 @@ def update_rule_refs_from_promoted(rule: Dict[str, Any], *, promoted: PromotedIn
     return {"touched": touched, "changes": changes}
 
 
-# -----------------------------
+# =============================================================================
 # Main
-# -----------------------------
+# =============================================================================
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Update rules by mapping LM group refs to promoted GM groups.")
 
     ap.add_argument("--gm-name", type=str, default=DEFAULT_GM_NAME)
     ap.add_argument("--rules-domain", type=str, default=DEFAULT_RULES_DOMAIN,
-                    help="Domain folder to read rules from (ex: nsx-lm1.lab.local).")
+                    help="Domain folder to read rules from (ex: nsx-lm1.lab.local OR default).")
     ap.add_argument("--dst-domain", type=str, default=DEFAULT_DST_DOMAIN)
     ap.add_argument("--suffix", type=str, default=DEFAULT_SUFFIX)
 
@@ -357,19 +398,26 @@ def main() -> None:
     ap.add_argument("--write-all", action="store_true")
     ap.add_argument("--copy-unchanged", action="store_true")
 
-    ap.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
+    ap.add_argument("--log-dir", type=Path, default=None,
+                    help="Base log directory. For dry-run, '_dry_run' is appended to this directory name.")
     ap.add_argument("--changes-jsonl", type=Path, default=None)
     ap.add_argument("--changes-pretty", type=Path, default=None)
     ap.add_argument("--log-level", type=str, default="INFO")
 
     args = ap.parse_args()
 
+    # Resolve effective log directory (dry-run gets its own dir)
+    effective_log_dir = _resolve_log_dir(args.log_dir, dry_run=bool(args.dry_run))
+
+    # Setup runtime logging (console + file) into effective_log_dir
     log_file = _setup_logging(
         tool_name="update_rules_from_promoted_groups",
-        log_dir_arg=args.log_dir,
+        log_dir=effective_log_dir,
         level=args.log_level,
     )
     log.info("Log file:            %s", log_file)
+    log.info("Dry-run:             %s", bool(args.dry_run))
+    log.info("Effective log dir:   %s", effective_log_dir)
 
     gm_name = args.gm_name
     rules_domain = args.rules_domain
@@ -388,15 +436,17 @@ def main() -> None:
         REPO_ROOT / "nsx_updated_rules" / gm_name / "domains" / dst_domain / rules_domain / "security-policies"
     )
 
-    log_dir: Path = Path(args.log_dir)
-    changes_jsonl: Path = args.changes_jsonl or (log_dir / "nsx_rule_updates_from_promoted_groups.jsonl")
-    changes_pretty: Path = args.changes_pretty or (log_dir / "nsx_rule_updates_from_promoted_groups.pretty.json")
-    per_rule_log_dir: Path = log_dir / "rule_updates_from_promoted"
+    # Logs/records ALWAYS go to effective_log_dir (including dry-run)
+    changes_jsonl: Path = args.changes_jsonl or (effective_log_dir / "nsx_rule_updates_from_promoted_groups.jsonl")
+    changes_pretty: Path = args.changes_pretty or (effective_log_dir / "nsx_rule_updates_from_promoted_groups.pretty.json")
+    per_rule_log_dir: Path = effective_log_dir / "rule_updates_from_promoted"
 
     log.info("Promoted groups dir: %s", promoted_groups_dir)
     log.info("Rules input dir:     %s", rules_dir)
     log.info("Rules output dir:    %s", rules_out_dir)
     log.info("Mode:                %s", "REPLACE" if args.replace else "ADD-ONLY")
+    log.info("Will write records:  %s", True)
+    log.info("Will write rules:    %s", (not args.dry_run))
 
     if not promoted_groups_dir.exists():
         raise SystemExit(f"Promoted groups dir not found: {promoted_groups_dir}")
@@ -406,20 +456,21 @@ def main() -> None:
     promoted = build_promoted_index(promoted_groups_dir, suffix=suffix, dst_domain=dst_domain)
     log.info("Loaded %d promoted group mapping(s).", len(promoted.oldid_to_newid))
 
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure record dirs exist
+    effective_log_dir.mkdir(parents=True, exist_ok=True)
     per_rule_log_dir.mkdir(parents=True, exist_ok=True)
     changes_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    changes_fh = None
+    # We ALWAYS write JSONL + pretty + per-rule records, even in dry-run
+    changes_fh = changes_jsonl.open("w", encoding="utf-8")
     all_records: List[Dict[str, Any]] = []
     records_written = 0
-
-    if not args.dry_run:
-        changes_fh = changes_jsonl.open("w", encoding="utf-8")
 
     total_files = 0
     changed_files = 0
     touched_rules = 0
+    copied_unchanged = 0
+    written_files = 0
 
     for rf in iter_docs(rules_dir):
         total_files += 1
@@ -446,22 +497,29 @@ def main() -> None:
 
         out_path = rules_out_dir / rf.relative_to(rules_dir)
 
+        # Write updated rules ONLY when not dry-run
         if not args.dry_run:
             if any_change_in_file or args.write_all:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
+
                 if (not any_change_in_file) and args.write_all and args.copy_unchanged:
                     shutil.copy2(rf, out_path)
+                    copied_unchanged += 1
+                    written_files += 1
                 else:
                     if rf.suffix.lower() in (".yaml", ".yml"):
                         write_yaml(out_path, rdoc)
                     else:
                         write_json(out_path, rdoc, indent=2)
+                    written_files += 1
 
         if any_change_in_file:
             changed_files += 1
+            log.info("[DRY-RUN] Would update %s", rf) if args.dry_run else log.info("Updated %s", rf)
 
             rec = {
                 "type": "rule_file_update_from_promoted_groups",
+                "dry_run": bool(args.dry_run),
                 "gm_name": gm_name,
                 "rules_domain": rules_domain,
                 "dst_domain": dst_domain,
@@ -474,29 +532,34 @@ def main() -> None:
                 "changes": file_changes,
             }
 
-            if args.dry_run:
-                log.info("[DRY-RUN] Would update %s", rf)
-            else:
-                all_records.append(rec)
-                if changes_fh:
-                    write_jsonl_record(changes_fh, rec)
-                    records_written += 1
+            all_records.append(rec)
+            write_jsonl_record(changes_fh, rec)
+            records_written += 1
 
-                pretty_path = per_rule_log_dir / rf.relative_to(rules_dir)
-                pretty_path = pretty_path.with_suffix(".json")
-                write_json(pretty_path, rec, indent=2)
+            # Per-file pretty record
+            pretty_path = per_rule_log_dir / rf.relative_to(rules_dir)
+            pretty_path = pretty_path.with_suffix(".json")
+            write_json(pretty_path, rec, indent=2)
 
-    if changes_fh:
-        changes_fh.close()
+    changes_fh.close()
 
-    if (not args.dry_run) and all_records:
-        write_json(changes_pretty, all_records, indent=2)
+    # Pretty combined JSON (ALWAYS written, even dry-run)
+    write_json(changes_pretty, all_records, indent=2)
 
-    log.info("Complete. Total files=%d, changed files=%d, touched rules=%d", total_files, changed_files, touched_rules)
+    log.info(
+        "Complete. Total files=%d, changed files=%d, touched rules=%d",
+        total_files, changed_files, touched_rules
+    )
+    log.info("Records written (jsonl): %d -> %s", records_written, changes_jsonl)
+    log.info("Pretty combined:         %s", changes_pretty)
+    log.info("Per-file logs:           %s", per_rule_log_dir)
+
     if not args.dry_run:
-        log.info("Change log: %s (records=%d)", changes_jsonl, records_written)
-        log.info("Pretty log:  %s", changes_pretty)
-        log.info("Per-file logs:%s", per_rule_log_dir)
+        log.info("Rule files written:      %d", written_files)
+        if args.write_all and args.copy_unchanged:
+            log.info("Unchanged files copied:  %d", copied_unchanged)
+    else:
+        log.info("Dry-run: rule files were NOT written.")
 
 
 if __name__ == "__main__":
