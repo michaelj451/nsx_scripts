@@ -40,12 +40,14 @@ from nsx.nsx_object_functions.nsx_group_remap import (
     add_mapped_ips_in_doc,
 )
 
+EXPORT_ROOT = "nsx_export_promote"
+
 # =============================================================================
 # Paths / Defaults
 # =============================================================================
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
+NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / EXPORT_ROOT
 NSX_UPDATED_DIR_DEFAULT = REPO_ROOT / "nsx_groups_additive"
 CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
