@@ -1,28 +1,87 @@
 #!/usr/bin/env python3
-# tools/nsx/export_nsx_objects.py
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
-import logging
 import json
+import logging
+import os
 import shutil
+from datetime import datetime
+from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_object_functions.nsx_object_exporter import run_export
-from nsx.nsx_constants import resolve_manager
+from nsx.nsx_constants import resolve_manager, nsx_log_dir
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+# =============================================================================
+# Repo Root
+# =============================================================================
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+from pathlib import Path
+from nsx.nsx_constants import nsx_log_dir
+
+def _resolve_log_dir() -> Path:
+    if not nsx_log_dir:
+        raise RuntimeError("nsx_log_dir is empty (NSX_LOG_DIR not loaded?)")
+
+    p = Path(nsx_log_dir).resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _setup_logging(tool_name: str) -> Path:
+    log_dir = _resolve_log_dir()
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = (log_dir / f"{tool_name}_{ts}.log").resolve()
+
+    # Force file creation immediately
+    log_file.touch(exist_ok=True)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Clear existing handlers
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+    )
+
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(fmt)
+
+    root.addHandler(ch)
+    root.addHandler(fh)
+
+    logging.getLogger(__name__).info("Logging to %s", log_file)
+    return log_file
+
 
 log = logging.getLogger(__name__)
 
+# =============================================================================
+# Helpers
+# =============================================================================
 
 def _resolve_manager_base(base_dir: str, manager_name: str) -> Path:
-    """
-    If base_dir already ends with manager_name, don't append it again.
-    Examples:
-      base_dir="nsx_export" -> nsx_export/nsx-gm1.lab.local
-      base_dir="nsx_export/nsx-gm1.lab.local" -> nsx_export/nsx-gm1.lab.local
-    """
     base = Path(base_dir)
     if base.name == manager_name:
         return base
@@ -30,18 +89,10 @@ def _resolve_manager_base(base_dir: str, manager_name: str) -> Path:
 
 
 def _manager_dirname(manager_host: str) -> str:
-    # Normalize "https://nsx-gm1.lab.local" -> "nsx-gm1.lab.local"
     return manager_host.replace("https://", "").rstrip("/")
 
 
 def _extract_domain_ids(domains_payload) -> list[str]:
-    """
-    Accepts common shapes:
-      - {"domains": [ { "id": "...", "path": "...", ... }, ... ], ...}
-      - [ { "id": "..."} , ... ]
-      - ["default", "prod", ...]
-    Returns: list of domain IDs (strings)
-    """
     if domains_payload is None:
         return []
 
@@ -49,6 +100,7 @@ def _extract_domain_ids(domains_payload) -> list[str]:
         domains_payload = domains_payload.get("domains", [])
 
     domain_ids: list[str] = []
+
     for d in domains_payload:
         if isinstance(d, str):
             domain_ids.append(d)
@@ -56,51 +108,11 @@ def _extract_domain_ids(domains_payload) -> list[str]:
             domain_ids.append(d["id"])
         else:
             domain_ids.append(getattr(d, "id"))
+
     return domain_ids
 
 
-def _write_manager_manifest(
-    manager_base: Path,
-    manager_host: str,
-    federation_global: bool,
-    domains_payload,
-) -> None:
-    """
-    Writes a small manifest at:
-      <base-dir>/<manager>/_manifest.json
-    """
-    try:
-        manifest = {
-            "manager": manager_host,
-            "federation_global": federation_global,
-        }
-
-        if isinstance(domains_payload, dict):
-            for key in ("policy_root", "manager", "federation_global"):
-                if key in domains_payload:
-                    manifest[key] = domains_payload[key]
-            if "domains" in domains_payload:
-                manifest["domains"] = domains_payload["domains"]
-
-        manager_base.mkdir(parents=True, exist_ok=True)
-        (manager_base / "_manifest.json").write_text(
-            json.dumps(manifest, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        log.warning("Failed to write manager manifest: %s", e)
-
-
 def _purge_groups_output_dirs(manager_base: Path, domain_id: str) -> None:
-    """
-    Always delete pre-existing exported GROUP files for the target domain,
-    for both supported layouts:
-
-      NEW: <manager_base>/<domain_id>/groups
-      OLD: <manager_base>/domains/<domain_id>/groups
-
-    This prevents stale group files from lingering across exports.
-    """
     candidates = [
         manager_base / domain_id / "groups",
         manager_base / "domains" / domain_id / "groups",
@@ -112,50 +124,91 @@ def _purge_groups_output_dirs(manager_base: Path, domain_id: str) -> None:
             shutil.rmtree(p)
 
 
+# =============================================================================
+# Object Counting
+# =============================================================================
+
+def _iter_object_files(dir_path: Path) -> list[Path]:
+    if not dir_path.exists():
+        return []
+    files: list[Path] = []
+    for ext in ("*.yaml", "*.yml", "*.json"):
+        files.extend(dir_path.rglob(ext))
+    return files
+
+
+def _load_object(path: Path) -> dict:
+    try:
+        if path.suffix.lower() in (".yaml", ".yml"):
+            if yaml is None:
+                return {}
+            with path.open("r", encoding="utf-8") as f:
+                return yaml.safe_load(f)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Failed to parse %s: %s", path, e)
+        return {}
+
+
+def _count_domain_objects(manager_base: Path, domain_id: str) -> dict[str, int]:
+    new_root = manager_base / domain_id
+    old_root = manager_base / "domains" / domain_id
+    root = new_root if new_root.exists() else old_root
+
+    counts = {
+        "services_total": 0,
+        "groups_total": 0,
+        "policies_total": 0,
+        "rules_total": 0,
+    }
+
+    # Services
+    for f in _iter_object_files(root / "services"):
+        counts["services_total"] += 1
+
+    # Groups
+    for f in _iter_object_files(root / "groups"):
+        counts["groups_total"] += 1
+
+    # Policies + Rules
+    policies_dir = root / "security-policies"
+    if policies_dir.exists():
+        for policy_dir in policies_dir.iterdir():
+            if policy_dir.is_dir():
+                counts["policies_total"] += 1
+                rules_dir = policy_dir / "rules"
+                counts["rules_total"] += len(_iter_object_files(rules_dir))
+
+    return counts
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export NSX Policy objects (groups, services, policies, rules) to YAML/JSON"
+        description="Export NSX Policy objects (groups, services, policies, rules)"
     )
-    parser.add_argument(
-        "--base-dir",
-        default="nsx_export",
-        help="Base output directory (default: nsx_export)",
-    )
-    parser.add_argument(
-        "--domain-id",
-        default="default",
-        help="NSX Policy domain ID (default: default)",
-    )
-    parser.add_argument(
-        "--federation-global",
-        action="store_true",
-        help="Use global federation endpoints",
-    )
+    parser.add_argument("--base-dir", default="nsx_export")
+    parser.add_argument("--domain-id", default="default")
+    parser.add_argument("--federation-global", action="store_true")
     parser.add_argument(
         "--manager",
         choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
         default="nsx-lm1",
-        help="Which NSX manager to export from (default: nsx-lm1)",
     )
-    parser.add_argument(
-        "--output-format",
-        choices=["yaml", "json", "both"],
-        default="yaml",
-        help="Output format for exported objects (default: yaml)",
-    )
-    parser.add_argument(
-        "--all-domains",
-        action="store_true",
-        help="Export objects from all policy domains",
-    )
-
+    parser.add_argument("--output-format", choices=["yaml", "json", "both"], default="yaml")
+    parser.add_argument("--all-domains", action="store_true")
     args = parser.parse_args()
+
+    log_file = _setup_logging("export_nsx_objects")
 
     init_cli()
 
     manager_host = resolve_manager(args.manager)
     if not manager_host:
-        raise RuntimeError(f"NSX manager host is not set for {args.manager}. Check your .env.")
+        raise RuntimeError(f"Manager not defined for {args.manager}")
 
     client = NsxPolicyClient(
         nsxmanager=manager_host,
@@ -165,44 +218,45 @@ def main() -> None:
     manager_name = _manager_dirname(manager_host)
     manager_base = _resolve_manager_base(args.base_dir, manager_name)
 
-    all_stats: dict[str, object] = {}
+    log.info("Starting NSX export")
+    log.info("Manager: %s", manager_host)
+    log.info("Base dir: %s", manager_base.resolve())
+
+    all_stats = {}
+    all_counts = {}
 
     if args.all_domains:
         domains_payload = client.list_domains()
         domain_ids = _extract_domain_ids(domains_payload)
-
-        log.info("Found %d domains on %s", len(domain_ids), manager_name)
-
-        _write_manager_manifest(manager_base, manager_host, args.federation_global, domains_payload)
-
-        for domain_id in domain_ids:
-            log.info("Exporting domain: %s (manager: %s)", domain_id, manager_name)
-
-            # NEW: purge group output dirs for this domain before exporting
-            _purge_groups_output_dirs(manager_base, domain_id)
-
-            stats = run_export(
-                client=client,
-                base_dir=str(manager_base),
-                domain_id=domain_id,
-                output_format=args.output_format,
-            )
-            all_stats[domain_id] = stats
-
     else:
-        # NEW: purge group output dirs for this domain before exporting
-        _purge_groups_output_dirs(manager_base, args.domain_id)
+        domain_ids = [args.domain_id]
+
+    for domain_id in domain_ids:
+        log.info("Exporting domain: %s", domain_id)
+
+        _purge_groups_output_dirs(manager_base, domain_id)
 
         stats = run_export(
             client=client,
             base_dir=str(manager_base),
-            domain_id=args.domain_id,
+            domain_id=domain_id,
             output_format=args.output_format,
         )
-        all_stats[args.domain_id] = stats
 
-    log.info("NSX object export complete: %s", all_stats)
-    print(all_stats)
+        all_stats[domain_id] = stats
+        all_counts[domain_id] = _count_domain_objects(manager_base, domain_id)
+
+    log.info("Export complete.")
+    log.info("Stats: %s", all_stats)
+    log.info("Counts: %s", all_counts)
+
+    result = {
+        "export_stats": all_stats,
+        "object_counts": all_counts,
+        "log_file": str(log_file),
+    }
+
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
