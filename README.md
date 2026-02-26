@@ -70,6 +70,8 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --
 python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains --base-dir nsx_export_promote
 ```
 
+------------------------------------------------------------------------
+
 ## 6) Promote Local Groups to Global
 
 Dry Run:
@@ -91,13 +93,13 @@ python tools/nsx/promote_local_groups.py --all-lm-domains
 Dry Run:
 
 ``` bash
-python tools/nsx/push_groups_only.py --manager gm1 --federation-global --dry-run
+python tools/nsx/push_new_global_groups.py --manager gm1 --federation-global --dry-run
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/push_groups_only.py --manager gm1 --federation-global
+python tools/nsx/push_new_global_groups.py --manager gm1 --federation-global
 ```
 
 ------------------------------------------------------------------------
