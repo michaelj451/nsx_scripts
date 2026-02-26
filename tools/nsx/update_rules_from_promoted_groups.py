@@ -2,44 +2,25 @@
 """
 tools/nsx/update_rules_from_promoted_groups.py
 
-Read *promoted* GM groups (already created) and update a ruleset (typically GM shared domain)
-so any references to Local-Manager domain groups are mapped to the promoted GM groups.
+Update rules by mapping LM group references to promoted GM groups.
 
-This script does NOT promote groups. It only:
-- Reads promoted groups from:
-    <repo>/nsx_promoted_groups/<gm-name>/domains/<dst-domain>/groups
+Reads promoted groups from:
+  <repo>/nsx_promoted_groups/<gm-name>/domains/<dst-domain>/groups
 
-- Reads rules from:
-    <repo>/nsx_export/<gm-name>/domains/<rules-domain>/security-policies
+Reads rules from (NOTE: domain matters!):
+  <repo>/nsx_export_promote/<gm-name>/domains/<rules-domain>/security-policies
 
-- Writes UPDATED rules to:
-    <repo>/nsx_updated_rules/<gm-name>/domains/<dst-domain>/<rules-domain>/security-policies
+Writes updated rules to:
+  <repo>/nsx_updated_rules/<gm-name>/domains/<dst-domain>/<rules-domain>/security-policies
 
-How mapping works:
-- Promoted groups are assumed to have ids like: <old_id><suffix>  (default suffix "_svb_m3")
-- Rules may reference LM groups like:
-    /global-infra/domains/<lm-domain>/groups/<old_id>
-- If we have a promoted group id matching <old_id><suffix>, we can map:
-    /global-infra/domains/<lm-domain>/groups/<old_id>
-  -> /global-infra/domains/<dst-domain>/groups/<old_id><suffix>
+Mapping:
+  /global-infra/domains/<lm-domain>/groups/<old_id>
+    -> /global-infra/domains/<dst-domain>/groups/<old_id><suffix>
+when that promoted group exists.
 
-Update mode:
-- Default (add-only): if a rule contains an LM ref, add the promoted GM ref (leave LM ref in place)
-- --replace: replace the LM ref with the promoted GM ref
-
-Output behavior:
-- Default: write ONLY files that changed.
-- --write-all: also write/copy unchanged rule files to output, so output tree is complete.
-  - If --copy-unchanged: unchanged files are copied byte-for-byte (preserves formatting).
-  - Otherwise unchanged files are re-serialized from parsed YAML/JSON (may alter formatting).
-
-Logs:
-- JSONL (one record per changed rule file):
-    <repo>/nsx_logs/nsx_rule_updates_from_promoted_groups.jsonl
-- Pretty combined JSON:
-    <repo>/nsx_logs/nsx_rule_updates_from_promoted_groups.pretty.json
-- Pretty per-rule-file:
-    <repo>/nsx_logs/rule_updates_from_promoted/<relative/path>.json
+Modes:
+  - default add-only: add promoted ref alongside LM ref
+  - --replace: replace LM ref with promoted ref
 """
 
 from __future__ import annotations
@@ -53,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from nsx.nsx_constants import nsx_lm1, nsx_log_dir  # <- use env-backed values
+
 try:
     import yaml  # PyYAML
 except ImportError as e:
@@ -60,29 +43,38 @@ except ImportError as e:
 
 log = logging.getLogger("update_rules_from_promoted_groups")
 
-# -----------------------------
-# Repo defaults (match your layout)
-# -----------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# ---- Defaults (match your repo layout) ----
+RULES_EXPORT_BASE = REPO_ROOT / "nsx_export_promote"
+
 DEFAULT_GM_NAME = "nsx-gm1.lab.local"
-DEFAULT_RULES_DOMAIN = "default"          # production global manager rules live here
-DEFAULT_DST_DOMAIN = "default"            # where promoted groups live
+DEFAULT_RULES_DOMAIN = nsx_lm1 or "nsx-lm1.lab.local"   # <- default to LM1 domain exports
+DEFAULT_DST_DOMAIN = "default"
 DEFAULT_SUFFIX = "_svb_m3"
 
-DEFAULT_PROMOTED_GROUPS_DIR = REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / "groups"
-DEFAULT_RULES_ROOT = REPO_ROOT / "nsx_export" / DEFAULT_GM_NAME / "domains"
-DEFAULT_RULES_OUT_ROOT = REPO_ROOT / "nsx_updated_rules" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN
+DEFAULT_PROMOTED_GROUPS_DIR = (
+    REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / "groups"
+)
 
-DEFAULT_LOG_DIR = REPO_ROOT / "nsx_logs"
+DEFAULT_RULES_DIR = (
+    RULES_EXPORT_BASE / DEFAULT_GM_NAME / "domains" / DEFAULT_RULES_DOMAIN / "security-policies"
+)
+
+DEFAULT_RULES_OUT_DIR = (
+    REPO_ROOT / "nsx_updated_rules" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / DEFAULT_RULES_DOMAIN / "security-policies"
+)
+
+# ---- Logging defaults ----
+DEFAULT_LOG_DIR = Path(nsx_log_dir) if nsx_log_dir else (REPO_ROOT / "nsx_logs")
 DEFAULT_CHANGES_JSONL = DEFAULT_LOG_DIR / "nsx_rule_updates_from_promoted_groups.jsonl"
 DEFAULT_CHANGES_PRETTY = DEFAULT_LOG_DIR / "nsx_rule_updates_from_promoted_groups.pretty.json"
 DEFAULT_RULE_LOG_DIR = DEFAULT_LOG_DIR / "rule_updates_from_promoted"
 
+
 # -----------------------------
 # IO helpers
 # -----------------------------
-
 def load_doc(path: Path) -> Any:
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() in (".yaml", ".yml"):
@@ -110,19 +102,13 @@ def write_jsonl_record(fh, record: Dict[str, Any]) -> None:
     fh.write(json.dumps(record, separators=(",", ":")) + "\n")
     fh.flush()
 
-# -----------------------------
-# NSX detection / normalization
-# -----------------------------
 
+# -----------------------------
+# Group detection / normalization
+# -----------------------------
 def is_group_payload(doc: Any) -> bool:
-    if not isinstance(doc, dict):
-        return False
-    rt = doc.get("resource_type")
-    if rt == "Group":
-        return True
-    if "expression" in doc and "display_name" in doc and "id" in doc:
-        return True
-    return False
+    # re-added strict requirement
+    return isinstance(doc, dict) and doc.get("resource_type") == "Group"
 
 def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
     groups: List[Dict[str, Any]] = []
@@ -133,17 +119,21 @@ def extract_group_payloads(doc: Any) -> List[Dict[str, Any]]:
             val = doc.get(key)
             if isinstance(val, list):
                 for x in val:
-                    if isinstance(x, dict) and is_group_payload(x):
+                    if is_group_payload(x):
                         groups.append(x)
-            elif isinstance(val, dict) and is_group_payload(val):
+            elif is_group_payload(val):
                 groups.append(val)
         return groups
     if isinstance(doc, list):
         for x in doc:
-            if isinstance(x, dict) and is_group_payload(x):
+            if is_group_payload(x):
                 groups.append(x)
     return groups
 
+
+# -----------------------------
+# Rule detection
+# -----------------------------
 def is_rule_container(doc: Any) -> bool:
     return isinstance(doc, dict) and isinstance(doc.get("rules"), list)
 
@@ -158,7 +148,6 @@ def is_rule_payload(doc: Any) -> bool:
     return False
 
 def iter_rules_from_doc(doc: Any) -> Iterator[Tuple[str, Dict[str, Any], Optional[int]]]:
-    """Yields (kind, rule_dict, index)."""
     if is_rule_container(doc):
         for i, r in enumerate(doc["rules"]):
             if isinstance(r, dict):
@@ -166,10 +155,10 @@ def iter_rules_from_doc(doc: Any) -> Iterator[Tuple[str, Dict[str, Any], Optiona
     elif is_rule_payload(doc):
         yield ("single", doc, None)
 
+
 # -----------------------------
 # Rule updating logic
 # -----------------------------
-
 GROUP_REF_KEYS = {
     "source_groups",
     "destination_groups",
@@ -183,11 +172,10 @@ LM_GROUP_PATH_RE = re.compile(r"^/global-infra/domains/(?P<domain>[^/]+)/groups/
 
 @dataclass(frozen=True)
 class PromotedIndex:
-    """Lookup for promoted groups by old_id (without suffix)."""
     suffix: str
     dst_domain: str
-    oldid_to_newid: Dict[str, str]     # old_id -> new_id (old_id+suffix)
-    newid_to_path: Dict[str, str]      # new_id -> /global-infra/domains/<dst>/groups/<new_id>
+    oldid_to_newid: Dict[str, str]
+    newid_to_path: Dict[str, str]
 
 def build_promoted_index(promoted_groups_dir: Path, *, suffix: str, dst_domain: str) -> PromotedIndex:
     oldid_to_newid: Dict[str, str] = {}
@@ -205,8 +193,8 @@ def build_promoted_index(promoted_groups_dir: Path, *, suffix: str, dst_domain: 
             if not isinstance(gid, str) or not gid:
                 continue
             if not gid.endswith(suffix):
-                # This can happen if the directory contains other groups; ignore them.
                 continue
+
             old_id = gid[: -len(suffix)]
             if not old_id:
                 continue
@@ -215,22 +203,9 @@ def build_promoted_index(promoted_groups_dir: Path, *, suffix: str, dst_domain: 
             oldid_to_newid[old_id] = gid
             newid_to_path[gid] = new_path
 
-    return PromotedIndex(
-        suffix=suffix,
-        dst_domain=dst_domain,
-        oldid_to_newid=oldid_to_newid,
-        newid_to_path=newid_to_path,
-    )
+    return PromotedIndex(suffix=suffix, dst_domain=dst_domain, oldid_to_newid=oldid_to_newid, newid_to_path=newid_to_path)
 
-def remap_lm_ref_to_promoted(
-    ref: str,
-    *,
-    promoted: PromotedIndex,
-) -> Optional[Tuple[str, str, str]]:
-    """
-    If ref looks like /global-infra/domains/<domain>/groups/<gid> AND <domain> != dst_domain,
-    and we have a promoted group for that gid, return (old_ref, new_ref, old_domain).
-    """
+def remap_lm_ref_to_promoted(ref: str, *, promoted: PromotedIndex) -> Optional[Tuple[str, str, str]]:
     if not isinstance(ref, str) or not ref:
         return None
     m = LM_GROUP_PATH_RE.match(ref)
@@ -240,7 +215,6 @@ def remap_lm_ref_to_promoted(
     old_domain = m.group("domain")
     old_id = m.group("gid")
 
-    # ignore refs already in dst domain
     if old_domain == promoted.dst_domain:
         return None
 
@@ -248,20 +222,9 @@ def remap_lm_ref_to_promoted(
     if not new_id:
         return None
 
-    new_ref = promoted.newid_to_path[new_id]
-    return (ref, new_ref, old_domain)
+    return (ref, promoted.newid_to_path[new_id], old_domain)
 
-def update_rule_refs_from_promoted(
-    rule: Dict[str, Any],
-    *,
-    promoted: PromotedIndex,
-    replace: bool,
-) -> Dict[str, Any]:
-    """
-    Update a rule by mapping any LM group refs to promoted GM refs.
-    - replace=True: replace LM refs with promoted refs
-    - replace=False: add promoted ref when LM ref exists
-    """
+def update_rule_refs_from_promoted(rule: Dict[str, Any], *, promoted: PromotedIndex, replace: bool) -> Dict[str, Any]:
     changes: List[Dict[str, Any]] = []
     touched = False
 
@@ -305,36 +268,29 @@ def update_rule_refs_from_promoted(
 
     return {"touched": touched, "changes": changes}
 
+
 # -----------------------------
 # Main
 # -----------------------------
-
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Update rules by mapping LM group references to promoted GM groups (reads promoted groups)."
-    )
+    ap = argparse.ArgumentParser(description="Update rules by mapping LM group refs to promoted GM groups.")
 
     ap.add_argument("--gm-name", type=str, default=DEFAULT_GM_NAME)
     ap.add_argument("--rules-domain", type=str, default=DEFAULT_RULES_DOMAIN,
-                    help="Domain to read rules from (prod: default).")
-    ap.add_argument("--dst-domain", type=str, default=DEFAULT_DST_DOMAIN,
-                    help="Destination domain where promoted groups live (usually default).")
-    ap.add_argument("--suffix", type=str, default=DEFAULT_SUFFIX,
-                    help="Suffix used on promoted group ids (default: _svb_m3).")
+                    help="Domain folder to read rules from (ex: nsx-lm1.lab.local).")
+    ap.add_argument("--dst-domain", type=str, default=DEFAULT_DST_DOMAIN)
+    ap.add_argument("--suffix", type=str, default=DEFAULT_SUFFIX)
 
-    ap.add_argument("--promoted-groups-dir", type=Path, default=None,
-                    help="Directory containing promoted group YAMLs. Default computed from gm-name/dst-domain.")
-    ap.add_argument("--rules-root", type=Path, default=DEFAULT_RULES_ROOT,
-                    help="Root containing domains/<rules-domain>/security-policies.")
-    ap.add_argument("--rules-out-root", type=Path, default=None,
-                    help="Output root for updated rules. Default computed from gm-name/dst-domain.")
+    ap.add_argument("--promoted-groups-dir", type=Path, default=None)
+    ap.add_argument("--rules-dir", type=Path, default=None,
+                    help="Explicit rules input directory (security-policies). Overrides gm-name/rules-domain defaults.")
+    ap.add_argument("--rules-out-dir", type=Path, default=None,
+                    help="Explicit rules output directory (security-policies). Overrides defaults.")
 
-    ap.add_argument("--replace", action="store_true", help="Replace LM refs with promoted refs (default add-only).")
-    ap.add_argument("--dry-run", action="store_true", help="Do not write outputs; only report changes.")
-    ap.add_argument("--write-all", action="store_true",
-                    help="Write unchanged files too (complete output tree). Default writes only changed files.")
-    ap.add_argument("--copy-unchanged", action="store_true",
-                    help="When --write-all and a file is unchanged, copy it byte-for-byte to output.")
+    ap.add_argument("--replace", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--write-all", action="store_true")
+    ap.add_argument("--copy-unchanged", action="store_true")
 
     ap.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     ap.add_argument("--changes-jsonl", type=Path, default=None)
@@ -345,22 +301,28 @@ def main() -> None:
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(levelname)s %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    gm_name: str = args.gm_name
-    rules_domain: str = args.rules_domain
-    dst_domain: str = args.dst_domain
-    suffix: str = args.suffix
+    gm_name = args.gm_name
+    rules_domain = args.rules_domain
+    dst_domain = args.dst_domain
+    suffix = args.suffix
 
     promoted_groups_dir = args.promoted_groups_dir or (
         REPO_ROOT / "nsx_promoted_groups" / gm_name / "domains" / dst_domain / "groups"
     )
-    rules_dir = args.rules_root / rules_domain / "security-policies"
-    rules_out_root = args.rules_out_root or (REPO_ROOT / "nsx_updated_rules" / gm_name / "domains" / dst_domain)
-    rules_out_dir = rules_out_root / rules_domain / "security-policies"
 
-    log_dir: Path = args.log_dir
+    rules_dir = args.rules_dir or (
+        RULES_EXPORT_BASE / gm_name / "domains" / rules_domain / "security-policies"
+    )
+
+    rules_out_dir = args.rules_out_dir or (
+        REPO_ROOT / "nsx_updated_rules" / gm_name / "domains" / dst_domain / rules_domain / "security-policies"
+    )
+
+    log_dir: Path = Path(args.log_dir)
     changes_jsonl: Path = args.changes_jsonl or (log_dir / "nsx_rule_updates_from_promoted_groups.jsonl")
     changes_pretty: Path = args.changes_pretty or (log_dir / "nsx_rule_updates_from_promoted_groups.pretty.json")
     per_rule_log_dir: Path = log_dir / "rule_updates_from_promoted"
@@ -375,11 +337,9 @@ def main() -> None:
     if not rules_dir.exists():
         raise SystemExit(f"Rules input dir not found: {rules_dir}")
 
-    # Build promoted lookup
     promoted = build_promoted_index(promoted_groups_dir, suffix=suffix, dst_domain=dst_domain)
     log.info("Loaded %d promoted group mapping(s).", len(promoted.oldid_to_newid))
 
-    # Prepare logs
     log_dir.mkdir(parents=True, exist_ok=True)
     per_rule_log_dir.mkdir(parents=True, exist_ok=True)
     changes_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -420,17 +380,12 @@ def main() -> None:
 
         out_path = rules_out_dir / rf.relative_to(rules_dir)
 
-        # Write behavior:
-        # - changed files are written (unless dry-run)
-        # - unchanged files written only if --write-all
         if not args.dry_run:
             if any_change_in_file or args.write_all:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-
                 if (not any_change_in_file) and args.write_all and args.copy_unchanged:
                     shutil.copy2(rf, out_path)
                 else:
-                    # serialize from parsed doc (changed or unchanged)
                     if rf.suffix.lower() in (".yaml", ".yml"):
                         write_yaml(out_path, rdoc)
                     else:
@@ -461,7 +416,6 @@ def main() -> None:
                     write_jsonl_record(changes_fh, rec)
                     records_written += 1
 
-                # per-file pretty record
                 pretty_path = per_rule_log_dir / rf.relative_to(rules_dir)
                 pretty_path = pretty_path.with_suffix(".json")
                 write_json(pretty_path, rec, indent=2)

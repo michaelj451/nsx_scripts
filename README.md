@@ -67,7 +67,7 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --
 ## 5) Export All Local Manager Objects (LM1 example)
 
 ``` bash
-python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --base-dir nsx_export_promote --domain-id nsx-lm1.lab.local
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --base-dir nsx_export_promote --all-domains
 ```
 
 ------------------------------------------------------------------------
@@ -132,6 +132,8 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --suffix _svb_m3
 ```
 
+------------------------------------------------------------------------
+
 Write Complete Ruleset Tree:
 
 ``` bash
@@ -145,11 +147,7 @@ python tools/nsx/update_rules_from_promoted_groups.py \
 
 Push Updated Ruleset Tree:
 
-python tools/nsx/update_rules_from_promoted_groups.py \
-  --gm-name nsx-gm1.lab.local \
-  --rules-domain default \
-  --dst-domain default \
-  --suffix _svb_m3
+python tools/nsx/push_updated_rules.py --federation-global
 
 
 ------------------------------------------------------------------------
@@ -168,6 +166,8 @@ python tools/nsx/update_rules_from_promoted_groups.py \
 -   Rollback is achieved by simply not publishing updated rules.
 
 -   All steps support dry-run validation before execution.
+
+
 
 ------------------------------------------------------------------------
 
