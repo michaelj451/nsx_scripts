@@ -83,7 +83,7 @@ python tools/nsx/promote_local_groups.py
 Apply:
 
 ``` bash
-python tools/nsx/push_promoted_lm_groups.py  --all-lm-domains
+python tools/nsx/promote_local_groups.py  --all-lm-domains
 ```
 
 ------------------------------------------------------------------------
