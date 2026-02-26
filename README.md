@@ -93,13 +93,18 @@ python tools/nsx/promote_local_groups.py  --all-lm-domains
 Dry Run:
 
 ``` bash
-python tools/nsx/push_promoted_lm_groups.py --manager gm1 --federation-global --dry-run
+python tools/nsx/push_promoted_lm_groups.py \
+  --manager gm1 \
+  --federation-global \
+  --dry-run
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/push_promoted_lm_groups.py --manager gm1 --federation-global
+python tools/nsx/push_promoted_lm_groups.py \
+  --manager gm1 \
+  --federation-global
 ```
 
 ------------------------------------------------------------------------
