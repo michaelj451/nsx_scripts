@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, object_appendix, nsx_log_dir
 
 try:
     import yaml  # PyYAML
@@ -45,11 +46,12 @@ log = logging.getLogger("promote_local_groups")
 # -----------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+LOG_DIR_NAME = nsx_log_dir
 
-DEFAULT_GM_NAME = "nsx-gm1.lab.local"
-DEFAULT_SRC_DOMAIN = "nsx-lm1.lab.local"  # where LM-scoped objects live on GM in your env
-DEFAULT_DST_DOMAIN = "default"            # shared/global domain you want to promote INTO
-DEFAULT_SUFFIX = "_to_gm"
+DEFAULT_GM_NAME = nsx_gm1               # used for default paths, not critical
+DEFAULT_SRC_DOMAIN = nsx_lm1            # where LM-scoped objects live on GM in your env
+DEFAULT_DST_DOMAIN = "default"          # shared/global domain you want to promote INTO
+DEFAULT_SUFFIX = object_appendix
 
 # Input groups default: additive/remapped groups
 DEFAULT_GROUPS_ROOT = REPO_ROOT / "nsx_groups_additive" / DEFAULT_GM_NAME / "domains"
@@ -58,7 +60,7 @@ DEFAULT_GROUPS_ROOT = REPO_ROOT / "nsx_groups_additive" / DEFAULT_GM_NAME / "dom
 DEFAULT_GM_OUT_DIR = REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / "groups"
 
 # Logging outputs
-DEFAULT_LOG_DIR = REPO_ROOT / "nsx_logs"
+DEFAULT_LOG_DIR = REPO_ROOT / LOG_DIR_NAME
 DEFAULT_CHANGES_JSONL = DEFAULT_LOG_DIR / "nsx_group_promotion_changes.jsonl"
 DEFAULT_CHANGES_PRETTY = DEFAULT_LOG_DIR / "nsx_group_promotion_changes.pretty.json"
 DEFAULT_GROUP_LOG_DIR = DEFAULT_LOG_DIR / "group_promotions"

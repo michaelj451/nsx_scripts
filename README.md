@@ -40,36 +40,37 @@ python tools/nsx/add_mapped_ips_to_groups_files.py
 
 ------------------------------------------------------------------------
 
-## 3) Push Groups to GM (Additive / Remapped)
+## 3) Push Remapped Groups to GM (Additive / Remapped)
 
 Preview:
 
 ``` bash
-python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1 --apply
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --apply
 ```
 
 ------------------------------------------------------------------------
 
-## 4) Push Groups to LM (Optional)
+## 4) Push Remapped Groups to LM
 
 ``` bash
-python tools/nsx/push_nsx_groups.py \
-  --target nsx-gm1 \
-  --federation-global \
-  --input-dir nsx_groups_additive \
-  --domain-id nsx-lm1.lab.local \
-  --apply
+python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm1.lab.local --apply
 ```
 
 ------------------------------------------------------------------------
 
-## 5) Promote Local Groups to Global
+## 5) Export All Objects
+
+``` bash
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains --base-dir nsx_export_promote
+```
+
+## 6) Promote Local Groups to Global
 
 Dry Run:
 
@@ -85,7 +86,7 @@ python tools/nsx/promote_local_groups.py --all-lm-domains
 
 ------------------------------------------------------------------------
 
-## 6) Push Promoted Groups (Global-Infra)
+## 7) Push Promoted Groups (Global-Infra)
 
 Dry Run:
 
@@ -101,7 +102,7 @@ python tools/nsx/push_groups_only.py --manager gm1 --federation-global
 
 ------------------------------------------------------------------------
 
-## 7) Generate Updated Rule Files (From Promoted Groups)
+## 8) Generate Updated Rule Files (From Promoted Groups)
 
 Dry Run:
 
@@ -110,7 +111,7 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --gm-name nsx-gm1.lab.local \
   --rules-domain default \
   --dst-domain default \
-  --suffix _to_gm \
+  --suffix _svb_m3 \
   --dry-run
 ```
 
@@ -121,7 +122,7 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --gm-name nsx-gm1.lab.local \
   --rules-domain default \
   --dst-domain default \
-  --suffix _to_gm
+  --suffix _svb_m3
 ```
 
 Write Complete Ruleset Tree:
@@ -134,6 +135,15 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --suffix _to_gm \
   --write-all --copy-unchanged
 ```
+
+Push Updated Ruleset Tree:
+
+python tools/nsx/update_rules_from_promoted_groups.py \
+  --gm-name nsx-gm1.lab.local \
+  --rules-domain default \
+  --dst-domain default \
+  --suffix _svb_m3
+
 
 ------------------------------------------------------------------------
 

@@ -16,7 +16,7 @@ This script does NOT promote groups. It only:
     <repo>/nsx_updated_rules/<gm-name>/domains/<dst-domain>/<rules-domain>/security-policies
 
 How mapping works:
-- Promoted groups are assumed to have ids like: <old_id><suffix>  (default suffix "_to_gm")
+- Promoted groups are assumed to have ids like: <old_id><suffix>  (default suffix "_svb_m3")
 - Rules may reference LM groups like:
     /global-infra/domains/<lm-domain>/groups/<old_id>
 - If we have a promoted group id matching <old_id><suffix>, we can map:
@@ -68,7 +68,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_GM_NAME = "nsx-gm1.lab.local"
 DEFAULT_RULES_DOMAIN = "default"          # production global manager rules live here
 DEFAULT_DST_DOMAIN = "default"            # where promoted groups live
-DEFAULT_SUFFIX = "_to_gm"
+DEFAULT_SUFFIX = "_svb_m3"
 
 DEFAULT_PROMOTED_GROUPS_DIR = REPO_ROOT / "nsx_promoted_groups" / DEFAULT_GM_NAME / "domains" / DEFAULT_DST_DOMAIN / "groups"
 DEFAULT_RULES_ROOT = REPO_ROOT / "nsx_export" / DEFAULT_GM_NAME / "domains"
@@ -320,7 +320,7 @@ def main() -> None:
     ap.add_argument("--dst-domain", type=str, default=DEFAULT_DST_DOMAIN,
                     help="Destination domain where promoted groups live (usually default).")
     ap.add_argument("--suffix", type=str, default=DEFAULT_SUFFIX,
-                    help="Suffix used on promoted group ids (default: _to_gm).")
+                    help="Suffix used on promoted group ids (default: _svb_m3).")
 
     ap.add_argument("--promoted-groups-dir", type=Path, default=None,
                     help="Directory containing promoted group YAMLs. Default computed from gm-name/dst-domain.")
