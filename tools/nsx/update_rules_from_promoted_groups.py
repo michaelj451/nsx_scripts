@@ -73,6 +73,71 @@ DEFAULT_RULE_LOG_DIR = DEFAULT_LOG_DIR / "rule_updates_from_promoted"
 
 
 # -----------------------------
+# Log Helpers
+# -----------------------------
+
+import os
+from datetime import datetime
+
+def _resolve_log_dir(log_dir_arg: Path | None) -> Path:
+    """
+    Resolve log dir with env-backed nsx_log_dir support.
+    - If --log-dir is passed, use that
+    - Else use nsx_log_dir from nsx_constants (already expanded in your Option A fix)
+    - Else fallback to repo/nsx_logs
+    Always mkdir.
+    """
+    if log_dir_arg:
+        p = Path(os.path.expandvars(os.path.expanduser(str(log_dir_arg)))).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    if nsx_log_dir:
+        p = Path(os.path.expandvars(os.path.expanduser(str(nsx_log_dir)))).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    p = (REPO_ROOT / "nsx_logs").resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _setup_logging(tool_name: str, log_dir_arg: Path | None, level: str) -> Path:
+    """
+    Configure console + file logging. Returns log file path.
+    """
+    log_dir = _resolve_log_dir(log_dir_arg)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = (log_dir / f"{tool_name}_{ts}.log").resolve()
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # Clear existing handlers to prevent duplicates
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    ch = logging.StreamHandler()
+    ch.setLevel(getattr(logging, level.upper(), logging.INFO))
+    ch.setFormatter(fmt)
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(getattr(logging, level.upper(), logging.INFO))
+    fh.setFormatter(fmt)
+
+    root.addHandler(ch)
+    root.addHandler(fh)
+
+    logging.getLogger(tool_name).info("Logging to %s", log_file)
+    return log_file
+
+
+# -----------------------------
 # IO helpers
 # -----------------------------
 def load_doc(path: Path) -> Any:
@@ -299,11 +364,12 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    log_file = _setup_logging(
+        tool_name="update_rules_from_promoted_groups",
+        log_dir_arg=args.log_dir,
+        level=args.log_level,
     )
+    log.info("Log file:            %s", log_file)
 
     gm_name = args.gm_name
     rules_domain = args.rules_domain
