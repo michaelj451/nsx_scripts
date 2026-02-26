@@ -69,7 +69,13 @@ python tools/nsx/push_nsx_groups.py \
 
 ------------------------------------------------------------------------
 
-## 5) Promote Local Groups to Global
+## 5) Export All Objects
+
+``` bash
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains --base-dir nsx_export_promote
+```
+
+## 6) Promote Local Groups to Global
 
 Dry Run:
 
@@ -85,7 +91,7 @@ python tools/nsx/promote_local_groups.py --all-lm-domains
 
 ------------------------------------------------------------------------
 
-## 6) Push Promoted Groups (Global-Infra)
+## 7) Push Promoted Groups (Global-Infra)
 
 Dry Run:
 
@@ -101,7 +107,7 @@ python tools/nsx/push_groups_only.py --manager gm1 --federation-global
 
 ------------------------------------------------------------------------
 
-## 7) Generate Updated Rule Files (From Promoted Groups)
+## 8) Generate Updated Rule Files (From Promoted Groups)
 
 Dry Run:
 
