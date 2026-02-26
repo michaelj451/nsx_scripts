@@ -11,10 +11,10 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_object_functions.nsx_group_importer import GroupImportConfig, NsxGroupImporter
+from nsx.nsx_constants import nsx_log_dir
 
 DEFAULT_INPUT_DIR = "nsx_groups_additive"
-
-LOG_DIR_NAME = "nsx_logs"
+LOG_DIR_NAME = nsx_log_dir
 LOG_FILE_NAME = "push_nsx_groups.log"
 
 
@@ -144,7 +144,13 @@ def main() -> None:
         help=f"Root folder containing exported groups layout (default: <repo>/{DEFAULT_INPUT_DIR}).",
     )
 
-    parser.add_argument("--domain-id", default="default")
+    parser.add_argument(
+        "--domain-id",
+        default="default",
+        choices=["default", nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4],
+        help="Domain ID to operate on (default: default).",
+    )
+
     parser.add_argument("--input-format", choices=["yaml", "json"], default="yaml")
     parser.add_argument("--apply", action="store_true", help="Actually push changes (otherwise dry-run).")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop on first error.")

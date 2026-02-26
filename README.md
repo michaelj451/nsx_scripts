@@ -40,68 +40,76 @@ python tools/nsx/add_mapped_ips_to_groups_files.py
 
 ------------------------------------------------------------------------
 
-## 3) Push Groups to GM (Additive / Remapped)
+## 3) Push Remapped Groups to GM (Additive / Remapped)
 
 Preview:
 
 ``` bash
-python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/push_nsx_groups.py --federation-global --target nsx-gm1 --apply
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --apply
 ```
 
 ------------------------------------------------------------------------
 
-## 4) Push Groups to LM (Optional)
+## 4) Push Remapped Groups to LM
 
 ``` bash
-python tools/nsx/push_nsx_groups.py \
-  --target nsx-gm1 \
+python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm1.lab.local --apply
+```
+
+------------------------------------------------------------------------
+
+## 5) Export All Local Manager Objects (LM1 example)
+
+``` bash
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --base-dir nsx_export_promote --all-domains
+```
+
+------------------------------------------------------------------------
+
+## 6) Promote Local Groups to Global
+
+Dry Run:
+
+``` bash
+python tools/nsx/promote_local_groups.py
+```
+
+Apply:
+
+``` bash
+python tools/nsx/promote_local_groups.py  --all-lm-domains
+```
+
+------------------------------------------------------------------------
+
+## 7) Push Promoted Groups (Global-Infra)
+
+Dry Run:
+
+``` bash
+python tools/nsx/push_promoted_lm_groups.py \
+  --manager gm1 \
   --federation-global \
-  --input-dir nsx_groups_additive \
-  --domain-id nsx-lm1.lab.local \
-  --apply
-```
-
-------------------------------------------------------------------------
-
-## 5) Promote Local Groups to Global
-
-Dry Run:
-
-``` bash
-python tools/nsx/promote_local_groups.py --all-lm-domains --dry-run
+  --dry-run
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/promote_local_groups.py --all-lm-domains
+python tools/nsx/push_promoted_lm_groups.py \
+  --manager gm1 \
+  --federation-global
 ```
 
 ------------------------------------------------------------------------
 
-## 6) Push Promoted Groups (Global-Infra)
-
-Dry Run:
-
-``` bash
-python tools/nsx/push_groups_only.py --manager gm1 --federation-global --dry-run
-```
-
-Apply:
-
-``` bash
-python tools/nsx/push_groups_only.py --manager gm1 --federation-global
-```
-
-------------------------------------------------------------------------
-
-## 7) Generate Updated Rule Files (From Promoted Groups)
+## 8) Generate Updated Rule Files (From Promoted Groups)
 
 Dry Run:
 
@@ -124,6 +132,29 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --suffix _svb_m3
 ```
 
+
+
+------------------------------------------------------------------------
+
+## 9) Push Rules
+
+``` bash
+python tools/nsx/push_updated_rules.py \
+  --manager gm1 \
+  --federation-global \
+  --rules-domain default
+```
+
+``` bash
+python tools/nsx/push_updated_rules.py \
+  --manager gm1 \
+  --federation-global \
+  --rules-domain default \
+  --apply
+```
+
+------------------------------------------------------------------------
+
 Write Complete Ruleset Tree:
 
 ``` bash
@@ -137,11 +168,7 @@ python tools/nsx/update_rules_from_promoted_groups.py \
 
 Push Updated Ruleset Tree:
 
-python tools/nsx/update_rules_from_promoted_groups.py \
-  --gm-name nsx-gm1.lab.local \
-  --rules-domain default \
-  --dst-domain default \
-  --suffix _svb_m3
+python tools/nsx/push_updated_rules.py --federation-global
 
 
 ------------------------------------------------------------------------
@@ -160,6 +187,8 @@ python tools/nsx/update_rules_from_promoted_groups.py \
 -   Rollback is achieved by simply not publishing updated rules.
 
 -   All steps support dry-run validation before execution.
+
+
 
 ------------------------------------------------------------------------
 
