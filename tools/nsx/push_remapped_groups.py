@@ -144,7 +144,13 @@ def main() -> None:
         help=f"Root folder containing exported groups layout (default: <repo>/{DEFAULT_INPUT_DIR}).",
     )
 
-    parser.add_argument("--domain-id", default="default")
+    parser.add_argument(
+        "--domain-id",
+        default="default",
+        choices=["default", nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4],
+        help="Domain ID to operate on (default: default).",
+    )
+
     parser.add_argument("--input-format", choices=["yaml", "json"], default="yaml")
     parser.add_argument("--apply", action="store_true", help="Actually push changes (otherwise dry-run).")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop on first error.")
