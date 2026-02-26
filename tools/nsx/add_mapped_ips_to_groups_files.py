@@ -17,16 +17,20 @@ Outputs:
 - Preserves relative directory structure from nsx_export
 
 Logging:
-- Console + ./nsx_logs/add_mapped_ips_to_groups_files.log
-- JSONL changes are still written by nsx_group_remap.py to ./nsx_logs/nsx_group_remap_changes.jsonl
+- Console + <NSX_LOG_DIR>/add_mapped_ips_to_groups_files_YYYYMMDD_HHMMSS.log
+- JSONL changes are still written by nsx_group_remap.py to <NSX_LOG_DIR>/nsx_group_remap_changes.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+from nsx.nsx_constants import nsx_log_dir
 from nsx.nsx_object_functions.nsx_group_remap import (
     read_csv_mappings,
     load_doc,
@@ -36,24 +40,59 @@ from nsx.nsx_object_functions.nsx_group_remap import (
     add_mapped_ips_in_doc,
 )
 
-LOG_DIR_NAME = "nsx_logs"
-LOG_FILE_NAME = "add_mapped_ips_to_groups_files.log"
+EXPORT_ROOT = "nsx_export_promote"
+
+# =============================================================================
+# Paths / Defaults
+# =============================================================================
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / EXPORT_ROOT
+NSX_UPDATED_DIR_DEFAULT = REPO_ROOT / "nsx_groups_additive"
+CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
 
 
-def setup_logging() -> logging.Logger:
-    repo_root = Path(__file__).resolve().parents[2]
-    log_dir = repo_root / LOG_DIR_NAME
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / LOG_FILE_NAME
+def _resolve_log_dir() -> Path:
+    """
+    Resolve nsx_log_dir from env/constant and ensure it exists.
+    Supports:
+      - "nsx_logs" (repo-relative)
+      - "logs" (repo-relative)
+      - "/abs/path/logs"
+      - "$HOME/.../logs" or "$ROOT_DIR/logs" (expanded)
+    """
+    if not nsx_log_dir:
+        # Safe fallback: repo-relative nsx_logs
+        p = REPO_ROOT / "nsx_logs"
+        p.mkdir(parents=True, exist_ok=True)
+        return p.resolve()
+
+    expanded = os.path.expandvars(os.path.expanduser(str(nsx_log_dir)))
+    p = Path(expanded)
+
+    if not p.is_absolute():
+        p = REPO_ROOT / p
+
+    p = p.resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _setup_logging() -> tuple[logging.Logger, Path]:
+    log_dir = _resolve_log_dir()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = (log_dir / f"add_mapped_ips_to_groups_files_{ts}.log").resolve()
+    log_file.touch(exist_ok=True)
 
     logger = logging.getLogger("add_mapped_ips_to_groups_files")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    if logger.handlers:
-        return logger
+    # Clear handlers so reruns in same interpreter don't duplicate logs
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
     fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     fh.setLevel(logging.INFO)
@@ -67,58 +106,63 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(sh)
 
     logger.info("Log file: %s", log_file)
-    return logger
+    return logger, log_file
 
 
-log = setup_logging()
+@dataclass
+class Counters:
+    scanned: int = 0
+    docs_with_changes: int = 0
+    groups_touched_total: int = 0
+    tokens_added_total: int = 0
+    written: int = 0
+    skipped_parse: int = 0
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-NSX_EXPORT_DIR_DEFAULT = REPO_ROOT / "nsx_export"
-NSX_UPDATED_DIR_DEFAULT = REPO_ROOT / "nsx_groups_additive"
-CSV_DEFAULT = REPO_ROOT / "data" / "subnet_map.csv"
+
+def _validate_inputs(csv_path: Path, export_root: Path) -> None:
+    if not csv_path.exists():
+        raise SystemExit(f"CSV not found: {csv_path}")
+    if not export_root.exists():
+        raise SystemExit(f"Export dir not found: {export_root}")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Add mapped IPs/subnets/ranges to existing NSX groups (additive only)")
+    ap = argparse.ArgumentParser(
+        description="Add mapped IPs/subnets/ranges to existing NSX groups (additive only)"
+    )
     ap.add_argument("--csv", default=str(CSV_DEFAULT), help="CSV with old_subnet,new_subnet,vlan,description")
     ap.add_argument("--nsx-export", default=str(NSX_EXPORT_DIR_DEFAULT), help="Input export root (default: ./nsx_export)")
     ap.add_argument("--nsx-updated", default=str(NSX_UPDATED_DIR_DEFAULT), help="Output root (default: ./nsx_groups_additive)")
     ap.add_argument("--dry-run", action="store_true", help="Analyze only; do not write output files.")
     args = ap.parse_args()
 
-    csv_path = Path(args.csv)
-    export_root = Path(args.nsx_export)
-    out_root = Path(args.nsx_updated)
+    log, _log_file = _setup_logging()
+
+    csv_path = Path(args.csv).expanduser()
+    export_root = Path(args.nsx_export).expanduser()
+    out_root = Path(args.nsx_updated).expanduser()
 
     log.info("Starting add_mapped_ips_to_groups_files")
-    log.info("CSV:           %s", csv_path)
-    log.info("NSX export:     %s", export_root)
-    log.info("NSX updated:    %s", out_root)
-    log.info("Dry-run:        %s", args.dry_run)
+    log.info("CSV:        %s", csv_path.resolve())
+    log.info("NSX export:  %s", export_root.resolve())
+    log.info("NSX updated: %s", out_root.resolve())
+    log.info("Dry-run:     %s", args.dry_run)
 
-    if not csv_path.exists():
-        raise SystemExit(f"CSV not found: {csv_path}")
-    if not export_root.exists():
-        raise SystemExit(f"Export dir not found: {export_root}")
+    _validate_inputs(csv_path, export_root)
 
     maps = read_csv_mappings(csv_path)
     in_files = iter_group_files(export_root)
 
-    scanned = 0
-    docs_with_changes = 0
-    groups_touched_total = 0
-    tokens_added_total = 0
-    written = 0
-    skipped_parse = 0
+    c = Counters()
 
     for f in in_files:
-        scanned += 1
+        c.scanned += 1
         rel = f.relative_to(export_root)
 
         try:
             doc = load_doc(f)
         except Exception as e:
-            skipped_parse += 1
+            c.skipped_parse += 1
             log.warning("SKIP parse error: %s (%s)", rel, e)
             continue
 
@@ -127,31 +171,37 @@ def main() -> None:
         if tokens_added == 0:
             continue
 
-        docs_with_changes += 1
-        groups_touched_total += groups_touched
-        tokens_added_total += tokens_added
+        c.docs_with_changes += 1
+        c.groups_touched_total += groups_touched
+        c.tokens_added_total += tokens_added
 
         out_f = out_path_for(f, export_root, out_root)
-        log.info("[update] %s -> %s  (groups_touched=%d, tokens_added=%d)",
-                 rel, out_f.relative_to(REPO_ROOT), groups_touched, tokens_added)
+        log.info(
+            "[update] %s -> %s (groups_touched=%d, tokens_added=%d)",
+            rel,
+            out_f.resolve(),
+            groups_touched,
+            tokens_added,
+        )
 
         if args.dry_run:
             continue
 
         out_f.parent.mkdir(parents=True, exist_ok=True)
         write_output(out_f, updated_doc)
-        written += 1
+        c.written += 1
 
     log.info("Finished add_mapped_ips_to_groups_files")
-    log.info("Scanned files:        %d", scanned)
-    log.info("Docs with changes:    %d", docs_with_changes)
-    log.info("Groups touched:       %d", groups_touched_total)
-    log.info("Tokens added:         %d", tokens_added_total)
-    log.info("Skipped parse errors: %d", skipped_parse)
+    log.info("Scanned files:        %d", c.scanned)
+    log.info("Docs with changes:    %d", c.docs_with_changes)
+    log.info("Groups touched:       %d", c.groups_touched_total)
+    log.info("Tokens added:         %d", c.tokens_added_total)
+    log.info("Skipped parse errors: %d", c.skipped_parse)
+
     if args.dry_run:
         log.info("Dry-run only. No files written.")
     else:
-        log.info("Files written:        %d", written)
+        log.info("Files written:        %d", c.written)
         log.info("Output directory:     %s", out_root.resolve())
 
 
