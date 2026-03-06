@@ -62,7 +62,7 @@ python tools/test/add_groups_to_rules.py \
   --host nsx-gm2.lab.local \
   --domain-id default \
   --group-domain-id nsx-lm3.lab.local \
-  --group-prefix loadtest-lm3 \
+  --group-prefix laodtest-lm3 \
   --group-start 1 \
   --group-end 10 \
   --add-to both \
@@ -73,7 +73,7 @@ python tools/test/add_groups_to_rules.py \
   --host nsx-gm2.lab.local \
   --domain-id default \
   --group-domain-id nsx-lm4.lab.local \
-  --group-prefix loadtest-lm4 \
+  --group-prefix laodtest-lm4 \
   --group-start 1 \
   --group-end 10 \
   --add-to both \
