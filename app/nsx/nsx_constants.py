@@ -21,6 +21,7 @@ nsx_lm2 = os.getenv("NSX_LM2")
 nsx_lm3 = os.getenv("NSX_LM3")
 nsx_lm4 = os.getenv("NSX_LM4")
 nsx_gm1 = os.getenv("NSX_GM1")
+nsx_gm2 = os.getenv("NSX_GM2")
 nsx_username = os.getenv("NSX_USERNAME")
 nsx_password = os.getenv("NSX_PASSWORD")
 object_appendix = os.getenv("OBJECT_APPENDIX")
@@ -45,6 +46,7 @@ NSX_DOMAINS = [
 def resolve_manager(choice: str) -> str:
     mapping = {
         "nsx-gm1": nsx_gm1,
+        "nsx-gm2": nsx_gm2,
         "nsx-lm1": nsx_lm1,
         "nsx-lm2": nsx_lm2,
         "nsx-lm3": nsx_lm3,

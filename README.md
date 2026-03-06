@@ -30,6 +30,10 @@ export PYTHONPATH="$PWD/app"
 python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains
 ```
 
+``` bash
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm2 --output-format yaml --all-domains
+```
+
 ------------------------------------------------------------------------
 
 ## 2) Remap Groups (Build Additive Groups)

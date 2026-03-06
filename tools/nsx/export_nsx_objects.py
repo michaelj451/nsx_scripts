@@ -247,8 +247,8 @@ def main() -> None:
     parser.add_argument("--federation-global", action="store_true")
     parser.add_argument(
         "--manager",
-        choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
-        default="nsx-lm1",
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        default="nsx-gm1",
     )
     parser.add_argument("--output-format", choices=["yaml", "json", "both"], default="yaml")
     parser.add_argument("--all-domains", action="store_true")
