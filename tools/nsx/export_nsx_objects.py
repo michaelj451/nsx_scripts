@@ -4,8 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +20,13 @@ except ImportError:
     yaml = None
 
 # =============================================================================
+# Throttle (hard-coded)
+# =============================================================================
+# 5 requests/second => 0.2s between requests
+THROTTLE_RPS = 5.0
+THROTTLE_INTERVAL_S = 1.0 / THROTTLE_RPS
+
+# =============================================================================
 # Repo Root
 # =============================================================================
 
@@ -28,9 +35,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # =============================================================================
 # Logging
 # =============================================================================
-
-from pathlib import Path
-from nsx.nsx_constants import nsx_log_dir
 
 def _resolve_log_dir() -> Path:
     if not nsx_log_dir:
@@ -183,6 +187,54 @@ def _count_domain_objects(manager_base: Path, domain_id: str) -> dict[str, int]:
 
 
 # =============================================================================
+# Throttling wrapper
+# =============================================================================
+
+def _apply_throttle_to_client(client: NsxPolicyClient) -> None:
+    """
+    Hard-code throttling at ~5 req/sec by wrapping client._get (and optionally other verbs).
+    No CLI flags; always on.
+    """
+    if hasattr(client, "_throttle_wrapped") and getattr(client, "_throttle_wrapped"):
+        return
+
+    # Wrap _get
+    if hasattr(client, "_get"):
+        orig_get = client._get
+        last_ts = {"t": 0.0}
+
+        def throttled_get(*args, **kwargs):
+            now = time.monotonic()
+            wait = THROTTLE_INTERVAL_S - (now - last_ts["t"])
+            if wait > 0:
+                time.sleep(wait)
+            resp = orig_get(*args, **kwargs)
+            last_ts["t"] = time.monotonic()
+            return resp
+
+        client._get = throttled_get  # type: ignore[attr-defined]
+        log.info("Enabled NSX GET throttling: %.2f req/sec (min interval %.3fs)", THROTTLE_RPS, THROTTLE_INTERVAL_S)
+
+    # Optional: also wrap other verbs if your client uses them elsewhere
+    # for verb in ("_post", "_put", "_patch", "_delete"):
+    #     if hasattr(client, verb):
+    #         orig = getattr(client, verb)
+    #         def _wrap(orig_fn):
+    #             def throttled(*args, **kwargs):
+    #                 now = time.monotonic()
+    #                 wait = THROTTLE_INTERVAL_S - (now - last_ts["t"])
+    #                 if wait > 0:
+    #                     time.sleep(wait)
+    #                 resp = orig_fn(*args, **kwargs)
+    #                 last_ts["t"] = time.monotonic()
+    #                 return resp
+    #             return throttled
+    #         setattr(client, verb, _wrap(orig))
+
+    setattr(client, "_throttle_wrapped", True)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -215,12 +267,16 @@ def main() -> None:
         federation_global=args.federation_global,
     )
 
+    # Always-on throttle at 5 req/sec (GETs)
+    _apply_throttle_to_client(client)
+
     manager_name = _manager_dirname(manager_host)
     manager_base = _resolve_manager_base(args.base_dir, manager_name)
 
     log.info("Starting NSX export")
     log.info("Manager: %s", manager_host)
     log.info("Base dir: %s", manager_base.resolve())
+    log.info("Throttle: %.2f req/sec (GET)", THROTTLE_RPS)
 
     all_stats = {}
     all_counts = {}
