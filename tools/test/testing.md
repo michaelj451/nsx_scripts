@@ -22,3 +22,17 @@ python tools/test/create_load_objects.py \
   --groups-per-side 5 \
   --prefix loadtest2 \
   --base-cidr 10.6.0.0/16
+
+
+### FOR TESTING ONLY ---- DESTRUCTIVE ----- ###
+
+python tools/test/wipe_app_policies_then_groups.py \
+  --target nsx-gm1 \
+  --federation-global \
+  --domain-id default
+
+python tools/test/wipe_app_policies_then_groups.py \
+  --target nsx-gm1 \
+  --federation-global \
+  --domain-id default \
+  --apply
