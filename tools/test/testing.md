@@ -55,6 +55,29 @@ python tools/test/create_load_objects.py \
   --prefix loadtest-lm4 \
   --base-cidr 10.6.0.0/16
 
+### ADD GROUPS TO RULES
+
+python tools/test/add_groups_to_rules.py \
+  --mode gm \
+  --host nsx-gm2.lab.local \
+  --domain-id default \
+  --group-domain-id nsx-lm3.lab.local \
+  --group-prefix loadtest-lm3 \
+  --group-start 1 \
+  --group-end 10 \
+  --add-to both \
+  --apply
+
+python tools/test/add_groups_to_rules.py \
+  --mode gm \
+  --host nsx-gm2.lab.local \
+  --domain-id default \
+  --group-domain-id nsx-lm4.lab.local \
+  --group-prefix loadtest-lm4 \
+  --group-start 1 \
+  --group-end 10 \
+  --add-to both \
+  --apply
 
 ### FOR TESTING ONLY ---- DESTRUCTIVE ----- ###
 
