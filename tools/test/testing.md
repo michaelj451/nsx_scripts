@@ -33,7 +33,7 @@ python tools/test/create_load_objects.py \
   --ranges-per-group 5 \
   --range-width 2 \
   --throttle-rps 0 \
-  --prefix laodtest-lm3 \
+  --prefix loadtest-lm3 \
   --base-cidr 10.5.0.0/16
 
 python tools/test/create_load_objects.py \
@@ -73,7 +73,7 @@ python tools/test/add_groups_to_rules.py \
   --host nsx-gm2.lab.local \
   --domain-id default \
   --group-domain-id nsx-lm4.lab.local \
-  --group-prefix laodtest-lm4 \
+  --group-prefix loadtest-lm4 \
   --group-start 1 \
   --group-end 10 \
   --add-to both \

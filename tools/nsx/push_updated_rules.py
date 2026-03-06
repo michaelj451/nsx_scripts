@@ -54,13 +54,13 @@ except ImportError as e:
     raise SystemExit("Missing dependency: PyYAML. Install with: pip install pyyaml") from e
 
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4, nsx_log_dir  # env-backed values
+from nsx.nsx_constants import nsx_gm1, nsx_gm2, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4, nsx_log_dir  # env-backed values
 
 log = logging.getLogger("push_updated_rules")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_GM_NAME = nsx_gm1               # used for default paths, not critical
+DEFAULT_GM_NAME = nsx_gm2               # used for default paths, not critical
 DEFAULT_DST_DOMAIN = "default"
 DEFAULT_RULES_DOMAIN = "default"
 
@@ -225,6 +225,7 @@ def resolve_manager(manager: str) -> str:
 
     aliases = {
         "gm1": nsx_gm1,
+        "gm2": nsx_gm2,
         "lm1": nsx_lm1,
         "lm2": nsx_lm2,
         "lm3": nsx_lm3,

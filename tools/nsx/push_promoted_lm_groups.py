@@ -16,6 +16,7 @@ import yaml
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_constants import (
     nsx_gm1,
+    nsx_gm2,
     nsx_lm1,
     nsx_lm2,
     nsx_lm3,
@@ -143,7 +144,7 @@ def main() -> None:
     parser.add_argument(
         "--manager",
         default="gm1",
-        choices=["gm1", "lm1", "lm2", "lm3", "lm4"],
+        choices=["gm1", "gm2","lm1", "lm2", "lm3", "lm4"],
         help="Target NSX manager",
     )
 
@@ -163,6 +164,7 @@ def main() -> None:
 
     manager_map = {
         "gm1": nsx_gm1,
+        "gm2": nsx_gm2,
         "lm1": nsx_lm1,
         "lm2": nsx_lm2,
         "lm3": nsx_lm3,
