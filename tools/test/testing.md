@@ -1,4 +1,4 @@
-python create_load_objects.py \
+python tools/test/create_load_objects.py \
   --mode gm \
   --host nsx-gm2.lab.local \
   --domain-id default \
@@ -6,11 +6,19 @@ python create_load_objects.py \
   --policies 500 \
   --rules-per-policy 20 \
   --groups-per-side 5 \
-  --prefix chg123457 \
+  --prefix loadtest1 \
   --base-cidr 10.4.0.0/16
 
-
-
+python tools/test/create_load_objects.py \
+  --mode gm \
+  --host nsx-gm2.lab.local \
+  --domain-id nsx-lm3.lab.local \
+  --groups 200 \
+  --policies 10 \
+  --rules-per-policy 20 \
+  --groups-per-side 5 \
+  --prefix loadtest3 \
+  --base-cidr 10.5.0.0/16
 
 python tools/test/create_load_objects.py \
   --mode gm \
@@ -27,12 +35,26 @@ python tools/test/create_load_objects.py \
 ### FOR TESTING ONLY ---- DESTRUCTIVE ----- ###
 
 python tools/test/wipe_app_policies_then_groups.py \
-  --target nsx-gm1 \
+  --target nsx-gm2 \
   --federation-global \
-  --domain-id default
+  --domain-id nsx-lm3.lab.local \
+  --apply
 
 python tools/test/wipe_app_policies_then_groups.py \
-  --target nsx-gm1 \
+  --target nsx-gm2 \
   --federation-global \
+  --domain-id nsx-lm4.lab.local \
+  --apply
+
+python tools/test/wipe_app_policies_then_groups.py \
+  --target nsx-gm2 \
+  --federation-global \
+  --domain-id default \
+  --apply
+
+
+
+python tools/test/wipe_app_policies_then_groups.py \
+  --target nsx-lm3 \
   --domain-id default \
   --apply

@@ -1,36 +1,15 @@
 #!/usr/bin/env python3
-"""
-Wipe NSX Application policies, then wipe all groups in a domain.
-
-Default behavior is DRY-RUN.
-Use --apply to actually delete objects.
-
-Examples
---------
-Dry run against GM/global:
-    python tools/nsx/wipe_app_policies_then_groups.py \
-      --target nsx-gm1 \
-      --federation-global \
-      --domain-id default
-
-Actually apply:
-    python tools/nsx/wipe_app_policies_then_groups.py \
-      --target nsx-gm1 \
-      --federation-global \
-      --domain-id default \
-      --apply
-"""
 
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
-from typing import Any, Dict, Iterable, List, Optional
+import time
 
-# Adjust these imports to match your repo layout if needed
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_constants import nsx_gm1
+
 
 LOG = logging.getLogger("wipe_app_policies_then_groups")
 
@@ -43,160 +22,139 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-def api_prefix(federation_global: bool) -> str:
-    # GM/global objects live under /global-infra
-    # LM/local objects live under /infra
-    return "/global-infra" if federation_global else "/infra"
+def get_application_policies(client: NsxPolicyClient, domain_id: str):
+    policies = client.list_security_policies(domain_id=domain_id)
+    return [
+        p for p in policies
+        if (p.get("category") or "").strip().lower() == "application"
+    ]
 
 
-def normalize_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not payload:
-        return []
-    if isinstance(payload, dict) and "results" in payload:
-        return payload.get("results") or []
-    if isinstance(payload, list):
-        return payload
-    return []
-
-
-def get_path(prefix: str, domain_id: str, kind: str) -> str:
-    if kind == "policies":
-        return f"{prefix}/domains/{domain_id}/security-policies"
-    if kind == "groups":
-        return f"{prefix}/domains/{domain_id}/groups"
-    raise ValueError(f"Unsupported kind: {kind}")
-
-
-def list_security_policies(client: NsxPolicyClient, prefix: str, domain_id: str) -> List[Dict[str, Any]]:
-    path = get_path(prefix, domain_id, "policies")
-    payload = client.get(path)
-    return normalize_results(payload)
-
-
-def list_groups(client: NsxPolicyClient, prefix: str, domain_id: str) -> List[Dict[str, Any]]:
-    path = get_path(prefix, domain_id, "groups")
-    payload = client.get(path)
-    return normalize_results(payload)
-
-
-def is_application_policy(policy: Dict[str, Any]) -> bool:
-    category = str(policy.get("category") or "").strip().lower()
-    return category == "application"
-
-
-def is_default_or_system_group(group: Dict[str, Any]) -> bool:
-    """
-    Conservative guardrails so you don't accidentally delete obvious built-ins.
-    Tweak if you truly want every single group.
-    """
-    gid = str(group.get("id") or "")
-    display_name = str(group.get("display_name") or "")
-    path = str(group.get("path") or "")
-
-    protected_ids = {
-        "ANY",
-    }
-
-    if gid in protected_ids:
-        return True
-
-    # Heuristic: skip system-owned defaults if flagged
-    if group.get("_system_owned") is True:
-        return True
-
-    # Extra paranoia for built-ins
-    built_in_markers = ["/infra/domains/", "/global-infra/domains/"]
-    if any(marker in path for marker in built_in_markers):
-        # not enough alone to skip, since user groups also live here
-        pass
-
-    # Keep this mild, not overprotective
-    return False
-
-
-def delete_object(client: NsxPolicyClient, path: str, apply: bool) -> bool:
-    if not apply:
-        LOG.info("[DRY-RUN] DELETE %s", path)
-        return True
-
-    try:
-        client.delete(path)
-        LOG.info("Deleted: %s", path)
-        return True
-    except Exception as exc:
-        LOG.error("Failed to delete %s :: %s", path, exc)
-        return False
+def get_groups(client: NsxPolicyClient, domain_id: str):
+    return client.list_groups(domain_id=domain_id)
 
 
 def wipe_application_policies(
     client: NsxPolicyClient,
-    prefix: str,
     domain_id: str,
     apply: bool,
-) -> int:
-    policies = list_security_policies(client, prefix, domain_id)
-    app_policies = [p for p in policies if is_application_policy(p)]
+) -> tuple[int, int]:
+    policies = get_application_policies(client, domain_id)
 
-    LOG.info("Found %d total security policies", len(policies))
-    LOG.info("Found %d Application-category policies", len(app_policies))
+    LOG.info("Application policies found: %s", len(policies))
 
     deleted = 0
-    for policy in app_policies:
-        policy_id = policy.get("id")
-        display_name = policy.get("display_name", policy_id)
-        path = policy.get("path") or f"{get_path(prefix, domain_id, 'policies')}/{policy_id}"
+    failed = 0
 
-        LOG.info("Removing Application policy: %s (%s)", display_name, policy_id)
-        if delete_object(client, path, apply):
+    for policy in policies:
+        policy_id = policy.get("id")
+        display_name = policy.get("display_name") or policy_id
+
+        if not policy_id:
+            LOG.warning("Skipping policy with no id: %s", policy)
+            failed += 1
+            continue
+
+        if apply:
+            LOG.info("Deleting policy: %s (%s)", display_name, policy_id)
+            try:
+                client.delete_security_policy(
+                    security_policy_id=policy_id,
+                    domain_id=domain_id,
+                )
+                deleted += 1
+            except Exception as e:
+                LOG.warning("Could not delete policy %s: %s", policy_id, e)
+                failed += 1
+        else:
+            LOG.info("[DRY-RUN] Would delete policy: %s (%s)", display_name, policy_id)
             deleted += 1
 
-    return deleted
+    return deleted, failed
 
 
 def wipe_groups(
     client: NsxPolicyClient,
-    prefix: str,
     domain_id: str,
     apply: bool,
-) -> int:
-    groups = list_groups(client, prefix, domain_id)
+) -> tuple[int, int]:
+    groups = get_groups(client, domain_id)
 
-    LOG.info("Found %d total groups", len(groups))
+    LOG.info("Groups found: %s", len(groups))
 
     deleted = 0
-    skipped = 0
+    failed = 0
 
     for group in groups:
         group_id = group.get("id")
-        display_name = group.get("display_name", group_id)
-        path = group.get("path") or f"{get_path(prefix, domain_id, 'groups')}/{group_id}"
+        display_name = group.get("display_name") or group_id
 
-        if is_default_or_system_group(group):
-            LOG.info("Skipping protected/system group: %s (%s)", display_name, group_id)
-            skipped += 1
+        if not group_id:
+            LOG.warning("Skipping group with no id: %s", group)
+            failed += 1
             continue
 
-        LOG.info("Removing group: %s (%s)", display_name, group_id)
-        if delete_object(client, path, apply):
+        if apply:
+            LOG.info("Deleting group: %s (%s)", display_name, group_id)
+            try:
+                client.delete_group(
+                    group_id=group_id,
+                    domain_id=domain_id,
+                )
+                deleted += 1
+            except Exception as e:
+                LOG.warning("Could not delete group %s: %s", group_id, e)
+                failed += 1
+        else:
+            LOG.info("[DRY-RUN] Would delete group: %s (%s)", display_name, group_id)
             deleted += 1
 
-    LOG.info("Groups skipped: %d", skipped)
-    return deleted
+    return deleted, failed
+
+
+def verify_remaining(client: NsxPolicyClient, domain_id: str) -> tuple[list, list]:
+    remaining_policies = get_application_policies(client, domain_id)
+    remaining_groups = get_groups(client, domain_id)
+
+    LOG.warning("VERIFY remaining Application policies: %s", len(remaining_policies))
+    LOG.warning("VERIFY remaining groups: %s", len(remaining_groups))
+
+    if remaining_policies:
+        LOG.warning(
+            "Sample remaining policies: %s",
+            [p.get("id") for p in remaining_policies[:20]],
+        )
+
+    if remaining_groups:
+        LOG.warning(
+            "Sample remaining groups: %s",
+            [g.get("id") for g in remaining_groups[:20]],
+        )
+
+    return remaining_policies, remaining_groups
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Wipe Application policies and then groups from an NSX domain.")
-    p.add_argument("--target", default=nsx_gm1, help="NSX manager/GM hostname")
+    p = argparse.ArgumentParser(
+        description="Delete all Application security policies, then all groups"
+    )
+    p.add_argument("--target", default=nsx_gm1, help="NSX manager hostname")
     p.add_argument("--domain-id", default="default", help="NSX domain ID")
     p.add_argument(
         "--federation-global",
         action="store_true",
-        help="Use /global-infra paths (GM/global objects). Default is local /infra.",
+        help="Use GM/global-infra view",
     )
     p.add_argument(
         "--apply",
         action="store_true",
-        help="Actually delete objects. Without this flag, script only does a dry-run.",
+        help="Actually delete objects. Without this, runs as dry-run.",
+    )
+    p.add_argument(
+        "--verify-delay",
+        type=int,
+        default=2,
+        help="Seconds to wait before re-query verification",
     )
     p.add_argument(
         "--verbose",
@@ -210,40 +168,48 @@ def main() -> int:
     args = build_parser().parse_args()
     setup_logging(args.verbose)
 
-    prefix = api_prefix(args.federation_global)
+    LOG.warning("TARGET            : %s", args.target)
+    LOG.warning("DOMAIN            : %s", args.domain_id)
+    LOG.warning("FEDERATION GLOBAL : %s", args.federation_global)
+    LOG.warning("MODE              : %s", "APPLY" if args.apply else "DRY RUN")
 
-    LOG.warning("TARGET              : %s", args.target)
-    LOG.warning("DOMAIN              : %s", args.domain_id)
-    LOG.warning("FEDERATION GLOBAL   : %s", args.federation_global)
-    LOG.warning("MODE                : %s", "APPLY" if args.apply else "DRY-RUN")
+    client = NsxPolicyClient(
+        nsxmanager=args.target,
+        federation_global=args.federation_global,
+    )
 
-    try:
-        client = NsxPolicyClient(
-            nsxmanager=args.target,
-            federation_global=args.federation_global,
-        )
-    except Exception as exc:
-        LOG.error("Failed to create NSX client: %s", exc)
-        return 2
-
-    # Step 1: Delete Application policies
-    deleted_policies = wipe_application_policies(
+    deleted_policies, failed_policies = wipe_application_policies(
         client=client,
-        prefix=prefix,
         domain_id=args.domain_id,
         apply=args.apply,
     )
 
-    # Step 2: Delete groups
-    deleted_groups = wipe_groups(
+    deleted_groups, failed_groups = wipe_groups(
         client=client,
-        prefix=prefix,
         domain_id=args.domain_id,
         apply=args.apply,
     )
 
-    LOG.warning("Done. Policies deleted: %d | Groups deleted: %d", deleted_policies, deleted_groups)
-    return 0
+    if args.apply and args.verify_delay > 0:
+        LOG.info("Waiting %s seconds before verification...", args.verify_delay)
+        time.sleep(args.verify_delay)
+
+    remaining_policies, remaining_groups = verify_remaining(
+        client=client,
+        domain_id=args.domain_id,
+    )
+
+    LOG.warning(
+        "Summary: deleted_policies=%s failed_policies=%s deleted_groups=%s failed_groups=%s remaining_policies=%s remaining_groups=%s",
+        deleted_policies,
+        failed_policies,
+        deleted_groups,
+        failed_groups,
+        len(remaining_policies),
+        len(remaining_groups),
+    )
+
+    return 0 if not remaining_policies and not remaining_groups else 1
 
 
 if __name__ == "__main__":
