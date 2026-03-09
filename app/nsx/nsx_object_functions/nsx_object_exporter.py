@@ -70,7 +70,7 @@ def yaml_dump(data: Any) -> str:
 class ExportConfig:
     base_dir: Path = Path("nsx_export")
     domain_id: str = "default"
-    page_size: int = 200
+    page_size: int = 1000
     output_format: Literal["yaml", "json", "both"] = "yaml"
     strip_keys: Iterable[str] = field(default_factory=lambda: set(DEFAULT_STRIP_KEYS))
 

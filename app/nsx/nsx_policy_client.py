@@ -4,7 +4,7 @@ import requests
 import logging
 from typing import Any, Dict, Iterator, List, Optional
 
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_username, nsx_password
+from nsx.nsx_constants import nsx_gm1, nsx_gm2, nsx_lm1, nsx_lm2, nsx_username, nsx_password
 
 import urllib3
 
@@ -28,6 +28,7 @@ class NsxPolicyClient:
         mgr_norm = (nsxmanager or "").strip().removeprefix("https://").removeprefix("http://").rstrip("/").lower()
         gm_hosts = {  # keep in nsx_constants ideally
             (nsx_gm1 or "").lower(),
+            (nsx_gm2 or "").lower(),
             # add nsx_gm2 if you have it, etc.
         }
         is_gm = any(mgr_norm == h or mgr_norm.startswith(h + ".") or h.startswith(mgr_norm + ".") for h in gm_hosts if h)

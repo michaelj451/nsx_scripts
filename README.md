@@ -30,6 +30,10 @@ export PYTHONPATH="$PWD/app"
 python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --all-domains
 ```
 
+``` bash
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm2 --output-format yaml --all-domains
+```
+
 ------------------------------------------------------------------------
 
 ## 2) Remap Groups (Build Additive Groups)
@@ -53,13 +57,21 @@ Apply:
 ``` bash
 python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --apply
 ```
-
+``` bash
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --apply
+```
 ------------------------------------------------------------------------
 
 ## 4) Push Remapped Groups to LM
 
 ``` bash
 python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm1.lab.local --apply
+```
+``` bash
+python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm3.lab.local --apply
+```
+``` bash
+python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm4.lab.local --apply
 ```
 
 ------------------------------------------------------------------------
@@ -68,6 +80,9 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --
 
 ``` bash
 python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --base-dir nsx_export_promote --all-domains
+```
+``` bash
+python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm2 --output-format yaml --base-dir nsx_export_promote --all-domains
 ```
 
 ------------------------------------------------------------------------
@@ -106,6 +121,11 @@ python tools/nsx/push_promoted_lm_groups.py \
   --manager gm1 \
   --federation-global
 ```
+``` bash
+python tools/nsx/push_promoted_lm_groups.py \
+  --manager gm2 \
+  --federation-global
+```
 
 ------------------------------------------------------------------------
 
@@ -131,6 +151,13 @@ python tools/nsx/update_rules_from_promoted_groups.py \
   --dst-domain default \
   --suffix _svb_m3
 ```
+``` bash
+python tools/nsx/update_rules_from_promoted_groups.py \
+  --gm-name nsx-gm2.lab.local \
+  --rules-domain default \
+  --dst-domain default \
+  --suffix _svb_m3
+```
 
 
 
@@ -148,6 +175,13 @@ python tools/nsx/push_updated_rules.py \
 ``` bash
 python tools/nsx/push_updated_rules.py \
   --manager gm1 \
+  --federation-global \
+  --rules-domain default \
+  --apply
+```
+``` bash
+python tools/nsx/push_updated_rules.py \
+  --manager gm2 \
   --federation-global \
   --rules-domain default \
   --apply

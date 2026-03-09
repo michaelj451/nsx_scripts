@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
+from nsx.nsx_constants import nsx_gm1,nsx_gm2, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_object_functions.nsx_group_importer import GroupImportConfig, NsxGroupImporter
 from nsx.nsx_constants import nsx_log_dir
@@ -52,6 +52,7 @@ log = setup_logging()
 def _build_mgr_map() -> Dict[str, str]:
     return {
         "nsx-gm1": nsx_gm1,
+        "nsx-gm2": nsx_gm2,
         "nsx-lm1": nsx_lm1,
         "nsx-lm2": nsx_lm2,
         "nsx-lm3": nsx_lm3,
@@ -132,7 +133,7 @@ def main() -> None:
 
     parser.add_argument(
         "--target",
-        choices=["nsx-gm1", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
         required=True,
         help="NSX manager to push groups into.",
     )
@@ -147,7 +148,7 @@ def main() -> None:
     parser.add_argument(
         "--domain-id",
         default="default",
-        choices=["default", nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4],
+        choices=["default", nsx_gm1, nsx_gm2, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4],
         help="Domain ID to operate on (default: default).",
     )
 
