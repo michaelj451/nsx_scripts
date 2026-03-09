@@ -22,6 +22,28 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def confirm_apply(target: str, domain_id: str, federation_global: bool) -> None:
+    """
+    Require an exact typed confirmation of the target hostname before destructive actions.
+    """
+    print()
+    print("DESTRUCTIVE ACTION WARNING")
+    print("--------------------------")
+    print(f"Target            : {target}")
+    print(f"Domain            : {domain_id}")
+    print(f"Federation Global : {federation_global}")
+    print()
+    print("This will delete ALL Application security policies and ALL groups")
+    print("visible to this scope.")
+    print()
+    print(f"To continue, type the target exactly: {target}")
+    typed = input("Confirmation: ").strip()
+
+    if typed != target:
+        print("Confirmation did not match target. Aborting.")
+        raise SystemExit(2)
+
+
 def get_application_policies(client: NsxPolicyClient, domain_id: str):
     policies = client.list_security_policies(domain_id=domain_id)
     return [
@@ -172,6 +194,13 @@ def main() -> int:
     LOG.warning("DOMAIN            : %s", args.domain_id)
     LOG.warning("FEDERATION GLOBAL : %s", args.federation_global)
     LOG.warning("MODE              : %s", "APPLY" if args.apply else "DRY RUN")
+
+    if args.apply:
+        confirm_apply(
+            target=args.target,
+            domain_id=args.domain_id,
+            federation_global=args.federation_global,
+        )
 
     client = NsxPolicyClient(
         nsxmanager=args.target,
