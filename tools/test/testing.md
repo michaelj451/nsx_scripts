@@ -105,3 +105,24 @@ python tools/test/wipe_app_policies_then_groups.py \
   --target nsx-lm3 \
   --domain-id default \
   --apply
+
+
+## PUSH GROUPS FROM ONE GM TO ANOTHER ##
+
+python tools/test/push_nsx_objects.py \
+  --source nsx-gm1 \
+  --target nsx-gm2 \
+  --base-dir nsx_export \
+  --domain-id default \
+  --input-format yaml \
+  --federation-global
+
+
+python tools/test/push_nsx_objects.py \
+  --source nsx-gm1 \
+  --target nsx-gm2 \
+  --base-dir nsx_export \
+  --domain-id default \
+  --input-format yaml \
+  --federation-global \
+  --apply

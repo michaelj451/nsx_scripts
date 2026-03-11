@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # app/nsx/nsx_file_import_functions/nsx_object_importer.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 import json
-import yaml
 import logging
+
+import yaml
 
 log = logging.getLogger(__name__)
 
@@ -34,8 +36,15 @@ class NsxImporter:
 
         if new_root.exists():
             self.dom_root = new_root
-        else:
+        elif old_root.exists():
             self.dom_root = old_root
+        else:
+            raise RuntimeError(
+                "Could not determine domain root.\n"
+                f"Checked:\n"
+                f"  - {new_root}\n"
+                f"  - {old_root}"
+            )
 
         self.stats = {
             "services": 0,
@@ -47,47 +56,68 @@ class NsxImporter:
         }
         self.errors: List[str] = []
 
-    # ---------------- helpers ----------------
+    # -------------------------------------------------------------------------
+    # helpers
+    # -------------------------------------------------------------------------
 
     def _load_file(self, path: Path) -> Dict[str, Any]:
+        text = path.read_text(encoding="utf-8")
+
         if path.suffix.lower() in (".yaml", ".yml"):
-            return yaml.safe_load(path.read_text(encoding="utf-8"))
-        if path.suffix.lower() == ".json":
-            return json.loads(path.read_text(encoding="utf-8"))
-        raise ValueError(f"Unsupported file type: {path}")
+            data = yaml.safe_load(text)
+        elif path.suffix.lower() == ".json":
+            data = json.loads(text)
+        else:
+            raise ValueError(f"Unsupported file type: {path}")
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected object/dict in file: {path}")
+
+        return data
 
     def _iter_files(self, root: Path) -> List[Path]:
         if not root.exists():
             return []
+
         exts = (".yaml", ".yml") if self.cfg.input_format == "yaml" else (".json",)
-        return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in exts)
+        return sorted(
+            p for p in root.iterdir()
+            if p.is_file() and p.suffix.lower() in exts
+        )
 
     def _policy_path(self, rel: str) -> str:
         """
-        Use the client's policy root logic (LM vs GM federation-global).
-        Falls back to rel if client doesn't provide helper.
+        Delegate path generation to the client if possible.
+        For example:
+          LM  -> /infra/...
+          GM  -> /global-infra/...
         """
         fn = getattr(self.client, "_policy_path", None)
         return fn(rel) if callable(fn) else rel
 
     def _put_or_patch(self, path: str, payload: Dict[str, Any]) -> None:
+        obj_id = payload.get("id", "<missing-id>")
+
         if self.cfg.dry_run:
-            log.info("[DRY-RUN] PUT/PATCH %s (id=%s)", path, payload.get("id"))
+            log.info("[DRY-RUN] PUT/PATCH %s (id=%s)", path, obj_id)
             return
 
         try:
+            log.info("PUT %s (id=%s)", path, obj_id)
             self.client._put(path, payload)
         except Exception as e:
-            # retry as PATCH if already exists
-            if "already exists" in str(e) or "500127" in str(e):
+            msg = str(e)
+            if "already exists" in msg or "500127" in msg:
+                log.info("PATCH fallback %s (id=%s)", path, obj_id)
                 self.client._patch(path, payload)
             else:
                 raise
 
-    def _record_error(self, msg: str):
+    def _record_error(self, msg: str) -> None:
         self.stats["errors"] += 1
         self.errors.append(msg)
         log.error(msg)
+
         if not self.cfg.continue_on_error:
             raise RuntimeError(msg)
 
@@ -98,6 +128,7 @@ class NsxImporter:
         order_file = policy_dir / f"rules_order.{self.cfg.input_format}"
         if not order_file.exists():
             return None
+
         try:
             data = self._load_file(order_file)
             rules = data.get("rules")
@@ -106,16 +137,44 @@ class NsxImporter:
             log.warning("Failed to read %s: %s", order_file, e)
             return None
 
-    # ---------------- import stages ----------------
+    def _sort_rule_files(self, rule_files: List[Path], explicit_order: Optional[List[str]]) -> List[Path]:
+        """
+        If rules_order is present, sort files by rule id according to that order.
+        Otherwise fall back to filename sort.
+        """
+        if not explicit_order:
+            return rule_files
 
-    def import_services(self):
+        order_index = {rid: idx for idx, rid in enumerate(explicit_order)}
+
+        def _key(path: Path):
+            try:
+                rule = self._load_file(path)
+                rid = rule.get("id")
+                if rid in order_index:
+                    return (0, order_index[rid], path.name)
+                return (1, 999999, path.name)
+            except Exception:
+                return (2, 999999, path.name)
+
+        return sorted(rule_files, key=_key)
+
+    # -------------------------------------------------------------------------
+    # import stages
+    # -------------------------------------------------------------------------
+
+    def import_services(self) -> None:
         svc_dir = self.dom_root / "services"
+        files = self._iter_files(svc_dir)
 
-        for f in self._iter_files(svc_dir):
+        log.info("Importing services from %s (%d files)", svc_dir, len(files))
+
+        for f in files:
             try:
                 data = self._load_file(f)
 
                 if data.get("_system_owned") is True:
+                    log.info("Skipping system-owned service file: %s", f.name)
                     self.stats["skipped"] += 1
                     continue
 
@@ -130,14 +189,18 @@ class NsxImporter:
             except Exception as e:
                 self._record_error(f"Failed importing service file {f}: {e}")
 
-    def import_groups(self):
+    def import_groups(self) -> None:
         grp_dir = self.dom_root / "groups"
+        files = self._iter_files(grp_dir)
 
-        for f in self._iter_files(grp_dir):
+        log.info("Importing groups from %s (%d files)", grp_dir, len(files))
+
+        for f in files:
             try:
                 data = self._load_file(f)
 
                 if data.get("system_defined") is True or data.get("_system_owned") is True:
+                    log.info("Skipping system-defined/system-owned group file: %s", f.name)
                     self.stats["skipped"] += 1
                     continue
 
@@ -152,15 +215,20 @@ class NsxImporter:
             except Exception as e:
                 self._record_error(f"Failed importing group file {f}: {e}")
 
-    def import_policies_and_rules(self):
+    def import_policies_and_rules(self) -> None:
         pol_root = self.dom_root / "security-policies"
         if not pol_root.exists():
+            log.info("No security-policies folder found under %s", self.dom_root)
             return
 
-        for pol_dir in sorted(p for p in pol_root.iterdir() if p.is_dir()):
+        policy_dirs = sorted(p for p in pol_root.iterdir() if p.is_dir())
+        log.info("Importing security policies from %s (%d policy dirs)", pol_root, len(policy_dirs))
+
+        for pol_dir in policy_dirs:
             try:
                 policy_file = pol_dir / f"policy.{self.cfg.input_format}"
                 if not policy_file.exists():
+                    log.warning("Skipping %s because %s is missing", pol_dir, policy_file.name)
                     self.stats["skipped"] += 1
                     continue
 
@@ -173,39 +241,48 @@ class NsxImporter:
                 self._put_or_patch(pol_path, policy)
                 self.stats["policies"] += 1
 
-                # rules
                 rules_dir = pol_dir / "rules"
                 if not rules_dir.exists():
+                    log.info("No rules folder for policy %s", pid)
                     continue
 
                 rule_files = self._iter_files(rules_dir)
-
-                # Optional: enforce explicit order if present
                 explicit_order = self._load_rules_order(pol_dir)
-                if explicit_order:
-                    # files are named like 0001_<id>.yaml; ordering is mostly fine already,
-                    # but explicit_order lets you sanity-check / re-apply deterministically.
-                    # We still iterate files because payload contains rule id.
-                    pass
+                rule_files = self._sort_rule_files(rule_files, explicit_order)
+
+                log.info("Importing %d rules for policy %s", len(rule_files), pid)
 
                 for rf in rule_files:
-                    rule = self._load_file(rf)
-                    rid = rule.get("id")
-                    if not rid:
-                        self.stats["skipped"] += 1
-                        continue
+                    try:
+                        rule = self._load_file(rf)
+                        rid = rule.get("id")
+                        if not rid:
+                            log.warning("Skipping rule file with missing id: %s", rf)
+                            self.stats["skipped"] += 1
+                            continue
 
-                    rule_path = self._policy_path(f"/domains/{self.cfg.domain_id}/security-policies/{pid}/rules/{rid}")
-                    self._put_or_patch(rule_path, rule)
-                    self.stats["rules"] += 1
+                        rule_path = self._policy_path(
+                            f"/domains/{self.cfg.domain_id}/security-policies/{pid}/rules/{rid}"
+                        )
+                        self._put_or_patch(rule_path, rule)
+                        self.stats["rules"] += 1
+
+                    except Exception as e:
+                        self._record_error(f"Failed importing rule file {rf}: {e}")
 
             except Exception as e:
                 self._record_error(f"Failed importing policy folder {pol_dir}: {e}")
 
-    # ---------------- entrypoint ----------------
+    # -------------------------------------------------------------------------
+    # entrypoint
+    # -------------------------------------------------------------------------
 
     def import_all(self) -> Dict[str, Any]:
-        log.info("Starting NSX import from %s (domain layout root: %s)", self.cfg.export_root, self.dom_root)
+        log.info("Starting NSX import from export_root=%s", self.cfg.export_root)
+        log.info("Resolved domain layout root: %s", self.dom_root)
+        log.info("Input format: %s", self.cfg.input_format)
+        log.info("Dry run: %s", self.cfg.dry_run)
+        log.info("Continue on error: %s", self.cfg.continue_on_error)
 
         self.import_services()
         self.import_groups()
