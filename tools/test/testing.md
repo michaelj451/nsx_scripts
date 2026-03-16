@@ -107,21 +107,31 @@ python tools/test/wipe_app_policies_then_groups.py \
   --apply
 
 
+## BUILD NSX IMPORT TREE ##
+
+python tools/test/build_nsx_import_tree.py \
+  --source nsx-gm1 \
+  --target nsx-gm2 \
+  --export-base nsx_export \
+  --import-base nsx_import \
+  --input-format yaml \
+  --federation-global \
+  --force
+
+
 ## PUSH GROUPS FROM ONE GM TO ANOTHER ##
 
-python tools/test/push_nsx_objects.py \
-  --source nsx-gm1 \
+python tools/test/push_nsx_import_tree.py \
   --target nsx-gm2 \
-  --base-dir nsx_export \
+  --import-base nsx_import \
   --domain-id default \
   --input-format yaml \
-  --federation-global
+  --federation-global 
 
 
-python tools/test/push_nsx_objects.py \
-  --source nsx-gm1 \
+python tools/test/push_nsx_import_tree.py \
   --target nsx-gm2 \
-  --base-dir nsx_export \
+  --import-base nsx_import \
   --domain-id default \
   --input-format yaml \
   --federation-global \
