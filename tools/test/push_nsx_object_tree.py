@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/test/push_nsx_import_tree.py
+# tools/test/push_nsx_object_tree.py
 
 from __future__ import annotations
 
@@ -42,9 +42,9 @@ def _setup_logging() -> None:
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    RUN_LOG_PATH = log_dir / f"push_nsx_import_tree_{ts}.log"
-    ERROR_LOG_PATH = log_dir / f"push_nsx_import_tree_errors_{ts}.log"
-    PUSH_JSONL_PATH = log_dir / f"push_nsx_import_tree_{ts}.jsonl"
+    RUN_LOG_PATH = log_dir / f"push_nsx_object_tree_{ts}.log"
+    ERROR_LOG_PATH = log_dir / f"push_nsx_object_tree_errors_{ts}.log"
+    PUSH_JSONL_PATH = log_dir / f"push_nsx_object_tree_{ts}.jsonl"
 
     logging.basicConfig(
         level=logging.INFO,
@@ -146,7 +146,7 @@ def _has_full_domain_content(import_root: Path, domain_id: str) -> bool:
     if not domain_root.exists():
         return False
 
-    for sub in ("groups", "services", "security-policies"):
+    for sub in ("groups", "services", "security-policies_compiled"):
         if _count_files(domain_root / sub) > 0:
             return True
     return False
@@ -205,7 +205,83 @@ def _make_importer(
     return NsxImporter(client=client, cfg=cfg)
 
 
-def _run_import_all(
+def _import_compiled_policies(
+    importer: NsxImporter,
+    import_root: Path,
+    domain_id: str,
+) -> Dict[str, Any]:
+    """
+    Import compiled policy payloads from:
+      domains/<domain_id>/security-policies_compiled/*.yaml|json
+
+    Each compiled file is a full policy object with embedded rules.
+    """
+    compiled_dir = import_root / "domains" / domain_id / "security-policies_compiled"
+
+    stats = {
+        "services": 0,
+        "groups": 0,
+        "policies": 0,
+        "rules": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    errors: List[str] = []
+
+    if not compiled_dir.exists():
+        log.info("No compiled policies directory found for domain %s: %s", domain_id, compiled_dir)
+        return {"stats": stats, "errors": errors}
+
+    files = importer._iter_files(compiled_dir)
+    log.info("Importing compiled policies from %s (%d files)", compiled_dir, len(files))
+
+    for f in files:
+        try:
+            data = importer._load_file(f)
+
+            pid = data.get("id")
+            if not pid:
+                raise ValueError("Compiled policy missing id")
+
+            embedded_rules = data.get("rules")
+            embedded_rule_count = len(embedded_rules) if isinstance(embedded_rules, list) else 0
+
+            pol_path = importer._policy_path(
+                f"/domains/{domain_id}/security-policies/{pid}"
+            )
+
+            importer._put_or_patch(pol_path, data)
+
+            stats["policies"] += 1
+            stats["rules"] += embedded_rule_count
+
+            _append_jsonl(
+                PUSH_JSONL_PATH,
+                {
+                    "action": "import_compiled_policy",
+                    "domain": domain_id,
+                    "file": str(f),
+                    "policy_id": pid,
+                    "embedded_rule_count": embedded_rule_count,
+                },
+            )
+
+        except Exception as e:
+            msg = f"Failed importing compiled policy file {f}: {e}"
+            log.exception(msg)
+            errors.append(msg)
+            stats["errors"] += 1
+
+            if not importer.cfg.continue_on_error:
+                raise
+
+    return {
+        "stats": stats,
+        "errors": errors,
+    }
+
+
+def _run_import_default_compiled(
     client: NsxPolicyClient,
     import_root: Path,
     domain_id: str,
@@ -213,6 +289,12 @@ def _run_import_all(
     dry_run: bool,
     continue_on_error: bool,
 ) -> Dict[str, Any]:
+    """
+    Full import for the default domain using compiled policies:
+      - services
+      - groups
+      - compiled policies (with embedded rules)
+    """
     importer = _make_importer(
         client=client,
         import_root=import_root,
@@ -222,19 +304,84 @@ def _run_import_all(
         continue_on_error=continue_on_error,
     )
 
-    result = importer.import_all()
+    merged_stats = {
+        "services": 0,
+        "groups": 0,
+        "policies": 0,
+        "rules": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    merged_errors: List[str] = []
+
+    # Services
+    try:
+        before = dict(importer.stats)
+        importer.import_services()
+        merged_stats["services"] += importer.stats["services"] - before["services"]
+        merged_stats["skipped"] += importer.stats["skipped"] - before["skipped"]
+        merged_stats["errors"] += importer.stats["errors"] - before["errors"]
+    except Exception as exc:
+        msg = f"Service import failed for domain {domain_id}: {exc}"
+        log.exception(msg)
+        merged_errors.append(msg)
+        merged_stats["errors"] += 1
+        if not continue_on_error:
+            raise
+
+    # Groups
+    try:
+        result = importer.import_groups()
+        if isinstance(result, dict):
+            result_stats = result.get("stats", {}) or {}
+            result_errors = result.get("errors", []) or []
+            for key in merged_stats:
+                merged_stats[key] += int(result_stats.get(key, 0) or 0)
+            merged_errors.extend(result_errors)
+    except Exception as exc:
+        msg = f"Group import failed for domain {domain_id}: {exc}"
+        log.exception(msg)
+        merged_errors.append(msg)
+        merged_stats["errors"] += 1
+        if not continue_on_error:
+            raise
+
+    # Compiled Policies
+    try:
+        result = _import_compiled_policies(
+            importer=importer,
+            import_root=import_root,
+            domain_id=domain_id,
+        )
+        result_stats = result.get("stats", {}) or {}
+        result_errors = result.get("errors", []) or []
+        for key in merged_stats:
+            merged_stats[key] += int(result_stats.get(key, 0) or 0)
+        merged_errors.extend(result_errors)
+    except Exception as exc:
+        msg = f"Compiled policy import failed for domain {domain_id}: {exc}"
+        log.exception(msg)
+        merged_errors.append(msg)
+        merged_stats["errors"] += 1
+        if not continue_on_error:
+            raise
+
+    result = {
+        "stats": merged_stats,
+        "errors": merged_errors,
+    }
 
     _append_jsonl(
         PUSH_JSONL_PATH,
         {
             "action": "import_result",
-            "mode": "full",
+            "mode": "default_compiled",
             "domain": domain_id,
-            "stats": result.get("stats", {}),
+            "stats": merged_stats,
         },
     )
 
-    for err in result.get("errors", []) or []:
+    for err in merged_errors:
         _append_error(domain_id, err)
 
     return result
@@ -340,7 +487,7 @@ def main() -> None:
     _setup_logging()
 
     parser = argparse.ArgumentParser(
-        description="Push a prebuilt nsx_import tree to an NSX manager."
+        description="Push a prebuilt nsx_import tree to an NSX manager using compiled policies."
     )
 
     parser.add_argument("--target", required=True, help="Target manager alias, e.g. nsx-gm2")
@@ -368,7 +515,7 @@ def main() -> None:
     if not import_root.exists():
         raise RuntimeError(
             f"Import root does not exist: {import_root}\n"
-            f"Build it first with build_nsx_import_tree.py."
+            f"Build it first with build_nsx_import_tree.py and compile_nsx_policies.py."
         )
 
     log.info("Target manager    : %s", dst_mgr)
@@ -406,8 +553,8 @@ def main() -> None:
 
         for domain_id in import_order:
             if domain_id == "default":
-                log.info("Starting full import for domain: %s", domain_id)
-                result = _run_import_all(
+                log.info("Starting compiled full import for domain: %s", domain_id)
+                result = _run_import_default_compiled(
                     client=client,
                     import_root=import_root,
                     domain_id=domain_id,
@@ -435,7 +582,7 @@ def main() -> None:
         final_result = _merge_results(results)
 
     else:
-        final_result = _run_import_all(
+        final_result = _run_import_default_compiled(
             client=client,
             import_root=import_root,
             domain_id=args.domain_id,

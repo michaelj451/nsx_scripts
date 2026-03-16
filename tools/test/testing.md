@@ -119,17 +119,27 @@ python tools/test/build_nsx_import_tree.py \
   --force
 
 
+## COMPILE POLICY TREE ##
+
+python tools/test/compile_nsx_policies.py \
+  --target nsx-gm2 \
+  --import-base nsx_import \
+  --input-format yaml \
+  --output-format yaml \
+  --force
+
+
 ## PUSH GROUPS FROM ONE GM TO ANOTHER ##
 
-python tools/test/push_nsx_import_tree.py \
+python tools/test/push_nsx_object_tree.py \
   --target nsx-gm2 \
   --import-base nsx_import \
   --domain-id default \
   --input-format yaml \
-  --federation-global 
+  --federation-global
 
 
-python tools/test/push_nsx_import_tree.py \
+python tools/test/push_nsx_object_tree.py \
   --target nsx-gm2 \
   --import-base nsx_import \
   --domain-id default \
