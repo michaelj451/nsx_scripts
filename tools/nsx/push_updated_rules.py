@@ -60,7 +60,7 @@ log = logging.getLogger("push_updated_rules")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_GM_NAME = nsx_gm2               # used for default paths, not critical
+DEFAULT_GM_NAME = nsx_gm1               # used for default paths, not critical
 DEFAULT_DST_DOMAIN = "default"
 DEFAULT_RULES_DOMAIN = "default"
 

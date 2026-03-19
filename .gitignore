@@ -6,6 +6,7 @@ __pycache__/
 
 # NSX export intermediate files
 nsx_export/
+nsx_import/
 nsx_export_promote/
 nsx_domain_meta/
 nsx_remapped_groups/

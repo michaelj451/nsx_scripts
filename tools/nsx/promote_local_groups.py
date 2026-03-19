@@ -57,8 +57,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Defaults (UPDATED)
 # -----------------------------------------------------------------------------
 
-DEFAULT_GM_NAME = nsx_gm2                      # e.g. "nsx-gm1.lab.local" (dir name)
-DEFAULT_IMPORTED_LM1_DOMAIN = nsx_lm3          # e.g. "nsx-lm1.lab.local" (imported LM1 domain on GM)
+DEFAULT_GM_NAME = nsx_gm1                      # e.g. "nsx-gm1.lab.local" (dir name)
+DEFAULT_IMPORTED_LM1_DOMAIN = nsx_lm2          # e.g. "nsx-lm1.lab.local" (imported LM1 domain on GM)
 
 DEFAULT_DST_DOMAIN = "default"
 DEFAULT_SUFFIX = object_appendix

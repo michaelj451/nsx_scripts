@@ -68,6 +68,9 @@ python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --
 python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm1.lab.local --apply
 ```
 ``` bash
+python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm2.lab.local --apply
+```
+``` bash
 python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm3.lab.local --apply
 ```
 ``` bash
