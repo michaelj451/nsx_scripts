@@ -60,6 +60,29 @@ python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --
 ``` bash
 python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --apply
 ```
+
+## 3b) REVERT
+
+``` bash
+python tools/test/rollback_nsx_groups.py \
+  --manager https://nsx-gm2.lab.local \
+  --username admin \
+  --password 'yourpassword' \
+  --export-root nsx_export/nsx-gm1.lab.local \
+  --domain-id default \
+  --federation-global
+```
+
+``` bash
+python tools/test/rollback_nsx_groups.py \
+  --manager https://nsx-gm2.lab.local \
+  --username admin \
+  --password 'yourpassword' \
+  --export-root nsx_export/nsx-gm1.lab.local \
+  --domain-id default \
+  --federation-global \
+  --apply
+```
 ------------------------------------------------------------------------
 
 ## 4) Push Remapped Groups to LM
