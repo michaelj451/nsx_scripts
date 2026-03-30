@@ -156,6 +156,7 @@ def main() -> None:
 
     c = Counters()
     all_snapshots: list[dict] = []
+    all_range_events: list[dict] = []
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for f in in_files:
@@ -169,7 +170,11 @@ def main() -> None:
             log.warning("SKIP parse error: %s (%s)", rel, e)
             continue
 
-        updated_doc, groups_touched, tokens_added, file_snapshots = add_mapped_ips_in_doc(doc, maps)
+        updated_doc, groups_touched, tokens_added, file_snapshots, file_range_events = add_mapped_ips_in_doc(doc, maps)
+
+        for ev in file_range_events:
+            ev["source_file"] = str(rel)
+        all_range_events.extend(file_range_events)
 
         if tokens_added == 0:
             continue
@@ -211,9 +216,10 @@ def main() -> None:
         log.info("Files written:        %d", c.written)
         log.info("Output directory:     %s", out_root.resolve())
 
+    log_dir = _resolve_log_dir()
+    mode = "dryrun" if args.dry_run else "run"
+
     if all_snapshots:
-        mode = "dryrun" if args.dry_run else "run"
-        log_dir = _resolve_log_dir()
         snapshot_dir = log_dir / "nsx_snapshots" / f"{run_ts}_add_mapped_ips_{mode}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot_file = snapshot_dir / "snapshot.json"
@@ -227,6 +233,45 @@ def main() -> None:
         }
         snapshot_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
         log.info("Snapshot written: %s", snapshot_file)
+
+    if all_range_events:
+        # JSONL: one record per range found across all files
+        jsonl_file = log_dir / f"ip_range_events_{run_ts}.jsonl"
+        with jsonl_file.open("w", encoding="utf-8") as fh:
+            for ev in all_range_events:
+                fh.write(json.dumps(ev) + "\n")
+        log.info("IP range events (jsonl): %s", jsonl_file)
+
+        # JSON: ranges grouped by object, showing before/after per group
+        groups_map: dict[str, dict] = {}
+        for ev in all_range_events:
+            key = ev["group_id"]
+            if key not in groups_map:
+                groups_map[key] = {
+                    "group_id": ev["group_id"],
+                    "group_display_name": ev["group_display_name"],
+                    "source_file": ev.get("source_file"),
+                    "ranges": [],
+                }
+            groups_map[key]["ranges"].append({
+                "before": ev["range"],
+                "after": ev["proposed_change"],
+                "status": ev["status"],
+            })
+
+        json_file = log_dir / f"ip_range_summary_{run_ts}.json"
+        json_file.write_text(
+            json.dumps({
+                "run_ts": run_ts,
+                "mode": mode,
+                "total_ranges_found": len(all_range_events),
+                "groups": list(groups_map.values()),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        log.info("IP range summary (json):  %s", json_file)
+    else:
+        log.info("No IP ranges found in any group.")
 
 
 if __name__ == "__main__":

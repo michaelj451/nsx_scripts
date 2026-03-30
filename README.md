@@ -49,7 +49,7 @@ python tools/nsx/add_mapped_ips_to_groups_files.py
 Preview:
 
 ``` bash
-python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2
 ```
 
 Apply:
