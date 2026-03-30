@@ -512,23 +512,27 @@ def add_mapped_ip_addresses_additive(tokens: Iterable[Any], maps: list[SubnetMap
     return out, added
 
 
-def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, int]:
+def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, int, list]:
     """
     Mutates group docs in-place (additive):
       - Only modifies IPAddressExpression.ip_addresses
       - Keeps original tokens and appends mapped tokens
-    Returns (doc, groups_touched, tokens_added_total)
+    Returns (doc, groups_touched, tokens_added_total, snapshots)
+    where snapshots is a list of per-group before/after/added dicts.
     """
     _, groups = find_groups_container(doc)
 
     groups_touched = 0
     tokens_added_total = 0
+    snapshots: list[dict] = []
 
     for g in groups:
         if not isinstance(g, dict):
             continue
 
         group_added = 0
+        before_all: list[str] = []
+        after_all: list[str] = []
 
         for expr in g.get("expression", []) or []:
             if not isinstance(expr, dict):
@@ -556,11 +560,37 @@ def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, in
                 expr["ip_addresses"] = after
                 group_added += added
 
+            before_all.extend(before)
+            after_all.extend(after)
+
         if group_added > 0:
             groups_touched += 1
             tokens_added_total += group_added
 
-    return doc, groups_touched, tokens_added_total
+        if before_all or after_all:
+            before_set = set(before_all)
+            after_set = set(after_all)
+            added_ips = [ip for ip in after_all if ip not in before_set]
+            removed_ips = [ip for ip in before_all if ip not in after_set]
+            snapshots.append({
+                "group_id": str(g.get("id", "unknown")),
+                "group_display_name": g.get("display_name") or g.get("name"),
+                "before": {
+                    "ip_count": len(before_all),
+                    "ips": [{"value": ip, "type": _classify_token(ip), "status": "pre-existing"} for ip in before_all],
+                },
+                "after": {
+                    "ip_count": len(after_all),
+                    "ips": [
+                        {"value": ip, "type": _classify_token(ip), "status": "added" if ip not in before_set else "pre-existing"}
+                        for ip in after_all
+                    ],
+                },
+                "added": [{"value": ip, "type": _classify_token(ip), "status": "added"} for ip in added_ips],
+                "removed": [{"value": ip, "type": _classify_token(ip), "status": "removed"} for ip in removed_ips],
+            })
+
+    return doc, groups_touched, tokens_added_total, snapshots
 
 
 # =============================================================================

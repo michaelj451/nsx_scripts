@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
 
@@ -214,6 +216,33 @@ def _wrap_group_patch_controls(
     )
 
 
+def _write_snapshot(
+    snapshots: list,
+    *,
+    target: str,
+    domain_id: str,
+    dry_run: bool,
+    run_ts: str,
+    snapshots_base: Path,
+) -> Path:
+    mode = "dryrun" if dry_run else "apply"
+    run_dir = snapshots_base / f"{run_ts}_{target}_{mode}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    out = {
+        "run_ts": run_ts,
+        "target": target,
+        "domain_id": domain_id,
+        "mode": mode,
+        "groups_snapshotted": len(snapshots),
+        "groups": snapshots,
+    }
+
+    snapshot_file = run_dir / "snapshot.json"
+    snapshot_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return snapshot_file
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Push NSX Group updates from files (additive-only, existing groups) into a target NSX manager"
@@ -313,6 +342,8 @@ def main() -> None:
 
     importer = NsxGroupImporter(client=client, cfg=cfg)
 
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
     try:
         result = importer.import_all()
     except KeyboardInterrupt as exc:
@@ -320,6 +351,22 @@ def main() -> None:
         raise SystemExit(130)
 
     log.info("Push complete. Stats=%s Errors=%d", result.get("stats"), len(result.get("errors", [])))
+
+    snapshots = result.get("snapshots", [])
+    if snapshots:
+        snapshots_base = Path(nsx_log_dir) / "nsx_snapshots"
+        snapshot_file = _write_snapshot(
+            snapshots,
+            target=args.target,
+            domain_id=args.domain_id,
+            dry_run=(not args.apply),
+            run_ts=run_ts,
+            snapshots_base=snapshots_base,
+        )
+        log.info("Snapshot written: %s", snapshot_file)
+    else:
+        log.info("No groups snapshotted (nothing matched or all skipped).")
+
     print(result)
 
 

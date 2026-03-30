@@ -24,6 +24,7 @@ Logging:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -154,6 +155,8 @@ def main() -> None:
     in_files = iter_group_files(export_root)
 
     c = Counters()
+    all_snapshots: list[dict] = []
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for f in in_files:
         c.scanned += 1
@@ -166,7 +169,7 @@ def main() -> None:
             log.warning("SKIP parse error: %s (%s)", rel, e)
             continue
 
-        updated_doc, groups_touched, tokens_added = add_mapped_ips_in_doc(doc, maps)
+        updated_doc, groups_touched, tokens_added, file_snapshots = add_mapped_ips_in_doc(doc, maps)
 
         if tokens_added == 0:
             continue
@@ -174,6 +177,10 @@ def main() -> None:
         c.docs_with_changes += 1
         c.groups_touched_total += groups_touched
         c.tokens_added_total += tokens_added
+
+        for snap in file_snapshots:
+            snap["source_file"] = str(rel)
+        all_snapshots.extend(file_snapshots)
 
         out_f = out_path_for(f, export_root, out_root)
         log.info(
@@ -203,6 +210,23 @@ def main() -> None:
     else:
         log.info("Files written:        %d", c.written)
         log.info("Output directory:     %s", out_root.resolve())
+
+    if all_snapshots:
+        mode = "dryrun" if args.dry_run else "run"
+        log_dir = _resolve_log_dir()
+        snapshot_dir = log_dir / "nsx_snapshots" / f"{run_ts}_add_mapped_ips_{mode}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_file = snapshot_dir / "snapshot.json"
+        out = {
+            "run_ts": run_ts,
+            "mode": mode,
+            "csv": str(csv_path.resolve()),
+            "nsx_export": str(export_root.resolve()),
+            "groups_snapshotted": len(all_snapshots),
+            "groups": all_snapshots,
+        }
+        snapshot_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+        log.info("Snapshot written: %s", snapshot_file)
 
 
 if __name__ == "__main__":

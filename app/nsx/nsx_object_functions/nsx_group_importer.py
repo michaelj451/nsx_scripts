@@ -10,6 +10,8 @@ import json
 import yaml
 import logging
 
+from nsx.nsx_object_functions.nsx_group_remap import _classify_token
+
 log = logging.getLogger(__name__)
 
 
@@ -93,6 +95,7 @@ class NsxGroupImporter:
             "errors": 0,
         }
         self.errors: List[str] = []
+        self.snapshots: List[Dict] = []
         self._groups_allowlist: Optional[Set[str]] = self._load_groups_allowlist()
 
     # ---------------- helpers ----------------
@@ -318,6 +321,22 @@ class NsxGroupImporter:
                 after_ips = self._normalize_ip_list(after_ips)
                 added_ips = [ip for ip in after_ips if ip not in set(before_ips)]
 
+                self.snapshots.append({
+                    "group_id": gid,
+                    "group_display_name": payload.get("display_name"),
+                    "domain_id": self.cfg.domain_id,
+                    "file": str(f),
+                    "before": {
+                        "ip_count": len(before_ips),
+                        "ips": [{"value": ip, "type": _classify_token(ip)} for ip in before_ips],
+                    },
+                    "after": {
+                        "ip_count": len(after_ips),
+                        "ips": [{"value": ip, "type": _classify_token(ip)} for ip in after_ips],
+                    },
+                    "added": [{"value": ip, "type": _classify_token(ip)} for ip in added_ips],
+                })
+
                 if self.cfg.dry_run:
                     log.info(
                         "[DRY-RUN] PATCH %s (id=%s) additive IP merge only; added_ip_count=%d added_ips=%s",
@@ -354,4 +373,4 @@ class NsxGroupImporter:
         if self.cfg.mode in ("groups_only", "all"):
             self.import_groups()
 
-        return {"stats": self.stats, "errors": self.errors}
+        return {"stats": self.stats, "errors": self.errors, "snapshots": self.snapshots}

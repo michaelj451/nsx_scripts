@@ -23,8 +23,8 @@ except ImportError:
 # Throttle (hard-coded)
 # =============================================================================
 # 5 requests/second => 0.2s between requests
-THROTTLE_RPS = 0.5
-THROTTLE_INTERVAL_S = 1.0 / THROTTLE_RPS
+THROTTLE_RPS = 0.1
+THROTTLE_INTERVAL_S = 0.1 / THROTTLE_RPS
 
 # =============================================================================
 # Repo Root
