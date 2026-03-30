@@ -49,6 +49,7 @@ def sanitize_group_payload_for_put(raw: dict) -> dict:
 
     return out
 
+
 @dataclass
 class GroupImportConfig:
     export_root: Path
@@ -154,8 +155,6 @@ class NsxGroupImporter:
 
         raise ValueError(f"Allowlist file {f} must be a list or dict with a 'groups' list")
 
-
-
     def _is_new_group(self, group_payload: Dict[str, Any]) -> bool:
         gid = str(group_payload.get("id") or "")
         name = str(group_payload.get("display_name") or "")
@@ -170,6 +169,96 @@ class NsxGroupImporter:
         # If neither configured, allow all groups in folder
         return True
 
+    def _stable_json(self, value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    def _normalize_ip_list(self, ips: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+
+        for ip in ips:
+            s = str(ip).strip()
+            if not s:
+                continue
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+
+        return out
+
+    def _extract_ip_expression_ips(self, expr: Dict[str, Any]) -> List[str]:
+        if not isinstance(expr, dict):
+            return []
+
+        if expr.get("resource_type") != "IPAddressExpression":
+            return []
+
+        ips = expr.get("ip_addresses") or []
+        if not isinstance(ips, list):
+            return []
+
+        return [str(x).strip() for x in ips if str(x).strip()]
+
+    def _merge_ip_address_expressions_only(
+        self,
+        live: Dict[str, Any],
+        incoming: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Additive-only merge for IPAddressExpression objects.
+
+        Rules:
+        - Preserve the live object as the source of truth.
+        - Only inspect incoming IPAddressExpression entries.
+        - Only add missing IPs.
+        - Do not remove existing IPs.
+        - Do not modify non-IPAddressExpression entries.
+        - Do not modify unrelated scalar fields.
+        """
+        merged = dict(live)
+
+        live_exprs = list(live.get("expression") or [])
+        incoming_exprs = list(incoming.get("expression") or [])
+
+        if not isinstance(live_exprs, list):
+            live_exprs = []
+        if not isinstance(incoming_exprs, list):
+            incoming_exprs = []
+
+        incoming_ips: List[str] = []
+        for expr in incoming_exprs:
+            incoming_ips.extend(self._extract_ip_expression_ips(expr))
+
+        incoming_ips = self._normalize_ip_list(incoming_ips)
+
+        if not incoming_ips:
+            return merged
+
+        # Find first live IPAddressExpression to append into
+        live_ip_expr_index: Optional[int] = None
+        existing_ips: List[str] = []
+
+        for idx, expr in enumerate(live_exprs):
+            if isinstance(expr, dict) and expr.get("resource_type") == "IPAddressExpression":
+                live_ip_expr_index = idx
+                existing_ips = self._extract_ip_expression_ips(expr)
+                break
+
+        if live_ip_expr_index is not None:
+            combined_ips = self._normalize_ip_list(existing_ips + incoming_ips)
+            updated_expr = dict(live_exprs[live_ip_expr_index])
+            updated_expr["ip_addresses"] = combined_ips
+            live_exprs[live_ip_expr_index] = updated_expr
+        else:
+            # No live IP expression exists; append a new one.
+            live_exprs.append({
+                "resource_type": "IPAddressExpression",
+                "ip_addresses": incoming_ips,
+            })
+
+        merged["expression"] = live_exprs
+        return merged
+
     # ---------------- import stages ----------------
 
     def import_groups(self):
@@ -183,17 +272,67 @@ class NsxGroupImporter:
                     self.stats["skipped"] += 1
                     continue
 
+                if not self._is_new_group(data):
+                    self.stats["skipped"] += 1
+                    log.info(
+                        "Skipping group not matched by allowlist/suffix: id=%s display_name=%s file=%s",
+                        data.get("id"),
+                        data.get("display_name"),
+                        f,
+                    )
+                    continue
+
                 gid = data.get("id")
                 if not gid:
                     raise ValueError("Group missing id")
 
                 path = self._policy_path(f"/domains/{self.cfg.domain_id}/groups/{gid}")
-                payload = sanitize_group_payload_for_put(data)
+
+                incoming = sanitize_group_payload_for_put(data)
+
+                # Read live object so we can do additive-only merge
+                live = self.client._get(path)
+                if not isinstance(live, dict) or not live:
+                    raise ValueError(f"Live group not found or unreadable: {gid}")
+
+                live_clean = sanitize_group_payload_for_put(live)
+
+                # Merge only IPAddressExpression IPs
+                payload = self._merge_ip_address_expressions_only(
+                    live=live_clean,
+                    incoming=incoming,
+                )
+
+                before_ips: List[str] = []
+                after_ips: List[str] = []
+
+                for expr in live_clean.get("expression") or []:
+                    if isinstance(expr, dict) and expr.get("resource_type") == "IPAddressExpression":
+                        before_ips.extend(self._extract_ip_expression_ips(expr))
+
+                for expr in payload.get("expression") or []:
+                    if isinstance(expr, dict) and expr.get("resource_type") == "IPAddressExpression":
+                        after_ips.extend(self._extract_ip_expression_ips(expr))
+
+                before_ips = self._normalize_ip_list(before_ips)
+                after_ips = self._normalize_ip_list(after_ips)
+                added_ips = [ip for ip in after_ips if ip not in set(before_ips)]
 
                 if self.cfg.dry_run:
-                    log.info("[DRY-RUN] PATCH %s (id=%s)", path, gid)
+                    log.info(
+                        "[DRY-RUN] PATCH %s (id=%s) additive IP merge only; added_ip_count=%d added_ips=%s",
+                        path,
+                        gid,
+                        len(added_ips),
+                        added_ips,
+                    )
                 else:
                     self.client._patch(path, payload)
+                    log.info(
+                        "Patched group %s with additive IP merge only; added_ip_count=%d",
+                        gid,
+                        len(added_ips),
+                    )
 
                 self.stats["groups"] += 1
 
@@ -209,6 +348,7 @@ class NsxGroupImporter:
             self.cfg.new_group_suffix,
             str(self.cfg.new_groups_allowlist_file) if self.cfg.new_groups_allowlist_file else None,
         )
+        log.info("Group importer behavior: additive IPAddressExpression merge only; existing non-IP expressions are preserved")
 
         # For your use case, keep it tight:
         if self.cfg.mode in ("groups_only", "all"):
