@@ -87,15 +87,23 @@ def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: 
     if added:
         logger.info("  added: %s", added)
 
-    _write_change_record(
-        {
-            "kind": "ip_addresses_change",
+    for token in removed:
+        _write_change_record({
+            "kind": _classify_token(token),
+            "action": "removed",
+            "value": token,
             "group_id": group_id,
             "expr_id": expr_id,
-            "removed": removed,
-            "added": added,
-        }
-    )
+        })
+
+    for token in added:
+        _write_change_record({
+            "kind": _classify_token(token),
+            "action": "added",
+            "value": token,
+            "group_id": group_id,
+            "expr_id": expr_id,
+        })
 
 
 # =============================================================================
@@ -106,12 +114,9 @@ def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: 
 class SubnetMap:
     old: ipaddress._BaseNetwork
     new: ipaddress._BaseNetwork
-    vlan: str | None = None
-    description: str | None = None
-
 
 def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
-    required = {"old_subnet", "new_subnet", "vlan", "description"}
+    required = {"old_subnet", "new_subnet"}
     maps: list[SubnetMap] = []
 
     with csv_path.open(newline="", encoding="utf-8") as f:
@@ -138,9 +143,7 @@ def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
             maps.append(
                 SubnetMap(
                     old=old_net,
-                    new=new_net,
-                    vlan=(row.get("vlan") or "").strip() or None,
-                    description=(row.get("description") or "").strip() or None,
+                    new=new_net
                 )
             )
 
@@ -251,6 +254,25 @@ def rebuild_expression_paths(expr: dict, new_group_path: str) -> None:
 # =============================================================================
 
 _RANGE_RE = re.compile(r"^\s*([0-9a-fA-F\.:]+)\s*-\s*([0-9a-fA-F\.:]+)\s*$")
+
+
+def _classify_token(s: str) -> str:
+    """Return 'ip_range', 'subnet', or 'ip_address' for a token.
+
+      - Contains '-'              => ip_range  (e.g. 10.1.0.1-10.1.0.10)
+      - CIDR with prefix < /32   => subnet     (e.g. 10.1.0.0/24)
+      - /32, bare IP, or fallback => ip_address (e.g. 10.1.2.3/32, 10.1.2.3)
+    """
+    if _RANGE_RE.match(s):
+        return "ip_range"
+    if "/" in s:
+        try:
+            net = ipaddress.ip_network(s, strict=False)
+            if net.prefixlen < net.max_prefixlen:
+                return "subnet"
+        except ValueError:
+            pass
+    return "ip_address"
 
 
 def looks_like_ip_token(s: str) -> bool:
