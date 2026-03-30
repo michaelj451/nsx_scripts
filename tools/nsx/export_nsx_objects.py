@@ -23,7 +23,7 @@ except ImportError:
 # Throttle (hard-coded)
 # =============================================================================
 # 5 requests/second => 0.2s between requests
-THROTTLE_RPS = 5.0
+THROTTLE_RPS = 0.5
 THROTTLE_INTERVAL_S = 1.0 / THROTTLE_RPS
 
 # =============================================================================
@@ -201,13 +201,16 @@ def _apply_throttle_to_client(client: NsxPolicyClient) -> None:
     # Wrap _get
     if hasattr(client, "_get"):
         orig_get = client._get
-        last_ts = {"t": 0.0}
+        last_ts = {"t": time.monotonic()}
 
         def throttled_get(*args, **kwargs):
             now = time.monotonic()
-            wait = THROTTLE_INTERVAL_S - (now - last_ts["t"])
+            elapsed = now - last_ts["t"]
+            wait = THROTTLE_INTERVAL_S - elapsed
             if wait > 0:
                 time.sleep(wait)
+            path = args[0] if args else kwargs.get("path", "?")
+            log.info("[+%.3fs] GET %s", elapsed, path)
             resp = orig_get(*args, **kwargs)
             last_ts["t"] = time.monotonic()
             return resp
