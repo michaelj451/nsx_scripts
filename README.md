@@ -63,25 +63,82 @@ python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --
 
 ## 3b) REVERT
 
+Credentials are read from `.env` — no username/password args required.
+
+Dry run (nsx-gm2):
+
 ``` bash
-python tools/test/rollback_nsx_groups.py \
-  --manager https://nsx-gm2.lab.local \
-  --username admin \
-  --password 'yourpassword' \
+python tools/nsx/push_nsx_groups_revert.py \
+  --target nsx-gm2 \
+  --export-root nsx_export/nsx-gm2.lab.local \
+  --domain-id default \
+  --federation-global
+```
+
+Dry run (nsx-gm1):
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py \
+  --target nsx-gm1 \
   --export-root nsx_export/nsx-gm1.lab.local \
   --domain-id default \
   --federation-global
 ```
 
+Apply (nsx-gm2):
+
 ``` bash
-python tools/test/rollback_nsx_groups.py \
-  --manager https://nsx-gm2.lab.local \
-  --username admin \
-  --password 'yourpassword' \
+python tools/nsx/push_nsx_groups_revert.py \
+  --target nsx-gm2 \
+  --export-root nsx_export/nsx-gm2.lab.local \
+  --domain-id default \
+  --federation-global \
+  --apply
+```
+
+Apply (nsx-gm1):
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py \
+  --target nsx-gm1 \
   --export-root nsx_export/nsx-gm1.lab.local \
   --domain-id default \
   --federation-global \
   --apply
+```
+
+### Revert non-default domains (LM domains)
+
+LM1 and LM2 are imported under GM1; LM3 and LM4 under GM2.
+
+Dry run:
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm1.lab.local --federation-global
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm2.lab.local --federation-global
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
+```
+
+Apply:
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm1.lab.local --federation-global --apply
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm2.lab.local --federation-global --apply
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global --apply
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global --apply
 ```
 ------------------------------------------------------------------------
 
