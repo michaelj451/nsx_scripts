@@ -278,13 +278,19 @@ def main() -> None:
         "--group-interval-seconds",
         type=float,
         default=GROUP_PATCH_INTERVAL_SECONDS,
-        help=f"Minimum seconds between applied group updates (default: {GROUP_PATCH_INTERVAL_SECONDS}).",
+        help=(
+            f"Time throttle: minimum seconds to wait between each PATCH call to NSX (default: {GROUP_PATCH_INTERVAL_SECONDS}). "
+            "Prevents hammering the API. Increase if NSX returns rate-limit errors."
+        ),
     )
     parser.add_argument(
         "--prompt-every",
         type=int,
         default=PROMPT_EVERY_N_UPDATES,
-        help=f"Prompt to continue after this many applied updates (default: {PROMPT_EVERY_N_UPDATES}). Use 0 to disable.",
+        help=(
+            f"Human checkpoint: pause and ask 'Continue?' after every N successful patches (default: {PROMPT_EVERY_N_UPDATES}). "
+            "Lets you review results before proceeding. Use 0 to disable and run unattended."
+        ),
     )
 
     args = parser.parse_args()
@@ -367,7 +373,7 @@ def main() -> None:
     else:
         log.info("No groups snapshotted (nothing matched or all skipped).")
 
-    print(result)
+    log.info("Stats: %s", result.get("stats"))
 
 
 if __name__ == "__main__":
