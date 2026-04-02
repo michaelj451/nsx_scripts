@@ -18,8 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -30,6 +31,9 @@ from nsx.nsx_policy_client import NsxPolicyClient
 log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+GROUP_PATCH_INTERVAL_SECONDS = 1.0
+PROMPT_EVERY_N_UPDATES = 1
 
 DEFAULT_STRIP_KEYS = {
     "_create_time",
@@ -50,6 +54,10 @@ DEFAULT_STRIP_KEYS = {
     "overridden",
     "origin_site_id",
     "owner_id",
+}
+
+LOCAL_ONLY_KEYS = {
+    "_source_file",
 }
 
 
@@ -95,6 +103,13 @@ def clean_payload(obj: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in obj.items() if k not in DEFAULT_STRIP_KEYS}
 
 
+def payload_for_patch(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip any local-only helper keys before sending payload to NSX.
+    """
+    return {k: v for k, v in obj.items() if k not in LOCAL_ONLY_KEYS}
+
+
 def discover_group_files(export_root: Path, domain_id: str) -> List[Path]:
     candidates = [
         export_root / domain_id / "groups",
@@ -123,8 +138,179 @@ def load_desired_groups(export_root: Path, domain_id: str) -> Dict[str, Dict[str
         if not group_id:
             log.warning("Skipping %s — no 'id' field", path)
             continue
-        desired[group_id] = clean_payload(obj)
+        cleaned = clean_payload(obj)
+        cleaned["_source_file"] = str(path)
+        desired[group_id] = cleaned
     return desired
+
+
+# -----------------------------------------------------------------------------
+# Diff helpers
+# -----------------------------------------------------------------------------
+
+def _extract_ip_address_entries(node: Any) -> List[str]:
+    """
+    Recursively collect all entries from IPAddressExpression.ip_addresses.
+    This captures IPs, CIDRs, and ranges because NSX stores them as strings.
+    """
+    found: List[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if obj.get("resource_type") == "IPAddressExpression":
+                for value in obj.get("ip_addresses", []) or []:
+                    if isinstance(value, str):
+                        found.append(value.strip())
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(node)
+    return found
+
+
+def _diff_group_ip_entries(current_group: Optional[dict], desired_group: dict) -> Dict[str, List[str]]:
+    current_entries = set(_extract_ip_address_entries(current_group or {}))
+    desired_entries = set(_extract_ip_address_entries(desired_group))
+
+    return {
+        "current": sorted(current_entries),
+        "desired": sorted(desired_entries),
+        "to_add": sorted(desired_entries - current_entries),
+        "to_remove": sorted(current_entries - desired_entries),
+        "already_present": sorted(desired_entries & current_entries),
+    }
+
+
+def _format_entries(entries: Optional[List[str]], *, max_items: int = 200) -> str:
+    if entries is None:
+        return "[unknown]"
+
+    if not entries:
+        return "[]"
+
+    if len(entries) <= max_items:
+        return "[" + ", ".join(entries) + "]"
+
+    shown = entries[:max_items]
+    return "[" + ", ".join(shown) + f", ... +{len(entries) - max_items} more]"
+
+
+def _action_word(add_count: int, remove_count: int) -> str:
+    if add_count > 0 and remove_count > 0:
+        return "ADD+REMOVE"
+    if add_count > 0:
+        return "ADD"
+    if remove_count > 0:
+        return "REMOVE"
+    return "NO-CHANGE"
+
+
+# -----------------------------------------------------------------------------
+# Pacing / approval helpers
+# -----------------------------------------------------------------------------
+
+def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
+    while True:
+        answer = input(
+            f"\nProcessed {processed_count} {phase}. Continue with next item? [y/N]: "
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            log.info("Operator chose to continue after %d %s.", processed_count, phase)
+            return
+
+        if answer in ("", "n", "no"):
+            log.warning("Operator aborted after %d %s.", processed_count, phase)
+            raise KeyboardInterrupt(f"Stopped by operator after {processed_count} {phase}.")
+
+        print("Please enter 'y' or 'n'.")
+
+
+def _controlled_checkpoint(*, processed_count: int, last_ts: float, phase: str) -> float:
+    now = time.monotonic()
+    wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+    if wait > 0:
+        log.info("%s throttle: waiting %.3f seconds before next item", phase, wait)
+        time.sleep(wait)
+
+    new_ts = time.monotonic()
+
+    if PROMPT_EVERY_N_UPDATES > 0 and processed_count % PROMPT_EVERY_N_UPDATES == 0:
+        _prompt_to_continue(processed_count, phase=phase)
+
+    return new_ts
+
+
+def _log_group_state(
+    *,
+    phase_label: str,
+    index: int,
+    total: int,
+    group_id: str,
+    display_name: str,
+    exists_in_nsx: bool,
+    current_entries: Optional[List[str]],
+    to_add: List[str],
+    to_remove: List[str],
+    source_file: Optional[str] = None,
+) -> None:
+    action = _action_word(len(to_add), len(to_remove))
+
+    if total > 0:
+        prefix = f"[{phase_label} {index}/{total}]"
+    else:
+        prefix = f"[{phase_label} {index}]"
+
+    log.info(
+        "%s group=%s display_name=%s exists_in_nsx=%s action=%s current=%s add=%d remove=%d%s",
+        prefix,
+        group_id,
+        display_name,
+        "yes" if exists_in_nsx else "no",
+        action,
+        len(current_entries) if current_entries is not None else "unknown",
+        len(to_add),
+        len(to_remove),
+        f" source_file={source_file}" if source_file else "",
+    )
+    log.info("  [CURRENT EXISTS] %s", _format_entries(current_entries))
+    log.info("  [RESTORE ADD]    %s", _format_entries(to_add))
+    log.info("  [RESTORE REMOVE] %s", _format_entries(to_remove))
+
+
+def _write_validation_report(
+    records: list,
+    *,
+    target: str,
+    domain_id: str,
+    run_ts: str,
+    output_base: Path,
+) -> Path:
+    run_dir = output_base / f"{run_ts}_{target}_revert_validate"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    out = {
+        "run_ts": run_ts,
+        "target": target,
+        "domain_id": domain_id,
+        "groups_validated": len(records),
+        "groups_missing_in_nsx": sum(1 for r in records if not r["exists_in_nsx"]),
+        "groups_with_additions": sum(1 for r in records if r["to_add_count"] > 0),
+        "groups_with_removals": sum(1 for r in records if r["to_remove_count"] > 0),
+        "groups_with_no_delta": sum(
+            1
+            for r in records
+            if r["exists_in_nsx"] and r["to_add_count"] == 0 and r["to_remove_count"] == 0
+        ),
+        "groups": records,
+    }
+
+    report_file = run_dir / "validation_report.json"
+    report_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return report_file
 
 
 # -----------------------------------------------------------------------------
@@ -138,6 +324,8 @@ def rollback_groups(
     *,
     dry_run: bool = True,
     delete_extraneous: bool = False,
+    target: str,
+    run_ts: str,
 ) -> None:
     desired = load_desired_groups(export_root, domain_id)
     if not desired:
@@ -160,32 +348,117 @@ def rollback_groups(
     log.info("  create (new)   : %d", len(to_create))
     log.info("  update         : %d", len(to_update))
     log.info("  delete extra   : %d", len(to_delete) if delete_extraneous else 0)
+    log.info("  pacing interval: %s", GROUP_PATCH_INTERVAL_SECONDS)
+    log.info("  prompt every   : %s", PROMPT_EVERY_N_UPDATES)
 
-    if dry_run:
-        for gid in to_create:
-            log.info("[DRY-RUN] would create: %s", gid)
-        for gid in to_update:
-            log.info("[DRY-RUN] would update: %s", gid)
-        if delete_extraneous:
-            for gid in to_delete:
-                log.info("[DRY-RUN] would delete extraneous: %s", gid)
-        return
+    validation_records: List[Dict[str, Any]] = []
+    ordered_restore_ids = sorted(desired.keys())
+    last_ts = 0.0
 
-    for gid in sorted(desired.keys()):
+    for idx, gid in enumerate(ordered_restore_ids, start=1):
         payload = desired[gid]
+        patch_payload = payload_for_patch(payload)
+        display_name = payload.get("display_name") or payload.get("name") or gid
+        source_file = payload.get("_source_file")
+        existing_group = existing.get(gid)
+
+        diff = _diff_group_ip_entries(existing_group, patch_payload)
+        current_entries = diff["current"] if existing_group is not None else None
+        to_add = diff["to_add"] if existing_group is not None else diff["desired"]
+        to_remove = diff["to_remove"] if existing_group is not None else []
+
+        _log_group_state(
+            phase_label="REVERT",
+            index=idx,
+            total=len(ordered_restore_ids),
+            group_id=gid,
+            display_name=display_name,
+            exists_in_nsx=(existing_group is not None),
+            current_entries=current_entries,
+            to_add=to_add,
+            to_remove=to_remove,
+            source_file=source_file,
+        )
+
+        validation_records.append(
+            {
+                "group_id": gid,
+                "display_name": display_name,
+                "source_file": source_file,
+                "exists_in_nsx": existing_group is not None,
+                "current_entries": current_entries,
+                "current_count": len(current_entries) if current_entries is not None else None,
+                "desired_entries": diff["desired"],
+                "desired_count": len(diff["desired"]),
+                "to_add": to_add,
+                "to_add_count": len(to_add),
+                "to_remove": to_remove,
+                "to_remove_count": len(to_remove),
+                "already_present": diff["already_present"] if existing_group is not None else [],
+                "already_present_count": len(diff["already_present"]) if existing_group is not None else 0,
+                "action": _action_word(len(to_add), len(to_remove)),
+            }
+        )
+
+        if dry_run:
+            last_ts = _controlled_checkpoint(
+                processed_count=idx,
+                last_ts=last_ts,
+                phase="dry-run rollback checks",
+            )
+            continue
+
         log.info("Restoring group: %s", gid)
         try:
-            client.patch_group(gid, payload, domain_id)
+            client.patch_group(gid, patch_payload, domain_id)
         except Exception as exc:
             log.error("Failed restoring %s: %s", gid, exc)
 
+        last_ts = _controlled_checkpoint(
+            processed_count=idx,
+            last_ts=last_ts,
+            phase="rollback updates",
+        )
+
     if delete_extraneous:
-        for gid in to_delete:
+        for delete_idx, gid in enumerate(to_delete, start=1):
+            log.info(
+                "[DELETE %d/%d] extraneous group=%s action=DELETE",
+                delete_idx,
+                len(to_delete),
+                gid,
+            )
+
+            if dry_run:
+                log.info("[DRY-RUN] would delete extraneous: %s", gid)
+                last_ts = _controlled_checkpoint(
+                    processed_count=len(ordered_restore_ids) + delete_idx,
+                    last_ts=last_ts,
+                    phase="dry-run rollback deletions",
+                )
+                continue
+
             log.info("Deleting extraneous group: %s", gid)
             try:
                 client.delete_group(gid, domain_id)
             except Exception as exc:
                 log.error("Failed deleting %s: %s", gid, exc)
+
+            last_ts = _controlled_checkpoint(
+                processed_count=len(ordered_restore_ids) + delete_idx,
+                last_ts=last_ts,
+                phase="rollback deletions",
+            )
+
+    validation_base = Path(nsx_log_dir) / "nsx_validation"
+    validation_file = _write_validation_report(
+        validation_records,
+        target=target,
+        domain_id=domain_id,
+        run_ts=run_ts,
+        output_base=validation_base,
+    )
+    log.info("Rollback validation report written: %s", validation_file)
 
 
 # -----------------------------------------------------------------------------
@@ -241,13 +514,17 @@ def main() -> None:
     if not manager_host:
         raise SystemExit(f"Manager not defined for {args.target}. Check your .env.")
 
+    run_ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+
     log.info("Starting push_nsx_groups_revert")
-    log.info("Target:           %s (%s)", args.target, manager_host)
-    log.info("Export root:      %s", Path(args.export_root).resolve())
-    log.info("Domain ID:        %s", args.domain_id)
-    log.info("Federation GM:    %s", args.federation_global)
-    log.info("Delete extra:     %s", args.delete_extraneous)
-    log.info("Mode:             %s", "APPLY" if args.apply else "DRY-RUN")
+    log.info("Target:                        %s (%s)", args.target, manager_host)
+    log.info("Export root:                   %s", Path(args.export_root).resolve())
+    log.info("Domain ID:                     %s", args.domain_id)
+    log.info("Federation GM:                 %s", args.federation_global)
+    log.info("Delete extra:                  %s", args.delete_extraneous)
+    log.info("Mode:                          %s", "APPLY" if args.apply else "DRY-RUN")
+    log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
+    log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
 
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)
 
@@ -257,6 +534,8 @@ def main() -> None:
         domain_id=args.domain_id,
         dry_run=not args.apply,
         delete_extraneous=args.delete_extraneous,
+        target=args.target,
+        run_ts=run_ts,
     )
 
 
