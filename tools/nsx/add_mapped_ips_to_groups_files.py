@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -135,6 +136,7 @@ def main() -> None:
     ap.add_argument("--nsx-export", default=str(NSX_EXPORT_DIR_DEFAULT), help="Input export root (default: ./nsx_export)")
     ap.add_argument("--nsx-updated", default=str(NSX_UPDATED_DIR_DEFAULT), help="Output root (default: ./nsx_groups_additive)")
     ap.add_argument("--dry-run", action="store_true", help="Analyze only; do not write output files.")
+    ap.add_argument("--no-clean", action="store_true", help="Skip clearing the output directory before writing. By default the output dir is wiped so only groups updated in this run are present.")
     args = ap.parse_args()
 
     log, _log_file = _setup_logging()
@@ -150,6 +152,10 @@ def main() -> None:
     log.info("Dry-run:     %s", args.dry_run)
 
     _validate_inputs(csv_path, export_root)
+
+    if not args.dry_run and not args.no_clean and out_root.exists():
+        log.info("Clearing output directory: %s", out_root.resolve())
+        shutil.rmtree(out_root)
 
     maps = read_csv_mappings(csv_path)
     in_files = iter_group_files(export_root)

@@ -210,13 +210,18 @@ class NsxGroupImporter:
         """
         Additive-only merge for IPAddressExpression objects.
 
+        Returns the full sanitized live object (as produced by
+        sanitize_group_payload_for_put) with only ip_addresses modified.
+        The full payload is required by the NSX GM federation PATCH endpoint —
+        sending a minimal payload causes error 500336 (type mismatch) because
+        NSX needs the full group context to validate the member type.
+
         Rules:
         - Preserve the live object as the source of truth.
-        - Only inspect incoming IPAddressExpression entries.
-        - Only add missing IPs.
-        - Do not remove existing IPs.
-        - Do not modify non-IPAddressExpression entries.
-        - Do not modify unrelated scalar fields.
+        - Only inspect incoming IPAddressExpression entries for new IPs to add.
+        - Only add missing IPs — never remove existing ones.
+        - Non-IPAddressExpression entries are untouched.
+        - Tags, display_name, scope etc. pass through unchanged from the live object.
         """
         merged = dict(live)
 
