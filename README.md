@@ -189,6 +189,14 @@ python tools/nsx/validate_nsx_groups.py \
   --federation-global
 ```
 
+``` bash
+python tools/nsx/validate_nsx_groups.py \
+  --target nsx-gm2 \
+  --expected-root nsx_export/nsx-gm2.lab.local \
+  --domain-id nsx-lm3.lab.local \
+  --federation-global
+```
+
 ## Safety Model
 
 This workflow is:

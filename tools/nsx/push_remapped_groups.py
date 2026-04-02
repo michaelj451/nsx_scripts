@@ -25,7 +25,7 @@ LOG_FILE_NAME = "push_nsx_groups.log"
 
 # These two fields regulate both dry-run validation pacing and apply pacing.
 GROUP_PATCH_INTERVAL_SECONDS = 1.0
-PROMPT_EVERY_N_UPDATES = 1
+PROMPT_EVERY_N_UPDATES = 5
 
 
 def setup_logging() -> logging.Logger:
@@ -144,6 +144,34 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
         if answer in ("", "n", "no"):
             log.warning("Operator aborted after %d %s.", processed_count, phase)
             raise KeyboardInterrupt(f"Stopped by operator after {processed_count} {phase}.")
+
+        print("Please enter 'y' or 'n'.")
+
+
+def _prompt_before_apply(*, validated_count: int, additions_count: int, missing_count: int) -> None:
+    while True:
+        answer = input(
+            f"\nValidation complete: groups_validated={validated_count}, groups_with_additions={additions_count}, "
+            f"missing_in_baseline={missing_count}. Proceed to APPLY push? [y/N]: "
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            log.info(
+                "Operator approved transition from validation to apply. validated=%d additions=%d missing=%d",
+                validated_count,
+                additions_count,
+                missing_count,
+            )
+            return
+
+        if answer in ("", "n", "no"):
+            log.warning(
+                "Operator aborted before apply after validation. validated=%d additions=%d missing=%d",
+                validated_count,
+                additions_count,
+                missing_count,
+            )
+            raise KeyboardInterrupt("Stopped by operator before apply phase.")
 
         print("Please enter 'y' or 'n'.")
 
@@ -817,6 +845,7 @@ def main() -> None:
     client = NsxPolicyClient(nsxmanager=dst_mgr, federation_global=args.federation_global)
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+    validation_records: list = []
     if not args.skip_baseline_validate:
         validation_records = _validate_groups_against_baseline(
             desired_groups_dir=desired_groups_dir,
@@ -854,6 +883,15 @@ def main() -> None:
                 "This script does not do fallback matching.",
                 len(missing),
             )
+
+    if args.apply and not args.skip_baseline_validate:
+        missing_count = sum(1 for r in validation_records if not r.get("exists_in_baseline"))
+        additions_count = sum(1 for r in validation_records if r.get("to_add_count", 0) > 0)
+        _prompt_before_apply(
+            validated_count=len(validation_records),
+            additions_count=additions_count,
+            missing_count=missing_count,
+        )
 
     _wrap_group_patch_controls(
         client,
