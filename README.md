@@ -157,7 +157,24 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --
 python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm4.lab.local --apply
 ```
 
+## 5) Validation
 
+``` bash
+python tools/nsx/validate_nsx_groups.py \
+  --target nsx-gm2 \
+  --expected-root nsx_groups_additive/nsx-gm2.lab.local \
+  --baseline-root nsx_export/nsx-gm2.lab.local \
+  --domain-id default \
+  --federation-global
+```
+
+``` bash
+python tools/nsx/validate_nsx_groups.py \
+  --target nsx-gm2 \
+  --expected-root nsx_export/nsx-gm2.lab.local \
+  --domain-id default \
+  --federation-global
+```
 
 ## Safety Model
 
