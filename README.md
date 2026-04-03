@@ -85,43 +85,25 @@ Credentials are read from `.env` — no username/password args required.
 Dry run (nsx-gm2):
 
 ``` bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-gm2 \
-  --export-root nsx_export/nsx-gm2.lab.local \
-  --domain-id default \
-  --federation-global
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
 ```
 
 Dry run (nsx-gm1):
 
 ``` bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-gm1 \
-  --export-root nsx_export/nsx-gm1.lab.local \
-  --domain-id default \
-  --federation-global
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id default --federation-global
 ```
 
 Apply (nsx-gm2):
 
 ``` bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-gm2 \
-  --export-root nsx_export/nsx-gm2.lab.local \
-  --domain-id default \
-  --federation-global \
-  --apply
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global --apply
 ```
 
 Apply (nsx-gm1):
 
 ``` bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-gm1 \
-  --export-root nsx_export/nsx-gm1.lab.local \
-  --domain-id default \
-  --federation-global \
-  --apply
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id default --federation-global --apply
 ```
 
 ## 5b) Revert non-default domains (LM domains)
@@ -162,71 +144,46 @@ python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_ex
 ## 5a) Push Validation
 
 ``` bash
-python tools/nsx/validate_nsx_groups.py \
-  --target nsx-gm2 \
-  --expected-root nsx_groups_additive/nsx-gm2.lab.local \
-  --baseline-root nsx_export/nsx-gm2.lab.local \
-  --domain-id default \
-  --federation-global
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
 ```
 
 ``` bash
-python tools/nsx/validate_nsx_groups.py \
-  --target nsx-gm2 \
-  --expected-root nsx_groups_additive/nsx-gm2.lab.local \
-  --baseline-root nsx_export/nsx-gm2.lab.local \
-  --domain-id nsx-lm3.lab.local \
-  --federation-global
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
 ```
 
 
 ``` bash
-python tools/nsx/validate_nsx_groups.py \
-  --target nsx-gm2 \
-  --expected-root nsx_groups_additive/nsx-gm2.lab.local \
-  --baseline-root nsx_export/nsx-gm2.lab.local \
-  --domain-id nsx-lm4.lab.local \
-  --federation-global
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
 ```
 
 ## 5b) Rollback Validation
 
 ``` bash
-python tools/nsx/validate_nsx_groups.py \
-  --target nsx-gm2 \
-  --expected-root nsx_export/nsx-gm2.lab.local \
-  --domain-id default \
-  --federation-global
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
 ```
 
 ``` bash
-python tools/nsx/validate_nsx_groups.py \
-  --target nsx-gm2 \
-  --expected-root nsx_export/nsx-gm2.lab.local \
-  --domain-id nsx-lm3.lab.local \
-  --federation-global
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
+
+
+``` bash
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
 ```
 
 ## FINAL - LIVE VALIDATE
 
-python tools/nsx/validate_nsx_groups_live.py \
-  --target nsx-gm2 \
-  --expected-root nsx_groups_additive/nsx-gm2.lab.local \
-  --domain-id default \
-  --federation-global
+``` bash
+python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id default --federation-global
+```
 
-python tools/nsx/validate_nsx_groups_live.py \
-  --target nsx-gm2 \
-  --expected-root nsx_groups_additive/nsx-gm2.lab.local\
-  --domain-id nsx-lm3.lab.local \
-  --federation-global
+``` bash
+python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
 
-python tools/nsx/validate_nsx_groups_live.py \
-  --target nsx-gm2 \
-  --expected-root nsx_groups_additive/nsx-gm2.lab.local \
-  --domain-id nsx-lm4.lab.local \
-  --federation-global
-
+``` bash
+python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
+```
 
 ## Safety Model
 
