@@ -19,6 +19,9 @@ execution.
 ## 0) Set Python Path
 
 ``` bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r docker/requirements-pip.txt 
 export PYTHONPATH="$PWD/app"
 ```
 
@@ -83,6 +86,8 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --
 ```
 
 
+python tools/nsx/push_remapped_groups.py --target nsx-lm3 --input-dir nsx_groups_additive --domain-id default --apply
+
 ## 5a) REVERT Global managaers
 
 Credentials are read from `.env` — no username/password args required.
@@ -144,6 +149,10 @@ python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_ex
 ``` bash
 python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global --apply
 ```
+
+python tools/nsx/push_nsx_groups_revert.py --target nsx-lm3 --export-root nsx_export/nsx-lm3.lab.local --domain-id default --apply
+
+
 ------------------------------------------------------------------------
 
 ## 5a) Push Validation
@@ -170,6 +179,8 @@ python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_exp
 ``` bash
 python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
 ```
+
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
 
 
 ``` bash

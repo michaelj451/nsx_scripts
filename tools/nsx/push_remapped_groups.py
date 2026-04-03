@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,6 @@ from nsx.nsx_policy_client import NsxPolicyClient
 
 DEFAULT_INPUT_DIR = "nsx_groups_additive"
 DEFAULT_BASELINE_DIR = "nsx_export"
-LOG_DIR_NAME = nsx_log_dir
 LOG_FILE_NAME = "push_nsx_groups.log"
 
 # These two fields regulate both dry-run validation pacing and apply pacing.
@@ -28,35 +28,63 @@ GROUP_PATCH_INTERVAL_SECONDS = 1.0
 PROMPT_EVERY_N_UPDATES = 5
 
 
+log = logging.getLogger("push_nsx_groups")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_log_dir() -> Path:
+    """
+    Resolve nsx_log_dir safely across Linux/macOS/Windows.
+
+    Supports:
+      - repo-relative paths like "nsx_logs"
+      - absolute paths
+      - environment-expanded paths like %USERPROFILE%\\logs or $HOME/logs
+      - home-relative paths like ~/logs
+    """
+    repo_root = _repo_root()
+
+    if not nsx_log_dir:
+        p = repo_root / "nsx_logs"
+    else:
+        expanded = os.path.expandvars(os.path.expanduser(str(nsx_log_dir)))
+        p = Path(expanded)
+        if not p.is_absolute():
+            p = repo_root / p
+
+    p.mkdir(parents=True, exist_ok=True)
+    return p.resolve()
+
+
 def setup_logging() -> logging.Logger:
-    repo_root = Path(__file__).resolve().parents[2]
-    log_dir = repo_root / LOG_DIR_NAME
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = _resolve_log_dir()
     log_file = log_dir / LOG_FILE_NAME
 
     logger = logging.getLogger("push_nsx_groups")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    if not logger.handlers:
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
 
-        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(fmt)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-        sh = logging.StreamHandler()
-        sh.setLevel(logging.INFO)
-        sh.setFormatter(fmt)
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
 
-        logger.addHandler(fh)
-        logger.addHandler(sh)
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
 
     logger.info("Log file: %s", log_file)
     return logger
-
-
-log = setup_logging()
 
 
 def _build_mgr_map() -> Dict[str, str]:
@@ -71,13 +99,11 @@ def _build_mgr_map() -> Dict[str, str]:
 
 
 def _default_input_dir() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / DEFAULT_INPUT_DIR
+    return _repo_root() / DEFAULT_INPUT_DIR
 
 
 def _default_baseline_dir() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / DEFAULT_BASELINE_DIR
+    return _repo_root() / DEFAULT_BASELINE_DIR
 
 
 def _manager_dirname(manager_host: str) -> str:
@@ -746,6 +772,8 @@ def _write_snapshot(
 
 
 def main() -> None:
+    global log
+
     parser = argparse.ArgumentParser(
         description="Push NSX Group updates from files using nsx_export as the additive-only baseline for review logging."
     )
@@ -790,6 +818,7 @@ def main() -> None:
 
     args = parser.parse_args()
     init_cli()
+    log = setup_logging()
 
     mgr_map = _build_mgr_map()
     dst_mgr = mgr_map.get(args.target)
@@ -841,6 +870,7 @@ def main() -> None:
     log.info("Skip baseline validation:      %s", args.skip_baseline_validate)
     log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
     log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
+    log.info("Resolved log dir:              %s", _resolve_log_dir())
 
     client = NsxPolicyClient(nsxmanager=dst_mgr, federation_global=args.federation_global)
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -852,7 +882,7 @@ def main() -> None:
             baseline_groups_dir=baseline_groups_dir,
             input_format=args.input_format,
         )
-        validation_base = Path(nsx_log_dir) / "nsx_validation"
+        validation_base = _resolve_log_dir() / "nsx_validation"
         validation_file = _write_validation_report(
             validation_records,
             target=args.target,
@@ -921,7 +951,7 @@ def main() -> None:
 
     snapshots = result.get("snapshots", [])
     if snapshots:
-        snapshots_base = Path(nsx_log_dir) / "nsx_snapshots"
+        snapshots_base = _resolve_log_dir() / "nsx_snapshots"
         snapshot_file = _write_snapshot(
             snapshots,
             target=args.target,

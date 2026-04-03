@@ -119,6 +119,15 @@ python tools/test/build_nsx_import_tree.py \
   --force
 
 
+python tools/test/build_nsx_import_tree.py \
+  --source nsx-gm1 \
+  --target nsx-lm3 \
+  --export-base nsx_export \
+  --import-base nsx_import \
+  --input-format yaml \
+  --force
+
+
 ## COMPILE POLICY TREE ##
 
 python tools/test/compile_nsx_policies.py \
@@ -129,6 +138,13 @@ python tools/test/compile_nsx_policies.py \
   --force
 
 
+python tools/test/compile_nsx_policies.py \
+  --target nsx-lm3 \
+  --import-base nsx_import \
+  --input-format yaml \
+  --output-format yaml \
+  --force
+
 ## PUSH OBJECTS FROM ONE GM TO ANOTHER ##
 
 # existing behavior
@@ -137,6 +153,13 @@ python tools/test/push_nsx_object_tree.py \
   --import-base nsx_import \
   --domain-id default \
   --federation-global \
+  --apply \
+  --push-type all
+
+python tools/test/push_nsx_object_tree.py \
+  --target nsx-lm3 \
+  --import-base nsx_import \
+  --domain-id default \
   --apply \
   --push-type all
 
