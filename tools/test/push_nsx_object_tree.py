@@ -29,6 +29,18 @@ RUN_LOG_PATH: Path | None = None
 ERROR_LOG_PATH: Path | None = None
 PUSH_JSONL_PATH: Path | None = None
 
+PUSH_TYPE_ALL = "all"
+PUSH_TYPE_SERVICES = "services"
+PUSH_TYPE_GROUPS = "groups"
+PUSH_TYPE_RULES = "rules"
+
+VALID_PUSH_TYPES = [
+    PUSH_TYPE_ALL,
+    PUSH_TYPE_SERVICES,
+    PUSH_TYPE_GROUPS,
+    PUSH_TYPE_RULES,
+]
+
 
 # ------------------------------------------------
 # Logging
@@ -139,6 +151,14 @@ def _discover_domain_dirs(import_root: Path) -> List[str]:
 
 def _has_groups(import_root: Path, domain_id: str) -> bool:
     return _count_files(import_root / "domains" / domain_id / "groups") > 0
+
+
+def _has_services(import_root: Path, domain_id: str) -> bool:
+    return _count_files(import_root / "domains" / domain_id / "services") > 0
+
+
+def _has_compiled_policies(import_root: Path, domain_id: str) -> bool:
+    return _count_files(import_root / "domains" / domain_id / "security-policies_compiled") > 0
 
 
 def _has_full_domain_content(import_root: Path, domain_id: str) -> bool:
@@ -281,6 +301,214 @@ def _import_compiled_policies(
     }
 
 
+def _run_import_services_only(
+    client: NsxPolicyClient,
+    import_root: Path,
+    domain_id: str,
+    input_format: str,
+    dry_run: bool,
+    continue_on_error: bool,
+) -> Dict[str, Any]:
+    importer = _make_importer(
+        client=client,
+        import_root=import_root,
+        domain_id=domain_id,
+        input_format=input_format,
+        dry_run=dry_run,
+        continue_on_error=continue_on_error,
+    )
+
+    stats = {
+        "services": 0,
+        "groups": 0,
+        "policies": 0,
+        "rules": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    errors: List[str] = []
+
+    services_dir = import_root / "domains" / domain_id / "services"
+    log.info("Services-only import for domain: %s", domain_id)
+
+    if services_dir.exists() and any(p.is_file() for p in services_dir.rglob("*")):
+        try:
+            before = dict(importer.stats)
+            importer.import_services()
+            stats["services"] += importer.stats["services"] - before["services"]
+            stats["skipped"] += importer.stats["skipped"] - before["skipped"]
+            stats["errors"] += importer.stats["errors"] - before["errors"]
+        except Exception as exc:
+            msg = f"Services-only import failed for domain {domain_id}: {exc}"
+            log.exception(msg)
+            errors.append(msg)
+            stats["errors"] += 1
+            if not continue_on_error:
+                raise
+    else:
+        log.info("No services found for domain %s; skipping services-only import", domain_id)
+
+    _append_jsonl(
+        PUSH_JSONL_PATH,
+        {
+            "action": "import_result",
+            "mode": "services_only",
+            "domain": domain_id,
+            "stats": stats,
+        },
+    )
+
+    for err in errors:
+        _append_error(domain_id, err)
+
+    return {
+        "stats": stats,
+        "errors": errors,
+    }
+
+
+def _run_import_groups_only(
+    client: NsxPolicyClient,
+    import_root: Path,
+    domain_id: str,
+    input_format: str,
+    dry_run: bool,
+    continue_on_error: bool,
+) -> Dict[str, Any]:
+    importer = _make_importer(
+        client=client,
+        import_root=import_root,
+        domain_id=domain_id,
+        input_format=input_format,
+        dry_run=dry_run,
+        continue_on_error=continue_on_error,
+    )
+
+    stats = {
+        "services": 0,
+        "groups": 0,
+        "policies": 0,
+        "rules": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    errors: List[str] = []
+
+    domain_root = import_root / "domains" / domain_id
+    groups_dir = domain_root / "groups"
+
+    log.info("Groups-only import for domain: %s", domain_id)
+
+    if groups_dir.exists() and any(p.is_file() for p in groups_dir.rglob("*")):
+        try:
+            result = importer.import_groups()
+            if isinstance(result, dict):
+                result_stats = result.get("stats", {}) or {}
+                result_errors = result.get("errors", []) or []
+                stats["groups"] += int(result_stats.get("groups", 0) or 0)
+                stats["errors"] += int(result_stats.get("errors", 0) or 0)
+                stats["skipped"] += int(result_stats.get("skipped", 0) or 0)
+                errors.extend(result_errors)
+        except Exception as exc:
+            msg = f"Groups-only import failed for domain {domain_id}: {exc}"
+            log.exception(msg)
+            errors.append(msg)
+            stats["errors"] += 1
+            if not continue_on_error:
+                raise
+    else:
+        log.info("No groups found for domain %s; skipping groups-only import", domain_id)
+
+    _append_jsonl(
+        PUSH_JSONL_PATH,
+        {
+            "action": "import_result",
+            "mode": "groups_only",
+            "domain": domain_id,
+            "stats": stats,
+        },
+    )
+
+    for err in errors:
+        _append_error(domain_id, err)
+
+    return {
+        "stats": stats,
+        "errors": errors,
+    }
+
+
+def _run_import_rules_only(
+    client: NsxPolicyClient,
+    import_root: Path,
+    domain_id: str,
+    input_format: str,
+    dry_run: bool,
+    continue_on_error: bool,
+) -> Dict[str, Any]:
+    importer = _make_importer(
+        client=client,
+        import_root=import_root,
+        domain_id=domain_id,
+        input_format=input_format,
+        dry_run=dry_run,
+        continue_on_error=continue_on_error,
+    )
+
+    stats = {
+        "services": 0,
+        "groups": 0,
+        "policies": 0,
+        "rules": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    errors: List[str] = []
+
+    compiled_dir = import_root / "domains" / domain_id / "security-policies_compiled"
+    log.info("Rules-only import for domain: %s", domain_id)
+
+    if compiled_dir.exists() and any(p.is_file() for p in compiled_dir.rglob("*")):
+        try:
+            result = _import_compiled_policies(
+                importer=importer,
+                import_root=import_root,
+                domain_id=domain_id,
+            )
+            result_stats = result.get("stats", {}) or {}
+            result_errors = result.get("errors", []) or []
+            for key in stats:
+                stats[key] += int(result_stats.get(key, 0) or 0)
+            errors.extend(result_errors)
+        except Exception as exc:
+            msg = f"Rules-only import failed for domain {domain_id}: {exc}"
+            log.exception(msg)
+            errors.append(msg)
+            stats["errors"] += 1
+            if not continue_on_error:
+                raise
+    else:
+        log.info("No compiled policies found for domain %s; skipping rules-only import", domain_id)
+
+    _append_jsonl(
+        PUSH_JSONL_PATH,
+        {
+            "action": "import_result",
+            "mode": "rules_only",
+            "domain": domain_id,
+            "stats": stats,
+        },
+    )
+
+    for err in errors:
+        _append_error(domain_id, err)
+
+    return {
+        "stats": stats,
+        "errors": errors,
+    }
+
+
 def _run_import_default_compiled(
     client: NsxPolicyClient,
     import_root: Path,
@@ -387,75 +615,6 @@ def _run_import_default_compiled(
     return result
 
 
-def _run_import_groups_only(
-    client: NsxPolicyClient,
-    import_root: Path,
-    domain_id: str,
-    input_format: str,
-    dry_run: bool,
-    continue_on_error: bool,
-) -> Dict[str, Any]:
-    importer = _make_importer(
-        client=client,
-        import_root=import_root,
-        domain_id=domain_id,
-        input_format=input_format,
-        dry_run=dry_run,
-        continue_on_error=continue_on_error,
-    )
-
-    stats = {
-        "services": 0,
-        "groups": 0,
-        "policies": 0,
-        "rules": 0,
-        "skipped": 0,
-        "errors": 0,
-    }
-    errors: List[str] = []
-
-    domain_root = import_root / "domains" / domain_id
-    groups_dir = domain_root / "groups"
-
-    log.info("Groups-only import for domain: %s", domain_id)
-
-    if groups_dir.exists() and any(p.is_file() for p in groups_dir.rglob("*")):
-        try:
-            result = importer.import_groups()
-            if isinstance(result, dict):
-                result_stats = result.get("stats", {}) or {}
-                result_errors = result.get("errors", []) or []
-                stats["groups"] += int(result_stats.get("groups", 0) or 0)
-                stats["errors"] += int(result_stats.get("errors", 0) or 0)
-                stats["skipped"] += int(result_stats.get("skipped", 0) or 0)
-                errors.extend(result_errors)
-        except Exception as exc:
-            msg = f"Groups-only import failed for domain {domain_id}: {exc}"
-            log.exception(msg)
-            errors.append(msg)
-            stats["errors"] += 1
-    else:
-        log.info("No groups found for domain %s; skipping groups-only import", domain_id)
-
-    _append_jsonl(
-        PUSH_JSONL_PATH,
-        {
-            "action": "import_result",
-            "mode": "groups_only",
-            "domain": domain_id,
-            "stats": stats,
-        },
-    )
-
-    for err in errors:
-        _append_error(domain_id, err)
-
-    return {
-        "stats": stats,
-        "errors": errors,
-    }
-
-
 def _merge_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     merged_stats: Dict[str, int] = {
         "services": 0,
@@ -479,6 +638,122 @@ def _merge_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _run_domain_import(
+    client: NsxPolicyClient,
+    import_root: Path,
+    domain_id: str,
+    input_format: str,
+    dry_run: bool,
+    continue_on_error: bool,
+    push_type: str,
+    federation_global: bool,
+) -> Dict[str, Any]:
+    """
+    Dispatch import behavior by domain + selected push type.
+
+    Federation-global behavior:
+      - default domain can import all/services/groups/rules
+      - non-default local domains can import groups only
+      - services/rules on non-default domains are skipped
+    """
+    if federation_global and domain_id != "default":
+        if push_type == PUSH_TYPE_ALL:
+            log.info("Starting groups-only import for local domain: %s", domain_id)
+            return _run_import_groups_only(
+                client=client,
+                import_root=import_root,
+                domain_id=domain_id,
+                input_format=input_format,
+                dry_run=dry_run,
+                continue_on_error=continue_on_error,
+            )
+
+        if push_type == PUSH_TYPE_GROUPS:
+            log.info("Starting groups-only import for local domain: %s", domain_id)
+            return _run_import_groups_only(
+                client=client,
+                import_root=import_root,
+                domain_id=domain_id,
+                input_format=input_format,
+                dry_run=dry_run,
+                continue_on_error=continue_on_error,
+            )
+
+        log.info(
+            "Skipping domain %s for push-type=%s; local domains only support groups in this script",
+            domain_id,
+            push_type,
+        )
+        skipped = {
+            "stats": {
+                "services": 0,
+                "groups": 0,
+                "policies": 0,
+                "rules": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "errors": [],
+        }
+        _append_jsonl(
+            PUSH_JSONL_PATH,
+            {
+                "action": "import_skipped",
+                "domain": domain_id,
+                "push_type": push_type,
+                "reason": "local domain only supports groups in federation-global mode",
+            },
+        )
+        return skipped
+
+    # default domain, or non-federation mode
+    if push_type == PUSH_TYPE_ALL:
+        log.info("Starting full import for domain: %s", domain_id)
+        return _run_import_default_compiled(
+            client=client,
+            import_root=import_root,
+            domain_id=domain_id,
+            input_format=input_format,
+            dry_run=dry_run,
+            continue_on_error=continue_on_error,
+        )
+
+    if push_type == PUSH_TYPE_SERVICES:
+        log.info("Starting services-only import for domain: %s", domain_id)
+        return _run_import_services_only(
+            client=client,
+            import_root=import_root,
+            domain_id=domain_id,
+            input_format=input_format,
+            dry_run=dry_run,
+            continue_on_error=continue_on_error,
+        )
+
+    if push_type == PUSH_TYPE_GROUPS:
+        log.info("Starting groups-only import for domain: %s", domain_id)
+        return _run_import_groups_only(
+            client=client,
+            import_root=import_root,
+            domain_id=domain_id,
+            input_format=input_format,
+            dry_run=dry_run,
+            continue_on_error=continue_on_error,
+        )
+
+    if push_type == PUSH_TYPE_RULES:
+        log.info("Starting rules-only import for domain: %s", domain_id)
+        return _run_import_rules_only(
+            client=client,
+            import_root=import_root,
+            domain_id=domain_id,
+            input_format=input_format,
+            dry_run=dry_run,
+            continue_on_error=continue_on_error,
+        )
+
+    raise RuntimeError(f"Unsupported push type: {push_type}")
+
+
 # ------------------------------------------------
 # Main
 # ------------------------------------------------
@@ -497,6 +772,12 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--federation-global", action="store_true")
+    parser.add_argument(
+        "--push-type",
+        default=PUSH_TYPE_ALL,
+        choices=VALID_PUSH_TYPES,
+        help="What to push: all, services, groups, or rules",
+    )
 
     args = parser.parse_args()
 
@@ -524,6 +805,7 @@ def main() -> None:
     log.info("Apply changes     : %s", args.apply)
     log.info("Federation global : %s", args.federation_global)
     log.info("Stop on error     : %s", args.stop_on_error)
+    log.info("Push type         : %s", args.push_type)
 
     _append_jsonl(
         PUSH_JSONL_PATH,
@@ -534,6 +816,7 @@ def main() -> None:
             "input_format": args.input_format,
             "apply": args.apply,
             "federation_global": args.federation_global,
+            "push_type": args.push_type,
         },
     )
 
@@ -552,26 +835,16 @@ def main() -> None:
         log.info("Federation-global import order: %s", import_order)
 
         for domain_id in import_order:
-            if domain_id == "default":
-                log.info("Starting compiled full import for domain: %s", domain_id)
-                result = _run_import_default_compiled(
-                    client=client,
-                    import_root=import_root,
-                    domain_id=domain_id,
-                    input_format=args.input_format,
-                    dry_run=(not args.apply),
-                    continue_on_error=(not args.stop_on_error),
-                )
-            else:
-                log.info("Starting groups-only import for local domain: %s", domain_id)
-                result = _run_import_groups_only(
-                    client=client,
-                    import_root=import_root,
-                    domain_id=domain_id,
-                    input_format=args.input_format,
-                    dry_run=(not args.apply),
-                    continue_on_error=(not args.stop_on_error),
-                )
+            result = _run_domain_import(
+                client=client,
+                import_root=import_root,
+                domain_id=domain_id,
+                input_format=args.input_format,
+                dry_run=(not args.apply),
+                continue_on_error=(not args.stop_on_error),
+                push_type=args.push_type,
+                federation_global=args.federation_global,
+            )
 
             results.append(result)
 
@@ -582,13 +855,15 @@ def main() -> None:
         final_result = _merge_results(results)
 
     else:
-        final_result = _run_import_default_compiled(
+        final_result = _run_domain_import(
             client=client,
             import_root=import_root,
             domain_id=args.domain_id,
             input_format=args.input_format,
             dry_run=(not args.apply),
             continue_on_error=(not args.stop_on_error),
+            push_type=args.push_type,
+            federation_global=args.federation_global,
         )
 
     log.info("Import finished: %s", final_result)

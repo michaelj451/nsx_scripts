@@ -17,7 +17,7 @@ def init_cli(level: int = logging.INFO) -> None:
     - Configure logging
     """
     # Find repo root as: tools/nsx/<script>.py -> parents[2] == repo root
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[2]
     env_path = repo_root / ".env"
 
     load_dotenv(dotenv_path=env_path, override=False)

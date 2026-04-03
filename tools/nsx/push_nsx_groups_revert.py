@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
+"""
+tools/nsx/push_nsx_groups_revert.py
+
+Rollback NSX Policy groups from an exported snapshot back to NSX.
+Reads group files from an export directory and PATCHes them back to the
+target manager. Credentials and manager hostnames come from .env via
+nsx_constants / cli_bootstrap — no username/password CLI args needed.
+
+Usage (dry-run):
+  python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local
+
+Usage (apply):
+  python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --apply
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import requests
 import yaml
-import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from nsx.cli_bootstrap import init_cli
+from nsx.nsx_constants import resolve_manager, nsx_log_dir
+from nsx.nsx_policy_client import NsxPolicyClient
 
 log = logging.getLogger(__name__)
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+GROUP_PATCH_INTERVAL_SECONDS = 1.0
+PROMPT_EVERY_N_UPDATES = 1
 
 DEFAULT_STRIP_KEYS = {
     "_create_time",
@@ -41,129 +56,41 @@ DEFAULT_STRIP_KEYS = {
     "owner_id",
 }
 
-
-# -----------------------------------------------------------------------------
-# Client
-# -----------------------------------------------------------------------------
-
-class NsxPolicyRollbackClient:
-    def __init__(
-        self,
-        manager: str,
-        username: str,
-        password: str,
-        *,
-        federation_global: bool = False,
-        verify_ssl: bool = False,
-        timeout: int = 30,
-    ) -> None:
-        self.manager = manager.rstrip("/")
-        self.username = username
-        self.password = password
-        self.federation_global = federation_global
-        self.verify_ssl = verify_ssl
-        self.timeout = timeout
-
-        if self.federation_global:
-            # GM Policy API
-            self.base_url = f"{self.manager}/global-manager/api/v1"
-        else:
-            # LM Policy API
-            self.base_url = f"{self.manager}/policy/api/v1"
-
-        self.session = requests.Session()
-        self.session.auth = (self.username, self.password)
-        self.session.verify = self.verify_ssl
-        self.session.headers.update({"Content-Type": "application/json"})
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        expected: Tuple[int, ...] = (200,),
-        data: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        url = f"{self.base_url}{path}"
-        resp = self.session.request(
-            method=method,
-            url=url,
-            json=data,
-            timeout=self.timeout,
-        )
-
-        if resp.status_code not in expected:
-            raise RuntimeError(
-                f"{method} {url} failed: HTTP {resp.status_code} - {resp.text}"
-            )
-
-        if not resp.text.strip():
-            return None
-
-        ctype = resp.headers.get("Content-Type", "")
-        if "application/json" in ctype:
-            return resp.json()
-
-        return resp.text
-
-    def list_groups(self, domain_id: str) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        cursor: Optional[str] = None
-
-        while True:
-            path = f"/infra/domains/{domain_id}/groups"
-            if cursor:
-                path += f"?cursor={cursor}"
-
-            payload = self.request("GET", path, expected=(200,))
-            page_results = payload.get("results", [])
-            results.extend(page_results)
-
-            cursor = payload.get("cursor")
-            if not cursor:
-                break
-
-        return results
-
-    def get_group(self, domain_id: str, group_id: str) -> Optional[Dict[str, Any]]:
-        try:
-            return self.request(
-                "GET",
-                f"/infra/domains/{domain_id}/groups/{group_id}",
-                expected=(200,),
-            )
-        except RuntimeError as exc:
-            if "HTTP 404" in str(exc):
-                return None
-            raise
-
-    def patch_group(self, domain_id: str, group_id: str, payload: Dict[str, Any]) -> None:
-        self.request(
-            "PATCH",
-            f"/infra/domains/{domain_id}/groups/{group_id}",
-            expected=(200, 201),
-            data=payload,
-        )
-
-    def delete_group(self, domain_id: str, group_id: str) -> None:
-        self.request(
-            "DELETE",
-            f"/infra/domains/{domain_id}/groups/{group_id}",
-            expected=(200, 204),
-        )
+LOCAL_ONLY_KEYS = {
+    "_source_file",
+}
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Logging
 # -----------------------------------------------------------------------------
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_dir = Path(nsx_log_dir) if nsx_log_dir else REPO_ROOT / "nsx_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "push_nsx_groups_revert.log"
 
+    root = logging.getLogger()
+    root.setLevel(level)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+
+    root.addHandler(fh)
+    root.addHandler(sh)
+    log.info("Log file: %s", log_file)
+
+
+# -----------------------------------------------------------------------------
+# File helpers
+# -----------------------------------------------------------------------------
 
 def load_file(path: Path) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8")
@@ -173,12 +100,14 @@ def load_file(path: Path) -> Dict[str, Any]:
 
 
 def clean_payload(obj: Dict[str, Any]) -> Dict[str, Any]:
-    cleaned = {}
-    for k, v in obj.items():
-        if k in DEFAULT_STRIP_KEYS:
-            continue
-        cleaned[k] = v
-    return cleaned
+    return {k: v for k, v in obj.items() if k not in DEFAULT_STRIP_KEYS}
+
+
+def payload_for_patch(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip any local-only helper keys before sending payload to NSX.
+    """
+    return {k: v for k, v in obj.items() if k not in LOCAL_ONLY_KEYS}
 
 
 def discover_group_files(export_root: Path, domain_id: str) -> List[Path]:
@@ -186,14 +115,12 @@ def discover_group_files(export_root: Path, domain_id: str) -> List[Path]:
         export_root / domain_id / "groups",
         export_root / "domains" / domain_id / "groups",
     ]
-
     for root in candidates:
         if root.exists():
-            files = sorted(
-                [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in {".yaml", ".yml", ".json"}]
+            return sorted(
+                p for p in root.iterdir()
+                if p.is_file() and p.suffix.lower() in {".yaml", ".yml", ".json"}
             )
-            return files
-
     raise FileNotFoundError(
         f"Could not find group export folder under either:\n"
         f"  {candidates[0]}\n"
@@ -203,47 +130,206 @@ def discover_group_files(export_root: Path, domain_id: str) -> List[Path]:
 
 def load_desired_groups(export_root: Path, domain_id: str) -> Dict[str, Dict[str, Any]]:
     desired: Dict[str, Dict[str, Any]] = {}
-
     for path in discover_group_files(export_root, domain_id):
         obj = load_file(path)
         if not obj:
             continue
-
         group_id = obj.get("id")
         if not group_id:
-            log.warning("Skipping %s because it has no 'id'", path)
+            log.warning("Skipping %s — no 'id' field", path)
             continue
-
-        desired[group_id] = clean_payload(obj)
-
+        cleaned = clean_payload(obj)
+        cleaned["_source_file"] = str(path)
+        desired[group_id] = cleaned
     return desired
 
 
-def summarize_changes(
-    existing_ids: set[str],
-    desired_ids: set[str],
-) -> Tuple[List[str], List[str], List[str]]:
-    to_create = sorted(desired_ids - existing_ids)
-    to_update = sorted(desired_ids & existing_ids)
-    to_delete = sorted(existing_ids - desired_ids)
-    return to_create, to_update, to_delete
+# -----------------------------------------------------------------------------
+# Diff helpers
+# -----------------------------------------------------------------------------
+
+def _extract_ip_address_entries(node: Any) -> List[str]:
+    """
+    Recursively collect all entries from IPAddressExpression.ip_addresses.
+    This captures IPs, CIDRs, and ranges because NSX stores them as strings.
+    """
+    found: List[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if obj.get("resource_type") == "IPAddressExpression":
+                for value in obj.get("ip_addresses", []) or []:
+                    if isinstance(value, str):
+                        found.append(value.strip())
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(node)
+    return found
+
+
+def _diff_group_ip_entries(current_group: Optional[dict], desired_group: dict) -> Dict[str, List[str]]:
+    current_entries = set(_extract_ip_address_entries(current_group or {}))
+    desired_entries = set(_extract_ip_address_entries(desired_group))
+
+    return {
+        "current": sorted(current_entries),
+        "desired": sorted(desired_entries),
+        "to_add": sorted(desired_entries - current_entries),
+        "to_remove": sorted(current_entries - desired_entries),
+        "already_present": sorted(desired_entries & current_entries),
+    }
+
+
+def _format_entries(entries: Optional[List[str]], *, max_items: int = 200) -> str:
+    if entries is None:
+        return "[unknown]"
+
+    if not entries:
+        return "[]"
+
+    if len(entries) <= max_items:
+        return "[" + ", ".join(entries) + "]"
+
+    shown = entries[:max_items]
+    return "[" + ", ".join(shown) + f", ... +{len(entries) - max_items} more]"
+
+
+def _action_word(add_count: int, remove_count: int) -> str:
+    if add_count > 0 and remove_count > 0:
+        return "ADD+REMOVE"
+    if add_count > 0:
+        return "ADD"
+    if remove_count > 0:
+        return "REMOVE"
+    return "NO-CHANGE"
 
 
 # -----------------------------------------------------------------------------
-# Main rollback logic
+# Pacing / approval helpers
+# -----------------------------------------------------------------------------
+
+def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
+    while True:
+        answer = input(
+            f"\nProcessed {processed_count} {phase}. Continue with next item? [y/N]: "
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            log.info("Operator chose to continue after %d %s.", processed_count, phase)
+            return
+
+        if answer in ("", "n", "no"):
+            log.warning("Operator aborted after %d %s.", processed_count, phase)
+            raise KeyboardInterrupt(f"Stopped by operator after {processed_count} {phase}.")
+
+        print("Please enter 'y' or 'n'.")
+
+
+def _controlled_checkpoint(*, processed_count: int, last_ts: float, phase: str) -> float:
+    now = time.monotonic()
+    wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+    if wait > 0:
+        log.info("%s throttle: waiting %.3f seconds before next item", phase, wait)
+        time.sleep(wait)
+
+    new_ts = time.monotonic()
+
+    if PROMPT_EVERY_N_UPDATES > 0 and processed_count % PROMPT_EVERY_N_UPDATES == 0:
+        _prompt_to_continue(processed_count, phase=phase)
+
+    return new_ts
+
+
+def _log_group_state(
+    *,
+    phase_label: str,
+    index: int,
+    total: int,
+    group_id: str,
+    display_name: str,
+    exists_in_nsx: bool,
+    current_entries: Optional[List[str]],
+    to_add: List[str],
+    to_remove: List[str],
+    source_file: Optional[str] = None,
+) -> None:
+    action = _action_word(len(to_add), len(to_remove))
+
+    if total > 0:
+        prefix = f"[{phase_label} {index}/{total}]"
+    else:
+        prefix = f"[{phase_label} {index}]"
+
+    log.info(
+        "%s group=%s display_name=%s exists_in_nsx=%s action=%s current=%s add=%d remove=%d%s",
+        prefix,
+        group_id,
+        display_name,
+        "yes" if exists_in_nsx else "no",
+        action,
+        len(current_entries) if current_entries is not None else "unknown",
+        len(to_add),
+        len(to_remove),
+        f" source_file={source_file}" if source_file else "",
+    )
+    log.info("  [CURRENT EXISTS] %s", _format_entries(current_entries))
+    log.info("  [RESTORE ADD]    %s", _format_entries(to_add))
+    log.info("  [RESTORE REMOVE] %s", _format_entries(to_remove))
+
+
+def _write_validation_report(
+    records: list,
+    *,
+    target: str,
+    domain_id: str,
+    run_ts: str,
+    output_base: Path,
+) -> Path:
+    run_dir = output_base / f"{run_ts}_{target}_revert_validate"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    out = {
+        "run_ts": run_ts,
+        "target": target,
+        "domain_id": domain_id,
+        "groups_validated": len(records),
+        "groups_missing_in_nsx": sum(1 for r in records if not r["exists_in_nsx"]),
+        "groups_with_additions": sum(1 for r in records if r["to_add_count"] > 0),
+        "groups_with_removals": sum(1 for r in records if r["to_remove_count"] > 0),
+        "groups_with_no_delta": sum(
+            1
+            for r in records
+            if r["exists_in_nsx"] and r["to_add_count"] == 0 and r["to_remove_count"] == 0
+        ),
+        "groups": records,
+    }
+
+    report_file = run_dir / "validation_report.json"
+    report_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return report_file
+
+
+# -----------------------------------------------------------------------------
+# Rollback logic
 # -----------------------------------------------------------------------------
 
 def rollback_groups(
-    client: NsxPolicyRollbackClient,
+    client: NsxPolicyClient,
     export_root: Path,
     domain_id: str,
     *,
     dry_run: bool = True,
     delete_extraneous: bool = False,
+    target: str,
+    run_ts: str,
 ) -> None:
     desired = load_desired_groups(export_root, domain_id)
     if not desired:
-        log.warning("No desired groups found in export set")
+        log.warning("No desired groups found in export set — nothing to do.")
         return
 
     existing_groups = client.list_groups(domain_id)
@@ -252,93 +338,195 @@ def rollback_groups(
     desired_ids = set(desired.keys())
     existing_ids = set(existing.keys())
 
-    to_create, to_update, to_delete = summarize_changes(existing_ids, desired_ids)
+    to_create = sorted(desired_ids - existing_ids)
+    to_update = sorted(desired_ids & existing_ids)
+    to_delete = sorted(existing_ids - desired_ids)
 
     log.info("Rollback summary for domain '%s':", domain_id)
     log.info("  desired groups : %d", len(desired_ids))
     log.info("  existing groups: %d", len(existing_ids))
-    log.info("  create         : %d", len(to_create))
+    log.info("  create (new)   : %d", len(to_create))
     log.info("  update         : %d", len(to_update))
     log.info("  delete extra   : %d", len(to_delete) if delete_extraneous else 0)
+    log.info("  pacing interval: %s", GROUP_PATCH_INTERVAL_SECONDS)
+    log.info("  prompt every   : %s", PROMPT_EVERY_N_UPDATES)
 
-    if dry_run:
-        for gid in to_create:
-            log.info("[DRY-RUN] would create group: %s", gid)
-        for gid in to_update:
-            log.info("[DRY-RUN] would update group: %s", gid)
-        if delete_extraneous:
-            for gid in to_delete:
-                log.info("[DRY-RUN] would delete extraneous group: %s", gid)
-        return
+    validation_records: List[Dict[str, Any]] = []
+    ordered_restore_ids = sorted(desired.keys())
+    last_ts = 0.0
 
-    # Restore all desired groups
-    for gid in sorted(desired.keys()):
+    for idx, gid in enumerate(ordered_restore_ids, start=1):
         payload = desired[gid]
-        log.info("Restoring group: %s", gid)
-        client.patch_group(domain_id, gid, payload)
+        patch_payload = payload_for_patch(payload)
+        display_name = payload.get("display_name") or payload.get("name") or gid
+        source_file = payload.get("_source_file")
+        existing_group = existing.get(gid)
 
-    # Optionally delete groups that are not part of snapshot
+        diff = _diff_group_ip_entries(existing_group, patch_payload)
+        current_entries = diff["current"] if existing_group is not None else None
+        to_add = diff["to_add"] if existing_group is not None else diff["desired"]
+        to_remove = diff["to_remove"] if existing_group is not None else []
+
+        _log_group_state(
+            phase_label="REVERT",
+            index=idx,
+            total=len(ordered_restore_ids),
+            group_id=gid,
+            display_name=display_name,
+            exists_in_nsx=(existing_group is not None),
+            current_entries=current_entries,
+            to_add=to_add,
+            to_remove=to_remove,
+            source_file=source_file,
+        )
+
+        validation_records.append(
+            {
+                "group_id": gid,
+                "display_name": display_name,
+                "source_file": source_file,
+                "exists_in_nsx": existing_group is not None,
+                "current_entries": current_entries,
+                "current_count": len(current_entries) if current_entries is not None else None,
+                "desired_entries": diff["desired"],
+                "desired_count": len(diff["desired"]),
+                "to_add": to_add,
+                "to_add_count": len(to_add),
+                "to_remove": to_remove,
+                "to_remove_count": len(to_remove),
+                "already_present": diff["already_present"] if existing_group is not None else [],
+                "already_present_count": len(diff["already_present"]) if existing_group is not None else 0,
+                "action": _action_word(len(to_add), len(to_remove)),
+            }
+        )
+
+        if dry_run:
+            last_ts = _controlled_checkpoint(
+                processed_count=idx,
+                last_ts=last_ts,
+                phase="dry-run rollback checks",
+            )
+            continue
+
+        log.info("Restoring group: %s", gid)
+        try:
+            client.patch_group(gid, patch_payload, domain_id)
+        except Exception as exc:
+            log.error("Failed restoring %s: %s", gid, exc)
+
+        last_ts = _controlled_checkpoint(
+            processed_count=idx,
+            last_ts=last_ts,
+            phase="rollback updates",
+        )
+
     if delete_extraneous:
-        for gid in to_delete:
+        for delete_idx, gid in enumerate(to_delete, start=1):
+            log.info(
+                "[DELETE %d/%d] extraneous group=%s action=DELETE",
+                delete_idx,
+                len(to_delete),
+                gid,
+            )
+
+            if dry_run:
+                log.info("[DRY-RUN] would delete extraneous: %s", gid)
+                last_ts = _controlled_checkpoint(
+                    processed_count=len(ordered_restore_ids) + delete_idx,
+                    last_ts=last_ts,
+                    phase="dry-run rollback deletions",
+                )
+                continue
+
             log.info("Deleting extraneous group: %s", gid)
             try:
-                client.delete_group(domain_id, gid)
+                client.delete_group(gid, domain_id)
             except Exception as exc:
                 log.error("Failed deleting %s: %s", gid, exc)
+
+            last_ts = _controlled_checkpoint(
+                processed_count=len(ordered_restore_ids) + delete_idx,
+                last_ts=last_ts,
+                phase="rollback deletions",
+            )
+
+    validation_base = Path(nsx_log_dir) / "nsx_validation"
+    validation_file = _write_validation_report(
+        validation_records,
+        target=target,
+        domain_id=domain_id,
+        run_ts=run_ts,
+        output_base=validation_base,
+    )
+    log.info("Rollback validation report written: %s", validation_file)
 
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Rollback NSX Policy groups from exported files")
-    p.add_argument("--manager", required=True, help="NSX manager URL, ex: https://nsx-gm2.lab.local")
-    p.add_argument("--username", required=True, help="NSX username")
-    p.add_argument("--password", required=True, help="NSX password")
-    p.add_argument("--export-root", required=True, help="Export root folder")
-    p.add_argument("--domain-id", default="default", help="NSX domain ID")
-    p.add_argument(
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Rollback NSX Policy groups from an exported snapshot. Credentials from .env."
+    )
+    parser.add_argument(
+        "--target",
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        required=True,
+        help="NSX manager to push rollback groups into.",
+    )
+    parser.add_argument(
+        "--export-root",
+        required=True,
+        help="Export root folder containing the snapshot to restore from (e.g. nsx_export/nsx-gm2.lab.local).",
+    )
+    parser.add_argument(
+        "--domain-id",
+        default="default",
+        help="NSX domain ID (default: default).",
+    )
+    parser.add_argument(
         "--federation-global",
         action="store_true",
-        help="Use Global Manager API base path",
+        help="Use Global Manager federation API (global-infra).",
     )
-    p.add_argument(
-        "--verify-ssl",
-        action="store_true",
-        help="Verify TLS certificate",
-    )
-    p.add_argument(
+    parser.add_argument(
         "--delete-extraneous",
         action="store_true",
-        help="Delete groups that exist in NSX but are not in the rollback snapshot",
+        help="Delete groups that exist in NSX but are not in the rollback snapshot.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--apply",
         action="store_true",
         help="Actually make changes. Default is dry-run.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable debug logging",
+        help="Enable debug logging.",
     )
-    return p
-
-
-def main() -> None:
-    parser = build_parser()
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+    init_cli()
 
-    client = NsxPolicyRollbackClient(
-        manager=args.manager,
-        username=args.username,
-        password=args.password,
-        federation_global=args.federation_global,
-        verify_ssl=args.verify_ssl,
-    )
+    manager_host = resolve_manager(args.target)
+    if not manager_host:
+        raise SystemExit(f"Manager not defined for {args.target}. Check your .env.")
+
+    run_ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+
+    log.info("Starting push_nsx_groups_revert")
+    log.info("Target:                        %s (%s)", args.target, manager_host)
+    log.info("Export root:                   %s", Path(args.export_root).resolve())
+    log.info("Domain ID:                     %s", args.domain_id)
+    log.info("Federation GM:                 %s", args.federation_global)
+    log.info("Delete extra:                  %s", args.delete_extraneous)
+    log.info("Mode:                          %s", "APPLY" if args.apply else "DRY-RUN")
+    log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
+    log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
+
+    client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)
 
     rollback_groups(
         client=client,
@@ -346,6 +534,8 @@ def main() -> None:
         domain_id=args.domain_id,
         dry_run=not args.apply,
         delete_extraneous=args.delete_extraneous,
+        target=args.target,
+        run_ts=run_ts,
     )
 
 
