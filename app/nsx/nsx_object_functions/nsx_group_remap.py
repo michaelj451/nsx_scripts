@@ -87,15 +87,23 @@ def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: 
     if added:
         logger.info("  added: %s", added)
 
-    _write_change_record(
-        {
-            "kind": "ip_addresses_change",
+    for token in removed:
+        _write_change_record({
+            "kind": _classify_token(token),
+            "action": "removed",
+            "value": token,
             "group_id": group_id,
             "expr_id": expr_id,
-            "removed": removed,
-            "added": added,
-        }
-    )
+        })
+
+    for token in added:
+        _write_change_record({
+            "kind": _classify_token(token),
+            "action": "added",
+            "value": token,
+            "group_id": group_id,
+            "expr_id": expr_id,
+        })
 
 
 # =============================================================================
@@ -106,12 +114,9 @@ def _log_ip_list_changes(group_id: str, expr_id: str, before: list[str], after: 
 class SubnetMap:
     old: ipaddress._BaseNetwork
     new: ipaddress._BaseNetwork
-    vlan: str | None = None
-    description: str | None = None
-
 
 def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
-    required = {"old_subnet", "new_subnet", "vlan", "description"}
+    required = {"old_subnet", "new_subnet"}
     maps: list[SubnetMap] = []
 
     with csv_path.open(newline="", encoding="utf-8") as f:
@@ -138,9 +143,7 @@ def read_csv_mappings(csv_path: Path) -> list[SubnetMap]:
             maps.append(
                 SubnetMap(
                     old=old_net,
-                    new=new_net,
-                    vlan=(row.get("vlan") or "").strip() or None,
-                    description=(row.get("description") or "").strip() or None,
+                    new=new_net
                 )
             )
 
@@ -253,6 +256,25 @@ def rebuild_expression_paths(expr: dict, new_group_path: str) -> None:
 _RANGE_RE = re.compile(r"^\s*([0-9a-fA-F\.:]+)\s*-\s*([0-9a-fA-F\.:]+)\s*$")
 
 
+def _classify_token(s: str) -> str:
+    """Return 'ip_range', 'subnet', or 'ip_address' for a token.
+
+      - Contains '-'              => ip_range  (e.g. 10.1.0.1-10.1.0.10)
+      - CIDR with prefix < /32   => subnet     (e.g. 10.1.0.0/24)
+      - /32, bare IP, or fallback => ip_address (e.g. 10.1.2.3/32, 10.1.2.3)
+    """
+    if _RANGE_RE.match(s):
+        return "ip_range"
+    if "/" in s:
+        try:
+            net = ipaddress.ip_network(s, strict=False)
+            if net.prefixlen < net.max_prefixlen:
+                return "subnet"
+        except ValueError:
+            pass
+    return "ip_address"
+
+
 def looks_like_ip_token(s: str) -> bool:
     if not s:
         return False
@@ -318,6 +340,28 @@ def remap_token(token: str, maps: list[SubnetMap]) -> str:
         return str(_remap_ip(ip, m))
     except ValueError:
         return token
+
+
+def _analyze_range_token(token: str, maps: list[SubnetMap]) -> dict:
+    """
+    For an IP range token, return analysis with proposed_change and status:
+      - "mapped"                  both endpoints fall in the same subnet mapping
+      - "no_change - overlaps"    endpoints fall in different subnets
+      - "no_change - no_mapping"  no subnet mapping covers one or both endpoints
+    """
+    mrange = _RANGE_RE.match(token)
+    if not mrange:
+        return {}
+    a = ipaddress.ip_address(mrange.group(1))
+    b = ipaddress.ip_address(mrange.group(2))
+    ma = _find_mapping_for_ip(a, maps)
+    mb = _find_mapping_for_ip(b, maps)
+    if ma and mb and ma.old == mb.old:
+        proposed = f"{_remap_ip(a, ma)}-{_remap_ip(b, ma)}"
+        return {"proposed_change": proposed, "status": "mapped"}
+    if ma and mb and ma.old != mb.old:
+        return {"proposed_change": None, "status": "no_change - overlaps"}
+    return {"proposed_change": None, "status": "no_change - no_mapping"}
 
 
 def remap_ip_addresses_new_only(tokens: Iterable[Any], maps: list[SubnetMap]) -> tuple[list[str], int]:
@@ -490,23 +534,31 @@ def add_mapped_ip_addresses_additive(tokens: Iterable[Any], maps: list[SubnetMap
     return out, added
 
 
-def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, int]:
+def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, int, list]:
     """
     Mutates group docs in-place (additive):
       - Only modifies IPAddressExpression.ip_addresses
       - Keeps original tokens and appends mapped tokens
-    Returns (doc, groups_touched, tokens_added_total)
+    Returns (doc, groups_touched, tokens_added_total, snapshots, range_events)
+    where snapshots is a list of per-group before/after/added dicts and
+    range_events is a flat list of per-range analysis dicts.
     """
     _, groups = find_groups_container(doc)
 
     groups_touched = 0
     tokens_added_total = 0
+    snapshots: list[dict] = []
+    range_events: list[dict] = []
 
     for g in groups:
         if not isinstance(g, dict):
             continue
 
+        group_id = str(g.get("id", "unknown"))
+        group_display_name = g.get("display_name") or g.get("name")
         group_added = 0
+        before_all: list[str] = []
+        after_all: list[str] = []
 
         for expr in g.get("expression", []) or []:
             if not isinstance(expr, dict):
@@ -524,21 +576,59 @@ def add_mapped_ips_in_doc(doc: Any, maps: list[SubnetMap]) -> tuple[Any, int, in
 
             # Log the delta
             _log_ip_list_changes(
-                group_id=str(g.get("id", "unknown")),
+                group_id=group_id,
                 expr_id=str(expr.get("id", expr.get("relative_path", "unknown"))),
                 before=before,
                 after=after,
             )
 
+            # Collect range events for every range token in this expression
+            for token in before:
+                if _RANGE_RE.match(token):
+                    analysis = _analyze_range_token(token, maps)
+                    range_events.append({
+                        "group_id": group_id,
+                        "group_display_name": group_display_name,
+                        "range": token,
+                        "proposed_change": analysis.get("proposed_change"),
+                        "status": analysis.get("status", "unknown"),
+                    })
+
             if added > 0:
                 expr["ip_addresses"] = after
                 group_added += added
+
+            before_all.extend(before)
+            after_all.extend(after)
 
         if group_added > 0:
             groups_touched += 1
             tokens_added_total += group_added
 
-    return doc, groups_touched, tokens_added_total
+        if before_all or after_all:
+            before_set = set(before_all)
+            after_set = set(after_all)
+            added_ips = [ip for ip in after_all if ip not in before_set]
+            removed_ips = [ip for ip in before_all if ip not in after_set]
+            snapshots.append({
+                "group_id": group_id,
+                "group_display_name": group_display_name,
+                "before": {
+                    "ip_count": len(before_all),
+                    "ips": [{"value": ip, "type": _classify_token(ip), "status": "pre-existing"} for ip in before_all],
+                },
+                "after": {
+                    "ip_count": len(after_all),
+                    "ips": [
+                        {"value": ip, "type": _classify_token(ip), "status": "added" if ip not in before_set else "pre-existing"}
+                        for ip in after_all
+                    ],
+                },
+                "added": [{"value": ip, "type": _classify_token(ip), "status": "added"} for ip in added_ips],
+                "removed": [{"value": ip, "type": _classify_token(ip), "status": "removed"} for ip in removed_ips],
+            })
+
+    return doc, groups_touched, tokens_added_total, snapshots, range_events
 
 
 # =============================================================================

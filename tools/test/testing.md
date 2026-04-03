@@ -129,20 +129,39 @@ python tools/test/compile_nsx_policies.py \
   --force
 
 
-## PUSH GROUPS FROM ONE GM TO ANOTHER ##
+## PUSH OBJECTS FROM ONE GM TO ANOTHER ##
 
+# existing behavior
 python tools/test/push_nsx_object_tree.py \
   --target nsx-gm2 \
   --import-base nsx_import \
   --domain-id default \
-  --input-format yaml \
-  --federation-global
-
-
-python tools/test/push_nsx_object_tree.py \
-  --target nsx-gm2 \
-  --import-base nsx_import \
-  --domain-id default \
-  --input-format yaml \
   --federation-global \
-  --apply
+  --apply \
+  --push-type all
+
+
+# only services
+python tools/test/push_nsx_object_tree.py \
+  --target nsx-gm2 \
+  --import-base nsx_import \
+  --domain-id default \
+  --apply \
+  --push-type services
+
+  # only groups
+python tools/test/push_nsx_object_tree.py \
+  --target nsx-gm2 \
+  --import-base nsx_import \
+  --domain-id default \
+  --federation-global \
+  --apply \
+  --push-type groups
+
+# only rules / compiled policies
+python tools/test/push_nsx_object_tree.py \
+  --target nsx-gm2 \
+  --import-base nsx_import \
+  --domain-id default \
+  --apply \
+  --push-type rules

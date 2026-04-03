@@ -49,7 +49,7 @@ python tools/nsx/add_mapped_ips_to_groups_files.py
 Preview:
 
 ``` bash
-python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2
 ```
 
 Apply:
@@ -61,29 +61,6 @@ python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --
 python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --apply
 ```
 
-## 3b) REVERT
-
-``` bash
-python tools/test/rollback_nsx_groups.py \
-  --manager https://nsx-gm2.lab.local \
-  --username admin \
-  --password 'yourpassword' \
-  --export-root nsx_export/nsx-gm1.lab.local \
-  --domain-id default \
-  --federation-global
-```
-
-``` bash
-python tools/test/rollback_nsx_groups.py \
-  --manager https://nsx-gm2.lab.local \
-  --username admin \
-  --password 'yourpassword' \
-  --export-root nsx_export/nsx-gm1.lab.local \
-  --domain-id default \
-  --federation-global \
-  --apply
-```
-------------------------------------------------------------------------
 
 ## 4) Push Remapped Groups to LM
 
@@ -100,166 +77,113 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --
 python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm4.lab.local --apply
 ```
 
-------------------------------------------------------------------------
 
-## 5) Export All Local Manager Objects (LM1 example)
+## 5a) REVERT Global managaers
+
+Credentials are read from `.env` — no username/password args required.
+
+Dry run (nsx-gm2):
 
 ``` bash
-python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --output-format yaml --base-dir nsx_export_promote --all-domains
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
+```
+
+Dry run (nsx-gm1):
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id default --federation-global
+```
+
+Apply (nsx-gm2):
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global --apply
+```
+
+Apply (nsx-gm1):
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id default --federation-global --apply
+```
+
+## 5b) Revert non-default domains (LM domains)
+
+LM1 and LM2 are imported under GM1; LM3 and LM4 under GM2.
+
+Dry run:
+
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm1.lab.local --federation-global
 ```
 ``` bash
-python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm2 --output-format yaml --base-dir nsx_export_promote --all-domains
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm2.lab.local --federation-global
 ```
-
-------------------------------------------------------------------------
-
-## 6) Promote Local Groups to Global
-
-Dry Run:
-
 ``` bash
-python tools/nsx/promote_local_groups.py
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
 ```
 
 Apply:
 
 ``` bash
-python tools/nsx/promote_local_groups.py  --all-lm-domains
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm1.lab.local --federation-global --apply
 ```
-
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm2.lab.local --federation-global --apply
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global --apply
+```
+``` bash
+python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global --apply
+```
 ------------------------------------------------------------------------
 
-## 7) Push Promoted Groups (Global-Infra)
-
-Dry Run:
+## 5a) Push Validation
 
 ``` bash
-python tools/nsx/push_promoted_lm_groups.py \
-  --manager gm1 \
-  --federation-global \
-  --dry-run
-```
-
-Apply:
-
-``` bash
-python tools/nsx/push_promoted_lm_groups.py \
-  --manager gm1 \
-  --federation-global
-```
-``` bash
-python tools/nsx/push_promoted_lm_groups.py \
-  --manager gm2 \
-  --federation-global
-```
-
-------------------------------------------------------------------------
-
-## 8) Generate Updated Rule Files (From Promoted Groups)
-
-Dry Run:
-
-``` bash
-python tools/nsx/update_rules_from_promoted_groups.py \
-  --gm-name nsx-gm1.lab.local \
-  --rules-domain default \
-  --dst-domain default \
-  --suffix _svb_m3 \
-  --dry-run
-```
-
-Write Changed Files Only:
-
-``` bash
-python tools/nsx/update_rules_from_promoted_groups.py \
-  --gm-name nsx-gm1.lab.local \
-  --rules-domain default \
-  --dst-domain default \
-  --suffix _svb_m3
-```
-``` bash
-python tools/nsx/update_rules_from_promoted_groups.py \
-  --gm-name nsx-gm2.lab.local \
-  --rules-domain default \
-  --dst-domain default \
-  --suffix _svb_m3
-```
-
-
-
-------------------------------------------------------------------------
-
-## 9) Push Rules
-
-``` bash
-python tools/nsx/push_updated_rules.py \
-  --manager gm1 \
-  --federation-global \
-  --rules-domain default
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
 ```
 
 ``` bash
-python tools/nsx/push_updated_rules.py \
-  --manager gm1 \
-  --federation-global \
-  --rules-domain default \
-  --apply
-```
-``` bash
-python tools/nsx/push_updated_rules.py \
-  --manager gm2 \
-  --federation-global \
-  --rules-domain default \
-  --apply
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
 ```
 
-------------------------------------------------------------------------
-
-Write Complete Ruleset Tree:
 
 ``` bash
-python tools/nsx/update_rules_from_promoted_groups.py \
-  --gm-name nsx-gm1.lab.local \
-  --rules-domain default \
-  --dst-domain default \
-  --suffix _to_gm \
-  --write-all --copy-unchanged
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
 ```
 
-Push Updated Ruleset Tree:
+## 5b) Rollback Validation
 
-python tools/nsx/push_updated_rules.py --federation-global
+``` bash
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
+```
 
-
-------------------------------------------------------------------------
-
-## Operational Notes
-
--   Group matching is performed using **NSX object IDs**, not display
-    names.
-
--   Promoted groups are expected to follow the ID pattern:
-
-        <original_id>_to_gm
-
--   Rule updates are deterministic and reversible.
-
--   Rollback is achieved by simply not publishing updated rules.
-
--   All steps support dry-run validation before execution.
+``` bash
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
 
 
+``` bash
+python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
+```
 
-------------------------------------------------------------------------
+## FINAL - LIVE VALIDATE
 
-## Validation Checklist
+``` bash
+python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id default --federation-global
+```
 
--   ✅ Promoted groups exist in `/global-infra/domains/default/groups`
--   ✅ Updated rule files generated correctly
--   ✅ Dry-run shows expected rule modifications
--   ✅ Change logs generated under `nsx_logs/`
+``` bash
+python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
 
-------------------------------------------------------------------------
+``` bash
+python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
+```
 
 ## Safety Model
 
