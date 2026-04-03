@@ -34,6 +34,11 @@ python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm1 --o
 python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm2 --output-format yaml --all-domains
 ```
 
+``` bash
+python tools/nsx/export_nsx_objects.py --manager nsx-lm3 --output-format yaml
+```
+
+
 ------------------------------------------------------------------------
 
 ## 2) Remap Groups (Build Additive Groups)
