@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -62,13 +63,51 @@ LOCAL_ONLY_KEYS = {
 
 
 # -----------------------------------------------------------------------------
+# Path / logging helpers
+# -----------------------------------------------------------------------------
+
+def _resolve_log_dir() -> Path:
+    """
+    Resolve nsx_log_dir safely across Linux/macOS/Windows.
+
+    Supports:
+      - repo-relative paths like "nsx_logs"
+      - absolute paths
+      - environment-expanded paths like %USERPROFILE%\\logs or $HOME/logs
+      - home-relative paths like ~/logs
+    """
+    if not nsx_log_dir:
+        p = REPO_ROOT / "nsx_logs"
+    else:
+        expanded = os.path.expandvars(os.path.expanduser(str(nsx_log_dir)))
+        p = Path(expanded)
+        if not p.is_absolute():
+            p = REPO_ROOT / p
+    return p
+
+
+def _ensure_dir(path: Path, *, label: str) -> Path:
+    existed_before = path.exists()
+    path.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve()
+
+    root = logging.getLogger()
+    if root.handlers:
+        if existed_before:
+            root.info("%s directory already exists: %s", label, resolved)
+        else:
+            root.info("%s directory created: %s", label, resolved)
+
+    return resolved
+
+
+# -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    log_dir = Path(nsx_log_dir) if nsx_log_dir else REPO_ROOT / "nsx_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = _ensure_dir(_resolve_log_dir(), label="Resolved log")
     log_file = log_dir / "push_nsx_groups_revert.log"
 
     root = logging.getLogger()
@@ -85,7 +124,11 @@ def setup_logging(verbose: bool) -> None:
 
     root.addHandler(fh)
     root.addHandler(sh)
-    log.info("Log file: %s", log_file)
+
+    log.info("Log file initialized: %s", log_file.resolve())
+    log.info("Repository root resolved to: %s", REPO_ROOT.resolve())
+    log.info("Configured nsx_log_dir value: %s", nsx_log_dir)
+    log.info("Resolved log directory: %s", log_dir.resolve())
 
 
 # -----------------------------------------------------------------------------
@@ -117,10 +160,13 @@ def discover_group_files(export_root: Path, domain_id: str) -> List[Path]:
     ]
     for root in candidates:
         if root.exists():
-            return sorted(
+            files = sorted(
                 p for p in root.iterdir()
                 if p.is_file() and p.suffix.lower() in {".yaml", ".yml", ".json"}
             )
+            log.info("Discovered %d group file(s) under %s", len(files), root.resolve())
+            return files
+
     raise FileNotFoundError(
         f"Could not find group export folder under either:\n"
         f"  {candidates[0]}\n"
@@ -133,14 +179,19 @@ def load_desired_groups(export_root: Path, domain_id: str) -> Dict[str, Dict[str
     for path in discover_group_files(export_root, domain_id):
         obj = load_file(path)
         if not obj:
+            log.warning("Skipping %s — empty object", path)
             continue
+
         group_id = obj.get("id")
         if not group_id:
             log.warning("Skipping %s — no 'id' field", path)
             continue
+
         cleaned = clean_payload(obj)
         cleaned["_source_file"] = str(path)
         desired[group_id] = cleaned
+
+    log.info("Loaded %d desired group payload(s) from export set", len(desired))
     return desired
 
 
@@ -229,6 +280,42 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
         print("Please enter 'y' or 'n'.")
 
 
+def _prompt_apply_item(*, item_kind: str, group_id: str, display_name: str) -> str:
+    while True:
+        answer = input(
+            f"\nApply this {item_kind}? id={group_id} display_name={display_name} [y/N/s]: "
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            log.info(
+                "Operator chose APPLY for %s id=%s display_name=%s",
+                item_kind,
+                group_id,
+                display_name,
+            )
+            return "apply"
+
+        if answer in ("s", "skip"):
+            log.info(
+                "Operator chose SKIP for %s id=%s display_name=%s",
+                item_kind,
+                group_id,
+                display_name,
+            )
+            return "skip"
+
+        if answer in ("", "n", "no"):
+            log.warning(
+                "Operator chose ABORT for %s id=%s display_name=%s",
+                item_kind,
+                group_id,
+                display_name,
+            )
+            return "abort"
+
+        print("Please enter 'y', 'n', or 's'.")
+
+
 def _controlled_checkpoint(*, processed_count: int, last_ts: float, phase: str) -> float:
     now = time.monotonic()
     wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
@@ -289,8 +376,8 @@ def _write_validation_report(
     run_ts: str,
     output_base: Path,
 ) -> Path:
-    run_dir = output_base / f"{run_ts}_{target}_revert_validate"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    validation_base = _ensure_dir(output_base, label="Validation base")
+    run_dir = _ensure_dir(validation_base / f"{run_ts}_{target}_revert_validate", label="Validation run")
 
     out = {
         "run_ts": run_ts,
@@ -310,6 +397,7 @@ def _write_validation_report(
 
     report_file = run_dir / "validation_report.json"
     report_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    log.info("Validation report file written successfully: %s", report_file.resolve())
     return report_file
 
 
@@ -354,6 +442,8 @@ def rollback_groups(
     validation_records: List[Dict[str, Any]] = []
     ordered_restore_ids = sorted(desired.keys())
     last_ts = 0.0
+    skipped_restore_count = 0
+    skipped_delete_count = 0
 
     for idx, gid in enumerate(ordered_restore_ids, start=1):
         payload = desired[gid]
@@ -408,9 +498,36 @@ def rollback_groups(
             )
             continue
 
+        decision = _prompt_apply_item(
+            item_kind="group restore",
+            group_id=gid,
+            display_name=display_name,
+        )
+
+        if decision == "skip":
+            skipped_restore_count += 1
+            log.info(
+                "Skipped restore for group=%s display_name=%s skipped_restore_total=%d",
+                gid,
+                display_name,
+                skipped_restore_count,
+            )
+            last_ts = _controlled_checkpoint(
+                processed_count=idx,
+                last_ts=last_ts,
+                phase="rollback updates",
+            )
+            continue
+
+        if decision == "abort":
+            raise KeyboardInterrupt(
+                f"Stopped by operator at restore group id={gid} display_name={display_name}."
+            )
+
         log.info("Restoring group: %s", gid)
         try:
             client.patch_group(gid, patch_payload, domain_id)
+            log.info("Restore PATCH succeeded for group=%s display_name=%s", gid, display_name)
         except Exception as exc:
             log.error("Failed restoring %s: %s", gid, exc)
 
@@ -422,11 +539,14 @@ def rollback_groups(
 
     if delete_extraneous:
         for delete_idx, gid in enumerate(to_delete, start=1):
+            display_name = existing.get(gid, {}).get("display_name") or existing.get(gid, {}).get("name") or gid
+
             log.info(
-                "[DELETE %d/%d] extraneous group=%s action=DELETE",
+                "[DELETE %d/%d] extraneous group=%s display_name=%s action=DELETE",
                 delete_idx,
                 len(to_delete),
                 gid,
+                display_name,
             )
 
             if dry_run:
@@ -438,9 +558,36 @@ def rollback_groups(
                 )
                 continue
 
+            decision = _prompt_apply_item(
+                item_kind="group delete",
+                group_id=gid,
+                display_name=display_name,
+            )
+
+            if decision == "skip":
+                skipped_delete_count += 1
+                log.info(
+                    "Skipped delete for group=%s display_name=%s skipped_delete_total=%d",
+                    gid,
+                    display_name,
+                    skipped_delete_count,
+                )
+                last_ts = _controlled_checkpoint(
+                    processed_count=len(ordered_restore_ids) + delete_idx,
+                    last_ts=last_ts,
+                    phase="rollback deletions",
+                )
+                continue
+
+            if decision == "abort":
+                raise KeyboardInterrupt(
+                    f"Stopped by operator at delete group id={gid} display_name={display_name}."
+                )
+
             log.info("Deleting extraneous group: %s", gid)
             try:
                 client.delete_group(gid, domain_id)
+                log.info("Delete succeeded for group=%s display_name=%s", gid, display_name)
             except Exception as exc:
                 log.error("Failed deleting %s: %s", gid, exc)
 
@@ -450,7 +597,7 @@ def rollback_groups(
                 phase="rollback deletions",
             )
 
-    validation_base = Path(nsx_log_dir) / "nsx_validation"
+    validation_base = _resolve_log_dir() / "nsx_validation"
     validation_file = _write_validation_report(
         validation_records,
         target=target,
@@ -459,6 +606,11 @@ def rollback_groups(
         output_base=validation_base,
     )
     log.info("Rollback validation report written: %s", validation_file)
+    log.info(
+        "Rollback finished. skipped_restore_total=%d skipped_delete_total=%d",
+        skipped_restore_count,
+        skipped_delete_count,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -525,18 +677,23 @@ def main() -> None:
     log.info("Mode:                          %s", "APPLY" if args.apply else "DRY-RUN")
     log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
     log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
+    log.info("Resolved log dir:              %s", _resolve_log_dir().resolve())
 
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)
 
-    rollback_groups(
-        client=client,
-        export_root=Path(args.export_root),
-        domain_id=args.domain_id,
-        dry_run=not args.apply,
-        delete_extraneous=args.delete_extraneous,
-        target=args.target,
-        run_ts=run_ts,
-    )
+    try:
+        rollback_groups(
+            client=client,
+            export_root=Path(args.export_root),
+            domain_id=args.domain_id,
+            dry_run=not args.apply,
+            delete_extraneous=args.delete_extraneous,
+            target=args.target,
+            run_ts=run_ts,
+        )
+    except KeyboardInterrupt as exc:
+        log.warning("Rollback interrupted by operator: %s", exc)
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,43 +21,85 @@ from nsx.nsx_policy_client import NsxPolicyClient
 
 DEFAULT_INPUT_DIR = "nsx_groups_additive"
 DEFAULT_BASELINE_DIR = "nsx_export"
-LOG_DIR_NAME = nsx_log_dir
 LOG_FILE_NAME = "push_nsx_groups.log"
 
 # These two fields regulate both dry-run validation pacing and apply pacing.
 GROUP_PATCH_INTERVAL_SECONDS = 1.0
-PROMPT_EVERY_N_UPDATES = 5
+PROMPT_EVERY_N_UPDATES = 1
+
+log = logging.getLogger("push_nsx_groups")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _ensure_dir(path: Path, *, label: str) -> Path:
+    existed_before = path.exists()
+    path.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve()
+
+    if log.handlers:
+        if existed_before:
+            log.info("%s directory already exists: %s", label, resolved)
+        else:
+            log.info("%s directory created: %s", label, resolved)
+
+    return resolved
+
+
+def _resolve_log_dir() -> Path:
+    """
+    Resolve nsx_log_dir safely across Linux/macOS/Windows.
+
+    Supports:
+      - repo-relative paths like "nsx_logs"
+      - absolute paths
+      - environment-expanded paths like %USERPROFILE%\\logs or $HOME/logs
+      - home-relative paths like ~/logs
+    """
+    repo_root = _repo_root()
+
+    if not nsx_log_dir:
+        p = repo_root / "nsx_logs"
+    else:
+        expanded = os.path.expandvars(os.path.expanduser(str(nsx_log_dir)))
+        p = Path(expanded)
+        if not p.is_absolute():
+            p = repo_root / p
+
+    return _ensure_dir(p, label="Resolved log")
 
 
 def setup_logging() -> logging.Logger:
-    repo_root = Path(__file__).resolve().parents[2]
-    log_dir = repo_root / LOG_DIR_NAME
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = _resolve_log_dir()
     log_file = log_dir / LOG_FILE_NAME
 
     logger = logging.getLogger("push_nsx_groups")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    if not logger.handlers:
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
 
-        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(fmt)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-        sh = logging.StreamHandler()
-        sh.setLevel(logging.INFO)
-        sh.setFormatter(fmt)
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
 
-        logger.addHandler(fh)
-        logger.addHandler(sh)
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
 
-    logger.info("Log file: %s", log_file)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+
+    logger.info("Log file initialized: %s", log_file.resolve())
+    logger.info("Repository root resolved to: %s", _repo_root().resolve())
+    logger.info("Configured nsx_log_dir value: %s", nsx_log_dir)
+
     return logger
-
-
-log = setup_logging()
 
 
 def _build_mgr_map() -> Dict[str, str]:
@@ -71,13 +114,11 @@ def _build_mgr_map() -> Dict[str, str]:
 
 
 def _default_input_dir() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / DEFAULT_INPUT_DIR
+    return _repo_root() / DEFAULT_INPUT_DIR
 
 
 def _default_baseline_dir() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / DEFAULT_BASELINE_DIR
+    return _repo_root() / DEFAULT_BASELINE_DIR
 
 
 def _manager_dirname(manager_host: str) -> str:
@@ -148,32 +189,25 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
         print("Please enter 'y' or 'n'.")
 
 
-def _prompt_before_apply(*, validated_count: int, additions_count: int, missing_count: int) -> None:
+def _prompt_apply_item(*, group_id: Optional[str], display_name: str) -> str:
     while True:
         answer = input(
-            f"\nValidation complete: groups_validated={validated_count}, groups_with_additions={additions_count}, "
-            f"missing_in_baseline={missing_count}. Proceed to APPLY push? [y/N]: "
+            f"\nApply this group? id={group_id} display_name={display_name} [y/N/s]: "
         ).strip().lower()
 
         if answer in ("y", "yes"):
-            log.info(
-                "Operator approved transition from validation to apply. validated=%d additions=%d missing=%d",
-                validated_count,
-                additions_count,
-                missing_count,
-            )
-            return
+            log.info("Operator chose APPLY for group id=%s display_name=%s", group_id, display_name)
+            return "apply"
+
+        if answer in ("s", "skip"):
+            log.info("Operator chose SKIP for group id=%s display_name=%s", group_id, display_name)
+            return "skip"
 
         if answer in ("", "n", "no"):
-            log.warning(
-                "Operator aborted before apply after validation. validated=%d additions=%d missing=%d",
-                validated_count,
-                additions_count,
-                missing_count,
-            )
-            raise KeyboardInterrupt("Stopped by operator before apply phase.")
+            log.warning("Operator chose ABORT for group id=%s display_name=%s", group_id, display_name)
+            return "abort"
 
-        print("Please enter 'y' or 'n'.")
+        print("Please enter 'y', 'n', or 's'.")
 
 
 def _iter_group_files(groups_dir: Path, input_format: str) -> Iterable[Path]:
@@ -272,8 +306,9 @@ def _write_validation_report(
     run_ts: str,
     output_base: Path,
 ) -> Path:
+    _ensure_dir(output_base, label="Validation base")
     run_dir = output_base / f"{run_ts}_{target}_validate"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(run_dir, label="Validation run")
 
     out = {
         "run_ts": run_ts,
@@ -292,6 +327,7 @@ def _write_validation_report(
 
     report_file = run_dir / "validation_report.json"
     report_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    log.info("Validation report file written successfully: %s", report_file.resolve())
     return report_file
 
 
@@ -350,6 +386,8 @@ def _build_baseline_index(baseline_groups_dir: Path, input_format: str) -> Dict[
     if not baseline_groups_dir.exists():
         raise RuntimeError(f"Baseline groups directory does not exist: {baseline_groups_dir}")
 
+    log.info("Building baseline index from: %s", baseline_groups_dir.resolve())
+
     for group_file in _iter_group_files(baseline_groups_dir, input_format):
         try:
             payload = _load_group_file(group_file)
@@ -365,6 +403,7 @@ def _build_baseline_index(baseline_groups_dir: Path, input_format: str) -> Dict[
         payload["_baseline_file"] = str(group_file)
         index[group_id] = payload
 
+    log.info("Baseline index build complete: %d groups indexed", len(index))
     return index
 
 
@@ -604,6 +643,7 @@ def _wrap_group_patch_controls(
         return
 
     if getattr(client, "_group_patch_controls_wrapped", False):
+        log.info("PATCH controls already wrapped on client; skipping duplicate wrap.")
         return
 
     if not hasattr(client, "_patch"):
@@ -615,6 +655,7 @@ def _wrap_group_patch_controls(
     state = {
         "last_patch_ts": 0.0,
         "applied_count": 0,
+        "skipped_count": 0,
     }
 
     log.info(
@@ -649,7 +690,7 @@ def _wrap_group_patch_controls(
 
             _log_group_state(
                 phase_label="PATCH",
-                index=state["applied_count"] + 1,
+                index=state["applied_count"] + state["skipped_count"] + 1,
                 total=0,
                 group_id=group_id,
                 display_name=display_name or str(group_id),
@@ -661,7 +702,7 @@ def _wrap_group_patch_controls(
         else:
             _log_group_state(
                 phase_label="PATCH",
-                index=state["applied_count"] + 1,
+                index=state["applied_count"] + state["skipped_count"] + 1,
                 total=0,
                 group_id=group_id,
                 display_name=display_name or str(group_id),
@@ -669,6 +710,33 @@ def _wrap_group_patch_controls(
                 exists_in_baseline=False,
                 current_entries=None,
                 to_add=desired_entries,
+            )
+
+        decision = _prompt_apply_item(
+            group_id=group_id,
+            display_name=display_name or str(group_id),
+        )
+
+        if decision == "skip":
+            state["skipped_count"] += 1
+            state["last_patch_ts"] = time.monotonic()
+            log.info(
+                "Skipped group update #%d%s%s skipped_total=%d",
+                state["applied_count"] + state["skipped_count"],
+                f" (id={group_id})" if group_id else "",
+                f" (display_name={display_name})" if display_name else "",
+                state["skipped_count"],
+            )
+            return {
+                "skipped": True,
+                "path": path,
+                "group_id": group_id,
+                "display_name": display_name,
+            }
+
+        if decision == "abort":
+            raise KeyboardInterrupt(
+                f"Stopped by operator at group id={group_id} display_name={display_name}."
             )
 
         response = orig_patch(path, payload, *args, **kwargs)
@@ -682,27 +750,31 @@ def _wrap_group_patch_controls(
                 live_after_entries = sorted(set(_extract_ip_address_entries(live_after)))
                 remaining_add = sorted(set(desired_entries) - set(live_after_entries))
                 log.info(
-                    "Applied group update #%d%s%s remaining_add=%d",
-                    state["applied_count"],
+                    "Applied group update #%d%s%s remaining_add=%d applied_total=%d skipped_total=%d",
+                    state["applied_count"] + state["skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     len(remaining_add),
+                    state["applied_count"],
+                    state["skipped_count"],
                 )
                 log.info("  [POST CURRENT]    %s", _format_entries(live_after_entries))
                 log.info("  [POST ADD]        %s", _format_entries(remaining_add))
             else:
                 log.info(
-                    "Applied group update #%d%s%s post-check current state unavailable",
-                    state["applied_count"],
+                    "Applied group update #%d%s%s post-check current state unavailable applied_total=%d skipped_total=%d",
+                    state["applied_count"] + state["skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
+                    state["applied_count"],
+                    state["skipped_count"],
                 )
                 log.info("  [POST CURRENT]    [unknown]")
                 log.info("  [POST ADD]        [unknown]")
         except Exception as exc:
             log.warning(
                 "Applied group update #%d%s but post-check lookup failed: %s",
-                state["applied_count"],
+                state["applied_count"] + state["skipped_count"],
                 f" (id={group_id})" if group_id else "",
                 exc,
             )
@@ -728,8 +800,9 @@ def _write_snapshot(
     snapshots_base: Path,
 ) -> Path:
     mode = "dryrun" if dry_run else "apply"
+    _ensure_dir(snapshots_base, label="Snapshot base")
     run_dir = snapshots_base / f"{run_ts}_{target}_{mode}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(run_dir, label="Snapshot run")
 
     out = {
         "run_ts": run_ts,
@@ -742,10 +815,13 @@ def _write_snapshot(
 
     snapshot_file = run_dir / "snapshot.json"
     snapshot_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    log.info("Snapshot file written successfully: %s", snapshot_file.resolve())
     return snapshot_file
 
 
 def main() -> None:
+    global log
+
     parser = argparse.ArgumentParser(
         description="Push NSX Group updates from files using nsx_export as the additive-only baseline for review logging."
     )
@@ -790,6 +866,7 @@ def main() -> None:
 
     args = parser.parse_args()
     init_cli()
+    log = setup_logging()
 
     mgr_map = _build_mgr_map()
     dst_mgr = mgr_map.get(args.target)
@@ -841,6 +918,7 @@ def main() -> None:
     log.info("Skip baseline validation:      %s", args.skip_baseline_validate)
     log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
     log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
+    log.info("Resolved log dir:              %s", _resolve_log_dir())
 
     client = NsxPolicyClient(nsxmanager=dst_mgr, federation_global=args.federation_global)
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -852,7 +930,7 @@ def main() -> None:
             baseline_groups_dir=baseline_groups_dir,
             input_format=args.input_format,
         )
-        validation_base = Path(nsx_log_dir) / "nsx_validation"
+        validation_base = _resolve_log_dir() / "nsx_validation"
         validation_file = _write_validation_report(
             validation_records,
             target=args.target,
@@ -884,15 +962,6 @@ def main() -> None:
                 len(missing),
             )
 
-    if args.apply and not args.skip_baseline_validate:
-        missing_count = sum(1 for r in validation_records if not r.get("exists_in_baseline"))
-        additions_count = sum(1 for r in validation_records if r.get("to_add_count", 0) > 0)
-        _prompt_before_apply(
-            validated_count=len(validation_records),
-            additions_count=additions_count,
-            missing_count=missing_count,
-        )
-
     _wrap_group_patch_controls(
         client,
         dry_run=(not args.apply),
@@ -914,14 +983,14 @@ def main() -> None:
     try:
         result = importer.import_all()
     except KeyboardInterrupt as exc:
-        log.warning("Push interrupted: %s", exc)
+        log.warning("Push interrupted by operator: %s", exc)
         raise SystemExit(130)
 
     log.info("Push complete. Stats=%s Errors=%d", result.get("stats"), len(result.get("errors", [])))
 
     snapshots = result.get("snapshots", [])
     if snapshots:
-        snapshots_base = Path(nsx_log_dir) / "nsx_snapshots"
+        snapshots_base = _resolve_log_dir() / "nsx_snapshots"
         snapshot_file = _write_snapshot(
             snapshots,
             target=args.target,
@@ -935,6 +1004,7 @@ def main() -> None:
         log.info("No groups snapshotted (nothing matched or all skipped).")
 
     log.info("Final stats: %s", result.get("stats"))
+    log.info("push_nsx_groups finished successfully.")
 
 
 if __name__ == "__main__":
