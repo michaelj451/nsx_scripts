@@ -25,14 +25,27 @@ LOG_FILE_NAME = "push_nsx_groups.log"
 
 # These two fields regulate both dry-run validation pacing and apply pacing.
 GROUP_PATCH_INTERVAL_SECONDS = 1.0
-PROMPT_EVERY_N_UPDATES = 5
-
+PROMPT_EVERY_N_UPDATES = 1
 
 log = logging.getLogger("push_nsx_groups")
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _ensure_dir(path: Path, *, label: str) -> Path:
+    existed_before = path.exists()
+    path.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve()
+
+    if log.handlers:
+        if existed_before:
+            log.info("%s directory already exists: %s", label, resolved)
+        else:
+            log.info("%s directory created: %s", label, resolved)
+
+    return resolved
 
 
 def _resolve_log_dir() -> Path:
@@ -55,8 +68,7 @@ def _resolve_log_dir() -> Path:
         if not p.is_absolute():
             p = repo_root / p
 
-    p.mkdir(parents=True, exist_ok=True)
-    return p.resolve()
+    return _ensure_dir(p, label="Resolved log")
 
 
 def setup_logging() -> logging.Logger:
@@ -83,7 +95,10 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(sh)
 
-    logger.info("Log file: %s", log_file)
+    logger.info("Log file initialized: %s", log_file.resolve())
+    logger.info("Repository root resolved to: %s", _repo_root().resolve())
+    logger.info("Configured nsx_log_dir value: %s", nsx_log_dir)
+
     return logger
 
 
@@ -174,32 +189,25 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
         print("Please enter 'y' or 'n'.")
 
 
-def _prompt_before_apply(*, validated_count: int, additions_count: int, missing_count: int) -> None:
+def _prompt_apply_item(*, group_id: Optional[str], display_name: str) -> str:
     while True:
         answer = input(
-            f"\nValidation complete: groups_validated={validated_count}, groups_with_additions={additions_count}, "
-            f"missing_in_baseline={missing_count}. Proceed to APPLY push? [y/N]: "
+            f"\nApply this group? id={group_id} display_name={display_name} [y/N/s]: "
         ).strip().lower()
 
         if answer in ("y", "yes"):
-            log.info(
-                "Operator approved transition from validation to apply. validated=%d additions=%d missing=%d",
-                validated_count,
-                additions_count,
-                missing_count,
-            )
-            return
+            log.info("Operator chose APPLY for group id=%s display_name=%s", group_id, display_name)
+            return "apply"
+
+        if answer in ("s", "skip"):
+            log.info("Operator chose SKIP for group id=%s display_name=%s", group_id, display_name)
+            return "skip"
 
         if answer in ("", "n", "no"):
-            log.warning(
-                "Operator aborted before apply after validation. validated=%d additions=%d missing=%d",
-                validated_count,
-                additions_count,
-                missing_count,
-            )
-            raise KeyboardInterrupt("Stopped by operator before apply phase.")
+            log.warning("Operator chose ABORT for group id=%s display_name=%s", group_id, display_name)
+            return "abort"
 
-        print("Please enter 'y' or 'n'.")
+        print("Please enter 'y', 'n', or 's'.")
 
 
 def _iter_group_files(groups_dir: Path, input_format: str) -> Iterable[Path]:
@@ -298,8 +306,9 @@ def _write_validation_report(
     run_ts: str,
     output_base: Path,
 ) -> Path:
+    _ensure_dir(output_base, label="Validation base")
     run_dir = output_base / f"{run_ts}_{target}_validate"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(run_dir, label="Validation run")
 
     out = {
         "run_ts": run_ts,
@@ -318,6 +327,7 @@ def _write_validation_report(
 
     report_file = run_dir / "validation_report.json"
     report_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    log.info("Validation report file written successfully: %s", report_file.resolve())
     return report_file
 
 
@@ -376,6 +386,8 @@ def _build_baseline_index(baseline_groups_dir: Path, input_format: str) -> Dict[
     if not baseline_groups_dir.exists():
         raise RuntimeError(f"Baseline groups directory does not exist: {baseline_groups_dir}")
 
+    log.info("Building baseline index from: %s", baseline_groups_dir.resolve())
+
     for group_file in _iter_group_files(baseline_groups_dir, input_format):
         try:
             payload = _load_group_file(group_file)
@@ -391,6 +403,7 @@ def _build_baseline_index(baseline_groups_dir: Path, input_format: str) -> Dict[
         payload["_baseline_file"] = str(group_file)
         index[group_id] = payload
 
+    log.info("Baseline index build complete: %d groups indexed", len(index))
     return index
 
 
@@ -630,6 +643,7 @@ def _wrap_group_patch_controls(
         return
 
     if getattr(client, "_group_patch_controls_wrapped", False):
+        log.info("PATCH controls already wrapped on client; skipping duplicate wrap.")
         return
 
     if not hasattr(client, "_patch"):
@@ -641,6 +655,7 @@ def _wrap_group_patch_controls(
     state = {
         "last_patch_ts": 0.0,
         "applied_count": 0,
+        "skipped_count": 0,
     }
 
     log.info(
@@ -675,7 +690,7 @@ def _wrap_group_patch_controls(
 
             _log_group_state(
                 phase_label="PATCH",
-                index=state["applied_count"] + 1,
+                index=state["applied_count"] + state["skipped_count"] + 1,
                 total=0,
                 group_id=group_id,
                 display_name=display_name or str(group_id),
@@ -687,7 +702,7 @@ def _wrap_group_patch_controls(
         else:
             _log_group_state(
                 phase_label="PATCH",
-                index=state["applied_count"] + 1,
+                index=state["applied_count"] + state["skipped_count"] + 1,
                 total=0,
                 group_id=group_id,
                 display_name=display_name or str(group_id),
@@ -695,6 +710,33 @@ def _wrap_group_patch_controls(
                 exists_in_baseline=False,
                 current_entries=None,
                 to_add=desired_entries,
+            )
+
+        decision = _prompt_apply_item(
+            group_id=group_id,
+            display_name=display_name or str(group_id),
+        )
+
+        if decision == "skip":
+            state["skipped_count"] += 1
+            state["last_patch_ts"] = time.monotonic()
+            log.info(
+                "Skipped group update #%d%s%s skipped_total=%d",
+                state["applied_count"] + state["skipped_count"],
+                f" (id={group_id})" if group_id else "",
+                f" (display_name={display_name})" if display_name else "",
+                state["skipped_count"],
+            )
+            return {
+                "skipped": True,
+                "path": path,
+                "group_id": group_id,
+                "display_name": display_name,
+            }
+
+        if decision == "abort":
+            raise KeyboardInterrupt(
+                f"Stopped by operator at group id={group_id} display_name={display_name}."
             )
 
         response = orig_patch(path, payload, *args, **kwargs)
@@ -708,27 +750,31 @@ def _wrap_group_patch_controls(
                 live_after_entries = sorted(set(_extract_ip_address_entries(live_after)))
                 remaining_add = sorted(set(desired_entries) - set(live_after_entries))
                 log.info(
-                    "Applied group update #%d%s%s remaining_add=%d",
-                    state["applied_count"],
+                    "Applied group update #%d%s%s remaining_add=%d applied_total=%d skipped_total=%d",
+                    state["applied_count"] + state["skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     len(remaining_add),
+                    state["applied_count"],
+                    state["skipped_count"],
                 )
                 log.info("  [POST CURRENT]    %s", _format_entries(live_after_entries))
                 log.info("  [POST ADD]        %s", _format_entries(remaining_add))
             else:
                 log.info(
-                    "Applied group update #%d%s%s post-check current state unavailable",
-                    state["applied_count"],
+                    "Applied group update #%d%s%s post-check current state unavailable applied_total=%d skipped_total=%d",
+                    state["applied_count"] + state["skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
+                    state["applied_count"],
+                    state["skipped_count"],
                 )
                 log.info("  [POST CURRENT]    [unknown]")
                 log.info("  [POST ADD]        [unknown]")
         except Exception as exc:
             log.warning(
                 "Applied group update #%d%s but post-check lookup failed: %s",
-                state["applied_count"],
+                state["applied_count"] + state["skipped_count"],
                 f" (id={group_id})" if group_id else "",
                 exc,
             )
@@ -754,8 +800,9 @@ def _write_snapshot(
     snapshots_base: Path,
 ) -> Path:
     mode = "dryrun" if dry_run else "apply"
+    _ensure_dir(snapshots_base, label="Snapshot base")
     run_dir = snapshots_base / f"{run_ts}_{target}_{mode}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(run_dir, label="Snapshot run")
 
     out = {
         "run_ts": run_ts,
@@ -768,6 +815,7 @@ def _write_snapshot(
 
     snapshot_file = run_dir / "snapshot.json"
     snapshot_file.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    log.info("Snapshot file written successfully: %s", snapshot_file.resolve())
     return snapshot_file
 
 
@@ -914,15 +962,6 @@ def main() -> None:
                 len(missing),
             )
 
-    if args.apply and not args.skip_baseline_validate:
-        missing_count = sum(1 for r in validation_records if not r.get("exists_in_baseline"))
-        additions_count = sum(1 for r in validation_records if r.get("to_add_count", 0) > 0)
-        _prompt_before_apply(
-            validated_count=len(validation_records),
-            additions_count=additions_count,
-            missing_count=missing_count,
-        )
-
     _wrap_group_patch_controls(
         client,
         dry_run=(not args.apply),
@@ -944,7 +983,7 @@ def main() -> None:
     try:
         result = importer.import_all()
     except KeyboardInterrupt as exc:
-        log.warning("Push interrupted: %s", exc)
+        log.warning("Push interrupted by operator: %s", exc)
         raise SystemExit(130)
 
     log.info("Push complete. Stats=%s Errors=%d", result.get("stats"), len(result.get("errors", [])))
@@ -965,6 +1004,7 @@ def main() -> None:
         log.info("No groups snapshotted (nothing matched or all skipped).")
 
     log.info("Final stats: %s", result.get("stats"))
+    log.info("push_nsx_groups finished successfully.")
 
 
 if __name__ == "__main__":

@@ -198,7 +198,7 @@ python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root ns
 ```
 
 ``` bash
-python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
+python tools/nsx/validate_nsx_groups_live.py --target nsx-lm3 --expected-root nsx_export/nsx-lm3.lab.local --domain-id default
 ```
 
 ## Safety Model
