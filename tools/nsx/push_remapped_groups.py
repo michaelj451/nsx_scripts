@@ -29,8 +29,11 @@ GROUP_PATCH_INTERVAL_SECONDS = 0.5
 # Dry-run validation checkpoint cadence
 PROMPT_EVERY_N_UPDATES = 100
 
-# Apply checkpoint cadence (separate from dry-run)
-APPLY_PROMPT_EVERY_N_UPDATES = 1 # Keep at 1 for apply to require confirmation on every update, or set to 0 to disable prompts and rely on time pacing alone.
+# Initial apply batch size.
+# Example:
+#   1  -> prompt immediately for first item, then allow operator to ramp to 5, 10, 20, etc.
+#   0  -> disable checkpoint prompting and auto-approve everything subject only to time pacing.
+APPLY_PROMPT_EVERY_N_UPDATES = 1
 
 log = logging.getLogger("push_nsx_groups")
 
@@ -196,31 +199,32 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
 
 def _prompt_apply_checkpoint(processed_count: int, *, current_every: int) -> int:
     """
-    Prompt after N applied updates.
-    Returns the new apply checkpoint cadence to use going forward.
+    Prompt after a batch of applied group updates.
+    Returns the new batch size to use going forward.
 
     Allowed responses:
-      y / yes  -> continue with current cadence
+      y / yes  -> continue with current batch size
       n / no   -> abort
-      <number> -> continue and change cadence to that number
+      <number> -> continue and change batch size to that number
     """
     while True:
         answer = input(
-            f"\nApplied {processed_count} updates. Continue? "
-            f"[y/N or enter new checkpoint count; current={current_every}]: "
+            f"\nApplied {processed_count} group updates. "
+            f"Continue with current batch size={current_every}? "
+            f"[y/N or enter new batch size]: "
         ).strip().lower()
 
         if answer in ("y", "yes"):
             log.info(
-                "Operator chose to continue after %d apply updates with existing checkpoint cadence=%d.",
+                "Operator chose to continue after %d group updates with existing batch size=%d.",
                 processed_count,
                 current_every,
             )
             return current_every
 
         if answer in ("", "n", "no"):
-            log.warning("Operator aborted after %d apply updates.", processed_count)
-            raise KeyboardInterrupt(f"Stopped by operator after {processed_count} apply updates.")
+            log.warning("Operator aborted after %d group updates.", processed_count)
+            raise KeyboardInterrupt(f"Stopped by operator after {processed_count} group updates.")
 
         try:
             new_value = int(answer)
@@ -229,14 +233,14 @@ def _prompt_apply_checkpoint(processed_count: int, *, current_every: int) -> int
                 continue
 
             log.info(
-                "Operator changed apply checkpoint cadence from %d to %d after %d applied updates.",
+                "Operator changed apply batch size from %d to %d after %d applied updates.",
                 current_every,
                 new_value,
                 processed_count,
             )
             return new_value
         except ValueError:
-            print("Please enter 'y', 'n', or a positive integer like 10, 25, or 100.")
+            print("Please enter 'y', 'n', or a positive integer like 5, 10, or 20.")
 
 
 def _prompt_apply_item(*, group_id: Optional[str], display_name: str) -> str:
@@ -346,6 +350,39 @@ def _controlled_checkpoint(*, processed_count: int, last_ts: float, phase: str) 
         _prompt_to_continue(processed_count, phase=phase)
 
     return new_ts
+
+
+def _maybe_refresh_apply_budget(
+    *,
+    applied_count: int,
+    state: Dict[str, Any],
+) -> None:
+    current_every = state["apply_prompt_every_n_updates"]
+
+    if current_every <= 0:
+        state["auto_apply_remaining"] = 10**12
+        return
+
+    new_every = _prompt_apply_checkpoint(
+        applied_count,
+        current_every=current_every,
+    )
+    state["apply_prompt_every_n_updates"] = new_every
+    state["auto_apply_remaining"] = new_every
+
+
+def _should_prompt_for_apply(state: Dict[str, Any]) -> bool:
+    remaining = state.get("auto_apply_remaining", 0)
+    return remaining <= 0
+
+
+def _apply_time_pacing(*, last_ts: float, phase: str) -> float:
+    now = time.monotonic()
+    wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+    if wait > 0:
+        log.info("%s throttle: waiting %.3f seconds before next item", phase, wait)
+        time.sleep(wait)
+    return time.monotonic()
 
 
 def _write_validation_report(
@@ -709,7 +746,7 @@ def _wrap_group_patch_controls(
         "applied_count": 0,
         "skipped_count": 0,
         "apply_prompt_every_n_updates": initial_apply_prompt_every,
-        "next_apply_prompt_at": initial_apply_prompt_every if initial_apply_prompt_every > 0 else None,
+        "auto_apply_remaining": 0,
     }
 
     log.info(
@@ -721,12 +758,6 @@ def _wrap_group_patch_controls(
     log.info("Apply baseline index size: %d groups", len(baseline_index))
 
     def controlled_patch(path, payload, *args, **kwargs):
-        now = time.monotonic()
-        wait = GROUP_PATCH_INTERVAL_SECONDS - (now - state["last_patch_ts"])
-        if wait > 0:
-            log.info("apply updates throttle: waiting %.3f seconds before next item", wait)
-            time.sleep(wait)
-
         group_id = None
         display_name = None
         if isinstance(payload, dict):
@@ -766,37 +797,59 @@ def _wrap_group_patch_controls(
                 to_add=desired_entries,
             )
 
-        decision = _prompt_apply_item(
-            group_id=group_id,
-            display_name=display_name or str(group_id),
-        )
+        if _should_prompt_for_apply(state):
+            _maybe_refresh_apply_budget(
+                applied_count=state["applied_count"],
+                state=state,
+            )
 
-        if decision == "skip":
-            state["skipped_count"] += 1
-            state["last_patch_ts"] = time.monotonic()
+            decision = _prompt_apply_item(
+                group_id=group_id,
+                display_name=display_name or str(group_id),
+            )
+
+            if decision == "skip":
+                state["skipped_count"] += 1
+                state["last_patch_ts"] = _apply_time_pacing(
+                    last_ts=state["last_patch_ts"],
+                    phase="apply updates",
+                )
+                log.info(
+                    "Skipped group update #%d%s%s skipped_total=%d",
+                    state["applied_count"] + state["skipped_count"],
+                    f" (id={group_id})" if group_id else "",
+                    f" (display_name={display_name})" if display_name else "",
+                    state["skipped_count"],
+                )
+                return {
+                    "skipped": True,
+                    "path": path,
+                    "group_id": group_id,
+                    "display_name": display_name,
+                }
+
+            if decision == "abort":
+                raise KeyboardInterrupt(
+                    f"Stopped by operator at group id={group_id} display_name={display_name}."
+                )
+        else:
             log.info(
-                "Skipped group update #%d%s%s skipped_total=%d",
-                state["applied_count"] + state["skipped_count"],
-                f" (id={group_id})" if group_id else "",
-                f" (display_name={display_name})" if display_name else "",
-                state["skipped_count"],
+                "Auto-approving group update id=%s display_name=%s remaining_batch=%d",
+                group_id,
+                display_name,
+                state["auto_apply_remaining"],
             )
-            return {
-                "skipped": True,
-                "path": path,
-                "group_id": group_id,
-                "display_name": display_name,
-            }
 
-        if decision == "abort":
-            raise KeyboardInterrupt(
-                f"Stopped by operator at group id={group_id} display_name={display_name}."
-            )
+        state["last_patch_ts"] = _apply_time_pacing(
+            last_ts=state["last_patch_ts"],
+            phase="apply updates",
+        )
 
         response = orig_patch(path, payload, *args, **kwargs)
 
-        state["last_patch_ts"] = time.monotonic()
         state["applied_count"] += 1
+        if state["auto_apply_remaining"] > 0:
+            state["auto_apply_remaining"] -= 1
 
         try:
             live_after = _client_get_json(client, path)
@@ -804,24 +857,26 @@ def _wrap_group_patch_controls(
                 live_after_entries = sorted(set(_extract_ip_address_entries(live_after)))
                 remaining_add = sorted(set(desired_entries) - set(live_after_entries))
                 log.info(
-                    "Applied group update #%d%s%s remaining_add=%d applied_total=%d skipped_total=%d",
+                    "Applied group update #%d%s%s remaining_add=%d applied_total=%d skipped_total=%d remaining_batch=%d",
                     state["applied_count"] + state["skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     len(remaining_add),
                     state["applied_count"],
                     state["skipped_count"],
+                    state["auto_apply_remaining"],
                 )
                 log.info("  [POST CURRENT]    %s", _format_entries(live_after_entries))
                 log.info("  [POST ADD]        %s", _format_entries(remaining_add))
             else:
                 log.info(
-                    "Applied group update #%d%s%s post-check current state unavailable applied_total=%d skipped_total=%d",
+                    "Applied group update #%d%s%s post-check current state unavailable applied_total=%d skipped_total=%d remaining_batch=%d",
                     state["applied_count"] + state["skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     state["applied_count"],
                     state["skipped_count"],
+                    state["auto_apply_remaining"],
                 )
                 log.info("  [POST CURRENT]    [unknown]")
                 log.info("  [POST ADD]        [unknown]")
@@ -832,17 +887,6 @@ def _wrap_group_patch_controls(
                 f" (id={group_id})" if group_id else "",
                 exc,
             )
-
-        next_prompt_at = state["next_apply_prompt_at"]
-        current_every = state["apply_prompt_every_n_updates"]
-
-        if next_prompt_at is not None and current_every > 0 and state["applied_count"] >= next_prompt_at:
-            new_every = _prompt_apply_checkpoint(
-                state["applied_count"],
-                current_every=current_every,
-            )
-            state["apply_prompt_every_n_updates"] = new_every
-            state["next_apply_prompt_at"] = state["applied_count"] + new_every
 
         return response
 

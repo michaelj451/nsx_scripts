@@ -38,8 +38,11 @@ GROUP_PATCH_INTERVAL_SECONDS = 0.5
 # Dry-run review cadence
 PROMPT_EVERY_N_UPDATES = 100
 
-# Apply cadence for restore/delete operations
-APPLY_PROMPT_EVERY_N_UPDATES = 1 # Keep at 1 for apply to require confirmation on every update, or set to 0 to disable prompts and rely on time pacing alone.
+# Initial apply batch size.
+# Example:
+#   1  -> prompt immediately for first item, then allow operator to ramp to 5, 10, 20, etc.
+#   0  -> disable checkpoint prompting and auto-approve everything subject only to time pacing.
+APPLY_PROMPT_EVERY_N_UPDATES = 1
 
 DEFAULT_STRIP_KEYS = {
     "_create_time",
@@ -287,23 +290,24 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
 
 def _prompt_apply_checkpoint(processed_count: int, *, current_every: int) -> int:
     """
-    Prompt after N applied rollback operations.
-    Returns the new apply checkpoint cadence to use going forward.
+    Prompt after a batch of applied rollback operations.
+    Returns the new batch size to use going forward.
 
     Allowed responses:
-      y / yes  -> continue with current cadence
+      y / yes  -> continue with current batch size
       n / no   -> abort
-      <number> -> continue and change cadence to that number
+      <number> -> continue and change batch size to that number
     """
     while True:
         answer = input(
-            f"\nApplied {processed_count} rollback updates. Continue? "
-            f"[y/N or enter new checkpoint count; current={current_every}]: "
+            f"\nApplied {processed_count} rollback updates. "
+            f"Continue with current batch size={current_every}? "
+            f"[y/N or enter new batch size]: "
         ).strip().lower()
 
         if answer in ("y", "yes"):
             log.info(
-                "Operator chose to continue after %d rollback updates with existing checkpoint cadence=%d.",
+                "Operator chose to continue after %d rollback updates with existing batch size=%d.",
                 processed_count,
                 current_every,
             )
@@ -320,14 +324,14 @@ def _prompt_apply_checkpoint(processed_count: int, *, current_every: int) -> int
                 continue
 
             log.info(
-                "Operator changed rollback apply checkpoint cadence from %d to %d after %d applied updates.",
+                "Operator changed rollback apply batch size from %d to %d after %d applied updates.",
                 current_every,
                 new_value,
                 processed_count,
             )
             return new_value
         except ValueError:
-            print("Please enter 'y', 'n', or a positive integer like 10, 25, or 100.")
+            print("Please enter 'y', 'n', or a positive integer like 5, 10, or 20.")
 
 
 def _prompt_apply_item(*, item_kind: str, group_id: str, display_name: str) -> str:
@@ -381,24 +385,37 @@ def _controlled_checkpoint(*, processed_count: int, last_ts: float, phase: str) 
     return new_ts
 
 
-def _maybe_apply_checkpoint(
+def _maybe_refresh_apply_budget(
     *,
     applied_count: int,
     state: Dict[str, Any],
 ) -> None:
     current_every = state["apply_prompt_every_n_updates"]
-    next_prompt_at = state["next_apply_prompt_at"]
 
-    if next_prompt_at is None or current_every <= 0:
+    if current_every <= 0:
+        state["auto_apply_remaining"] = 10**12
         return
 
-    if applied_count >= next_prompt_at:
-        new_every = _prompt_apply_checkpoint(
-            applied_count,
-            current_every=current_every,
-        )
-        state["apply_prompt_every_n_updates"] = new_every
-        state["next_apply_prompt_at"] = applied_count + new_every
+    new_every = _prompt_apply_checkpoint(
+        applied_count,
+        current_every=current_every,
+    )
+    state["apply_prompt_every_n_updates"] = new_every
+    state["auto_apply_remaining"] = new_every
+
+
+def _should_prompt_for_apply(state: Dict[str, Any]) -> bool:
+    remaining = state.get("auto_apply_remaining", 0)
+    return remaining <= 0
+
+
+def _apply_time_pacing(*, last_ts: float, phase: str) -> float:
+    now = time.monotonic()
+    wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+    if wait > 0:
+        log.info("%s throttle: waiting %.3f seconds before next item", phase, wait)
+        time.sleep(wait)
+    return time.monotonic()
 
 
 def _log_group_state(
@@ -508,12 +525,12 @@ def rollback_groups(
     log.info("  delete extra   : %d", len(to_delete) if delete_extraneous else 0)
     log.info("  pacing interval: %s", GROUP_PATCH_INTERVAL_SECONDS)
     log.info("  dry-run prompt : %s", PROMPT_EVERY_N_UPDATES)
-    log.info("  apply prompt   : %s", APPLY_PROMPT_EVERY_N_UPDATES)
+    log.info("  apply batch    : %s", APPLY_PROMPT_EVERY_N_UPDATES)
 
     apply_prompt_every = APPLY_PROMPT_EVERY_N_UPDATES if APPLY_PROMPT_EVERY_N_UPDATES > 0 else 0
     apply_state: Dict[str, Any] = {
         "apply_prompt_every_n_updates": apply_prompt_every,
-        "next_apply_prompt_at": apply_prompt_every if apply_prompt_every > 0 else None,
+        "auto_apply_remaining": 0,
         "applied_count": 0,
     }
 
@@ -576,57 +593,65 @@ def rollback_groups(
             )
             continue
 
-        decision = _prompt_apply_item(
-            item_kind="group restore",
-            group_id=gid,
-            display_name=display_name,
-        )
+        if _should_prompt_for_apply(apply_state):
+            _maybe_refresh_apply_budget(
+                applied_count=apply_state["applied_count"],
+                state=apply_state,
+            )
 
-        if decision == "skip":
-            skipped_restore_count += 1
+            decision = _prompt_apply_item(
+                item_kind="group restore",
+                group_id=gid,
+                display_name=display_name,
+            )
+
+            if decision == "skip":
+                skipped_restore_count += 1
+                log.info(
+                    "Skipped restore for group=%s display_name=%s skipped_restore_total=%d",
+                    gid,
+                    display_name,
+                    skipped_restore_count,
+                )
+                last_ts = _apply_time_pacing(
+                    last_ts=last_ts,
+                    phase="rollback updates",
+                )
+                continue
+
+            if decision == "abort":
+                raise KeyboardInterrupt(
+                    f"Stopped by operator at restore group id={gid} display_name={display_name}."
+                )
+        else:
             log.info(
-                "Skipped restore for group=%s display_name=%s skipped_restore_total=%d",
+                "Auto-approving restore for group=%s display_name=%s remaining_batch=%d",
                 gid,
                 display_name,
-                skipped_restore_count,
-            )
-            now = time.monotonic()
-            wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
-            if wait > 0:
-                log.info("rollback updates throttle: waiting %.3f seconds before next item", wait)
-                time.sleep(wait)
-            last_ts = time.monotonic()
-            continue
-
-        if decision == "abort":
-            raise KeyboardInterrupt(
-                f"Stopped by operator at restore group id={gid} display_name={display_name}."
+                apply_state["auto_apply_remaining"],
             )
 
-        now = time.monotonic()
-        wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
-        if wait > 0:
-            log.info("rollback updates throttle: waiting %.3f seconds before next item", wait)
-            time.sleep(wait)
+        last_ts = _apply_time_pacing(
+            last_ts=last_ts,
+            phase="rollback updates",
+        )
 
         log.info("Restoring group: %s", gid)
         try:
             client.patch_group(gid, patch_payload, domain_id)
             apply_state["applied_count"] += 1
+            if apply_state["auto_apply_remaining"] > 0:
+                apply_state["auto_apply_remaining"] -= 1
+
             log.info(
-                "Restore PATCH succeeded for group=%s display_name=%s applied_total=%d",
+                "Restore PATCH succeeded for group=%s display_name=%s applied_total=%d remaining_batch=%d",
                 gid,
                 display_name,
                 apply_state["applied_count"],
+                apply_state["auto_apply_remaining"],
             )
         except Exception as exc:
             log.error("Failed restoring %s: %s", gid, exc)
-
-        last_ts = time.monotonic()
-        _maybe_apply_checkpoint(
-            applied_count=apply_state["applied_count"],
-            state=apply_state,
-        )
 
     if delete_extraneous:
         for delete_idx, gid in enumerate(to_delete, start=1):
@@ -649,57 +674,65 @@ def rollback_groups(
                 )
                 continue
 
-            decision = _prompt_apply_item(
-                item_kind="group delete",
-                group_id=gid,
-                display_name=display_name,
-            )
+            if _should_prompt_for_apply(apply_state):
+                _maybe_refresh_apply_budget(
+                    applied_count=apply_state["applied_count"],
+                    state=apply_state,
+                )
 
-            if decision == "skip":
-                skipped_delete_count += 1
+                decision = _prompt_apply_item(
+                    item_kind="group delete",
+                    group_id=gid,
+                    display_name=display_name,
+                )
+
+                if decision == "skip":
+                    skipped_delete_count += 1
+                    log.info(
+                        "Skipped delete for group=%s display_name=%s skipped_delete_total=%d",
+                        gid,
+                        display_name,
+                        skipped_delete_count,
+                    )
+                    last_ts = _apply_time_pacing(
+                        last_ts=last_ts,
+                        phase="rollback deletions",
+                    )
+                    continue
+
+                if decision == "abort":
+                    raise KeyboardInterrupt(
+                        f"Stopped by operator at delete group id={gid} display_name={display_name}."
+                    )
+            else:
                 log.info(
-                    "Skipped delete for group=%s display_name=%s skipped_delete_total=%d",
+                    "Auto-approving delete for group=%s display_name=%s remaining_batch=%d",
                     gid,
                     display_name,
-                    skipped_delete_count,
-                )
-                now = time.monotonic()
-                wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
-                if wait > 0:
-                    log.info("rollback deletions throttle: waiting %.3f seconds before next item", wait)
-                    time.sleep(wait)
-                last_ts = time.monotonic()
-                continue
-
-            if decision == "abort":
-                raise KeyboardInterrupt(
-                    f"Stopped by operator at delete group id={gid} display_name={display_name}."
+                    apply_state["auto_apply_remaining"],
                 )
 
-            now = time.monotonic()
-            wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
-            if wait > 0:
-                log.info("rollback deletions throttle: waiting %.3f seconds before next item", wait)
-                time.sleep(wait)
+            last_ts = _apply_time_pacing(
+                last_ts=last_ts,
+                phase="rollback deletions",
+            )
 
             log.info("Deleting extraneous group: %s", gid)
             try:
                 client.delete_group(gid, domain_id)
                 apply_state["applied_count"] += 1
+                if apply_state["auto_apply_remaining"] > 0:
+                    apply_state["auto_apply_remaining"] -= 1
+
                 log.info(
-                    "Delete succeeded for group=%s display_name=%s applied_total=%d",
+                    "Delete succeeded for group=%s display_name=%s applied_total=%d remaining_batch=%d",
                     gid,
                     display_name,
                     apply_state["applied_count"],
+                    apply_state["auto_apply_remaining"],
                 )
             except Exception as exc:
                 log.error("Failed deleting %s: %s", gid, exc)
-
-            last_ts = time.monotonic()
-            _maybe_apply_checkpoint(
-                applied_count=apply_state["applied_count"],
-                state=apply_state,
-            )
 
     validation_base = _resolve_log_dir() / "nsx_validation"
     validation_file = _write_validation_report(
