@@ -33,8 +33,13 @@ log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-GROUP_PATCH_INTERVAL_SECONDS = 1.0
-PROMPT_EVERY_N_UPDATES = 1
+GROUP_PATCH_INTERVAL_SECONDS = 0.5
+
+# Dry-run review cadence
+PROMPT_EVERY_N_UPDATES = 100
+
+# Apply cadence for restore/delete operations
+APPLY_PROMPT_EVERY_N_UPDATES = 1 # Keep at 1 for apply to require confirmation on every update, or set to 0 to disable prompts and rely on time pacing alone.
 
 DEFAULT_STRIP_KEYS = {
     "_create_time",
@@ -280,6 +285,51 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
         print("Please enter 'y' or 'n'.")
 
 
+def _prompt_apply_checkpoint(processed_count: int, *, current_every: int) -> int:
+    """
+    Prompt after N applied rollback operations.
+    Returns the new apply checkpoint cadence to use going forward.
+
+    Allowed responses:
+      y / yes  -> continue with current cadence
+      n / no   -> abort
+      <number> -> continue and change cadence to that number
+    """
+    while True:
+        answer = input(
+            f"\nApplied {processed_count} rollback updates. Continue? "
+            f"[y/N or enter new checkpoint count; current={current_every}]: "
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            log.info(
+                "Operator chose to continue after %d rollback updates with existing checkpoint cadence=%d.",
+                processed_count,
+                current_every,
+            )
+            return current_every
+
+        if answer in ("", "n", "no"):
+            log.warning("Operator aborted after %d rollback updates.", processed_count)
+            raise KeyboardInterrupt(f"Stopped by operator after {processed_count} rollback updates.")
+
+        try:
+            new_value = int(answer)
+            if new_value <= 0:
+                print("Please enter a positive integer greater than 0.")
+                continue
+
+            log.info(
+                "Operator changed rollback apply checkpoint cadence from %d to %d after %d applied updates.",
+                current_every,
+                new_value,
+                processed_count,
+            )
+            return new_value
+        except ValueError:
+            print("Please enter 'y', 'n', or a positive integer like 10, 25, or 100.")
+
+
 def _prompt_apply_item(*, item_kind: str, group_id: str, display_name: str) -> str:
     while True:
         answer = input(
@@ -329,6 +379,26 @@ def _controlled_checkpoint(*, processed_count: int, last_ts: float, phase: str) 
         _prompt_to_continue(processed_count, phase=phase)
 
     return new_ts
+
+
+def _maybe_apply_checkpoint(
+    *,
+    applied_count: int,
+    state: Dict[str, Any],
+) -> None:
+    current_every = state["apply_prompt_every_n_updates"]
+    next_prompt_at = state["next_apply_prompt_at"]
+
+    if next_prompt_at is None or current_every <= 0:
+        return
+
+    if applied_count >= next_prompt_at:
+        new_every = _prompt_apply_checkpoint(
+            applied_count,
+            current_every=current_every,
+        )
+        state["apply_prompt_every_n_updates"] = new_every
+        state["next_apply_prompt_at"] = applied_count + new_every
 
 
 def _log_group_state(
@@ -437,7 +507,15 @@ def rollback_groups(
     log.info("  update         : %d", len(to_update))
     log.info("  delete extra   : %d", len(to_delete) if delete_extraneous else 0)
     log.info("  pacing interval: %s", GROUP_PATCH_INTERVAL_SECONDS)
-    log.info("  prompt every   : %s", PROMPT_EVERY_N_UPDATES)
+    log.info("  dry-run prompt : %s", PROMPT_EVERY_N_UPDATES)
+    log.info("  apply prompt   : %s", APPLY_PROMPT_EVERY_N_UPDATES)
+
+    apply_prompt_every = APPLY_PROMPT_EVERY_N_UPDATES if APPLY_PROMPT_EVERY_N_UPDATES > 0 else 0
+    apply_state: Dict[str, Any] = {
+        "apply_prompt_every_n_updates": apply_prompt_every,
+        "next_apply_prompt_at": apply_prompt_every if apply_prompt_every > 0 else None,
+        "applied_count": 0,
+    }
 
     validation_records: List[Dict[str, Any]] = []
     ordered_restore_ids = sorted(desired.keys())
@@ -512,11 +590,12 @@ def rollback_groups(
                 display_name,
                 skipped_restore_count,
             )
-            last_ts = _controlled_checkpoint(
-                processed_count=idx,
-                last_ts=last_ts,
-                phase="rollback updates",
-            )
+            now = time.monotonic()
+            wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+            if wait > 0:
+                log.info("rollback updates throttle: waiting %.3f seconds before next item", wait)
+                time.sleep(wait)
+            last_ts = time.monotonic()
             continue
 
         if decision == "abort":
@@ -524,17 +603,29 @@ def rollback_groups(
                 f"Stopped by operator at restore group id={gid} display_name={display_name}."
             )
 
+        now = time.monotonic()
+        wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+        if wait > 0:
+            log.info("rollback updates throttle: waiting %.3f seconds before next item", wait)
+            time.sleep(wait)
+
         log.info("Restoring group: %s", gid)
         try:
             client.patch_group(gid, patch_payload, domain_id)
-            log.info("Restore PATCH succeeded for group=%s display_name=%s", gid, display_name)
+            apply_state["applied_count"] += 1
+            log.info(
+                "Restore PATCH succeeded for group=%s display_name=%s applied_total=%d",
+                gid,
+                display_name,
+                apply_state["applied_count"],
+            )
         except Exception as exc:
             log.error("Failed restoring %s: %s", gid, exc)
 
-        last_ts = _controlled_checkpoint(
-            processed_count=idx,
-            last_ts=last_ts,
-            phase="rollback updates",
+        last_ts = time.monotonic()
+        _maybe_apply_checkpoint(
+            applied_count=apply_state["applied_count"],
+            state=apply_state,
         )
 
     if delete_extraneous:
@@ -572,11 +663,12 @@ def rollback_groups(
                     display_name,
                     skipped_delete_count,
                 )
-                last_ts = _controlled_checkpoint(
-                    processed_count=len(ordered_restore_ids) + delete_idx,
-                    last_ts=last_ts,
-                    phase="rollback deletions",
-                )
+                now = time.monotonic()
+                wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+                if wait > 0:
+                    log.info("rollback deletions throttle: waiting %.3f seconds before next item", wait)
+                    time.sleep(wait)
+                last_ts = time.monotonic()
                 continue
 
             if decision == "abort":
@@ -584,17 +676,29 @@ def rollback_groups(
                     f"Stopped by operator at delete group id={gid} display_name={display_name}."
                 )
 
+            now = time.monotonic()
+            wait = GROUP_PATCH_INTERVAL_SECONDS - (now - last_ts)
+            if wait > 0:
+                log.info("rollback deletions throttle: waiting %.3f seconds before next item", wait)
+                time.sleep(wait)
+
             log.info("Deleting extraneous group: %s", gid)
             try:
                 client.delete_group(gid, domain_id)
-                log.info("Delete succeeded for group=%s display_name=%s", gid, display_name)
+                apply_state["applied_count"] += 1
+                log.info(
+                    "Delete succeeded for group=%s display_name=%s applied_total=%d",
+                    gid,
+                    display_name,
+                    apply_state["applied_count"],
+                )
             except Exception as exc:
                 log.error("Failed deleting %s: %s", gid, exc)
 
-            last_ts = _controlled_checkpoint(
-                processed_count=len(ordered_restore_ids) + delete_idx,
-                last_ts=last_ts,
-                phase="rollback deletions",
+            last_ts = time.monotonic()
+            _maybe_apply_checkpoint(
+                applied_count=apply_state["applied_count"],
+                state=apply_state,
             )
 
     validation_base = _resolve_log_dir() / "nsx_validation"
@@ -607,7 +711,8 @@ def rollback_groups(
     )
     log.info("Rollback validation report written: %s", validation_file)
     log.info(
-        "Rollback finished. skipped_restore_total=%d skipped_delete_total=%d",
+        "Rollback finished. applied_total=%d skipped_restore_total=%d skipped_delete_total=%d",
+        apply_state["applied_count"],
         skipped_restore_count,
         skipped_delete_count,
     )
@@ -677,6 +782,7 @@ def main() -> None:
     log.info("Mode:                          %s", "APPLY" if args.apply else "DRY-RUN")
     log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
     log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
+    log.info("APPLY_PROMPT_EVERY_N_UPDATES:  %s", APPLY_PROMPT_EVERY_N_UPDATES)
     log.info("Resolved log dir:              %s", _resolve_log_dir().resolve())
 
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=args.federation_global)

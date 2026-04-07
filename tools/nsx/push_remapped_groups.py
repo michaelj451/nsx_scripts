@@ -23,9 +23,14 @@ DEFAULT_INPUT_DIR = "nsx_groups_additive"
 DEFAULT_BASELINE_DIR = "nsx_export"
 LOG_FILE_NAME = "push_nsx_groups.log"
 
-# These two fields regulate both dry-run validation pacing and apply pacing.
-GROUP_PATCH_INTERVAL_SECONDS = 1.0
-PROMPT_EVERY_N_UPDATES = 1
+# These fields regulate both dry-run validation pacing and apply pacing.
+GROUP_PATCH_INTERVAL_SECONDS = 0.5
+
+# Dry-run validation checkpoint cadence
+PROMPT_EVERY_N_UPDATES = 100
+
+# Apply checkpoint cadence (separate from dry-run)
+APPLY_PROMPT_EVERY_N_UPDATES = 1 # Keep at 1 for apply to require confirmation on every update, or set to 0 to disable prompts and rely on time pacing alone.
 
 log = logging.getLogger("push_nsx_groups")
 
@@ -187,6 +192,51 @@ def _prompt_to_continue(processed_count: int, *, phase: str) -> None:
             raise KeyboardInterrupt(f"Stopped by operator after {processed_count} {phase}.")
 
         print("Please enter 'y' or 'n'.")
+
+
+def _prompt_apply_checkpoint(processed_count: int, *, current_every: int) -> int:
+    """
+    Prompt after N applied updates.
+    Returns the new apply checkpoint cadence to use going forward.
+
+    Allowed responses:
+      y / yes  -> continue with current cadence
+      n / no   -> abort
+      <number> -> continue and change cadence to that number
+    """
+    while True:
+        answer = input(
+            f"\nApplied {processed_count} updates. Continue? "
+            f"[y/N or enter new checkpoint count; current={current_every}]: "
+        ).strip().lower()
+
+        if answer in ("y", "yes"):
+            log.info(
+                "Operator chose to continue after %d apply updates with existing checkpoint cadence=%d.",
+                processed_count,
+                current_every,
+            )
+            return current_every
+
+        if answer in ("", "n", "no"):
+            log.warning("Operator aborted after %d apply updates.", processed_count)
+            raise KeyboardInterrupt(f"Stopped by operator after {processed_count} apply updates.")
+
+        try:
+            new_value = int(answer)
+            if new_value <= 0:
+                print("Please enter a positive integer greater than 0.")
+                continue
+
+            log.info(
+                "Operator changed apply checkpoint cadence from %d to %d after %d applied updates.",
+                current_every,
+                new_value,
+                processed_count,
+            )
+            return new_value
+        except ValueError:
+            print("Please enter 'y', 'n', or a positive integer like 10, 25, or 100.")
 
 
 def _prompt_apply_item(*, group_id: Optional[str], display_name: str) -> str:
@@ -652,16 +702,20 @@ def _wrap_group_patch_controls(
     orig_patch = client._patch
     baseline_index = _build_baseline_index(baseline_groups_dir, input_format)
 
+    initial_apply_prompt_every = APPLY_PROMPT_EVERY_N_UPDATES if APPLY_PROMPT_EVERY_N_UPDATES > 0 else 0
+
     state = {
         "last_patch_ts": 0.0,
         "applied_count": 0,
         "skipped_count": 0,
+        "apply_prompt_every_n_updates": initial_apply_prompt_every,
+        "next_apply_prompt_at": initial_apply_prompt_every if initial_apply_prompt_every > 0 else None,
     }
 
     log.info(
-        "Apply pacing: GROUP_PATCH_INTERVAL_SECONDS=%s PROMPT_EVERY_N_UPDATES=%s",
+        "Apply pacing: GROUP_PATCH_INTERVAL_SECONDS=%s APPLY_PROMPT_EVERY_N_UPDATES=%s",
         GROUP_PATCH_INTERVAL_SECONDS,
-        PROMPT_EVERY_N_UPDATES,
+        APPLY_PROMPT_EVERY_N_UPDATES,
     )
     log.info("Apply baseline comparison dir: %s", baseline_groups_dir)
     log.info("Apply baseline index size: %d groups", len(baseline_index))
@@ -779,8 +833,16 @@ def _wrap_group_patch_controls(
                 exc,
             )
 
-        if PROMPT_EVERY_N_UPDATES > 0 and state["applied_count"] % PROMPT_EVERY_N_UPDATES == 0:
-            _prompt_to_continue(state["applied_count"], phase="apply updates")
+        next_prompt_at = state["next_apply_prompt_at"]
+        current_every = state["apply_prompt_every_n_updates"]
+
+        if next_prompt_at is not None and current_every > 0 and state["applied_count"] >= next_prompt_at:
+            new_every = _prompt_apply_checkpoint(
+                state["applied_count"],
+                current_every=current_every,
+            )
+            state["apply_prompt_every_n_updates"] = new_every
+            state["next_apply_prompt_at"] = state["applied_count"] + new_every
 
         return response
 
@@ -918,6 +980,7 @@ def main() -> None:
     log.info("Skip baseline validation:      %s", args.skip_baseline_validate)
     log.info("GROUP_PATCH_INTERVAL_SECONDS:  %s", GROUP_PATCH_INTERVAL_SECONDS)
     log.info("PROMPT_EVERY_N_UPDATES:        %s", PROMPT_EVERY_N_UPDATES)
+    log.info("APPLY_PROMPT_EVERY_N_UPDATES:  %s", APPLY_PROMPT_EVERY_N_UPDATES)
     log.info("Resolved log dir:              %s", _resolve_log_dir())
 
     client = NsxPolicyClient(nsxmanager=dst_mgr, federation_global=args.federation_global)
