@@ -42,7 +42,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import yaml
 
@@ -398,6 +398,10 @@ def _controlled_checkpoint(*, processed_count: int, last_ts: float) -> float:
     return new_ts
 
 
+def _write_json_file(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def _write_validation_report(
     *,
     records: List[Dict[str, Any]],
@@ -410,6 +414,48 @@ def _write_validation_report(
     run_dir = output_base / f"{run_ts}_{target}_validate_live_groups"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    payload_diff_groups = [
+        {
+            "group_id": r["group_id"],
+            "display_name": r["display_name"],
+            "source_file": r["source_file"],
+            "payload_diff_count": r["payload_diff_count"],
+            "payload_diffs": r["payload_diffs"],
+        }
+        for r in records
+        if r["payload_diff_count"] > 0
+    ]
+
+    ip_diff_groups = [
+        {
+            "group_id": r["group_id"],
+            "display_name": r["display_name"],
+            "source_file": r["source_file"],
+            "expected_ip_entries": r["expected_ip_entries"],
+            "live_ip_entries": r["live_ip_entries"],
+            "missing_ip_entries": r["missing_ip_entries"],
+            "missing_ip_count": r["missing_ip_count"],
+            "extra_ip_entries": r["extra_ip_entries"],
+            "extra_ip_count": r["extra_ip_count"],
+        }
+        for r in records
+        if r["missing_ip_count"] > 0 or r["extra_ip_count"] > 0
+    ]
+
+    missing_groups = [
+        {
+            "group_id": r["group_id"],
+            "display_name": r["display_name"],
+            "source_file": r["source_file"],
+            "payload_diffs": r["payload_diffs"],
+            "expected_ip_entries": r["expected_ip_entries"],
+            "missing_ip_entries": r["missing_ip_entries"],
+            "missing_ip_count": r["missing_ip_count"],
+        }
+        for r in records
+        if not r["exists_in_nsx"]
+    ]
+
     report = {
         "run_ts": run_ts,
         "target": target,
@@ -418,17 +464,31 @@ def _write_validation_report(
         "groups_missing_in_nsx": sum(1 for r in records if not r["exists_in_nsx"]),
         "groups_payload_match": sum(1 for r in records if r["payload_match"] is True),
         "groups_ip_entries_match": sum(1 for r in records if r["ip_entries_match"] is True),
-        "groups_with_payload_diff": sum(1 for r in records if r["payload_diff_count"] > 0),
-        "groups_with_ip_diff": sum(
-            1 for r in records if r["missing_ip_count"] > 0 or r["extra_ip_count"] > 0
-        ),
+        "groups_with_payload_diff": len(payload_diff_groups),
+        "groups_with_ip_diff": len(ip_diff_groups),
         "extra_live_groups_count": len(extra_live_groups),
         "groups": records,
         "extra_live_groups": extra_live_groups,
     }
 
     report_file = run_dir / "validation_report.json"
-    report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    payload_diff_file = run_dir / "payload_diff_groups.json"
+    extra_live_file = run_dir / "extra_live_groups.json"
+    ip_diff_file = run_dir / "ip_diff_groups.json"
+    missing_groups_file = run_dir / "missing_groups.json"
+
+    _write_json_file(report_file, report)
+    _write_json_file(payload_diff_file, payload_diff_groups)
+    _write_json_file(extra_live_file, extra_live_groups)
+    _write_json_file(ip_diff_file, ip_diff_groups)
+    _write_json_file(missing_groups_file, missing_groups)
+
+    log.info("Validation master report written: %s", report_file)
+    log.info("Payload diff report written:      %s", payload_diff_file)
+    log.info("Extra live report written:        %s", extra_live_file)
+    log.info("IP diff report written:           %s", ip_diff_file)
+    log.info("Missing groups report written:    %s", missing_groups_file)
+
     return report_file
 
 
@@ -463,6 +523,7 @@ def validate_groups(
             "display_name": live_groups[gid].get("display_name") or gid,
             "source": "live_nsx_only",
             "ip_entries": _extract_ip_address_entries(live_groups[gid]),
+            "live_payload": _payload_subset_for_compare(live_groups[gid]),
         }
         for gid in extra_live_ids
     ]
@@ -504,6 +565,8 @@ def validate_groups(
                     "payload_match": False,
                     "payload_diff_count": 1,
                     "payload_diffs": ["group missing in live NSX"],
+                    "expected_payload": _payload_subset_for_compare(expected_group),
+                    "live_payload": {},
                     "expected_ip_entries": expected_ip_entries,
                     "live_ip_entries": [],
                     "missing_ip_entries": expected_ip_entries,
@@ -575,6 +638,8 @@ def validate_groups(
                 "payload_match": payload_match,
                 "payload_diff_count": len(payload_diffs),
                 "payload_diffs": payload_diffs,
+                "expected_payload": expected_compare,
+                "live_payload": live_compare,
                 "expected_ip_entries": expected_ip_entries,
                 "live_ip_entries": live_ip_entries,
                 "missing_ip_entries": missing_ip_entries,
