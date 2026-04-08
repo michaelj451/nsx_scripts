@@ -85,8 +85,9 @@ python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --
 python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm4.lab.local --apply
 ```
 
-
+``` bash
 python tools/nsx/push_remapped_groups.py --target nsx-lm3 --input-dir nsx_groups_additive --domain-id default --apply
+```
 
 ## 5a) REVERT Global managaers
 
@@ -150,8 +151,9 @@ python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_ex
 python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global --apply
 ```
 
+``` bash
 python tools/nsx/push_nsx_groups_revert.py --target nsx-lm3 --export-root nsx_export/nsx-lm3.lab.local --domain-id default --apply
-
+```
 
 ------------------------------------------------------------------------
 
