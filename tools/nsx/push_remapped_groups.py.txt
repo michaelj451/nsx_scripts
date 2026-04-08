@@ -712,7 +712,109 @@ def _group_policy_path(*, domain_id: str, group_id: str, federation_global: bool
     return f"{prefix}/domains/{domain_id}/groups/{encoded_group_id}"
 
 
-def _wrap_group_patch_controls(
+def _normalize_http_method(method: Any) -> str:
+    if method is None:
+        return ""
+    return str(method).strip().upper()
+
+
+def _is_group_write_method(method: Any) -> bool:
+    return _normalize_http_method(method) in {"PATCH", "PUT", "POST"}
+
+
+def _extract_group_context_from_payload(payload: Any) -> tuple[Optional[str], Optional[str], List[str]]:
+    group_id = None
+    display_name = None
+    desired_entries: List[str] = []
+
+    if isinstance(payload, dict):
+        group_id = payload.get("id")
+        display_name = payload.get("display_name") or payload.get("name") or group_id
+        desired_entries = sorted(set(_extract_ip_address_entries(payload)))
+
+    return group_id, display_name, desired_entries
+
+
+def _compute_group_delta(
+    *,
+    baseline_index: Dict[str, dict],
+    payload: Any,
+) -> Dict[str, Any]:
+    group_id, display_name, desired_entries = _extract_group_context_from_payload(payload)
+    baseline_payload = baseline_index.get(group_id) if isinstance(group_id, str) else None
+    baseline_file = baseline_payload.get("_baseline_file") if baseline_payload else None
+
+    if baseline_payload is not None and isinstance(payload, dict):
+        diff = _diff_group_ip_entries(baseline_payload, payload)
+        return {
+            "group_id": group_id,
+            "display_name": display_name,
+            "desired_entries": desired_entries,
+            "baseline_payload": baseline_payload,
+            "baseline_file": baseline_file,
+            "exists_in_baseline": True,
+            "current_entries": diff["baseline"],
+            "to_add": diff["to_add"],
+            "has_delta": len(diff["to_add"]) > 0,
+        }
+
+    return {
+        "group_id": group_id,
+        "display_name": display_name,
+        "desired_entries": desired_entries,
+        "baseline_payload": baseline_payload,
+        "baseline_file": baseline_file,
+        "exists_in_baseline": baseline_payload is not None,
+        "current_entries": None,
+        "to_add": desired_entries,
+        "has_delta": True,
+    }
+
+
+def _log_noop_skip(
+    *,
+    operation_name: str,
+    state: Dict[str, Any],
+    group_id: Optional[str],
+    display_name: Optional[str],
+    current_entries: Optional[List[str]],
+) -> Dict[str, Any]:
+    state["no_change_skipped_count"] += 1
+    ordinal = (
+        state["applied_count"]
+        + state["skipped_count"]
+        + state["no_change_skipped_count"]
+        + 1
+    )
+
+    log.info(
+        "[%s %d] group=%s display_name=%s baseline=yes action=NO-CHANGE current=%d add=0",
+        operation_name,
+        ordinal,
+        group_id,
+        display_name,
+        len(current_entries or []),
+    )
+    log.info("  [CURRENT EXISTS] %s", _format_entries(current_entries))
+    log.info("  [ADD]            []")
+    log.info(
+        "Skipping %s for unchanged group id=%s display_name=%s no_change_skipped_total=%d",
+        operation_name,
+        group_id,
+        display_name,
+        state["no_change_skipped_count"],
+    )
+
+    return {
+        "skipped": True,
+        "reason": "no_delta",
+        "operation": operation_name,
+        "group_id": group_id,
+        "display_name": display_name,
+    }
+
+
+def _wrap_group_write_controls(
     client: NsxPolicyClient,
     *,
     dry_run: bool,
@@ -724,19 +826,18 @@ def _wrap_group_patch_controls(
     No fallback matching.
     No removal logic.
     Additive review only.
+
+    In apply mode, hard-skip all wrapped write operations for groups
+    whose additive delta is empty relative to baseline.
     """
     if dry_run:
-        log.info("Dry-run mode: PATCH wrapper not applied. Validation pass provides paced review.")
+        log.info("Dry-run mode: write wrappers not applied. Validation pass provides paced review.")
         return
 
-    if getattr(client, "_group_patch_controls_wrapped", False):
-        log.info("PATCH controls already wrapped on client; skipping duplicate wrap.")
+    if getattr(client, "_group_write_controls_wrapped", False):
+        log.info("Write controls already wrapped on client; skipping duplicate wrap.")
         return
 
-    if not hasattr(client, "_patch"):
-        raise RuntimeError("NsxPolicyClient has no _patch method to wrap.")
-
-    orig_patch = client._patch
     baseline_index = _build_baseline_index(baseline_groups_dir, input_format)
 
     initial_apply_prompt_every = APPLY_PROMPT_EVERY_N_UPDATES if APPLY_PROMPT_EVERY_N_UPDATES > 0 else 0
@@ -745,6 +846,7 @@ def _wrap_group_patch_controls(
         "last_patch_ts": 0.0,
         "applied_count": 0,
         "skipped_count": 0,
+        "no_change_skipped_count": 0,
         "apply_prompt_every_n_updates": initial_apply_prompt_every,
         "auto_apply_remaining": 0,
     }
@@ -757,44 +859,40 @@ def _wrap_group_patch_controls(
     log.info("Apply baseline comparison dir: %s", baseline_groups_dir)
     log.info("Apply baseline index size: %d groups", len(baseline_index))
 
-    def controlled_patch(path, payload, *args, **kwargs):
-        group_id = None
-        display_name = None
-        if isinstance(payload, dict):
-            group_id = payload.get("id")
-            display_name = payload.get("display_name") or payload.get("name") or group_id
+    def _preflight_group_write(
+        *,
+        operation_name: str,
+        path: str,
+        payload: Any,
+    ) -> tuple[bool, Dict[str, Any]]:
+        delta = _compute_group_delta(baseline_index=baseline_index, payload=payload)
 
-        desired_entries = sorted(set(_extract_ip_address_entries(payload if isinstance(payload, dict) else {})))
-        baseline_payload = baseline_index.get(group_id) if isinstance(group_id, str) else None
-        baseline_file = baseline_payload.get("_baseline_file") if baseline_payload else None
+        group_id = delta["group_id"]
+        display_name = delta["display_name"] or str(group_id)
+        current_entries = delta["current_entries"]
+        to_add = delta["to_add"]
+        exists_in_baseline = delta["exists_in_baseline"]
+        baseline_file = delta["baseline_file"]
 
-        if baseline_payload is not None and isinstance(payload, dict):
-            diff_before = _diff_group_ip_entries(baseline_payload, payload)
-            current_entries = diff_before["baseline"]
-            to_add_before = diff_before["to_add"]
+        _log_group_state(
+            phase_label=operation_name,
+            index=state["applied_count"] + state["skipped_count"] + state["no_change_skipped_count"] + 1,
+            total=0,
+            group_id=group_id,
+            display_name=display_name,
+            baseline_path=baseline_file,
+            exists_in_baseline=exists_in_baseline,
+            current_entries=current_entries,
+            to_add=to_add,
+        )
 
-            _log_group_state(
-                phase_label="PATCH",
-                index=state["applied_count"] + state["skipped_count"] + 1,
-                total=0,
+        if exists_in_baseline and not delta["has_delta"]:
+            return False, _log_noop_skip(
+                operation_name=operation_name,
+                state=state,
                 group_id=group_id,
-                display_name=display_name or str(group_id),
-                baseline_path=baseline_file,
-                exists_in_baseline=True,
+                display_name=display_name,
                 current_entries=current_entries,
-                to_add=to_add_before,
-            )
-        else:
-            _log_group_state(
-                phase_label="PATCH",
-                index=state["applied_count"] + state["skipped_count"] + 1,
-                total=0,
-                group_id=group_id,
-                display_name=display_name or str(group_id),
-                baseline_path=baseline_file,
-                exists_in_baseline=False,
-                current_entries=None,
-                to_add=desired_entries,
             )
 
         if _should_prompt_for_apply(state):
@@ -805,7 +903,7 @@ def _wrap_group_patch_controls(
 
             decision = _prompt_apply_item(
                 group_id=group_id,
-                display_name=display_name or str(group_id),
+                display_name=display_name,
             )
 
             if decision == "skip":
@@ -816,13 +914,15 @@ def _wrap_group_patch_controls(
                 )
                 log.info(
                     "Skipped group update #%d%s%s skipped_total=%d",
-                    state["applied_count"] + state["skipped_count"],
+                    state["applied_count"] + state["skipped_count"] + state["no_change_skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     state["skipped_count"],
                 )
-                return {
+                return False, {
                     "skipped": True,
+                    "reason": "operator_skip",
+                    "operation": operation_name,
                     "path": path,
                     "group_id": group_id,
                     "display_name": display_name,
@@ -845,7 +945,18 @@ def _wrap_group_patch_controls(
             phase="apply updates",
         )
 
-        response = orig_patch(path, payload, *args, **kwargs)
+        return True, delta
+
+    def _postflight_group_write(
+        *,
+        operation_name: str,
+        path: str,
+        delta: Dict[str, Any],
+        response: Any,
+    ) -> Any:
+        group_id = delta["group_id"]
+        display_name = delta["display_name"]
+        desired_entries = delta["desired_entries"]
 
         state["applied_count"] += 1
         if state["auto_apply_remaining"] > 0:
@@ -853,47 +964,171 @@ def _wrap_group_patch_controls(
 
         try:
             live_after = _client_get_json(client, path)
-            if live_after is not None and isinstance(payload, dict):
+            if live_after is not None:
                 live_after_entries = sorted(set(_extract_ip_address_entries(live_after)))
                 remaining_add = sorted(set(desired_entries) - set(live_after_entries))
                 log.info(
-                    "Applied group update #%d%s%s remaining_add=%d applied_total=%d skipped_total=%d remaining_batch=%d",
-                    state["applied_count"] + state["skipped_count"],
+                    "Applied %s #%d%s%s remaining_add=%d applied_total=%d skipped_total=%d no_change_skipped_total=%d remaining_batch=%d",
+                    operation_name,
+                    state["applied_count"] + state["skipped_count"] + state["no_change_skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     len(remaining_add),
                     state["applied_count"],
                     state["skipped_count"],
+                    state["no_change_skipped_count"],
                     state["auto_apply_remaining"],
                 )
                 log.info("  [POST CURRENT]    %s", _format_entries(live_after_entries))
                 log.info("  [POST ADD]        %s", _format_entries(remaining_add))
             else:
                 log.info(
-                    "Applied group update #%d%s%s post-check current state unavailable applied_total=%d skipped_total=%d remaining_batch=%d",
-                    state["applied_count"] + state["skipped_count"],
+                    "Applied %s #%d%s%s post-check current state unavailable applied_total=%d skipped_total=%d no_change_skipped_total=%d remaining_batch=%d",
+                    operation_name,
+                    state["applied_count"] + state["skipped_count"] + state["no_change_skipped_count"],
                     f" (id={group_id})" if group_id else "",
                     f" (display_name={display_name})" if display_name else "",
                     state["applied_count"],
                     state["skipped_count"],
+                    state["no_change_skipped_count"],
                     state["auto_apply_remaining"],
                 )
                 log.info("  [POST CURRENT]    [unknown]")
                 log.info("  [POST ADD]        [unknown]")
         except Exception as exc:
             log.warning(
-                "Applied group update #%d%s but post-check lookup failed: %s",
-                state["applied_count"] + state["skipped_count"],
+                "Applied %s #%d%s but post-check lookup failed: %s",
+                operation_name,
+                state["applied_count"] + state["skipped_count"] + state["no_change_skipped_count"],
                 f" (id={group_id})" if group_id else "",
                 exc,
             )
 
         return response
 
-    client._patch = controlled_patch  # type: ignore[attr-defined]
-    setattr(client, "_group_patch_controls_wrapped", True)
+    if hasattr(client, "_patch") and callable(getattr(client, "_patch")):
+        orig_patch = client._patch
 
-    log.info("Enabled group PATCH controls using global pacing constants.")
+        def controlled_patch(path, payload, *args, **kwargs):
+            should_write, result = _preflight_group_write(
+                operation_name="PATCH",
+                path=path,
+                payload=payload,
+            )
+            if not should_write:
+                return result
+
+            response = orig_patch(path, payload, *args, **kwargs)
+            return _postflight_group_write(
+                operation_name="PATCH",
+                path=path,
+                delta=result,
+                response=response,
+            )
+
+        client._patch = controlled_patch  # type: ignore[attr-defined]
+        log.info("Wrapped client._patch with delta-aware no-op protection.")
+
+    if hasattr(client, "_put") and callable(getattr(client, "_put")):
+        orig_put = client._put
+
+        def controlled_put(path, payload, *args, **kwargs):
+            should_write, result = _preflight_group_write(
+                operation_name="PUT",
+                path=path,
+                payload=payload,
+            )
+            if not should_write:
+                return result
+
+            response = orig_put(path, payload, *args, **kwargs)
+            return _postflight_group_write(
+                operation_name="PUT",
+                path=path,
+                delta=result,
+                response=response,
+            )
+
+        client._put = controlled_put  # type: ignore[attr-defined]
+        log.info("Wrapped client._put with delta-aware no-op protection.")
+
+    if hasattr(client, "_post") and callable(getattr(client, "_post")):
+        orig_post = client._post
+
+        def controlled_post(path, payload, *args, **kwargs):
+            should_write, result = _preflight_group_write(
+                operation_name="POST",
+                path=path,
+                payload=payload,
+            )
+            if not should_write:
+                return result
+
+            response = orig_post(path, payload, *args, **kwargs)
+            return _postflight_group_write(
+                operation_name="POST",
+                path=path,
+                delta=result,
+                response=response,
+            )
+
+        client._post = controlled_post  # type: ignore[attr-defined]
+        log.info("Wrapped client._post with delta-aware no-op protection.")
+
+    if hasattr(client, "_request") and callable(getattr(client, "_request")):
+        orig_request = client._request
+
+        def controlled_request(method, path, payload=None, *args, **kwargs):
+            if not _is_group_write_method(method):
+                return orig_request(method, path, payload, *args, **kwargs)
+
+            should_write, result = _preflight_group_write(
+                operation_name=_normalize_http_method(method) or "REQUEST",
+                path=path,
+                payload=payload,
+            )
+            if not should_write:
+                return result
+
+            response = orig_request(method, path, payload, *args, **kwargs)
+            return _postflight_group_write(
+                operation_name=_normalize_http_method(method) or "REQUEST",
+                path=path,
+                delta=result,
+                response=response,
+            )
+
+        client._request = controlled_request  # type: ignore[attr-defined]
+        log.info("Wrapped client._request with delta-aware no-op protection.")
+
+    if hasattr(client, "request") and callable(getattr(client, "request")):
+        orig_public_request = client.request
+
+        def controlled_public_request(method, path, payload=None, *args, **kwargs):
+            if not _is_group_write_method(method):
+                return orig_public_request(method, path, payload, *args, **kwargs)
+
+            should_write, result = _preflight_group_write(
+                operation_name=_normalize_http_method(method) or "REQUEST",
+                path=path,
+                payload=payload,
+            )
+            if not should_write:
+                return result
+
+            response = orig_public_request(method, path, payload, *args, **kwargs)
+            return _postflight_group_write(
+                operation_name=_normalize_http_method(method) or "REQUEST",
+                path=path,
+                delta=result,
+                response=response,
+            )
+
+        client.request = controlled_public_request  # type: ignore[attr-defined]
+        log.info("Wrapped client.request with delta-aware no-op protection.")
+
+    setattr(client, "_group_write_controls_wrapped", True)
+    log.info("Enabled group write controls using global pacing constants.")
 
 
 def _write_snapshot(
@@ -1069,7 +1304,7 @@ def main() -> None:
                 len(missing),
             )
 
-    _wrap_group_patch_controls(
+    _wrap_group_write_controls(
         client,
         dry_run=(not args.apply),
         baseline_groups_dir=baseline_groups_dir,
