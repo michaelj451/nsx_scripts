@@ -209,3 +209,15 @@ This workflow is:
 -   Idempotent
 -   Repeatable
 -   Suitable for production CAB execution
+
+
+python tools/nsx/find_rules_affected_by_group_changes.py --federation-global
+
+python tools/nsx/find_rules_affected_by_group_changes.py --federation-global --verbose
+
+python tools/nsx/find_rules_affected_by_group_changes.py \
+  --additive-root nsx_groups_additive \
+  --export-root nsx_export \
+  --output-dir nsx_logs/affected_rule_reports \
+  --federation-global \
+  --verbose
