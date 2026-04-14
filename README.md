@@ -63,7 +63,7 @@ python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2
 Apply:
 
 ``` bash
-python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --apply
+python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --domain-id default --apply
 ```
 ``` bash
 python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --apply
@@ -182,7 +182,9 @@ python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_exp
 python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
 ```
 
+``` bash
 python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
+```
 
 
 ``` bash
