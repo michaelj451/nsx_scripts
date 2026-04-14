@@ -103,6 +103,16 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(sh)
 
+    # Route nsx.* module loggers (e.g. NsxGroupImporter) to the same file + console
+    # so PATCH errors from the importer are captured in real-time, not just on stderr.
+    nsx_logger = logging.getLogger("nsx")
+    nsx_logger.setLevel(logging.INFO)
+    for h in list(nsx_logger.handlers):
+        nsx_logger.removeHandler(h)
+    nsx_logger.addHandler(fh)
+    nsx_logger.addHandler(sh)
+    nsx_logger.propagate = False
+
     logger.info("Log file initialized: %s", log_file.resolve())
     logger.info("Repository root resolved to: %s", _repo_root().resolve())
     logger.info("Configured nsx_log_dir value: %s", nsx_log_dir)
@@ -1328,7 +1338,10 @@ def main() -> None:
         log.warning("Push interrupted by operator: %s", exc)
         raise SystemExit(130)
 
-    log.info("Push complete. Stats=%s Errors=%d", result.get("stats"), len(result.get("errors", [])))
+    errors = result.get("errors", [])
+    log.info("Push complete. Stats=%s Errors=%d", result.get("stats"), len(errors))
+    for err in errors:
+        log.error("  %s", err)
 
     snapshots = result.get("snapshots", [])
     if snapshots:
