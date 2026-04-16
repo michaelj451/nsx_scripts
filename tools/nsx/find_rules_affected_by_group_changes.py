@@ -440,6 +440,17 @@ def extract_candidate_rules(payload: Any) -> Iterator[Dict[str, Any]]:
             yield d
 
 
+def extract_group_ips(payload: Any) -> List[str]:
+    """Return all ip_addresses entries from IPAddressExpression blocks in a group payload."""
+    ips: Set[str] = set()
+    for d in walk_dicts(payload):
+        if d.get("resource_type") == "IPAddressExpression":
+            for v in d.get("ip_addresses", []) or []:
+                if isinstance(v, str) and v.strip():
+                    ips.add(v.strip())
+    return sorted(ips)
+
+
 # =============================================================================
 # Matching logic
 # =============================================================================
@@ -509,6 +520,43 @@ def group_ref_from_changed_group(grp: ChangedGroup) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Impact report builder
+# =============================================================================
+
+def build_impact_report(
+    sorted_rule_list: List[AffectedRule],
+    group_ips: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    """
+    Build a clean, human-readable impact report keyed by rule name.
+    For each affected rule: rule name, policy name, and for each group the
+    display name + the subnets/IPs that are changing in that group.
+    Intended for post-change troubleshooting — "is this issue related to the migration?"
+    """
+    out: List[Dict[str, Any]] = []
+    for rule in sorted_rule_list:
+        groups = []
+        for g in rule.affected_groups:
+            groups.append({
+                "group_name": g["display_name"] or g["group_id"],
+                "group_id": g["group_id"],
+                "manager": g["manager"],
+                "domain_id": g["domain_id"],
+                "subnets_added": group_ips.get(g["group_id"], []),
+            })
+        out.append({
+            "rule_name": rule.rule_display_name or rule.rule_id,
+            "rule_id": rule.rule_id,
+            "policy_name": rule.policy_display_name or rule.policy_id,
+            "policy_id": rule.policy_id,
+            "manager": rule.manager,
+            "domain_id": rule.domain_id,
+            "affected_groups": groups,
+        })
+    return out
+
+
+# =============================================================================
 # Main analysis
 # =============================================================================
 
@@ -535,6 +583,27 @@ def analyze(
     )
     if not changed_groups:
         logger.warning("No changed groups found under %s", additive_root)
+
+    # For each changed group, compute only the IPs that were added (additive - original).
+    # This is what gets shown in the impact report so reviewers see exactly what changed.
+    group_ips: Dict[str, List[str]] = {}
+    for grp in changed_groups:
+        try:
+            additive_payload = load_structured_file(Path(grp.file_path))
+            additive_ips = set(extract_group_ips(additive_payload))
+
+            rel = Path(grp.file_path).relative_to(additive_root)
+            export_file = export_root / rel
+            if export_file.exists():
+                export_payload = load_structured_file(export_file)
+                original_ips = set(extract_group_ips(export_payload))
+            else:
+                original_ips = set()
+
+            group_ips[grp.group_id] = sorted(additive_ips - original_ips)
+        except Exception as e:
+            logger.warning("Could not compute IP diff for group %s: %s", grp.file_path, e)
+            group_ips[grp.group_id] = []
 
     alias_index = build_alias_index(changed_groups)
 
@@ -652,14 +721,19 @@ def analyze(
             )
         )
 
+    sorted_rule_list = sorted_rules(affected_rules.values())
+    impact_report = build_impact_report(sorted_rule_list, group_ips)
+
     write_jsonl(output_dir / "changed_groups.jsonl", [asdict(g) for g in changed_groups])
-    write_jsonl(output_dir / "affected_rules.jsonl", [asdict(r) for r in sorted_rules(affected_rules.values())])
+    write_jsonl(output_dir / "affected_rules.jsonl", [asdict(r) for r in sorted_rule_list])
     write_jsonl(output_dir / "affected_policies.jsonl", [asdict(p) for p in sorted_policies(affected_policies)])
+    write_json(output_dir / "affected_rules.json", [asdict(r) for r in sorted_rule_list])
+    write_json(output_dir / "affected_rules_impact.json", impact_report, sort_keys=False)
 
     logger.info("Changed groups:    %d", len(changed_groups))
     logger.info("Affected rules:    %d", len(affected_rules))
     logger.info("Affected policies: %d", len(affected_policies))
-    logger.info("Wrote JSONL reports to %s", output_dir)
+    logger.info("Wrote reports to %s", output_dir)
 
     print("")
     print("Analysis complete")
@@ -673,6 +747,8 @@ def analyze(
     print(f"  - {output_dir / 'changed_groups.jsonl'}")
     print(f"  - {output_dir / 'affected_rules.jsonl'}")
     print(f"  - {output_dir / 'affected_policies.jsonl'}")
+    print(f"  - {output_dir / 'affected_rules.json'}")
+    print(f"  - {output_dir / 'affected_rules_impact.json'}  <-- human-readable: rule -> groups -> subnets")
     print("")
 
     return 0
@@ -687,6 +763,11 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def write_json(path: Path, rows: List[Dict[str, Any]], *, sort_keys: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=sort_keys), encoding="utf-8")
 
 
 def sorted_rules(rules: Iterable[AffectedRule]) -> List[AffectedRule]:

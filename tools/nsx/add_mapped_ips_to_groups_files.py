@@ -19,6 +19,33 @@ Outputs:
 Logging:
 - Console + <NSX_LOG_DIR>/add_mapped_ips_to_groups_files_YYYYMMDD_HHMMSS.log
 - JSONL changes are still written by nsx_group_remap.py to <NSX_LOG_DIR>/nsx_group_remap_changes.jsonl
+
+------------------------------------------------------------------------
+Usage
+------------------------------------------------------------------------
+
+# Standard run (uses all defaults):
+python tools/nsx/add_mapped_ips_to_groups_files.py
+
+# Dry-run only — analyze changes without writing any output files:
+python tools/nsx/add_mapped_ips_to_groups_files.py --dry-run
+
+# Custom paths:
+python tools/nsx/add_mapped_ips_to_groups_files.py \
+  --csv data/subnet_map.csv \
+  --nsx-export nsx_export \
+  --nsx-updated nsx_groups_additive
+
+# Skip clearing the output directory before writing:
+python tools/nsx/add_mapped_ips_to_groups_files.py --no-clean
+
+# All options:
+#   --csv          Path to subnet mapping CSV (columns: old_subnet, new_subnet, vlan, description)
+#   --nsx-export   Root directory of exported NSX group files (default: ./nsx_export)
+#   --nsx-updated  Root directory for additive output files   (default: ./nsx_groups_additive)
+#   --dry-run      Analyze and log changes only; do not write output files
+#   --no-clean     Skip wiping the output directory before writing
+------------------------------------------------------------------------
 """
 
 from __future__ import annotations
