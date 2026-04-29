@@ -38,9 +38,29 @@ python tools/nsx/export_nsx_objects.py --federation-global --manager nsx-gm2 --o
 ```
 
 ``` bash
-python tools/nsx/export_nsx_objects.py --manager nsx-lm3 --output-format yaml
+python tools/nsx/export_nsx_objects.py --manager nsx-lm1 --output-format yaml
 ```
 
+``` bash
+python tools/nsx/export_nsx_objects.py --manager nsx-lm2 --output-format yaml
+```
+
+``` bash
+python tools/nsx/export_nsx_objects.py \
+  --manager nsx-gm1 \
+  --base-dir nsx_export \
+  --domain-id default \
+  --federation-global \
+  --output-format yaml
+```
+
+``` bash
+python tools/nsx/export_nsx_objects.py \
+  --manager nsx-lm1 \
+  --base-dir nsx_export \
+  --domain-id default \
+  --output-format yaml
+```
 
 ------------------------------------------------------------------------
 
