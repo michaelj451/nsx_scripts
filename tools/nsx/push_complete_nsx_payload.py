@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
-from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 try:
     import yaml
@@ -20,6 +20,12 @@ except ImportError:
 
 
 THROTTLE_SECONDS = 0.2
+
+SKIP_POLICIES = {
+    "default-layer2-section",
+    "default-layer3-section",
+}
+
 log = logging.getLogger(__name__)
 
 
@@ -53,16 +59,24 @@ def load_file(path: Path) -> Dict[str, Any]:
 def iter_files(path: Path) -> Iterable[Path]:
     if not path.exists():
         return []
+
     files: List[Path] = []
     for ext in ("*.yaml", "*.yml", "*.json"):
         files.extend(path.rglob(ext))
+
     return sorted(files)
 
 
+def is_already_exists_error(e: Exception) -> bool:
+    msg = str(e)
+    return (
+        "already exists" in msg.lower()
+        or "500127" in msg
+        or "Cannot create an object" in msg
+    )
+
+
 def sanitize_for_put(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Remove NSX read-only / realization fields before PUT/PATCH.
-    """
     strip_keys = {
         "_create_time",
         "_create_user",
@@ -106,7 +120,15 @@ def push_services(client: NsxPolicyClient, domain_dir: Path, dry_run: bool) -> i
         log.info("%s service: %s", "DRY-RUN would push" if dry_run else "Pushing", service_id)
 
         if not dry_run:
-            client.put_service(service_id, obj)
+            try:
+                client.put_service(service_id, obj)
+            except NsxApiError as e:
+                if is_already_exists_error(e):
+                    log.info("Service exists, patching instead: %s", service_id)
+                    client.patch_service(service_id, obj)
+                else:
+                    raise
+
             time.sleep(THROTTLE_SECONDS)
 
         count += 1
@@ -129,7 +151,15 @@ def push_groups(client: NsxPolicyClient, domain_dir: Path, domain_id: str, dry_r
         log.info("%s group: %s", "DRY-RUN would push" if dry_run else "Pushing", group_id)
 
         if not dry_run:
-            client.put_group(group_id, obj, domain_id=domain_id)
+            try:
+                client.put_group(group_id, obj, domain_id=domain_id)
+            except NsxApiError as e:
+                if is_already_exists_error(e):
+                    log.info("Group exists, patching instead: %s", group_id)
+                    client.patch_group(group_id, obj, domain_id=domain_id)
+                else:
+                    raise
+
             time.sleep(THROTTLE_SECONDS)
 
         count += 1
@@ -147,6 +177,7 @@ def push_policies_and_rules(client: NsxPolicyClient, domain_dir: Path, domain_id
 
     for policy_dir in sorted(p for p in policies_dir.iterdir() if p.is_dir()):
         policy_file = None
+
         for candidate in ("policy.yaml", "policy.yml", "policy.json"):
             p = policy_dir / candidate
             if p.exists():
@@ -163,15 +194,28 @@ def push_policies_and_rules(client: NsxPolicyClient, domain_dir: Path, domain_id
             log.warning("Skipping policy without id: %s", policy_file)
             continue
 
+        if policy_id in SKIP_POLICIES:
+            log.info("Skipping built-in/default policy: %s", policy_id)
+            continue
+
         log.info("%s policy: %s", "DRY-RUN would push" if dry_run else "Pushing", policy_id)
 
         if not dry_run:
-            client.put_security_policy(policy_id, policy, domain_id=domain_id)
+            try:
+                client.put_security_policy(policy_id, policy, domain_id=domain_id)
+            except NsxApiError as e:
+                if is_already_exists_error(e):
+                    log.info("Policy exists, patching instead: %s", policy_id)
+                    client.patch_security_policy(policy_id, policy, domain_id=domain_id)
+                else:
+                    raise
+
             time.sleep(THROTTLE_SECONDS)
 
         policies_count += 1
 
         rules_dir = policy_dir / "rules"
+
         for rule_file in iter_files(rules_dir):
             rule = sanitize_for_put(load_file(rule_file))
             rule_id = rule.get("id")
@@ -188,12 +232,25 @@ def push_policies_and_rules(client: NsxPolicyClient, domain_dir: Path, domain_id
             )
 
             if not dry_run:
-                client.put_security_rule(
-                    security_policy_id=policy_id,
-                    rule_id=rule_id,
-                    payload=rule,
-                    domain_id=domain_id,
-                )
+                try:
+                    client.put_security_rule(
+                        security_policy_id=policy_id,
+                        rule_id=rule_id,
+                        payload=rule,
+                        domain_id=domain_id,
+                    )
+                except NsxApiError as e:
+                    if is_already_exists_error(e):
+                        log.info("Rule exists, patching instead: %s / %s", policy_id, rule_id)
+                        client.patch_security_rule(
+                            security_policy_id=policy_id,
+                            rule_id=rule_id,
+                            payload=rule,
+                            domain_id=domain_id,
+                        )
+                    else:
+                        raise
+
                 time.sleep(THROTTLE_SECONDS)
 
             rules_count += 1
