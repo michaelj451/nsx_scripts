@@ -67,7 +67,7 @@ python tools/nsx/export_nsx_objects.py \
 -----------------------------------------------------------------
 
 ``` bash
-python tools/nsx/build_group_ip_additive_live_members.py \
+python tools/nsx/build_group_ip_additive_from_live_members.py \
   --source-manager nsx-lm1 \
   --domain-id default \
   --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \

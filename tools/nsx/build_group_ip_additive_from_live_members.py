@@ -93,7 +93,13 @@ def ensure_ip_expression(group: Dict[str, Any], ips_to_add: List[str]) -> Tuple[
     """
     Add IPAddressExpression additively.
 
-    Keeps existing tag conditions untouched.
+    NSX Policy API requires:
+      operand OR operand
+
+    So the expression list must be:
+      Condition
+      ConjunctionOperator OR
+      IPAddressExpression
     """
     ips_to_add = sorted(set(ips_to_add))
     if not ips_to_add:
@@ -119,6 +125,19 @@ def ensure_ip_expression(group: Dict[str, Any], ips_to_add: List[str]) -> Tuple[
         return group, []
 
     if ip_expr is None:
+        if expr:
+            last = expr[-1]
+            if not (
+                isinstance(last, dict)
+                and last.get("resource_type") == "ConjunctionOperator"
+            ):
+                expr.append(
+                    {
+                        "resource_type": "ConjunctionOperator",
+                        "conjunction_operator": "OR",
+                    }
+                )
+
         expr.append(
             {
                 "resource_type": "IPAddressExpression",
