@@ -67,11 +67,11 @@ python tools/nsx/export_nsx_objects.py \
 -----------------------------------------------------------------
 
 ``` bash
-python tools/nsx/build_group_ip_additive_from_live_members.py \
+python tools/nsx/build_group_ip_additive_live_members.py \
   --source-manager nsx-lm1 \
   --domain-id default \
   --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive/nsx-lm5.lab.local/domains/default/groups \
+  --output-groups-dir nsx_groups_additive/nsx-lm3.lab.local/domains/default/groups \
   --output-format yaml \
   --copy-first \
   --continue-on-group-error
@@ -82,195 +82,37 @@ python tools/nsx/build_group_ip_additive_from_live_members.py \
 
 
 ``` bash
-python tools/nsx/build_group_ip_additive_from_tags.py \
-  --source-manager nsx-lm1 \
-  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive/nsx-lm5.lab.local/domains/default/groups \
-  --output-format yaml \
-  --copy-first
+python tools/nsx/build_complete_nsx_payload.py \
+  --source-manager-dir nsx_export/nsx-lm1.lab.local \
+  --additive-groups-dir nsx_groups_additive/nsx-lm3.lab.local/domains/default/groups \
+  --build-dir nsx_build/nsx-lm3.lab.local \
+  --domain-id default \
+  --overwrite
 
 ```
 
 ------------------------------------------------------------------------
 
-## 2) Remap Groups (Build Additive Groups)
+## 2) Push New NSX Configuration (Dry Run)
 
 ``` bash
-python tools/nsx/add_mapped_ips_to_groups_files.py
+python tools/nsx/push_complete_nsx_payload.py \
+  --target nsx-lm3 \
+  --build-dir nsx_build/nsx-lm3.lab.local \
+  --domain-id default \
+  --dry-run
 ```
 
 ------------------------------------------------------------------------
 
-## 3) Push Remapped Groups to GM (Additive / Remapped)
+## 3) Push New NSX Configuration
 
 Preview:
 
 ``` bash
-python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2
+python tools/nsx/push_complete_nsx_payload.py \
+  --target nsx-lm3 \
+  --build-dir nsx_build/nsx-lm3.lab.local \
+  --domain-id default \
+  --yes
 ```
-
-Apply:
-
-``` bash
-python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm1 --domain-id default --apply
-```
-``` bash
-python tools/nsx/push_remapped_groups.py --federation-global --target nsx-gm2 --apply
-```
-
-
-## 4) Push Remapped Groups to LM
-
-``` bash
-python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm1.lab.local --apply
-```
-``` bash
-python tools/nsx/push_remapped_groups.py --target nsx-gm1 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm2.lab.local --apply
-```
-``` bash
-python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm3.lab.local --apply
-```
-``` bash
-python tools/nsx/push_remapped_groups.py --target nsx-gm2 --federation-global --input-dir nsx_groups_additive --domain-id nsx-lm4.lab.local --apply
-```
-
-``` bash
-python tools/nsx/push_remapped_groups.py --target nsx-lm3 --input-dir nsx_groups_additive --domain-id default --apply
-```
-
-## 5a) REVERT Global managaers
-
-Credentials are read from `.env` — no username/password args required.
-
-Dry run (nsx-gm2):
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
-```
-
-Dry run (nsx-gm1):
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id default --federation-global
-```
-
-Apply (nsx-gm2):
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global --apply
-```
-
-Apply (nsx-gm1):
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id default --federation-global --apply
-```
-
-## 5b) Revert non-default domains (LM domains)
-
-LM1 and LM2 are imported under GM1; LM3 and LM4 under GM2.
-
-Dry run:
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm1.lab.local --federation-global
-```
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm2.lab.local --federation-global
-```
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
-```
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
-```
-
-Apply:
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm1.lab.local --federation-global --apply
-```
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm1 --export-root nsx_export/nsx-gm1.lab.local --domain-id nsx-lm2.lab.local --federation-global --apply
-```
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global --apply
-```
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global --apply
-```
-
-``` bash
-python tools/nsx/push_nsx_groups_revert.py --target nsx-lm3 --export-root nsx_export/nsx-lm3.lab.local --domain-id default --apply
-```
-
-------------------------------------------------------------------------
-
-## 5a) Push Validation
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
-```
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
-```
-
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --baseline-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
-```
-
-## 5b) Rollback Validation
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id default --federation-global
-```
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
-```
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
-```
-
-
-``` bash
-python tools/nsx/validate_nsx_groups.py --target nsx-gm2 --expected-root nsx_export/nsx-gm2.lab.local --domain-id nsx-lm4.lab.local --federation-global
-```
-
-## FINAL - LIVE VALIDATE
-
-``` bash
-python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id default --federation-global
-```
-
-``` bash
-python tools/nsx/validate_nsx_groups_live.py --target nsx-gm2 --expected-root nsx_groups_additive/nsx-gm2.lab.local --domain-id nsx-lm3.lab.local --federation-global
-```
-
-``` bash
-python tools/nsx/validate_nsx_groups_live.py --target nsx-lm3 --expected-root nsx_export/nsx-lm3.lab.local --domain-id default
-```
-
-## Safety Model
-
-This workflow is:
-
--   Non-destructive
--   Idempotent
--   Repeatable
--   Suitable for production CAB execution
-
-
-python tools/nsx/find_rules_affected_by_group_changes.py --federation-global
-
-python tools/nsx/find_rules_affected_by_group_changes.py --federation-global --verbose
-
-python tools/nsx/find_rules_affected_by_group_changes.py \
-  --additive-root nsx_groups_additive \
-  --export-root nsx_export \
-  --output-dir nsx_logs/affected_rule_reports \
-  --federation-global \
-  --verbose
