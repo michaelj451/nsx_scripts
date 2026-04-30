@@ -70,7 +70,7 @@ python tools/nsx/build_group_ip_additive_from_live_members.py \
 python tools/nsx/build_complete_nsx_payload.py \
   --source-manager-dir nsx_export/nsx-lm1.lab.local \
   --additive-groups-dir nsx_groups_additive/nsx-lm2.lab.local/domains/default/groups \
-  --build-dir nsx_build/nsx-lm3.lab.local \
+  --build-dir nsx_build/nsx-lm2.lab.local \
   --domain-id default \
   --overwrite
 
