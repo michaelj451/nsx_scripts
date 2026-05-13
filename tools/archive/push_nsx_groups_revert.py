@@ -539,6 +539,7 @@ def rollback_groups(
     last_ts = 0.0
     skipped_restore_count = 0
     skipped_delete_count = 0
+    skipped_no_change_count = 0
 
     for idx, gid in enumerate(ordered_restore_ids, start=1):
         payload = desired[gid]
@@ -590,6 +591,19 @@ def rollback_groups(
                 processed_count=idx,
                 last_ts=last_ts,
                 phase="dry-run rollback checks",
+            )
+            continue
+
+        # Hard no-op safeguard:
+        # If the group already exists in NSX and there is no IP delta at all,
+        # do not touch it.
+        if existing_group is not None and not to_add and not to_remove:
+            skipped_no_change_count += 1
+            log.info(
+                "Skipping restore for unchanged group=%s display_name=%s no_change_skipped_total=%d",
+                gid,
+                display_name,
+                skipped_no_change_count,
             )
             continue
 
@@ -744,10 +758,11 @@ def rollback_groups(
     )
     log.info("Rollback validation report written: %s", validation_file)
     log.info(
-        "Rollback finished. applied_total=%d skipped_restore_total=%d skipped_delete_total=%d",
+        "Rollback finished. applied_total=%d skipped_restore_total=%d skipped_delete_total=%d skipped_no_change_total=%d",
         apply_state["applied_count"],
         skipped_restore_count,
         skipped_delete_count,
+        skipped_no_change_count,
     )
 
 
