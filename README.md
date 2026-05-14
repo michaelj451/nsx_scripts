@@ -101,3 +101,40 @@ python tools/nsx/push_complete_nsx_payload.py \
   --domain-id default \
   --yes
 ```
+
+
+
+
+
+-------------------------------------------------------------------------
+
+``` bash
+python tools/nsx/export_nsx_objects.py --manager nsx-lm2 --output-format yaml
+```
+
+
+
+``` bash
+python tools/nsx/nsx_group_ip_remap_offline.py \
+  --export-root nsx_export/nsx-lm1.lab.local/default/groups \
+  --prepared-root nsx_export_additive/nsx-lm1.lab.local/default/groups \
+  --mapping-csv ./data/nonprod_map.csv \
+  --bidirectional \
+  --output-format yaml
+```
+
+``` bash
+python tools/nsx/push_additive_group_ips.py \
+  --target nsx-lm2 \
+  --groups-dir nsx_build_additive/nsx-lm2.lab.local/domains/default/groups \
+  --domain-id default \
+  --dry-run
+```
+
+``` bash
+python tools/nsx/push_additive_group_ips.py \
+  --target nsx-lm2 \
+  --groups-dir nsx_build_additive/nsx-lm2.lab.local/domains/default/groups \
+  --domain-id default \
+  --yes
+```

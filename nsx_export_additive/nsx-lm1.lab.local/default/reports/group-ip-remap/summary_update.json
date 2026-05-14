@@ -1,0 +1,19 @@
+{
+  "bidirectional": true,
+  "command": "offline_update",
+  "created_at": "2026-05-14T21:45:50.996708+00:00",
+  "export_root": "/Users/mxferguson/dev/nsx_scripts/nsx_export/nsx-lm1.lab.local/default/groups",
+  "groups": [],
+  "groups_changed": 0,
+  "groups_skipped": 0,
+  "groups_unchanged": 0,
+  "invalid_mapping_rows": 0,
+  "log_file": "/Users/mxferguson/dev/nsx_scripts/nsx_logs/nsx_group_ip_remap_offline_20260514_164550.log",
+  "mapping_csv": "/Users/mxferguson/dev/nsx_scripts/data/nonprod_map.csv",
+  "output_format": "yaml",
+  "prepared_root": "/Users/mxferguson/dev/nsx_scripts/nsx_export_additive/nsx-lm1.lab.local/default/groups",
+  "reports_dir": "/Users/mxferguson/dev/nsx_scripts/nsx_export_additive/nsx-lm1.lab.local/default/reports/group-ip-remap",
+  "total_added_ip_values": 0,
+  "total_group_files": 0,
+  "total_mapping_keys": 32
+}

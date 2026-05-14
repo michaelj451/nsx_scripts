@@ -15,6 +15,8 @@ from nsx.nsx_constants import (
     nsx_gm2,
     nsx_lm1,
     nsx_lm2,
+    nsx_lm3,
+    nsx_lm4,
     nsx_username,
     nsx_password,
 )
