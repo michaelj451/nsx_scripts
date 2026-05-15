@@ -109,32 +109,35 @@ python tools/nsx/push_complete_nsx_payload.py \
 -------------------------------------------------------------------------
 
 ``` bash
-python tools/nsx/export_nsx_objects.py --manager nsx-lm2 --output-format yaml
+python tools/nsx/export_nsx_objects.py --manager nsx-lm1 --output-format yaml
 ```
 
 
+
+``` bash
+python tools/nsx/build_group_ip_additive_from_live_members.py \
+  --source-manager nsx-lm1 \
+  --domain-id default \
+  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
+  --output-groups-dir nsx_groups_additive/nsx-lm1.lab.local/domains/default/groups \
+  --output-format yaml \
+  --copy-first \
+  --continue-on-group-error
+```
 
 ``` bash
 python tools/nsx/nsx_group_ip_remap_offline.py \
-  --export-root nsx_export/nsx-lm1.lab.local/default/groups \
-  --prepared-root nsx_export_additive/nsx-lm1.lab.local/default/groups \
-  --mapping-csv ./data/nonprod_map.csv \
-  --bidirectional \
-  --output-format yaml
+  --export-root nsx_groups_additive/nsx-lm1.lab.local/domains/default/groups \
+  --prepared-root nsx_groups_remapped/nsx-lm2.lab.local/domains/default/groups \
+  --mapping-csv data/nonprod_map.csv \
+  --output-format yaml \
+  --mapped-only
 ```
 
 ``` bash
 python tools/nsx/push_additive_group_ips.py \
-  --target nsx-lm2 \
-  --groups-dir nsx_build_additive/nsx-lm2.lab.local/domains/default/groups \
+  --target nsx-lm1 \
+  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
   --domain-id default \
   --dry-run
-```
-
-``` bash
-python tools/nsx/push_additive_group_ips.py \
-  --target nsx-lm2 \
-  --groups-dir nsx_build_additive/nsx-lm2.lab.local/domains/default/groups \
-  --domain-id default \
-  --yes
 ```

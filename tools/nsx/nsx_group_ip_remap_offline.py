@@ -4,67 +4,32 @@ tools/nsx/nsx_group_ip_remap_offline.py
 
 Offline-only NSX group IP remap tool.
 
-This script does NOT connect to NSX.
-This script does NOT contain NSX write APIs.
-This script does NOT PATCH, PUT, POST, or DELETE anything.
+Reads exported/additive NSX group files from disk, maps IPs/subnets from CSV,
+and writes prepared group files for a separate push step.
 
-Purpose:
-  Read existing exported NSX group files from disk, use a CSV IP mapping file,
-  and generate additive prepared group files for later review/push by a separate
-  tool.
+No NSX API calls.
+No PATCH/PUT/POST/DELETE.
 
-Expected workflow:
-
-  1) Export with existing tried/tested exporter:
-
-     python tools/nsx/export_nsx_objects.py \
-       --manager nsx-lm1 \
-       --domain-id default \
-       --base-dir nsx_export \
-       --output-format yaml
-
-  2) Run this offline remap script:
-
-     python tools/nsx/nsx_group_ip_remap_offline.py \
-       --export-root nsx_export/nsx-lm1.lab.local/default/groups \
-       --prepared-root nsx_export_additive/nsx-lm1.lab.local/default/groups \
-       --mapping-csv ip_mapping.csv \
-       --bidirectional \
-       --output-format yaml
-
-  3) Review reports and prepared group payloads.
-
-  4) Push prepared files with a separate, explicitly named push script/tool.
-
-Core behavior:
-  - Offline only
-  - Additive only
-  - Never removes existing IP values
-  - Never overwrites expressions
-  - Reads YAML/JSON exported group files
-  - Writes only changed group files to prepared-root
-  - Writes JSON and JSONL reports
-  - Uses existing project .env/bootstrap logging style
-
-CSV formats supported:
-  old_ip,new_ip
-  source,destination
-  src,dst
-  lm1_ip,lm2_ip
+Key behavior:
+  - Supports subnet mappings with longest-prefix match
+  - /32 wins over /31, /30, /29, /24, /16, etc.
+  - Additive by default
+  - --mapped-only replaces IPAddressExpression values with mapped values only
+  - Keeps original tag/dynamic group conditions unchanged
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import ipaddress
 import json
 import logging
 import shutil
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
-import ipaddress
+from typing import Any, Iterable, Optional
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir
@@ -74,16 +39,14 @@ try:
 except ImportError:
     yaml = None
 
-# =============================================================================
-# Repo Root
-# =============================================================================
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+log = logging.getLogger(__name__)
+
 
 # =============================================================================
 # Logging
 # =============================================================================
-
 
 def _resolve_log_dir() -> Path:
     if not nsx_log_dir:
@@ -96,7 +59,6 @@ def _resolve_log_dir() -> Path:
 
 def _setup_logging(tool_name: str) -> Path:
     log_dir = _resolve_log_dir()
-
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = (log_dir / f"{tool_name}_{ts}.log").resolve()
     log_file.touch(exist_ok=True)
@@ -121,16 +83,13 @@ def _setup_logging(tool_name: str) -> Path:
     root.addHandler(ch)
     root.addHandler(fh)
 
-    logging.getLogger(__name__).info("Logging to %s", log_file)
+    log.info("Logging to %s", log_file)
     return log_file
 
-
-log = logging.getLogger(__name__)
 
 # =============================================================================
 # Generic helpers
 # =============================================================================
-
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -204,9 +163,22 @@ def _purge_dir(path: Path) -> None:
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
+
 # =============================================================================
-# Mapping helpers
+# IP / subnet mapping helpers
 # =============================================================================
+
+def _to_network(value: str) -> ipaddress.IPv4Network:
+    value = str(value).strip()
+    if "/" not in value:
+        value = f"{value}/32"
+    return ipaddress.ip_network(value, strict=False)
+
+
+def _format_network_or_ip(net: ipaddress.IPv4Network) -> str:
+    if net.prefixlen == 32:
+        return str(net.network_address)
+    return str(net)
 
 
 def _canonical_ip_token(value: str) -> str:
@@ -222,9 +194,8 @@ def _canonical_ip_token(value: str) -> str:
             return value
 
     try:
-        if "/" in value:
-            return str(ipaddress.ip_network(value, strict=False))
-        return str(ipaddress.ip_address(value))
+        net = _to_network(value)
+        return _format_network_or_ip(net)
     except ValueError:
         return value
 
@@ -244,13 +215,52 @@ def _validate_ip_token(value: str) -> bool:
             return False
 
     try:
-        if "/" in value:
-            ipaddress.ip_network(value, strict=False)
-        else:
-            ipaddress.ip_address(value)
+        _to_network(value)
         return True
     except ValueError:
         return False
+
+
+def _token_is_range(value: str) -> bool:
+    return "-" in str(value) and "/" not in str(value)
+
+
+def _map_network_by_offset(
+    source_value: str,
+    src_net: ipaddress.IPv4Network,
+    dst_net: ipaddress.IPv4Network,
+) -> Optional[str]:
+    source_net = _to_network(source_value)
+
+    if source_net.prefixlen == 32:
+        src_ip = int(source_net.network_address)
+        offset = src_ip - int(src_net.network_address)
+        mapped_ip_int = int(dst_net.network_address) + offset
+        mapped_ip = ipaddress.ip_address(mapped_ip_int)
+
+        if mapped_ip not in dst_net:
+            return None
+
+        return str(mapped_ip)
+
+    if source_net.prefixlen < src_net.prefixlen:
+        return None
+
+    offset = int(source_net.network_address) - int(src_net.network_address)
+    mapped_network_int = int(dst_net.network_address) + offset
+
+    try:
+        mapped_net = ipaddress.ip_network(
+            f"{ipaddress.ip_address(mapped_network_int)}/{source_net.prefixlen}",
+            strict=False,
+        )
+    except ValueError:
+        return None
+
+    if not mapped_net.subnet_of(dst_net):
+        return None
+
+    return _format_network_or_ip(mapped_net)
 
 
 def _find_csv_columns(fieldnames: list[str]) -> tuple[str, str]:
@@ -278,12 +288,74 @@ def _find_csv_columns(fieldnames: list[str]) -> tuple[str, str]:
     )
 
 
-def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[dict[str, set[str]], list[dict]]:
-    mapping: dict[str, set[str]] = {}
+class PrefixMappingTable:
+    def __init__(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+
+    def add(self, source: str, destination: str, row_num: int, direction: str) -> None:
+        src_net = _to_network(source)
+        dst_net = _to_network(destination)
+
+        self.rows.append({
+            "source": _format_network_or_ip(src_net),
+            "destination": _format_network_or_ip(dst_net),
+            "src_net": src_net,
+            "dst_net": dst_net,
+            "row": row_num,
+            "direction": direction,
+            "source_prefixlen": src_net.prefixlen,
+            "destination_prefixlen": dst_net.prefixlen,
+        })
+
+    def finalize(self) -> None:
+        self.rows.sort(
+            key=lambda r: (
+                int(r["source_prefixlen"]),
+                int(r["destination_prefixlen"]),
+                int(r["row"]),
+            ),
+            reverse=True,
+        )
+
+    def map_token(self, token: str) -> tuple[list[str], Optional[dict[str, Any]]]:
+        token = _canonical_ip_token(token)
+
+        if _token_is_range(token):
+            for row in self.rows:
+                if row["source"] == token:
+                    return [row["destination"]], row
+            return [], None
+
+        try:
+            token_net = _to_network(token)
+        except ValueError:
+            return [], None
+
+        for row in self.rows:
+            src_net: ipaddress.IPv4Network = row["src_net"]
+
+            if not token_net.subnet_of(src_net):
+                continue
+
+            mapped = _map_network_by_offset(
+                source_value=token,
+                src_net=row["src_net"],
+                dst_net=row["dst_net"],
+            )
+
+            if mapped:
+                return [mapped], row
+
+        return [], None
+
+
+def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[PrefixMappingTable, list[dict]]:
+    table = PrefixMappingTable()
     invalid_rows: list[dict] = []
 
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+
         if not reader.fieldnames:
             raise RuntimeError("Mapping CSV has no header row")
 
@@ -297,9 +369,6 @@ def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[dict[str, set[st
             if not left_raw and not right_raw:
                 continue
 
-            left = _canonical_ip_token(left_raw)
-            right = _canonical_ip_token(right_raw)
-
             row_report = {
                 "row": row_num,
                 "left_column": left_col,
@@ -308,25 +377,33 @@ def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[dict[str, set[st
                 "right_value": right_raw,
             }
 
-            if not _validate_ip_token(left) or not _validate_ip_token(right):
+            if not _validate_ip_token(left_raw) or not _validate_ip_token(right_raw):
                 invalid_rows.append({**row_report, "reason": "Invalid IP/CIDR/range token"})
                 continue
+
+            left = _canonical_ip_token(left_raw)
+            right = _canonical_ip_token(right_raw)
 
             if left == right:
                 invalid_rows.append({**row_report, "reason": "Left and right values are the same"})
                 continue
 
-            mapping.setdefault(left, set()).add(right)
+            try:
+                table.add(left, right, row_num, "forward")
 
-            if bidirectional:
-                mapping.setdefault(right, set()).add(left)
+                if bidirectional:
+                    table.add(right, left, row_num, "reverse")
 
-    return mapping, invalid_rows
+            except Exception as e:
+                invalid_rows.append({**row_report, "reason": str(e)})
+
+    table.finalize()
+    return table, invalid_rows
+
 
 # =============================================================================
 # Group remap logic
 # =============================================================================
-
 
 def _is_ip_expression(expr: dict) -> bool:
     rt = expr.get("resource_type") or expr.get("_type") or ""
@@ -364,7 +441,11 @@ def _strip_readonly_fields(payload: dict) -> dict:
     return cleaned
 
 
-def _remap_group_payload(group: dict, mapping: dict[str, set[str]]) -> tuple[dict, dict]:
+def _remap_group_payload(
+    group: dict,
+    mapping: PrefixMappingTable,
+    mapped_only: bool = False,
+) -> tuple[dict, dict]:
     payload = deepcopy(group)
     group_id = payload.get("id") or payload.get("display_name") or "UNKNOWN"
     display_name = payload.get("display_name") or group_id
@@ -377,7 +458,9 @@ def _remap_group_payload(group: dict, mapping: dict[str, set[str]]) -> tuple[dic
         "timestamp": _utc_now_iso(),
         "matched_values": [],
         "added_values": [],
+        "mapping_hits": [],
         "expression_changes": [],
+        "mapped_only": mapped_only,
         "status": "unchanged",
     }
 
@@ -394,36 +477,64 @@ def _remap_group_payload(group: dict, mapping: dict[str, set[str]]) -> tuple[dic
 
         existing_values = _expression_ip_values(expr)
         existing_set = set(existing_values)
-        to_add: list[str] = []
+
+        mapped_for_expression: list[str] = []
         matched_here: list[str] = []
 
         for value in existing_values:
-            mapped_values = mapping.get(value, set())
+            mapped_values, mapping_row = mapping.map_token(value)
+
             if not mapped_values:
                 continue
 
             matched_here.append(value)
             report["matched_values"].append(value)
 
+            if mapping_row:
+                report["mapping_hits"].append({
+                    "source_value": value,
+                    "mapped_values": mapped_values,
+                    "mapping_source": mapping_row["source"],
+                    "mapping_destination": mapping_row["destination"],
+                    "mapping_prefixlen": mapping_row["source_prefixlen"],
+                    "mapping_row": mapping_row["row"],
+                    "direction": mapping_row["direction"],
+                })
+
             for mapped in sorted(mapped_values):
-                if mapped not in existing_set and mapped not in to_add:
-                    to_add.append(mapped)
-                    existing_set.add(mapped)
+                mapped = _canonical_ip_token(mapped)
+                if mapped not in mapped_for_expression:
+                    mapped_for_expression.append(mapped)
 
-        if to_add:
-            original = list(expr.get("ip_addresses", []))
-            expr["ip_addresses"] = original + to_add
-            group_added.update(to_add)
+        if not mapped_for_expression:
+            continue
 
-            report["expression_changes"].append({
-                "expression_index": idx,
-                "matched_values": matched_here,
-                "added_values": to_add,
-                "original_count": len(original),
-                "new_count": len(expr["ip_addresses"]),
-            })
+        if mapped_only:
+            final_values = sorted(set(mapped_for_expression))
+            added_values = final_values
+        else:
+            final_values = sorted(set(existing_values + mapped_for_expression))
+            added_values = sorted(v for v in final_values if v not in existing_set)
 
-    if group_added:
+        if not added_values and not mapped_only:
+            continue
+
+        original = list(expr.get("ip_addresses", []))
+        expr["ip_addresses"] = final_values
+        group_added.update(added_values)
+
+        report["expression_changes"].append({
+            "expression_index": idx,
+            "matched_values": matched_here,
+            "added_values": added_values,
+            "original_values": original,
+            "final_values": final_values,
+            "original_count": len(original),
+            "new_count": len(final_values),
+            "mapped_only": mapped_only,
+        })
+
+    if report["expression_changes"]:
         report["status"] = "changed"
         report["added_values"] = sorted(group_added)
         report["added_count"] = len(group_added)
@@ -433,22 +544,27 @@ def _remap_group_payload(group: dict, mapping: dict[str, set[str]]) -> tuple[dic
 
     return payload, report
 
+
 # =============================================================================
 # Main
 # =============================================================================
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Offline-only NSX group IP remap: exported groups + CSV mapping -> prepared additive groups"
+        description="Offline-only NSX group IP remap: exported groups + CSV subnet mapping -> prepared additive groups"
     )
 
-    parser.add_argument("--export-root", required=True, help="Existing exported groups directory")
+    parser.add_argument("--export-root", required=True, help="Existing exported/additive groups directory")
     parser.add_argument("--prepared-root", required=True, help="Output directory for changed prepared groups")
-    parser.add_argument("--mapping-csv", required=True, help="CSV file containing IP mapping")
+    parser.add_argument("--mapping-csv", required=True, help="CSV file containing IP/subnet mapping")
     parser.add_argument("--reports-dir", help="Optional reports directory")
     parser.add_argument("--output-format", choices=["yaml", "json"], default="yaml")
     parser.add_argument("--bidirectional", action="store_true")
+    parser.add_argument(
+        "--mapped-only",
+        action="store_true",
+        help="Replace IPAddressExpression values with mapped destination values only.",
+    )
     parser.add_argument("--clean", action="store_true", default=True)
     parser.add_argument(
         "--keep-readonly-fields",
@@ -482,12 +598,17 @@ def main() -> None:
     log.info("Reports dir: %s", reports_dir)
     log.info("Mapping CSV: %s", Path(args.mapping_csv).expanduser().resolve())
     log.info("Bidirectional: %s", args.bidirectional)
+    log.info("Mapped only: %s", args.mapped_only)
     log.info("Output format: %s", args.output_format)
 
-    mapping, invalid_mapping_rows = _load_mapping_csv(Path(args.mapping_csv).expanduser().resolve(), args.bidirectional)
+    mapping, invalid_mapping_rows = _load_mapping_csv(
+        Path(args.mapping_csv).expanduser().resolve(),
+        args.bidirectional,
+    )
+
     group_files = _iter_object_files(export_root)
 
-    log.info("Loaded mapping keys: %s", len(mapping))
+    log.info("Loaded mapping rows: %s", len(mapping.rows))
     log.info("Invalid mapping rows: %s", len(invalid_mapping_rows))
     log.info("Group files found: %s", len(group_files))
 
@@ -498,6 +619,7 @@ def main() -> None:
 
     for group_file in group_files:
         group = _read_object(group_file)
+
         if not group:
             skipped.append({
                 "source_file": str(group_file),
@@ -506,7 +628,12 @@ def main() -> None:
             })
             continue
 
-        updated, report = _remap_group_payload(group, mapping)
+        updated, report = _remap_group_payload(
+            group=group,
+            mapping=mapping,
+            mapped_only=args.mapped_only,
+        )
+
         report["source_file"] = str(group_file)
 
         if report["status"] == "changed":
@@ -539,8 +666,9 @@ def main() -> None:
         "reports_dir": str(reports_dir),
         "mapping_csv": str(Path(args.mapping_csv).expanduser().resolve()),
         "bidirectional": args.bidirectional,
+        "mapped_only": args.mapped_only,
         "output_format": args.output_format,
-        "total_mapping_keys": len(mapping),
+        "total_mapping_rows": len(mapping.rows),
         "invalid_mapping_rows": len(invalid_mapping_rows),
         "total_group_files": len(group_files),
         "groups_changed": len(changed),
@@ -556,6 +684,18 @@ def main() -> None:
 
     _write_json(reports_dir / "mapping_invalid_rows.json", invalid_mapping_rows)
     _write_jsonl(reports_dir / "mapping_invalid_rows.jsonl", invalid_mapping_rows)
+
+    _write_json(reports_dir / "mapping_table.json", [
+        {
+            "row": r["row"],
+            "direction": r["direction"],
+            "source": r["source"],
+            "destination": r["destination"],
+            "source_prefixlen": r["source_prefixlen"],
+            "destination_prefixlen": r["destination_prefixlen"],
+        }
+        for r in mapping.rows
+    ])
 
     _write_json(reports_dir / "groups_changed.json", changed)
     _write_jsonl(reports_dir / "groups_changed.jsonl", changed)

@@ -15,6 +15,9 @@ nsx_logs/
 nsx_groups_additive/
 nsx_promoted_groups/
 nsx_build/
+nsx_export_additive/
+nsx_groups_additive/
+nsx_groups_remapped/
 
 
 
