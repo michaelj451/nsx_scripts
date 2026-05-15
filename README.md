@@ -277,3 +277,164 @@ python tools/nsx/push_nsx_groups_revert.py \
   --domain-id default \
   --apply
 ```
+
+---
+
+# Workflow B — Live-Member Resolution + CSV Remap on `nsx-lm1`
+
+A workflow that takes `nsx-lm1`'s groups, flattens any dynamic/tag-based
+membership into static IPs by asking NSX for evaluated VM members, then
+applies a CSV subnet remap and pushes the result back to `nsx-lm1`.
+
+Groups-only push. Services, policies, and rules are not touched.
+
+With `--mapped-only` (used here), unmapped IPs are **dropped** from the
+result — only the CSV-mapped values are kept. Use this when you're staging
+a remapped configuration on `nsx-lm1` for testing, not as a production
+network-extension exercise.
+
+## B.1) Export `nsx-lm1`
+
+Captures the current state (also serves as the rollback snapshot for this workflow).
+
+```bash
+python tools/nsx/export_nsx_objects.py \
+  --manager nsx-lm1 \
+  --base-dir nsx_export \
+  --domain-id default \
+  --output-format yaml
+```
+
+## B.2) Resolve Live VM Membership → Additive Tree
+
+For each group on `nsx-lm1`, ask NSX who its evaluated VM members are right
+now, look up each VM's IPs via fabric VIFs, and append them as a static
+`IPAddressExpression` block. This flattens tag/condition expressions into
+static IP lists so the CSV remap in B.3 has concrete IPs to operate on.
+
+```bash
+python tools/nsx/build_group_ip_additive_from_live_members.py \
+  --source-manager nsx-lm1 \
+  --domain-id default \
+  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
+  --output-groups-dir nsx_groups_additive/nsx-lm1.lab.local/domains/default/groups \
+  --output-format yaml \
+  --copy-first \
+  --continue-on-group-error
+```
+
+Read-only against NSX. Writes group files locally.
+
+## B.3) Apply CSV Subnet Remap (Offline)
+
+Read the additive tree from B.2, apply the CSV mapping
+(`old_subnet,new_subnet` — longest-prefix match wins), and write the result
+to a separate tree. `--mapped-only` replaces each `IPAddressExpression` IP
+list with only the mapped values, dropping unmapped entries.
+
+```bash
+python tools/nsx/nsx_group_ip_remap_offline.py \
+  --export-root nsx_groups_additive/nsx-lm1.lab.local/domains/default/groups \
+  --prepared-root nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
+  --mapping-csv data/nonprod_map.csv \
+  --output-format yaml \
+  --mapped-only
+```
+
+Offline only. No NSX calls.
+
+Result:
+
+```text
+nsx_groups_remapped/
+└── nsx-lm1.lab.local/
+    └── domains/default/
+        ├── groups/
+        └── reports/
+            └── group-ip-remap/
+                ├── summary_update.json
+                ├── groups_changed.json
+                ├── groups_unchanged.json
+                └── mapping_invalid_rows.json
+```
+
+## B.4) Review Reports (Optional)
+
+```text
+nsx_groups_remapped/nsx-lm1.lab.local/domains/default/reports/group-ip-remap/
+```
+
+| File | Purpose |
+|---|---|
+| `summary_update.json` | High-level counts: groups changed, IPs added, IPs dropped |
+| `groups_changed.json` | Per-group before/after listing |
+| `groups_unchanged.json` | Groups with no matching mapping rows |
+| `mapping_invalid_rows.json` | CSV rows that failed validation |
+
+Optionally generate the affected-rules impact report:
+
+```bash
+python tools/nsx/find_rules_affected_by_group_changes.py \
+  --additive-root nsx_groups_remapped \
+  --export-root nsx_export \
+  --output-dir nsx_logs/affected_rule_reports \
+  --verbose
+```
+
+## B.5) Dry-Run Push to `nsx-lm1`
+
+Groups-only PATCH. Preview against the live `nsx-lm1`.
+
+```bash
+python tools/nsx/push_additive_group_ips.py \
+  --target nsx-lm1 \
+  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
+  --domain-id default \
+  --dry-run
+```
+
+## B.6) Apply Push to `nsx-lm1`
+
+```bash
+python tools/nsx/push_additive_group_ips.py \
+  --target nsx-lm1 \
+  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
+  --domain-id default \
+  --yes
+```
+
+## B.7) Validate
+
+```bash
+python tools/nsx/validate_nsx_groups_live.py \
+  --target nsx-lm1 \
+  --expected-root nsx_groups_remapped/nsx-lm1.lab.local \
+  --domain-id default
+```
+
+## B Rollback
+
+Revert `nsx-lm1` from the step B.1 snapshot:
+
+```bash
+python tools/nsx/push_nsx_groups_revert.py \
+  --target nsx-lm1 \
+  --export-root nsx_export/nsx-lm1.lab.local \
+  --domain-id default \
+  --apply
+```
+
+---
+
+## Workflow A vs Workflow B
+
+| | Workflow A — Clone `nsx-lm1` → `nsx-lm2` | Workflow B — In-place subnet add on `nsx-lm1` |
+|---|---|---|
+| Goal | Stand up a new manager with the same policy | Extend existing groups with additional subnets |
+| Source | `nsx-lm1` (live VMs resolved via API) | `nsx-lm1` exported group files |
+| Target | `nsx-lm2` (new manager) | `nsx-lm1` (same manager, in-place) |
+| Scope of push | Services + groups + policies + rules | Groups only (PATCH) |
+| Subnet remap | None (live IPs passed through as-is) | CSV-driven (`data/nonprod_map.csv`) |
+| Behaviour | Replaces target | Additive — originals preserved |
+| Push tool | `push_complete_nsx_payload.py` | `push_additive_group_ips.py` |
+
