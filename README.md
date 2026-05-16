@@ -74,7 +74,7 @@ now*, look up each VM's IPs via fabric VIFs, and append them as a static
 tag/condition expressions remain intact).
 
 ```bash
-python tools/nsx/build_group_ip_additive_from_live_members.py \
+PYTHONPATH="$PWD/app" python tools/nsx/build_group_ip_additive_from_live_members.py \
   --source-manager nsx-lm1 \
   --domain-id default \
   --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
