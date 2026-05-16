@@ -167,7 +167,7 @@ python tools/nsx/push_complete_nsx_payload.py \
   --target nsx-lm2 \
   --build-dir nsx_build/nsx-lm2.lab.local \
   --domain-id default \
-  --yes
+  --apply
 ```
 
 ---

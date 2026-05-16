@@ -41,7 +41,7 @@ def setup_logging(dry_run: bool) -> tuple[Path, Path]:
     mode_name = (
         "push_complete_nsx_payload_dry_run"
         if dry_run
-        else "push_complete_nsx_payload"
+        else "push_complete_nsx_payload_apply"
     )
 
     log_file = log_root / f"{mode_name}_{RUN_TS}.log"
@@ -464,12 +464,12 @@ def main() -> None:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Required to push. Without this, script only dry-runs.",
+        help="Actually push objects to NSX. Without this, script runs as dry-run.",
     )
 
     args = parser.parse_args()
 
-    actual_dry_run = args.dry_run or not args.yes
+    actual_dry_run = args.dry_run or not args.apply
 
     init_cli()
     log_file, reports_dir = setup_logging(actual_dry_run)
