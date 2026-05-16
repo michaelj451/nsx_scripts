@@ -45,11 +45,11 @@ Expected workflow:
        --target nsx-lm2 \
        --groups-dir nsx_build_additive/nsx-lm2.lab.local/domains/default/groups \
        --domain-id default \
-       --yes
+       --apply
 
 Safety:
-  - Real push requires --yes
-  - Without --yes, the script dry-runs
+  - Real push requires --apply
+  - Without --apply, the script dry-runs
   - Only group files under --groups-dir are processed
   - Uses PATCH by default so the operation is update/additive oriented
   - Writes timestamped logs and JSON/JSONL reports
@@ -411,7 +411,7 @@ def main() -> None:
     parser.add_argument("--reports-dir", help="Optional reports directory")
     parser.add_argument("--dry-run", action="store_true", help="Dry run only")
     parser.add_argument(
-        "--yes",
+        "--apply",
         action="store_true",
         help="Required to actually PATCH groups. Without this, script dry-runs.",
     )
@@ -434,7 +434,7 @@ def main() -> None:
     if not target_host:
         raise RuntimeError(f"Target manager not defined: {args.target}")
 
-    actual_dry_run = args.dry_run or not args.yes
+    actual_dry_run = args.dry_run or not args.apply
 
     client = NsxPolicyClient(
         nsxmanager=target_host,

@@ -317,7 +317,7 @@ python tools/nsx/build_group_ip_additive_from_live_members.py \
   --source-manager nsx-lm1 \
   --domain-id default \
   --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive/nsx-lm1.lab.local/domains/default/groups \
+  --output-groups-dir nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
   --output-format yaml \
   --copy-first \
   --continue-on-group-error
@@ -334,7 +334,7 @@ list with only the mapped values, dropping unmapped entries.
 
 ```bash
 python tools/nsx/nsx_group_ip_remap_offline.py \
-  --export-root nsx_groups_additive/nsx-lm1.lab.local/domains/default/groups \
+  --export-root nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
   --prepared-root nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
   --mapping-csv data/nonprod_map.csv \
   --output-format yaml \
@@ -400,7 +400,7 @@ python tools/nsx/push_additive_group_ips.py \
   --target nsx-lm1 \
   --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
   --domain-id default \
-  --yes
+  --apply
 ```
 
 ## B.7) Validate
