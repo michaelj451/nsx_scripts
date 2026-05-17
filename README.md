@@ -74,11 +74,11 @@ now*, look up each VM's IPs via fabric VIFs, and append them as a static
 tag/condition expressions remain intact).
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/nsx/build_group_ip_additive_from_live_members.py \
+python tools/nsx/build_group_ip_additive_from_live_members.py \
   --source-manager nsx-lm1 \
   --domain-id default \
   --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive/nsx-lm2.lab.local/domains/default/groups \
+  --output-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
   --output-format yaml \
   --copy-first \
   --continue-on-group-error
@@ -96,7 +96,9 @@ nsx_groups_additive/
 
 ---
 
-## 3) (Optional) Affected-Rule Impact Report
+## 3) (Optional) Pre-Push Analysis
+
+### 3a) Affected-Rule Impact Report
 
 Generate a human-readable report listing every rule affected by the changed
 groups and which subnets drive each match — useful for review and for
@@ -104,7 +106,7 @@ post-change troubleshooting.
 
 ```bash
 python tools/nsx/find_rules_affected_by_group_changes.py \
-  --additive-root nsx_groups_additive \
+  --additive-root nsx_groups_additive_a \
   --export-root nsx_export \
   --output-dir nsx_logs/affected_rule_reports \
   --verbose
@@ -113,6 +115,37 @@ python tools/nsx/find_rules_affected_by_group_changes.py \
 Key output: `nsx_logs/affected_rule_reports/affected_rules_impact.json` — one
 entry per rule, with the affected groups and the new subnets driving each
 match.
+
+### 3b) Segment Reference Inventory
+
+If you only have **DFW access** on `nsx-lm2`, you cannot create segments
+there. Any rule or group on `nsx-lm1` that references a segment path
+(`/infra/segments/<id>`) requires the same segment to already exist on
+`nsx-lm2`, or the reference will land dead.
+
+Generate the inventory of every segment path the export depends on:
+
+```bash
+PYTHONPATH="$PWD/app" python tools/nsx/find_segments_referenced.py \
+  --export-root nsx_export \
+  --output-dir nsx_logs/segment_inventory \
+  --verbose
+```
+
+Outputs:
+
+| File | Purpose |
+|---|---|
+| `segments_inventory.json` | Full report with per-segment references — which rule/group/policy uses each segment, and which field |
+| `segment_paths.txt` | Flat one-path-per-line list, suitable for handing to the network team to confirm presence on `nsx-lm2` |
+
+**Note:** Groups that reference segments are largely mitigated by step 2 —
+the live-member resolution already snapshotted resolved VM IPs into a
+static `IPAddressExpression`, so the group still has the right members on
+`nsx-lm2` even if the segment ref dies. The hard cases are **rules that
+reference segments directly** in `source_groups`, `destination_groups`, or
+`scope` — those have no IP fallback. Look at the
+`referenced_by_rules` count in the inventory to spot them.
 
 ---
 
@@ -124,7 +157,7 @@ from step 2 into a self-contained build directory.
 ```bash
 python tools/nsx/build_complete_nsx_payload.py \
   --source-manager-dir nsx_export/nsx-lm1.lab.local \
-  --additive-groups-dir nsx_groups_additive/nsx-lm2.lab.local/domains/default/groups \
+  --additive-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
   --build-dir nsx_build/nsx-lm2.lab.local \
   --domain-id default \
   --overwrite
