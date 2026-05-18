@@ -1,555 +1,168 @@
-# NSX Local Manager Clone — `nsx-lm1` (live) → `nsx-lm2` (new)
+# NSX DFW Toolset — Local Manager Operations
 
-## Summary
+A collection of Python tools for snapshotting, transforming, and pushing
+NSX Policy distributed-firewall objects (groups, services, security
+policies, rules) between Local Managers. Built for operators with **DFW
+access only** — no networking/segments permission required for the push
+target.
 
-Clone the policy configuration from the **original live** NSX Local Manager
-(`nsx-lm1` — has the real VMs and evaluated group memberships) onto the
-**new** NSX Local Manager (`nsx-lm2`). Live VM IPs from `nsx-lm1` are
-captured as static `IPAddressExpression` entries and pushed to `nsx-lm2`
-as-is.
+Two distinct operations are supported, each with its own runbook:
 
-Manager roles:
-
-| Manager | Role | NSX impact |
-|---|---|---|
-| `nsx-lm1` | Original live — read-only source | Read-only |
-| `nsx-lm2` | New manager — apply target | PATCH/POST via file payload |
-| `nsx-lm3` | Throwaway sandbox — optional testing only | None unless you choose to test against it |
-
-Properties:
-
-- Zero changes to the source manager (`nsx-lm1` is read-only throughout)
-- Tag/dynamic group membership is resolved through NSX's evaluator — no Python tag parsing
-- Every transform is offline and reviewable before push
-- Dry-run is the default safe mode on every write step
-
-Safe to repeat. Suitable for CAB-reviewed execution.
+| Operation | Source | Target | Scope | Runbook |
+|---|---|---|---|---|
+| **Clone** — stand up a new LM with the same DFW config | `nsx-lm1` (live) | `nsx-lm2` (new) | Services + groups + policies + rules | [RUNBOOK_A.md](RUNBOOK_A.md) |
+| **Subnet remap in place** — rewrite group IPs on a single LM using a CSV mapping | `nsx-lm1` | `nsx-lm1` | Groups only (PATCH) | [RUNBOOK_B.md](RUNBOOK_B.md) |
 
 ---
 
-## 0) Environment Setup
+## Design properties
+
+- **Read-only source** — the live source manager is never written to in either workflow.
+- **Tag/dynamic membership is resolved by NSX** — no Python tag parsing. The toolkit asks `/policy/.../groups/<id>/members/virtual-machines` for evaluated VM lists, then looks up each VM's IPs via fabric VIFs.
+- **Every transform is offline and reviewable** — exports, additive trees, transformed trees, build dirs, and remapped trees are all on-disk artifacts you can diff and inspect before any push.
+- **Dry-run is the default safe mode** on every write step. Real apply requires an explicit `--apply` (or `--yes` for the groups-only pusher).
+- **Idempotent push** — both push tools handle "already exists" and 412 revision-conflict by falling back from PUT to PATCH automatically.
+- **Per-run reports + logs** under `nsx_logs/` for every step.
+
+---
+
+## What's in this repo
+
+### Tools — `tools/nsx/`
+
+| Script | Purpose |
+|---|---|
+| `export_nsx_objects.py` | GET-only snapshot of an LM's groups/services/policies/rules → `nsx_export/<host>/` |
+| `build_group_ip_additive_from_live_members.py` | Resolve a group's evaluated VM members on a source LM, look up their IPs via fabric VIFs, append as a static `IPAddressExpression` (with `OR`) |
+| `find_rules_affected_by_group_changes.py` | Report which rules reference changed groups + which new subnets drive each match |
+| `find_segments_referenced.py` | Inventory every `/infra/segments/*` path referenced by groups/rules, optionally fetch live segment details (subnets, VLANs, TZ) |
+| `transform_group_segments.py` | Pre-build segment rewriter. `strip` mode drops segment refs and cleans operators; `convert` mode fetches segments and substitutes their subnet CIDRs |
+| `nsx_group_ip_remap_offline.py` | Offline CSV subnet remap on a group tree (`old_subnet,new_subnet` with longest-prefix match) |
+| `build_complete_nsx_payload.py` | Offline assembler — combine source services/policies/rules with a (transformed) groups tree into a ready-to-push build dir |
+| `push_complete_nsx_payload.py` | Push the build dir to a target LM. Dry-run by default. Handles services + groups + policies + rules |
+| `push_additive_group_ips.py` | Groups-only PATCH push. Used by Runbook B. Dry-run by default |
+| `validate_nsx_groups_live.py` | Read-only diff of live NSX groups vs a prepared payload |
+| `push_nsx_groups_revert.py` | Rollback — PATCH groups back to a saved export snapshot |
+
+### App library — `app/nsx/`
+
+| Module | Purpose |
+|---|---|
+| `nsx_policy_client.py` | Thin HTTP client for NSX Policy + fabric APIs (segments, groups, services, policies, rules, VMs, VIFs) |
+| `cli_bootstrap.py` | `.env` loader + shared CLI setup |
+| `nsx_constants.py` | Manager hostname resolution + path constants |
+| `nsx_object_functions/nsx_object_exporter.py` | Generic exporter used by `export_nsx_objects.py` |
+| `nsx_object_functions/nsx_object_importer.py` | Generic importer used by the push tools |
+| `nsx_object_functions/nsx_group_importer.py` | Group-specific importer with additive-merge logic |
+| `nsx_object_functions/nsx_group_remap.py` | Subnet-remap primitives used by `nsx_group_ip_remap_offline.py` |
+
+### Data + logs
+
+```
+data/
+  subnet_map.csv         — example IP-remap CSV
+  nonprod_map.csv        — prod → non-prod subnet remap
+
+nsx_export/              — read-only snapshots from each LM
+nsx_groups_additive_a/   — additive trees built for Runbook A (lm2 target)
+nsx_groups_additive_b/   — additive trees built for Runbook B (lm1 in-place)
+nsx_groups_transformed/  — segment-transformed groups (post step A.4)
+nsx_groups_remapped/     — CSV-remapped groups (post step B.3)
+nsx_build/               — complete push payloads
+nsx_logs/                — per-run logs, snapshots, validation reports
+```
+
+---
+
+## Which runbook should I follow?
+
+**[RUNBOOK_A.md](RUNBOOK_A.md)** — you want a *new* NSX Local Manager
+(`nsx-lm2`) to look like an existing one (`nsx-lm1`). Pushes services,
+groups (with live VM IPs snapshotted as static), policies, and rules. The
+new manager doesn't have to share segments with the source — optional
+step transforms segment refs into IP-address groups before push.
+
+**[RUNBOOK_B.md](RUNBOOK_B.md)** — you want to modify the live manager's
+own groups using a subnet remap CSV. Source and target are the same
+manager (`nsx-lm1`). Groups-only PATCH; services, policies, and rules are
+untouched. Use `--mapped-only` to replace IPs with their CSV-mapped
+values; omit it for additive expansion.
+
+The two workflows do not interact — pick whichever matches what you're
+trying to accomplish.
+
+---
+
+## Quick start (Runbook A)
+
+### 0) Env — macOS / Linux
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
 ```
 
----
+### 0) Env — Windows (PowerShell)
 
-## 1) Export Both Managers
-
-Snapshot non-system NSX Policy objects (groups, services, security policies, rules) to `nsx_export/`.
-
-### Source — original live manager
-
-```bash
-python tools/nsx/export_nsx_objects.py \
-  --manager nsx-lm1 \
-  --base-dir nsx_export \
-  --domain-id default \
-  --output-format yaml
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
+$env:PYTHONPATH = "$PWD\app"
 ```
 
-### Target — new manager (captures pre-change state for rollback)
+> If PowerShell blocks the activation script, run once per session:
+> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned`
 
-```bash
-python tools/nsx/export_nsx_objects.py \
-  --manager nsx-lm2 \
-  --base-dir nsx_export \
-  --domain-id default \
-  --output-format yaml
+### 0) Env — Windows (Command Prompt)
+
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r docker\requirements-pip.txt
+set PYTHONPATH=%CD%\app
 ```
 
-Read-only against NSX. GETs are throttled (5 req/sec).
+> All subsequent commands are written for bash / macOS-Linux. On Windows,
+> use `python` instead of `python3` and replace the `\` line-continuations
+> with backticks (PowerShell) or a single line.
 
----
-
-## 2) Resolve Live VM Membership — `nsx-lm1` → `nsx-lm2` Additive Tree
-
-For each group on `nsx-lm1`, ask NSX *who its evaluated VM members are right
-now*, look up each VM's IPs via fabric VIFs, and append them as a static
-`IPAddressExpression` block (with a `ConjunctionOperator: OR` so existing
-tag/condition expressions remain intact).
+### Workflow commands
 
 ```bash
+# 1) Export source + target
+python tools/nsx/export_nsx_objects.py --manager nsx-lm1 --output-format yaml
+python tools/nsx/export_nsx_objects.py --manager nsx-lm2 --output-format yaml
+
+# 2) Resolve live members lm1 → lm2 additive tree
 python tools/nsx/build_group_ip_additive_from_live_members.py \
-  --source-manager nsx-lm1 \
-  --domain-id default \
+  --source-manager nsx-lm1 --domain-id default \
   --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
   --output-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  --output-format yaml \
-  --copy-first \
-  --continue-on-group-error
-```
+  --output-format yaml --copy-first --continue-on-group-error
 
-Read-only against NSX. Writes group files locally.
+# 3,4) optional pre-push analysis + segment transform — see RUNBOOK_A.md
 
-Result:
-
-```text
-nsx_groups_additive/
-└── nsx-lm2.lab.local/
-    └── domains/default/groups/
-```
-
----
-
-## 3) (Optional) Pre-Push Analysis
-
-### 3a) Affected-Rule Impact Report
-
-Generate a human-readable report listing every rule affected by the changed
-groups and which subnets drive each match — useful for review and for
-post-change troubleshooting.
-
-```bash
-python tools/nsx/find_rules_affected_by_group_changes.py \
-  --additive-root nsx_groups_additive_a \
-  --export-root nsx_export \
-  --output-dir nsx_logs/affected_rule_reports \
-  --verbose
-```
-
-Key output: `nsx_logs/affected_rule_reports/affected_rules_impact.json` — one
-entry per rule, with the affected groups and the new subnets driving each
-match.
-
-### 3b) Segment Reference Inventory
-
-If you only have **DFW access** on `nsx-lm2`, you cannot create segments
-there. Any rule or group on `nsx-lm1` that references a segment path
-(`/infra/segments/<id>`) requires the same segment to already exist on
-`nsx-lm2`, or the reference will land dead.
-
-Generate the inventory of every segment path the export depends on:
-
-```bash
-PYTHONPATH="$PWD/app" python tools/nsx/find_segments_referenced.py \
-  --export-root nsx_export \
-  --output-dir nsx_logs/segment_inventory \
-  --verbose
-```
-
-To also pull live segment details (subnets, VLAN IDs, transport zone, type, gateway address) from `nsx-lm1`, add `--source-manager`. The live-fetch is wrapped in try/except — if you lack segment-read permission, the tool logs a warning and still produces the path-only inventory:
-
-```bash
-python tools/nsx/find_segments_referenced.py \
-  --export-root nsx_export \
-  --source-manager nsx-lm1 \
-  --output-dir nsx_logs/segment_inventory \
-  --verbose
-```
-
-Outputs:
-
-| File | Purpose |
-|---|---|
-| `segments_inventory.json` | Full report with per-segment references — which rule/group/policy uses each segment, and which field. Includes `details` block when `--source-manager` succeeded (subnets, VLANs, TZ path, gateway). |
-| `segment_paths.txt` | Flat one-path-per-line list, suitable for handing to the network team to confirm presence on `nsx-lm2`. |
-| `segment_details.json` | Flat list of fetched segment objects with subnet/VLAN/TZ info. Only written when `--source-manager` succeeds. |
-
-**Note:** Groups that reference segments are largely mitigated by step 2 —
-the live-member resolution already snapshotted resolved VM IPs into a
-static `IPAddressExpression`, so the group still has the right members on
-`nsx-lm2` even if the segment ref dies. The hard cases are **rules that
-reference segments directly** in `source_groups`, `destination_groups`, or
-`scope` — those have no IP fallback. Look at the
-`referenced_by_rules` count in the inventory to spot them.
-
----
-
-## 4) (Optional) Transform Segment References
-
-If you have DFW-only access on `nsx-lm2` and segments referenced in groups
-will not exist on the target, run `transform_group_segments.py` against the
-additive tree from step 2. The transformed output is written to a separate
-directory so you can diff/review before it goes into the build dir.
-
-Two modes:
-
-**Mode `strip`** — offline. Remove `/infra/segments/*` and
-`/global-infra/segments/*` from every `PathExpression.paths` list, drop any
-PathExpression that ends up empty, and clean up adjacent
-`ConjunctionOperator` entries so the expression list stays NSX-valid.
-
-```bash
-PYTHONPATH="$PWD/app" python tools/nsx/transform_group_segments.py \
-  --input-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  --output-dir nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups \
-  --mode strip \
-  --overwrite
-```
-
-**Mode `convert`** — fetches each segment from `nsx-lm1` and replaces the
-segment reference with an `IPAddressExpression` containing the segment's
-subnet CIDR(s). Groups become IP-address groups that resolve on `nsx-lm2`
-without the segments existing there.
-
-```bash
-PYTHONPATH="$PWD/app" python tools/nsx/transform_group_segments.py \
-  --input-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  --output-dir nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups \
-  --mode convert \
-  --source-manager nsx-lm1 \
-  --overwrite
-```
-
-Behavior per `PathExpression` in `convert` mode:
-
-| Case | Result |
-|---|---|
-| Paths contain only segments, all resolved | Replace the `PathExpression` in-place with an `IPAddressExpression` containing the union of those subnets |
-| Paths contain only segments, some/all unresolved | Drop only the unresolved segments. If anything resolved, use those; otherwise drop the expression (same as `strip` mode) |
-| Paths contain a mix of segments and non-segment paths | Keep the modified `PathExpression` with non-segment paths intact; append a new `IPAddressExpression` (joined by `OR`) for the resolved subnets |
-
-The live fetch in `convert` mode is wrapped in try/except — if the API
-call fails (no permission, network, etc.), the run automatically falls
-back to plain `strip` behavior and logs the reason.
-
-**Report**: `nsx_logs/transform_group_segments/<ts>/segments_stripped.json`
-contains per-group `paths_stripped`, `segments_converted` (with resolved
-subnets), `unresolved_segment_paths`, and `path_expressions_dropped`.
-
-**Review tip**: diff the input and output trees before moving on:
-
-```bash
-diff -r \
-  nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups
-```
-
-If you don't run this step, point step 5 at the original additive tree
-from step 2 (no transformation).
-
----
-
-## 5) Assemble Complete Payload for `nsx-lm2`
-
-Combine `nsx-lm1`'s services/policies/rules with the (optionally
-transformed) additive group tree into a self-contained build directory.
-
-```bash
+# 5) Build payload
 python tools/nsx/build_complete_nsx_payload.py \
   --source-manager-dir nsx_export/nsx-lm1.lab.local \
-  --additive-groups-dir nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups \
-  --build-dir nsx_build/nsx-lm2.lab.local \
-  --domain-id default \
-  --overwrite
-```
-
-If you skipped step 4, use the un-transformed tree instead:
-
-```bash
   --additive-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
+  --build-dir nsx_build/nsx-lm2.lab.local --domain-id default --overwrite
+
+# 6) Dry-run, 7) Apply
+python tools/nsx/push_complete_nsx_payload.py --target nsx-lm2 \
+  --build-dir nsx_build/nsx-lm2.lab.local --domain-id default --dry-run
+python tools/nsx/push_complete_nsx_payload.py --target nsx-lm2 \
+  --build-dir nsx_build/nsx-lm2.lab.local --domain-id default --apply
+
+# 8) Validate
+python tools/nsx/validate_nsx_groups_live.py --target nsx-lm2 \
+  --expected-root nsx_groups_additive_a/nsx-lm2.lab.local --domain-id default
 ```
 
-Offline file assembly. No NSX calls.
-
-Result:
-
-```text
-nsx_build/nsx-lm2.lab.local/
-├── domains/default/
-│   ├── groups/             (from additive tree — lm1 live IPs)
-│   ├── services/           (from lm1)
-│   └── security-policies/  (from lm1, includes rules)
-```
-
----
-
-## 6) Dry-Run Push to `nsx-lm2`
-
-Preview every PATCH/POST against `nsx-lm2`. No writes.
-
-```bash
-python tools/nsx/push_complete_nsx_payload.py \
-  --target nsx-lm2 \
-  --build-dir nsx_build/nsx-lm2.lab.local \
-  --domain-id default \
-  --dry-run
-```
-
----
-
-## 7) Apply Push to `nsx-lm2`
-
-Real write requires `--yes`. Pushes services, groups, policies, and rules.
-
-```bash
-python tools/nsx/push_complete_nsx_payload.py \
-  --target nsx-lm2 \
-  --build-dir nsx_build/nsx-lm2.lab.local \
-  --domain-id default \
-  --apply
-```
-
----
-
-## 8) Validate Live `nsx-lm2` State
-
-Read-only comparison of live `nsx-lm2` groups against the prepared payload.
-
-```bash
-python tools/nsx/validate_nsx_groups_live.py \
-  --target nsx-lm2 \
-  --expected-root nsx_groups_additive/nsx-lm2.lab.local \
-  --domain-id default
-```
-
-Outputs `nsx_logs/nsx_validation/<ts>_nsx-lm2_validate_live_groups/`:
-
-- `validation_report.json` — master report
-- `payload_diff_groups.json` — groups with non-IP differences
-- `ip_diff_groups.json` — groups with missing/extra IPs
-- `missing_groups.json` — groups expected but absent in NSX
-- `extra_live_groups.json` — groups in NSX but absent from prepared payload
-
----
-
-## Workflow Diagram
-
-```text
-nsx-lm1 (original live)                       nsx-lm2 (new manager)
-        │                                              ▲
-        │  1) export_nsx_objects.py                    │  6) push --target nsx-lm2 --yes
-        ▼                                              │
-nsx_export/nsx-lm1.lab.local/                          │
-        │                                              │
-        │  2) build_group_ip_additive_from_live_members.py
-        ▼                                              │
-nsx_groups_additive/nsx-lm2.lab.local/                 │
-        │                                              │
-        │  3) (optional) impact report                 │
-        │  4) build_complete_nsx_payload.py            │
-        ▼                                              │
-nsx_build/nsx-lm2.lab.local/  ─────────────────────────┤
-        │                                              │
-        │  5) push --target nsx-lm2 --dry-run          │
-        │                                              ▼
-        │                                       7) validate_nsx_groups_live.py
-        ▼
-nsx-lm3 (sandbox) ← optional throwaway target — see below
-```
-
----
-
-## Safety Characteristics
-
-| Step | NSX impact |
-|---|---|
-| 1 — Export | Read-only |
-| 2 — Live member resolution | Read-only (policy + fabric GETs on `nsx-lm1`) |
-| 3 — Impact report | Offline |
-| 4 — Build payload | Offline |
-| 5 — Dry-run push | Read-only (preview only) |
-| 6 — Apply push | PATCH/POST to `nsx-lm2` only; `nsx-lm1` untouched |
-| 7 — Validate | Read-only |
-
-**Source manager (`nsx-lm1`) is never written to.** All mutation happens on `nsx-lm2`.
-
----
-
-## Optional: Test Against `nsx-lm3` Sandbox
-
-`nsx-lm3` is a throwaway manager — safe to break, experiment on, or wipe.
-If you want to exercise the payload against it before touching `nsx-lm2`,
-point `--target` at `nsx-lm3` for either dry-run or apply. The build dir
-stays the same — `--target` only chooses where the API calls land.
-
-Dry-run against the sandbox:
-
-```bash
-python tools/nsx/push_complete_nsx_payload.py \
-  --target nsx-lm3 \
-  --build-dir nsx_build/nsx-lm2.lab.local \
-  --domain-id default \
-  --dry-run
-```
-
-Real apply against the sandbox (for end-to-end testing — not production):
-
-```bash
-python tools/nsx/push_complete_nsx_payload.py \
-  --target nsx-lm3 \
-  --build-dir nsx_build/nsx-lm2.lab.local \
-  --domain-id default \
-  --yes
-```
-
----
-
-## Rollback
-
-`nsx-lm2`'s pre-change state is captured at `nsx_export/nsx-lm2.lab.local/`
-in step 1. If a revert is needed:
-
-```bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-lm2 \
-  --export-root nsx_export/nsx-lm2.lab.local \
-  --domain-id default \
-  --apply
-```
-
----
-
-# Workflow B — Live-Member Resolution + CSV Remap on `nsx-lm1`
-
-A workflow that takes `nsx-lm1`'s groups, flattens any dynamic/tag-based
-membership into static IPs by asking NSX for evaluated VM members, then
-applies a CSV subnet remap and pushes the result back to `nsx-lm1`.
-
-Groups-only push. Services, policies, and rules are not touched.
-
-With `--mapped-only` (used here), unmapped IPs are **dropped** from the
-result — only the CSV-mapped values are kept. Use this when you're staging
-a remapped configuration on `nsx-lm1` for testing, not as a production
-network-extension exercise.
-
-## B.1) Export `nsx-lm1`
-
-Captures the current state (also serves as the rollback snapshot for this workflow).
-
-```bash
-python tools/nsx/export_nsx_objects.py \
-  --manager nsx-lm1 \
-  --base-dir nsx_export \
-  --domain-id default \
-  --output-format yaml
-```
-
-## B.2) Resolve Live VM Membership → Additive Tree
-
-For each group on `nsx-lm1`, ask NSX who its evaluated VM members are right
-now, look up each VM's IPs via fabric VIFs, and append them as a static
-`IPAddressExpression` block. This flattens tag/condition expressions into
-static IP lists so the CSV remap in B.3 has concrete IPs to operate on.
-
-```bash
-python tools/nsx/build_group_ip_additive_from_live_members.py \
-  --source-manager nsx-lm1 \
-  --domain-id default \
-  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
-  --output-format yaml \
-  --copy-first \
-  --continue-on-group-error
-```
-
-Read-only against NSX. Writes group files locally.
-
-## B.3) Apply CSV Subnet Remap (Offline)
-
-Read the additive tree from B.2, apply the CSV mapping
-(`old_subnet,new_subnet` — longest-prefix match wins), and write the result
-to a separate tree. `--mapped-only` replaces each `IPAddressExpression` IP
-list with only the mapped values, dropping unmapped entries.
-
-```bash
-python tools/nsx/nsx_group_ip_remap_offline.py \
-  --export-root nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
-  --prepared-root nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --mapping-csv data/nonprod_map.csv \
-  --output-format yaml \
-  --mapped-only
-```
-
-Offline only. No NSX calls.
-
-Result:
-
-```text
-nsx_groups_remapped/
-└── nsx-lm1.lab.local/
-    └── domains/default/
-        ├── groups/
-        └── reports/
-            └── group-ip-remap/
-                ├── summary_update.json
-                ├── groups_changed.json
-                ├── groups_unchanged.json
-                └── mapping_invalid_rows.json
-```
-
-## B.4) Review Reports (Optional)
-
-```text
-nsx_groups_remapped/nsx-lm1.lab.local/domains/default/reports/group-ip-remap/
-```
-
-| File | Purpose |
-|---|---|
-| `summary_update.json` | High-level counts: groups changed, IPs added, IPs dropped |
-| `groups_changed.json` | Per-group before/after listing |
-| `groups_unchanged.json` | Groups with no matching mapping rows |
-| `mapping_invalid_rows.json` | CSV rows that failed validation |
-
-Optionally generate the affected-rules impact report:
-
-```bash
-python tools/nsx/find_rules_affected_by_group_changes.py \
-  --additive-root nsx_groups_remapped \
-  --export-root nsx_export \
-  --output-dir nsx_logs/affected_rule_reports \
-  --verbose
-```
-
-## B.5) Dry-Run Push to `nsx-lm1`
-
-Groups-only PATCH. Preview against the live `nsx-lm1`.
-
-```bash
-python tools/nsx/push_additive_group_ips.py \
-  --target nsx-lm1 \
-  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --domain-id default \
-  --dry-run
-```
-
-## B.6) Apply Push to `nsx-lm1`
-
-```bash
-python tools/nsx/push_additive_group_ips.py \
-  --target nsx-lm1 \
-  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --domain-id default \
-  --apply
-```
-
-## B.7) Validate
-
-```bash
-python tools/nsx/validate_nsx_groups_live.py \
-  --target nsx-lm1 \
-  --expected-root nsx_groups_remapped/nsx-lm1.lab.local \
-  --domain-id default
-```
-
-## B Rollback
-
-Revert `nsx-lm1` from the step B.1 snapshot:
-
-```bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-lm1 \
-  --export-root nsx_export/nsx-lm1.lab.local \
-  --domain-id default \
-  --apply
-```
-
----
-
-## Workflow A vs Workflow B
-
-| | Workflow A — Clone `nsx-lm1` → `nsx-lm2` | Workflow B — In-place subnet add on `nsx-lm1` |
-|---|---|---|
-| Goal | Stand up a new manager with the same policy | Extend existing groups with additional subnets |
-| Source | `nsx-lm1` (live VMs resolved via API) | `nsx-lm1` exported group files |
-| Target | `nsx-lm2` (new manager) | `nsx-lm1` (same manager, in-place) |
-| Scope of push | Services + groups + policies + rules | Groups only (PATCH) |
-| Subnet remap | None (live IPs passed through as-is) | CSV-driven (`data/nonprod_map.csv`) |
-| Behaviour | Replaces target | Additive — originals preserved |
-| Push tool | `push_complete_nsx_payload.py` | `push_additive_group_ips.py` |
-
+For the full Runbook A with optional pre-push analysis, segment
+transformation, sandbox testing, and rollback, see
+[RUNBOOK_A.md](RUNBOOK_A.md).
+
+For the in-place CSV remap workflow, see [RUNBOOK_B.md](RUNBOOK_B.md).
