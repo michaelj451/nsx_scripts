@@ -160,47 +160,90 @@ reference segments directly** in `source_groups`, `destination_groups`, or
 
 ---
 
-## 4) Assemble Complete Payload for `nsx-lm2`
+## 4) (Optional) Transform Segment References
 
-Combine `nsx-lm1`'s services/policies/rules with the additive group tree
-from step 2 into a self-contained build directory.
+If you have DFW-only access on `nsx-lm2` and segments referenced in groups
+will not exist on the target, run `transform_group_segments.py` against the
+additive tree from step 2. The transformed output is written to a separate
+directory so you can diff/review before it goes into the build dir.
+
+Two modes:
+
+**Mode `strip`** — offline. Remove `/infra/segments/*` and
+`/global-infra/segments/*` from every `PathExpression.paths` list, drop any
+PathExpression that ends up empty, and clean up adjacent
+`ConjunctionOperator` entries so the expression list stays NSX-valid.
+
+```bash
+PYTHONPATH="$PWD/app" python tools/nsx/transform_group_segments.py \
+  --input-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
+  --output-dir nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups \
+  --mode strip \
+  --overwrite
+```
+
+**Mode `convert`** — fetches each segment from `nsx-lm1` and replaces the
+segment reference with an `IPAddressExpression` containing the segment's
+subnet CIDR(s). Groups become IP-address groups that resolve on `nsx-lm2`
+without the segments existing there.
+
+```bash
+PYTHONPATH="$PWD/app" python tools/nsx/transform_group_segments.py \
+  --input-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
+  --output-dir nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups \
+  --mode convert \
+  --source-manager nsx-lm1 \
+  --overwrite
+```
+
+Behavior per `PathExpression` in `convert` mode:
+
+| Case | Result |
+|---|---|
+| Paths contain only segments, all resolved | Replace the `PathExpression` in-place with an `IPAddressExpression` containing the union of those subnets |
+| Paths contain only segments, some/all unresolved | Drop only the unresolved segments. If anything resolved, use those; otherwise drop the expression (same as `strip` mode) |
+| Paths contain a mix of segments and non-segment paths | Keep the modified `PathExpression` with non-segment paths intact; append a new `IPAddressExpression` (joined by `OR`) for the resolved subnets |
+
+The live fetch in `convert` mode is wrapped in try/except — if the API
+call fails (no permission, network, etc.), the run automatically falls
+back to plain `strip` behavior and logs the reason.
+
+**Report**: `nsx_logs/transform_group_segments/<ts>/segments_stripped.json`
+contains per-group `paths_stripped`, `segments_converted` (with resolved
+subnets), `unresolved_segment_paths`, and `path_expressions_dropped`.
+
+**Review tip**: diff the input and output trees before moving on:
+
+```bash
+diff -r \
+  nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
+  nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups
+```
+
+If you don't run this step, point step 5 at the original additive tree
+from step 2 (no transformation).
+
+---
+
+## 5) Assemble Complete Payload for `nsx-lm2`
+
+Combine `nsx-lm1`'s services/policies/rules with the (optionally
+transformed) additive group tree into a self-contained build directory.
 
 ```bash
 python tools/nsx/build_complete_nsx_payload.py \
   --source-manager-dir nsx_export/nsx-lm1.lab.local \
-  --additive-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
+  --additive-groups-dir nsx_groups_transformed/nsx-lm2.lab.local/domains/default/groups \
   --build-dir nsx_build/nsx-lm2.lab.local \
   --domain-id default \
   --overwrite
 ```
 
-### Optional: strip segment references
-
-If you have DFW-only access on `nsx-lm2` and segments referenced in groups
-will not exist on the target, add `--strip-segments`:
+If you skipped step 4, use the un-transformed tree instead:
 
 ```bash
-python tools/nsx/build_complete_nsx_payload.py \
-  --source-manager-dir nsx_export/nsx-lm1.lab.local \
   --additive-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  --build-dir nsx_build/nsx-lm2.lab.local \
-  --domain-id default \
-  --overwrite \
-  --strip-segments
 ```
-
-What it does for each group file in the build's `groups/`:
-
-- Removes `/infra/segments/*` and `/global-infra/segments/*` entries from every `PathExpression.paths` list
-- Drops any `PathExpression` that ends up with no paths
-- Cleans up the adjacent `ConjunctionOperator` (the `OR` joining segments to the static IPAddressExpression) so the expression list stays NSX-valid
-- Writes a `segments_stripped.json` report under `nsx_logs/build_complete_nsx_payload/<ts>/`
-
-Group membership relies on the static `IPAddressExpression` populated in
-step 2 for the live-resolved VM IPs. **Groups whose membership came only
-from segments** (no VMs attached, no other expressions) will end up with
-`expression: []` — check the report for those, they'll match nothing on
-`nsx-lm2`.
 
 Offline file assembly. No NSX calls.
 
@@ -216,7 +259,7 @@ nsx_build/nsx-lm2.lab.local/
 
 ---
 
-## 5) Dry-Run Push to `nsx-lm2`
+## 6) Dry-Run Push to `nsx-lm2`
 
 Preview every PATCH/POST against `nsx-lm2`. No writes.
 
@@ -230,7 +273,7 @@ python tools/nsx/push_complete_nsx_payload.py \
 
 ---
 
-## 6) Apply Push to `nsx-lm2`
+## 7) Apply Push to `nsx-lm2`
 
 Real write requires `--yes`. Pushes services, groups, policies, and rules.
 
@@ -244,7 +287,7 @@ python tools/nsx/push_complete_nsx_payload.py \
 
 ---
 
-## 7) Validate Live `nsx-lm2` State
+## 8) Validate Live `nsx-lm2` State
 
 Read-only comparison of live `nsx-lm2` groups against the prepared payload.
 

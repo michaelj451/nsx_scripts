@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)"
+    ],
+    "deny": [
+      "Bash(stb harbor runsettings.:*)",
+      "Bash(stb submissions:*)"
+    ]
+  }
+}
