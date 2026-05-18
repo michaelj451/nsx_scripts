@@ -416,8 +416,20 @@ PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --apply
 ```
 
-Add `--include-services` if the push step added new services (the default
-push tool only PATCHes existing services, so this is rarely needed).
+Add `--include-services` if the push step **created** new services on the
+target (rather than just patching existing ones). This is the case when
+pushing to a brand-new or service-empty manager. The system-owned safety
+guard preserves all NSX built-in services; only custom services that
+exist on the target but not in the snapshot are deleted.
+
+```bash
+PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
+  --target nsx-lm2 \
+  --export-root nsx_export/nsx-lm2.lab.local \
+  --domain-id default \
+  --include-services \
+  --apply
+```
 
 > **Why not `push_nsx_groups_revert.py`?** That script is groups-only and
 > can't delete groups that are still referenced by the policies/rules from

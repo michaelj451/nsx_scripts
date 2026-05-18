@@ -19,6 +19,7 @@ nsx_export_additive/
 nsx_groups_additive*/
 nsx_groups_remapped/
 nsx_groups_transformed/
+nsx_export_verify/
 
 
 # # Palo Alto Networks Panorama configuration exports
