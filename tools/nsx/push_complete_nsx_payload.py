@@ -108,11 +108,29 @@ def iter_files(path: Path) -> Iterable[Path]:
 
 
 def is_already_exists_error(e: Exception) -> bool:
+    """
+    True when a PUT failure indicates the object already exists on the target
+    and the right next step is to PATCH instead. Covers two distinct flavors:
+
+      1) "Already exists" (NSX error_code 500127 / HTTP ~400) — classic
+         create-collision when PUT is treated as POST.
+      2) "Different version" / PRECONDITION_FAILED (NSX error_code 500071 /
+         HTTP 412) — optimistic-concurrency rejection because the local
+         payload has a stale `_revision` (or none) vs. the live object's
+         current revision. This happens when re-pushing rules/policies whose
+         parent was just modified earlier in the same run.
+
+    Both conditions mean: object exists, fall back to PATCH.
+    """
     msg = str(e)
+    lower = msg.lower()
     return (
-        "already exists" in msg.lower()
+        "already exists" in lower
         or "500127" in msg
-        or "Cannot create an object" in msg
+        or "cannot create an object" in lower
+        or "500071" in msg
+        or "precondition_failed" in lower
+        or "different version" in lower
     )
 
 

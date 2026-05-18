@@ -174,6 +174,34 @@ python tools/nsx/build_complete_nsx_payload.py \
   --overwrite
 ```
 
+### Optional: strip segment references
+
+If you have DFW-only access on `nsx-lm2` and segments referenced in groups
+will not exist on the target, add `--strip-segments`:
+
+```bash
+python tools/nsx/build_complete_nsx_payload.py \
+  --source-manager-dir nsx_export/nsx-lm1.lab.local \
+  --additive-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
+  --build-dir nsx_build/nsx-lm2.lab.local \
+  --domain-id default \
+  --overwrite \
+  --strip-segments
+```
+
+What it does for each group file in the build's `groups/`:
+
+- Removes `/infra/segments/*` and `/global-infra/segments/*` entries from every `PathExpression.paths` list
+- Drops any `PathExpression` that ends up with no paths
+- Cleans up the adjacent `ConjunctionOperator` (the `OR` joining segments to the static IPAddressExpression) so the expression list stays NSX-valid
+- Writes a `segments_stripped.json` report under `nsx_logs/build_complete_nsx_payload/<ts>/`
+
+Group membership relies on the static `IPAddressExpression` populated in
+step 2 for the live-resolved VM IPs. **Groups whose membership came only
+from segments** (no VMs attached, no other expressions) will end up with
+`expression: []` — check the report for those, they'll match nothing on
+`nsx-lm2`.
+
 Offline file assembly. No NSX calls.
 
 Result:
