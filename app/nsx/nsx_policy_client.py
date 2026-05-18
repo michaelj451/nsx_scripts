@@ -371,6 +371,29 @@ class NsxPolicyClient:
         path = self._fabric_path("/fabric/virtual-machines")
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
+    def update_vm_tags(
+        self,
+        external_id: str,
+        tags: List[Dict[str, str]],
+        *,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        """
+        Replace the tag set on a VM via the NSX fabric API.
+
+        NSX semantics: this POST REPLACES the entire tag set for the given VM.
+        Callers must do read-modify-write — fetch the current tags, mutate the
+        list, then call this with the full intended set.
+
+        Args:
+            external_id: VM external_id (the BIOS UUID from vCenter)
+            tags: full intended tag list, each entry like {"scope": "...", "tag": "..."}
+        """
+        self._require_lm("update_vm_tags")
+        path = self._fabric_path("/fabric/virtual-machines?action=update_tags")
+        payload = {"external_id": external_id, "tags": tags}
+        return self._post(path, payload, timeout=timeout)
+
     def list_vm_vifs(
         self,
         *,
