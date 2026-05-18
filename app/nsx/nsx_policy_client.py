@@ -15,6 +15,8 @@ from nsx.nsx_constants import (
     nsx_gm2,
     nsx_lm1,
     nsx_lm2,
+    nsx_lm3,
+    nsx_lm4,
     nsx_username,
     nsx_password,
 )
@@ -257,6 +259,17 @@ class NsxPolicyClient:
 
     def list_services(self, *, page_size: int = 1000, timeout: int = 60) -> List[Dict[str, Any]]:
         path = self._policy_path("/services")
+        return self._get_all_results(path, page_size=page_size, timeout=timeout)
+
+    def list_segments(self, *, page_size: int = 1000, timeout: int = 60) -> List[Dict[str, Any]]:
+        """
+        List all segments on the manager. Returns full segment objects including
+        subnets, vlan_ids, transport_zone_path, connectivity_path, type, etc.
+
+        Caller may not have permission to read segments (DFW-only roles); the
+        caller is responsible for handling NsxApiError accordingly.
+        """
+        path = self._policy_path("/segments")
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
     def list_security_policies(
