@@ -132,12 +132,23 @@ PYTHONPATH="$PWD/app" python tools/nsx/find_segments_referenced.py \
   --verbose
 ```
 
+To also pull live segment details (subnets, VLAN IDs, transport zone, type, gateway address) from `nsx-lm1`, add `--source-manager`. The live-fetch is wrapped in try/except — if you lack segment-read permission, the tool logs a warning and still produces the path-only inventory:
+
+```bash
+python tools/nsx/find_segments_referenced.py \
+  --export-root nsx_export \
+  --source-manager nsx-lm1 \
+  --output-dir nsx_logs/segment_inventory \
+  --verbose
+```
+
 Outputs:
 
 | File | Purpose |
 |---|---|
-| `segments_inventory.json` | Full report with per-segment references — which rule/group/policy uses each segment, and which field |
-| `segment_paths.txt` | Flat one-path-per-line list, suitable for handing to the network team to confirm presence on `nsx-lm2` |
+| `segments_inventory.json` | Full report with per-segment references — which rule/group/policy uses each segment, and which field. Includes `details` block when `--source-manager` succeeded (subnets, VLANs, TZ path, gateway). |
+| `segment_paths.txt` | Flat one-path-per-line list, suitable for handing to the network team to confirm presence on `nsx-lm2`. |
+| `segment_details.json` | Flat list of fetched segment objects with subnet/VLAN/TZ info. Only written when `--source-manager` succeeds. |
 
 **Note:** Groups that reference segments are largely mitigated by step 2 —
 the live-member resolution already snapshotted resolved VM IPs into a

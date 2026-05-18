@@ -26,9 +26,23 @@ Usage:
     --output-dir nsx_logs/segment_inventory \\
     --verbose
 
+Optionally enrich each segment with its live details (subnets, vlan_ids,
+transport zone, etc.) by querying the source NSX manager. If you don't have
+segment-read permission this call is wrapped in try/except — the tool will
+log a warning and still produce the path inventory:
+
+  python tools/nsx/find_segments_referenced.py \\
+    --export-root nsx_export \\
+    --source-manager nsx-lm1 \\
+    --output-dir nsx_logs/segment_inventory \\
+    --verbose
+
 Outputs:
-  - segments_inventory.json   (full report with per-segment references)
+  - segments_inventory.json   (full report with per-segment references and
+                               optional live details)
   - segment_paths.txt         (flat list, one path per line)
+  - segment_details.json      (flat list of fetched segment objects; only
+                               written when --source-manager succeeds)
 """
 
 from __future__ import annotations
@@ -301,10 +315,107 @@ def aggregate(refs: List[SegmentRef]) -> List[SegmentSummary]:
 # Main analysis
 # =============================================================================
 
+def _fetch_segment_details(
+    source_manager: Optional[str],
+    federation_global: bool,
+    referenced_paths: Set[str],
+    logger: logging.Logger,
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """
+    Try to fetch segment objects from the source manager. Returns
+    (segments_by_path, error_message). On any failure (auth, permission,
+    network, missing module), returns ({}, "reason") so the caller can
+    continue without enrichment.
+    """
+    if not source_manager:
+        return {}, None
+
+    try:
+        from nsx.cli_bootstrap import init_cli
+        from nsx.nsx_constants import resolve_manager
+        from nsx.nsx_policy_client import NsxPolicyClient
+
+        init_cli()
+        manager_host = resolve_manager(source_manager)
+        if not manager_host:
+            return {}, f"Manager not defined for {source_manager}"
+
+        client = NsxPolicyClient(nsxmanager=manager_host, federation_global=federation_global)
+        logger.info("Fetching live segment details from %s (federation_global=%s)",
+                    manager_host, federation_global)
+        all_segments = client.list_segments()
+
+        by_path: Dict[str, Dict[str, Any]] = {}
+        for seg in all_segments:
+            seg_path = seg.get("path") or seg.get("relative_path")
+            if isinstance(seg_path, str):
+                by_path[seg_path] = seg
+            seg_id = seg.get("id")
+            if isinstance(seg_id, str):
+                by_path.setdefault(f"/infra/segments/{seg_id}", seg)
+                by_path.setdefault(f"/global-infra/segments/{seg_id}", seg)
+
+        logger.info("Fetched %d segment object(s) from %s", len(all_segments), source_manager)
+
+        missing = sorted(p for p in referenced_paths if p not in by_path)
+        if missing:
+            logger.warning(
+                "%d referenced segment path(s) were NOT found on %s — these will "
+                "fail when DFW rules referencing them are pushed to a target that "
+                "lacks them.",
+                len(missing),
+                source_manager,
+            )
+            for m in missing:
+                logger.warning("  missing on source: %s", m)
+
+        return by_path, None
+
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "Could not fetch segment details from %s — continuing without "
+            "enrichment. Reason: %s",
+            source_manager,
+            msg,
+        )
+        return {}, msg
+
+
+def _extract_segment_detail(seg: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull the fields that matter for an operator: subnets, VLANs, TZ, etc."""
+    subnets: List[Dict[str, Any]] = []
+    for sn in seg.get("subnets", []) or []:
+        if isinstance(sn, dict):
+            subnets.append({
+                "network": sn.get("network"),
+                "gateway_address": sn.get("gateway_address"),
+                "dhcp_ranges": sn.get("dhcp_ranges"),
+            })
+
+    return {
+        "id": seg.get("id"),
+        "display_name": seg.get("display_name"),
+        "path": seg.get("path"),
+        "type": seg.get("type"),
+        "transport_zone_path": seg.get("transport_zone_path"),
+        "connectivity_path": seg.get("connectivity_path"),
+        "vlan_ids": seg.get("vlan_ids"),
+        "subnets": subnets,
+        "domain_name": seg.get("domain_name"),
+        "replication_mode": seg.get("replication_mode"),
+        "admin_state": seg.get("admin_state"),
+        "advanced_config": seg.get("advanced_config"),
+    }
+
+
 def analyze(
     export_root: Path,
     output_dir: Path,
     logger: logging.Logger,
+    *,
+    source_manager: Optional[str] = None,
+    federation_global: bool = False,
 ) -> int:
     if not export_root.exists():
         logger.error("Export root does not exist: %s", export_root)
@@ -340,6 +451,14 @@ def analyze(
         r.owner_id or "" for r in all_refs if r.owner_type == "group"
     })
 
+    referenced_paths: Set[str] = {s.segment_path for s in summaries}
+    segments_by_path, fetch_error = _fetch_segment_details(
+        source_manager=source_manager,
+        federation_global=federation_global,
+        referenced_paths=referenced_paths,
+        logger=logger,
+    )
+
     report = {
         "scan_root": str(export_root),
         "files_scanned": len(files),
@@ -348,6 +467,9 @@ def analyze(
         "unique_segment_paths": len(summaries),
         "unique_rules_with_segment_refs": len(rules_with_segment_refs),
         "unique_groups_with_segment_refs": len(groups_with_segment_refs),
+        "source_manager": source_manager,
+        "fetch_error": fetch_error,
+        "segments_fetched_from_source": len(segments_by_path) if source_manager else None,
         "segments": [
             {
                 "segment_path": s.segment_path,
@@ -356,6 +478,9 @@ def analyze(
                 "referenced_by_rules": s.referenced_by_rules,
                 "referenced_by_policies": s.referenced_by_policies,
                 "referenced_by_unknown": s.referenced_by_unknown,
+                "details": _extract_segment_detail(segments_by_path[s.segment_path])
+                    if s.segment_path in segments_by_path else None,
+                "found_on_source": s.segment_path in segments_by_path if source_manager else None,
                 "references": s.references,
             }
             for s in summaries
@@ -371,14 +496,33 @@ def analyze(
         encoding="utf-8",
     )
 
+    details_path: Optional[Path] = None
+    if segments_by_path:
+        details_path = output_dir / "segment_details.json"
+        details_payload = [
+            _extract_segment_detail(segments_by_path[p])
+            for p in sorted(referenced_paths) if p in segments_by_path
+        ]
+        details_path.write_text(
+            json.dumps(details_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     logger.info("Files scanned:                  %d", len(files))
     logger.info("Files with segment refs:        %d", files_with_refs)
-    logger.info("Total segment references:      %d", len(all_refs))
-    logger.info("Unique segment paths:          %d", len(summaries))
-    logger.info("Rules with segment refs:       %d", len(rules_with_segment_refs))
-    logger.info("Groups with segment refs:      %d", len(groups_with_segment_refs))
-    logger.info("Inventory written:             %s", inventory_path)
-    logger.info("Flat segment-path list:        %s", flat_list_path)
+    logger.info("Total segment references:       %d", len(all_refs))
+    logger.info("Unique segment paths:           %d", len(summaries))
+    logger.info("Rules with segment refs:        %d", len(rules_with_segment_refs))
+    logger.info("Groups with segment refs:       %d", len(groups_with_segment_refs))
+    if source_manager:
+        if fetch_error:
+            logger.warning("Source-manager fetch failed:    %s", fetch_error)
+        else:
+            logger.info("Segments fetched from source:   %d", len(segments_by_path))
+    logger.info("Inventory written:              %s", inventory_path)
+    logger.info("Flat segment-path list:         %s", flat_list_path)
+    if details_path:
+        logger.info("Segment details written:        %s", details_path)
 
     print("")
     print("Segment inventory complete")
@@ -387,10 +531,17 @@ def analyze(
     print(f"  Total references:        {len(all_refs)}")
     print(f"  Rules referencing segs:  {len(rules_with_segment_refs)}")
     print(f"  Groups referencing segs: {len(groups_with_segment_refs)}")
+    if source_manager:
+        if fetch_error:
+            print(f"  Source fetch:            FAILED ({fetch_error})")
+        else:
+            print(f"  Source fetch:            OK ({len(segments_by_path)} segments)")
     print("")
     print("Files written:")
     print(f"  - {inventory_path}")
     print(f"  - {flat_list_path}")
+    if details_path:
+        print(f"  - {details_path}")
     print("")
 
     return 0
@@ -419,6 +570,22 @@ def parse_args() -> argparse.Namespace:
         help=f"Directory for output (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--source-manager",
+        default=None,
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        help=(
+            "Optional: live NSX manager to fetch segment details from "
+            "(subnets, VLANs, transport zone, etc.). If the call fails "
+            "(no access, network, etc.) the tool still produces the path "
+            "inventory."
+        ),
+    )
+    parser.add_argument(
+        "--federation-global",
+        action="store_true",
+        help="Treat --source-manager as a Global Manager (/global-infra).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose console logging",
@@ -433,13 +600,17 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
 
     logger = setup_logging(output_dir=output_dir, verbose=args.verbose)
-    logger.info("Export root:  %s", export_root)
-    logger.info("Output dir:   %s", output_dir)
+    logger.info("Export root:        %s", export_root)
+    logger.info("Output dir:         %s", output_dir)
+    logger.info("Source manager:     %s", args.source_manager or "(none — path inventory only)")
+    logger.info("Federation global:  %s", args.federation_global)
 
     return analyze(
         export_root=export_root,
         output_dir=output_dir,
         logger=logger,
+        source_manager=args.source_manager,
+        federation_global=args.federation_global,
     )
 
 
