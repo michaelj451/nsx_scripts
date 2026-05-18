@@ -121,7 +121,7 @@ def _setup_logging() -> tuple[logging.Logger, Path]:
     for h in list(logger.handlers):
         logger.removeHandler(h)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%dT%H:%M:%S UTC")
 
     fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     fh.setLevel(logging.INFO)

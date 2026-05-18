@@ -94,7 +94,7 @@ def setup_logging(output_dir: Path, verbose: bool = False) -> logging.Logger:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
 
     fh = logging.FileHandler(log_path, encoding="utf-8")

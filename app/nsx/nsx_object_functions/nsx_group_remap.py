@@ -8,7 +8,7 @@ import json
 import re
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple, Iterable
 
@@ -70,7 +70,7 @@ def _changes_path() -> Path:
 def _write_change_record(record: dict) -> None:
     p = _changes_path()
     record = dict(record)
-    record.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+    record.setdefault("ts", datetime.now(timezone.utc).isoformat())
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

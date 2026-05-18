@@ -106,7 +106,7 @@ def setup_logging(verbose: bool) -> None:
     for h in list(root.handlers):
         root.removeHandler(h)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%dT%H:%M:%S UTC")
 
     fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     fh.setFormatter(fmt)

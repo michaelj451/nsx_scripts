@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
@@ -45,7 +45,7 @@ def setup_logging() -> tuple[Path, Path]:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
 
     ch = logging.StreamHandler()
@@ -260,7 +260,7 @@ def main() -> None:
 
     result = {
         "command": "build_complete_nsx_payload",
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "source_manager_dir": str(source_manager_dir),
         "source_domain_dir": str(source_domain_dir),
         "additive_groups_dir": str(additive_groups_dir),
