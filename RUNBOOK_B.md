@@ -222,7 +222,20 @@ nsx-lm1 (live, updated)
 
 ## Rollback
 
-Revert `nsx-lm1` from the step B.1 snapshot:
+Revert `nsx-lm1` from the step B.1 snapshot using the groups-only revert
+script. It PATCHes each group's payload back to the snapshot state — which
+for Workflow B undoes the additive IPs added in B.2 + B.3.
+
+Dry-run preview first:
+
+```bash
+python tools/nsx/push_nsx_groups_revert.py \
+  --target nsx-lm1 \
+  --export-root nsx_export/nsx-lm1.lab.local \
+  --domain-id default
+```
+
+Then apply:
 
 ```bash
 python tools/nsx/push_nsx_groups_revert.py \
@@ -231,3 +244,7 @@ python tools/nsx/push_nsx_groups_revert.py \
   --domain-id default \
   --apply
 ```
+
+> Workflow B only writes groups (PATCH), so the groups-only revert is the
+> complete rollback. Use `push_complete_nsx_revert.py` instead if you ever
+> push services/policies/rules — see Runbook A.

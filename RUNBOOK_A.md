@@ -390,12 +390,36 @@ python tools/nsx/push_complete_nsx_payload.py \
 ## Rollback
 
 `nsx-lm2`'s pre-change state is captured at `nsx_export/nsx-lm2.lab.local/`
-in step 1. If a revert is needed:
+in step 1. Use `push_complete_nsx_revert.py` — the full-stack counterpart
+to `push_complete_nsx_payload.py`. It deletes any policies, groups, and
+(optionally) services that exist on the target but are **not** in the
+snapshot, in the correct dependency order (policies → groups → services).
+NSX system-owned objects (default-layer sections, ServiceInsertion_NSGroup,
+etc.) are always preserved.
+
+Dry-run preview first:
 
 ```bash
-python tools/nsx/push_nsx_groups_revert.py \
+PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
+  --target nsx-lm2 \
+  --export-root nsx_export/nsx-lm2.lab.local \
+  --domain-id default
+```
+
+Then apply:
+
+```bash
+PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
   --export-root nsx_export/nsx-lm2.lab.local \
   --domain-id default \
   --apply
 ```
+
+Add `--include-services` if the push step added new services (the default
+push tool only PATCHes existing services, so this is rarely needed).
+
+> **Why not `push_nsx_groups_revert.py`?** That script is groups-only and
+> can't delete groups that are still referenced by the policies/rules from
+> a Workflow-A push. It's the correct tool for Runbook B's groups-only
+> rollback. Use `push_complete_nsx_revert.py` here.

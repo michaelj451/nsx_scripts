@@ -7,11 +7,25 @@ Reads group files from an export directory and PATCHes them back to the
 target manager. Credentials and manager hostnames come from .env via
 nsx_constants / cli_bootstrap — no username/password CLI args needed.
 
+Scope:
+  This is a **groups-only** revert. It restores each group's payload
+  (membership / IP list / expression) from the snapshot via PATCH. It does
+  NOT touch security policies, rules, or services.
+
+When to use:
+  Workflow B (in-place CSV remap on the same manager). The push step only
+  PATCHed groups, so reverting groups is the complete rollback.
+
+For Workflow A (the clone push, which writes services + groups + policies +
+rules to a new manager), use `push_complete_nsx_revert.py` instead — the
+groups-only revert here cannot delete groups that are still referenced by
+policies/rules from a Workflow-A push.
+
 Usage (dry-run):
-  python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local
+  python tools/nsx/push_nsx_groups_revert.py --target nsx-lm1 --export-root nsx_export/nsx-lm1.lab.local
 
 Usage (apply):
-  python tools/nsx/push_nsx_groups_revert.py --target nsx-gm2 --export-root nsx_export/nsx-gm2.lab.local --apply
+  python tools/nsx/push_nsx_groups_revert.py --target nsx-lm1 --export-root nsx_export/nsx-lm1.lab.local --apply
 """
 from __future__ import annotations
 
@@ -503,9 +517,14 @@ def rollback_groups(
     run_ts: str,
 ) -> None:
     desired = load_desired_groups(export_root, domain_id)
-    if not desired:
+    if not desired and not delete_extraneous:
         log.warning("No desired groups found in export set — nothing to do.")
         return
+    if not desired and delete_extraneous:
+        log.warning(
+            "No desired groups in export set, but --delete-extraneous is set. "
+            "Every group currently on the target will be considered extraneous."
+        )
 
     existing_groups = client.list_groups(domain_id)
     existing = {g["id"]: g for g in existing_groups if "id" in g}
@@ -515,9 +534,29 @@ def rollback_groups(
 
     to_create = sorted(desired_ids - existing_ids)
     to_update = sorted(desired_ids & existing_ids)
-    to_delete = sorted(existing_ids - desired_ids)
+    to_delete_all = sorted(existing_ids - desired_ids)
+
+    # Never delete NSX system-owned groups (ServiceInsertion_NSGroup,
+    # SystemVM_NSGroup, Edge_NSGroup, etc.). The exporter excludes these
+    # from snapshots, so they'll always appear "extraneous" — but they're
+    # platform-managed and must remain untouched.
+    system_owned_skipped: List[str] = []
+    to_delete: List[str] = []
+    for gid in to_delete_all:
+        live = existing.get(gid, {})
+        if live.get("_system_owned") is True:
+            system_owned_skipped.append(gid)
+            log.info(
+                "Skipping delete of system-owned group: id=%s display_name=%s",
+                gid,
+                live.get("display_name") or gid,
+            )
+            continue
+        to_delete.append(gid)
 
     log.info("Rollback summary for domain '%s':", domain_id)
+    if system_owned_skipped:
+        log.info("  system-owned   : %d (kept, never deleted)", len(system_owned_skipped))
     log.info("  desired groups : %d", len(desired_ids))
     log.info("  existing groups: %d", len(existing_ids))
     log.info("  create (new)   : %d", len(to_create))

@@ -42,7 +42,8 @@ Two distinct operations are supported, each with its own runbook:
 | `push_complete_nsx_payload.py` | Push the build dir to a target LM. Dry-run by default. Handles services + groups + policies + rules |
 | `push_additive_group_ips.py` | Groups-only PATCH push. Used by Runbook B. Dry-run by default |
 | `validate_nsx_groups_live.py` | Read-only diff of live NSX groups vs a prepared payload |
-| `push_nsx_groups_revert.py` | Rollback — PATCH groups back to a saved export snapshot |
+| `push_nsx_groups_revert.py` | **Runbook B rollback** — PATCH groups back to a saved export snapshot (groups-only) |
+| `push_complete_nsx_revert.py` | **Runbook A rollback** — full-stack delete-extraneous (policies → groups → optional services) |
 
 ### App library — `app/nsx/`
 
