@@ -21,6 +21,8 @@ nsx_groups_remapped/
 nsx_groups_transformed/
 nsx_export_verify/
 
+# VM Tag Logs
+nsx_vm_files/
 
 # # Palo Alto Networks Panorama configuration exports
 # modified-config.xml

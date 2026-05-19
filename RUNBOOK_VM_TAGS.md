@@ -60,7 +60,7 @@ pre-change report. Makes no NSX writes.
 ```bash
 python tools/vm_tags/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
-  --output-dir vm_tags_plan/nsx-lm1.lab.local \
+  --output-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
 ```
 
@@ -90,7 +90,7 @@ flow (so the export is reused across runs / fed into reports), use:
 ```bash
 python tools/vm_tags/export_vm_tags.py \
   --manager nsx-lm1 \
-  --base-dir vm_tags_export
+  --base-dir nsx_vm_logs/vm_tags_export
 ```
 
 Output: `vm_tags_export/<host>/vms.json`
@@ -99,8 +99,8 @@ Output: `vm_tags_export/<host>/vms.json`
 
 ```bash
 python tools/vm_tags/build_hostname_tag_plan.py \
-  --vm-export vm_tags_export/nsx-lm1.lab.local/vms.json \
-  --output-dir vm_tags_plan/nsx-lm1.lab.local \
+  --vm-export nsx_vm_logs/vm_tags_export/nsx-lm1.lab.local/vms.json \
+  --output-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
 ```
 
@@ -116,7 +116,7 @@ what would be PATCHed for each eligible VM.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 \
-  --plan-dir vm_tags_plan/nsx-lm1.lab.local
+  --plan-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local
 ```
 
 Dry-run is the default — no `--apply` flag means no NSX writes.
@@ -131,7 +131,7 @@ A dry-run manifest is written to:
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 \
-  --plan-dir vm_tags_plan/nsx-lm1.lab.local \
+  --plan-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local \
   --apply
 ```
 
@@ -156,7 +156,7 @@ now carries the expected hostname tag.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/validate_hostname_tags.py \
   --manager nsx-lm1 \
-  --plan-dir vm_tags_plan/nsx-lm1.lab.local
+  --plan-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local
 ```
 
 Buckets in the report: `match`, `mismatch_wrong_value`,

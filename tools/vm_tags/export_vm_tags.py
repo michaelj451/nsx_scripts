@@ -63,8 +63,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-dir",
-        default="vm_tags_export",
-        help="Output root (default: vm_tags_export).",
+        default=None,
+        help="Output root (default: <NSX_VM_LOG_DIR>/vm_tags_export).",
     )
     args = parser.parse_args()
 
@@ -80,7 +80,8 @@ def main() -> None:
     vms = client.list_virtual_machines()
     log.info("Total VMs: %d", len(vms))
 
-    base = Path(args.base_dir).expanduser().resolve() / manager_host
+    base_dir = args.base_dir or str(Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_export")
+    base = Path(base_dir).expanduser().resolve() / manager_host
     base.mkdir(parents=True, exist_ok=True)
     out = base / "vms.json"
 

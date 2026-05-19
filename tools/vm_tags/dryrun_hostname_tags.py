@@ -80,7 +80,11 @@ def main() -> None:
         required=True,
         help="NSX Local Manager to query.",
     )
-    parser.add_argument("--output-dir", required=True, help="Where to write the classification reports.")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Where to write the classification reports (default: <NSX_VM_LOG_DIR>/vm_tags_plan/<manager-host>).",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Delete --output-dir before writing.")
     args = parser.parse_args()
 
@@ -91,7 +95,10 @@ def main() -> None:
     if not manager_host:
         raise SystemExit(f"Manager not defined for {args.manager}.")
 
-    out_dir = Path(args.output_dir).expanduser().resolve()
+    if args.output_dir:
+        out_dir = Path(args.output_dir).expanduser().resolve()
+    else:
+        out_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(f"Output dir already exists: {out_dir}. Use --overwrite.")

@@ -157,7 +157,11 @@ def main() -> None:
         description="Build the hostname-tag plan from a VM export. Offline; no NSX writes."
     )
     parser.add_argument("--vm-export", required=True, help="Path to vms.json from export_vm_tags.py")
-    parser.add_argument("--output-dir", required=True, help="Where to write the plan JSON files")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Where to write the plan JSON files (default: <NSX_VM_LOG_DIR>/vm_tags_plan/<manager-host>, derived from the export).",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Delete --output-dir before writing")
     args = parser.parse_args()
 
@@ -168,7 +172,13 @@ def main() -> None:
     if not src.exists():
         raise SystemExit(f"VM export not found: {src}")
 
-    out_dir = Path(args.output_dir).expanduser().resolve()
+    if args.output_dir:
+        out_dir = Path(args.output_dir).expanduser().resolve()
+    else:
+        # Derive default from manager_host inside the export payload
+        peek = json.loads(src.read_text(encoding="utf-8"))
+        manager_host = peek.get("manager_host") or "unknown-manager"
+        out_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(f"Output dir already exists: {out_dir}. Use --overwrite.")
