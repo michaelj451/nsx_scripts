@@ -8,7 +8,7 @@ import json
 import re
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple, Iterable
 
@@ -27,9 +27,18 @@ LOG_FILE_NAME = "nsx_group_remap.log"
 CHANGES_FILE_NAME = "nsx_group_remap_changes.jsonl"
 
 
+def _resolve_log_dir() -> Path:
+    """Honor NSX_LOG_DIR env var; fall back to repo-relative nsx_logs."""
+    import os
+    env = os.getenv("NSX_LOG_DIR")
+    if env:
+        return Path(os.path.expandvars(os.path.expanduser(env))).resolve()
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / LOG_DIR_NAME
+
+
 def setup_logging() -> logging.Logger:
-    repo_root = Path(__file__).resolve().parents[3]  # .../app/nsx/nsx_object_functions -> repo root
-    log_dir = repo_root / LOG_DIR_NAME
+    log_dir = _resolve_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / LOG_FILE_NAME
 
@@ -61,8 +70,7 @@ logger = setup_logging()
 
 
 def _changes_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[3]
-    p = repo_root / LOG_DIR_NAME / CHANGES_FILE_NAME
+    p = _resolve_log_dir() / CHANGES_FILE_NAME
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -70,7 +78,7 @@ def _changes_path() -> Path:
 def _write_change_record(record: dict) -> None:
     p = _changes_path()
     record = dict(record)
-    record.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+    record.setdefault("ts", datetime.now(timezone.utc).isoformat())
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

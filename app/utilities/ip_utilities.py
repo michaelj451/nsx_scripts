@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # app/utilities/ip_utilities.py
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import random
 import string
@@ -11,9 +11,7 @@ import ipaddress
 
 
 def get_iso_zulu_time():
-    timestamp = datetime.utcnow().isoformat()
-    # return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    return timestamp
+    return datetime.now(timezone.utc).isoformat()
 
 def generate_random_string(stringLength=5):
             

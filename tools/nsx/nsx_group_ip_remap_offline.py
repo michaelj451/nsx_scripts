@@ -71,7 +71,7 @@ def _setup_logging(tool_name: str) -> Path:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
 
     ch = logging.StreamHandler()

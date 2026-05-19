@@ -6,12 +6,13 @@ policies, rules) between Local Managers. Built for operators with **DFW
 access only** — no networking/segments permission required for the push
 target.
 
-Two distinct operations are supported, each with its own runbook:
+Three distinct operations are supported, each with its own runbook:
 
 | Operation | Source | Target | Scope | Runbook |
 |---|---|---|---|---|
 | **Clone** — stand up a new LM with the same DFW config | `nsx-lm1` (live) | `nsx-lm2` (new) | Services + groups + policies + rules | [RUNBOOK_A.md](RUNBOOK_A.md) |
 | **Subnet remap in place** — rewrite group IPs on a single LM using a CSV mapping | `nsx-lm1` | `nsx-lm1` | Groups only (PATCH) | [RUNBOOK_B.md](RUNBOOK_B.md) |
+| **VM hostname tagging** — give every regular VM an NSX tag matching its trailing digits | `nsx-lm1` | `nsx-lm1` | VM tags only (append, never replace) | [RUNBOOK_VM_TAGS.md](RUNBOOK_VM_TAGS.md) |
 
 ---
 
@@ -44,6 +45,12 @@ Two distinct operations are supported, each with its own runbook:
 | `validate_nsx_groups_live.py` | Read-only diff of live NSX groups vs a prepared payload |
 | `push_nsx_groups_revert.py` | **Runbook B rollback** — PATCH groups back to a saved export snapshot (groups-only) |
 | `push_complete_nsx_revert.py` | **Runbook A rollback** — full-stack delete-extraneous (policies → groups → optional services) |
+| `tools/vm_tags/export_vm_tags.py` | **VM tags** — snapshot every VM's current tag set from the NSX fabric API |
+| `tools/vm_tags/build_hostname_tag_plan.py` | **VM tags** — offline classifier; produces eligible / skip_has_tag / skip_invalid_name / skip_edge / skip_other_type buckets |
+| `tools/vm_tags/dryrun_hostname_tags.py` | **VM tags** — single-command export + classify with flagging report |
+| `tools/vm_tags/push_hostname_tags.py` | **VM tags** — append hostname tag to eligible VMs; read-modify-write, never removes |
+| `tools/vm_tags/validate_hostname_tags.py` | **VM tags** — read-only validation against the plan |
+| `tools/vm_tags/revert_hostname_tags.py` | **VM tags rollback** — un-assign exactly the hostname tags this push added, per manifest |
 
 ### App library — `app/nsx/`
 

@@ -53,7 +53,7 @@ import json
 import logging
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -92,7 +92,7 @@ def setup_logging() -> Tuple[Path, Path]:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
@@ -569,7 +569,7 @@ def main() -> None:
 
     report_payload = {
         "command": "transform_group_segments",
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": args.mode,
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),

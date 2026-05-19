@@ -62,8 +62,20 @@ except ImportError as e:
 
 
 DEFAULT_EXPORT_ROOT = "nsx_export"
-DEFAULT_OUTPUT_DIR = "nsx_logs/segment_inventory"
 LOG_FILE_NAME = "find_segments_referenced.log"
+
+
+def _default_output_dir() -> str:
+    """Resolve the default output dir from NSX_LOG_DIR at runtime."""
+    try:
+        from nsx.nsx_constants import nsx_log_dir
+    except Exception:
+        nsx_log_dir = None
+    base = nsx_log_dir or "nsx_logs"
+    return str(Path(base) / "segment_inventory")
+
+
+DEFAULT_OUTPUT_DIR = "<NSX_LOG_DIR>/segment_inventory"
 
 # Matches /infra/segments/<id> and /global-infra/segments/<id> exactly.
 # Trailing /ports/... or other sub-resources are treated as the parent segment.
@@ -94,7 +106,7 @@ def setup_logging(output_dir: Path, verbose: bool = False) -> logging.Logger:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -566,8 +578,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Directory for output (default: {DEFAULT_OUTPUT_DIR})",
+        default=None,
+        help=f"Directory for output (default: {DEFAULT_OUTPUT_DIR}, resolved from NSX_LOG_DIR at runtime)",
     )
     parser.add_argument(
         "--source-manager",
@@ -596,8 +608,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    # Load .env so NSX_LOG_DIR is available for the default resolver
+    try:
+        from nsx.cli_bootstrap import init_cli
+        init_cli()
+    except Exception:
+        pass
+
     export_root = Path(args.export_root).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir or _default_output_dir()).expanduser().resolve()
 
     logger = setup_logging(output_dir=output_dir, verbose=args.verbose)
     logger.info("Export root:        %s", export_root)

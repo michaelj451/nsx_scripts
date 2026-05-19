@@ -94,7 +94,7 @@ def setup_logging(verbose: bool) -> Path:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
     fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     fh.setFormatter(fmt)

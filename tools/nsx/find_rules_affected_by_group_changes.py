@@ -37,8 +37,21 @@ python tools/nsx/find_rules_affected_by_group_changes.py \
 
 DEFAULT_ADDITIVE_ROOT = "nsx_groups_additive"
 DEFAULT_EXPORT_ROOT = "nsx_export"
-DEFAULT_OUTPUT_DIR = "nsx_logs/affected_rule_reports"
 LOG_FILE_NAME = "find_rules_affected_by_group_changes.log"
+
+
+def _default_output_dir() -> str:
+    """Resolve the default output dir from NSX_LOG_DIR at runtime, not at import."""
+    try:
+        from nsx.nsx_constants import nsx_log_dir
+    except Exception:
+        nsx_log_dir = None
+    base = nsx_log_dir or "nsx_logs"
+    return str(Path(base) / "affected_rule_reports")
+
+
+# Kept as a sentinel for help text; actual default resolved in parse_args via _default_output_dir().
+DEFAULT_OUTPUT_DIR = "<NSX_LOG_DIR>/affected_rule_reports"
 
 
 # =============================================================================
@@ -56,7 +69,7 @@ def setup_logging(output_dir: Path, verbose: bool = False) -> logging.Logger:
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S UTC",
     )
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -820,8 +833,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Directory for JSONL output (default: {DEFAULT_OUTPUT_DIR})",
+        default=None,
+        help=f"Directory for JSONL output (default: {DEFAULT_OUTPUT_DIR}, resolved from NSX_LOG_DIR at runtime)",
     )
     parser.add_argument(
         "--federation-global",
@@ -839,9 +852,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    # Load .env so NSX_LOG_DIR is available for the default resolver
+    try:
+        from nsx.cli_bootstrap import init_cli
+        init_cli()
+    except Exception:
+        pass
+
     additive_root = Path(args.additive_root).expanduser().resolve()
     export_root = Path(args.export_root).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir or _default_output_dir()).expanduser().resolve()
 
     logger = setup_logging(output_dir=output_dir, verbose=args.verbose)
     logger.info("Additive root:      %s", additive_root)
