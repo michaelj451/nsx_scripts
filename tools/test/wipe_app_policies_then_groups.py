@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 import time
+from typing import List, Optional
 
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_constants import nsx_gm1
@@ -31,6 +32,7 @@ def confirm_apply(
     target: str,
     domain_id: str,
     federation_global: bool,
+    categories: Optional[List[str]],
     include_services: bool,
 ) -> None:
     """
@@ -42,9 +44,14 @@ def confirm_apply(
     print(f"Target            : {target}")
     print(f"Domain            : {domain_id}")
     print(f"Federation Global : {federation_global}")
+    print(f"Policy categories : {sorted({c.lower() for c in categories}) if categories else 'ALL'}")
     print(f"Include services  : {include_services}")
     print()
-    scope = "ALL Application security policies and ALL non-system groups"
+    cat_label = (
+        "in categories " + ", ".join(sorted({c.lower() for c in categories}))
+        if categories else "in ALL categories"
+    )
+    scope = f"ALL security policies {cat_label} and ALL non-system groups"
     if include_services:
         scope += " and ALL non-system services"
     print(f"This will delete {scope} visible to this scope.")
@@ -58,11 +65,22 @@ def confirm_apply(
         raise SystemExit(2)
 
 
-def get_application_policies(client: NsxPolicyClient, domain_id: str):
+def get_policies_in_scope(
+    client: NsxPolicyClient,
+    domain_id: str,
+    categories: Optional[List[str]] = None,
+):
+    """
+    Return policies in scope. If `categories` is None or empty → all
+    categories. Otherwise restrict to the given (case-insensitive) names.
+    """
     policies = client.list_security_policies(domain_id=domain_id)
+    if not categories:
+        return policies
+    wanted = {c.strip().lower() for c in categories if c.strip()}
     return [
         p for p in policies
-        if (p.get("category") or "").strip().lower() == "application"
+        if (p.get("category") or "").strip().lower() in wanted
     ]
 
 
@@ -70,14 +88,16 @@ def get_groups(client: NsxPolicyClient, domain_id: str):
     return client.list_groups(domain_id=domain_id)
 
 
-def wipe_application_policies(
+def wipe_policies(
     client: NsxPolicyClient,
     domain_id: str,
+    categories: Optional[List[str]],
     apply: bool,
 ) -> tuple[int, int]:
-    policies = get_application_policies(client, domain_id)
+    policies = get_policies_in_scope(client, domain_id, categories)
 
-    LOG.info("Application policies found: %s", len(policies))
+    scope_label = f"in categories {sorted({c.lower() for c in categories})}" if categories else "in ALL categories"
+    LOG.info("Policies found %s: %s", scope_label, len(policies))
 
     deleted = 0
     failed = 0
@@ -208,18 +228,23 @@ def wipe_custom_services(
 def verify_remaining(
     client: NsxPolicyClient,
     domain_id: str,
+    categories: Optional[List[str]],
     include_services: bool,
 ) -> tuple[list, list, list]:
-    remaining_policies = get_application_policies(client, domain_id)
+    remaining_policies = get_policies_in_scope(client, domain_id, categories)
     remaining_groups = [g for g in get_groups(client, domain_id) if not _is_system_owned(g)]
     remaining_services: list = []
     if include_services:
         remaining_services = [s for s in get_services(client) if not _is_system_owned(s)]
 
-    LOG.warning("VERIFY remaining Application policies : %s", len(remaining_policies))
-    LOG.warning("VERIFY remaining non-system groups    : %s", len(remaining_groups))
+    scope_label = (
+        f"in categories {sorted({c.lower() for c in categories})}"
+        if categories else "in ALL categories"
+    )
+    LOG.warning("VERIFY remaining policies %s: %s", scope_label, len(remaining_policies))
+    LOG.warning("VERIFY remaining non-system groups: %s", len(remaining_groups))
     if include_services:
-        LOG.warning("VERIFY remaining non-system services  : %s", len(remaining_services))
+        LOG.warning("VERIFY remaining non-system services: %s", len(remaining_services))
 
     if remaining_policies:
         LOG.warning("Sample remaining policies: %s",
@@ -237,10 +262,10 @@ def verify_remaining(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Delete all Application security policies, then all non-system "
-            "groups, then optionally all non-system services. System-owned "
-            "objects are always preserved. Supports both Local Manager and "
-            "Global Manager (set --federation-global for GM)."
+            "Delete security policies (all categories by default), then all "
+            "non-system groups, then optionally all non-system services. "
+            "System-owned objects are always preserved. Supports both Local "
+            "Manager and Global Manager (set --federation-global for GM)."
         )
     )
     p.add_argument(
@@ -253,6 +278,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--federation-global",
         action="store_true",
         help="Use the Global Manager API surface (/global-infra/...). Required when --target points at a GM.",
+    )
+    p.add_argument(
+        "--policy-categories",
+        default=None,
+        help=(
+            "Comma-separated list of policy categories to wipe "
+            "(e.g. Application,Infrastructure,Environment,Emergency,Ethernet). "
+            "Default: ALL categories. Case-insensitive."
+        ),
     )
     p.add_argument(
         "--include-services",
@@ -286,9 +320,14 @@ def main() -> int:
     args = build_parser().parse_args()
     setup_logging(args.verbose)
 
+    categories: Optional[List[str]] = None
+    if args.policy_categories:
+        categories = [c for c in args.policy_categories.split(",") if c.strip()]
+
     LOG.warning("TARGET            : %s", args.target)
     LOG.warning("DOMAIN            : %s", args.domain_id)
     LOG.warning("FEDERATION GLOBAL : %s", args.federation_global)
+    LOG.warning("POLICY CATEGORIES : %s", sorted({c.lower() for c in categories}) if categories else "ALL")
     LOG.warning("INCLUDE SERVICES  : %s", args.include_services)
     LOG.warning("MODE              : %s", "APPLY" if args.apply else "DRY RUN")
 
@@ -297,6 +336,7 @@ def main() -> int:
             target=args.target,
             domain_id=args.domain_id,
             federation_global=args.federation_global,
+            categories=categories,
             include_services=args.include_services,
         )
 
@@ -306,9 +346,10 @@ def main() -> int:
     )
 
     # 1. Policies first — removes the references that pin groups in place
-    deleted_policies, failed_policies = wipe_application_policies(
+    deleted_policies, failed_policies = wipe_policies(
         client=client,
         domain_id=args.domain_id,
+        categories=categories,
         apply=args.apply,
     )
 
@@ -339,6 +380,7 @@ def main() -> int:
     remaining_policies, remaining_groups, remaining_services = verify_remaining(
         client=client,
         domain_id=args.domain_id,
+        categories=categories,
         include_services=args.include_services,
     )
 
