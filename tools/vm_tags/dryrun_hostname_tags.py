@@ -39,7 +39,7 @@ from nsx.nsx_policy_client import NsxPolicyClient
 
 # Re-use the classifier from build_hostname_tag_plan.py to avoid duplication.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_hostname_tag_plan import classify_vm  # type: ignore
+from build_hostname_tag_plan import classify_vm, write_tag_inventory_jsonl  # type: ignore
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -96,9 +96,13 @@ def main() -> None:
         raise SystemExit(f"Manager not defined for {args.manager}.")
 
     if args.output_dir:
-        out_dir = Path(args.output_dir).expanduser().resolve()
+        host_dir = Path(args.output_dir).expanduser().resolve()
     else:
-        out_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
+        host_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
+
+    # Per-run timestamped subdir so successive runs accumulate instead of
+    # overwriting each other.
+    out_dir = host_dir / RUN_TS
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(f"Output dir already exists: {out_dir}. Use --overwrite.")
@@ -129,6 +133,11 @@ def main() -> None:
         )
         log.info("  %s: %d VM(s)", key, len(rows))
 
+    # Per-VM tag inventory (every VM, regardless of classification)
+    inv_path = out_dir / "vm_tag_inventory.jsonl"
+    inv_count = write_tag_inventory_jsonl(vms, inv_path)
+    log.info("  vm_tag_inventory: %d row(s) -> %s", inv_count, inv_path)
+
     flagged = (
         len(buckets["skip_has_tag"])
         + len(buckets["skip_invalid_name"])
@@ -142,6 +151,7 @@ def main() -> None:
         "vm_count_total": len(vms),
         "counts": {k: len(v) for k, v in buckets.items()},
         "flagged_for_review": flagged,
+        "vm_tag_inventory": str(inv_path),
         "output_dir": str(out_dir),
         "log_file": str(log_file),
     }

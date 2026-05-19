@@ -60,11 +60,18 @@ pre-change report. Makes no NSX writes.
 ```bash
 python tools/vm_tags/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
-  --output-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local \
+  --output-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
 ```
 
-Outputs under `vm_tags_plan/<host>/`:
+Outputs under `vm_tags_plan/<host>/<TIMESTAMP>/` — each run gets its own
+timestamped subdir so successive runs accumulate side-by-side instead of
+overwriting each other. The timestamp format is `YYYYMMDD_HHMMSS` (UTC).
+`push` and `validate` auto-pick the latest timestamped subdir when you
+point them at the host-level dir; pass an explicit timestamped path if
+you need a specific historical run.
+
+Per-run output files:
 
 | File | Purpose |
 |---|---|
@@ -74,9 +81,28 @@ Outputs under `vm_tags_plan/<host>/`:
 | `skip_invalid_name.json` | Operator review — name lacks 3–6 trailing digits |
 | `skip_edge.json` | NSX Edge VMs (always skipped) |
 | `skip_other_type.json` | Other non-REGULAR types (vCLS, NSX manager appliances, etc.) |
+| `vm_tag_inventory.jsonl` | Per-VM tag inventory — one JSON object per line for EVERY VM (regardless of classification), with `display_name`, `external_id`, `type`, `tag_count`, and full `tags` list. Good for ad-hoc `grep` / `jq` queries. |
 
 The `flagged_for_review` count in the printed summary tells you whether
 any VM needs operator attention before pushing.
+
+### Sample queries against `vm_tag_inventory.jsonl`
+
+```bash
+# How many tags does each VM have, sorted descending?
+jq -r '.display_name + "\t" + (.tag_count|tostring)' \
+  nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local/vm_tag_inventory.jsonl \
+  | sort -k2 -n -r
+
+# Which VMs carry a tag with scope 'env'?
+jq -c 'select(.tags[]?.scope == "env") | {display_name, tags}' \
+  nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local/vm_tag_inventory.jsonl
+
+# All distinct (scope, tag) pairs in use across the manager
+jq -r '.tags[] | [.scope, .tag] | @tsv' \
+  nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local/vm_tag_inventory.jsonl \
+  | sort -u
+```
 
 ---
 
@@ -90,7 +116,7 @@ flow (so the export is reused across runs / fed into reports), use:
 ```bash
 python tools/vm_tags/export_vm_tags.py \
   --manager nsx-lm1 \
-  --base-dir nsx_vm_logs/vm_tags_export
+  --base-dir nsx_vm_files/vm_tags_export
 ```
 
 Output: `vm_tags_export/<host>/vms.json`
@@ -99,12 +125,12 @@ Output: `vm_tags_export/<host>/vms.json`
 
 ```bash
 python tools/vm_tags/build_hostname_tag_plan.py \
-  --vm-export nsx_vm_logs/vm_tags_export/nsx-lm1.lab.local/vms.json \
-  --output-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local \
+  --vm-export nsx_vm_files/vm_tags_export/nsx-lm1.lab.local/vms.json \
+  --output-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
 ```
 
-Same `vm_tags_plan/<host>/` outputs as step 1.
+Same `vm_tags_plan/<host>/<TIMESTAMP>/` outputs as step 1 (each invocation gets its own timestamped subdir).
 
 ---
 
@@ -116,13 +142,13 @@ what would be PATCHed for each eligible VM.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 \
-  --plan-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local
+  --plan-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local
 ```
 
 Dry-run is the default — no `--apply` flag means no NSX writes.
 
 A dry-run manifest is written to:
-`nsx_vm_logs/vm_tags_manifests/<host>/<TS>_dryrun.json`
+`nsx_vm_files/vm_tags_manifests/<host>/<TS>_dryrun.json`
 
 ---
 
@@ -131,7 +157,7 @@ A dry-run manifest is written to:
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 \
-  --plan-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local \
+  --plan-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --apply
 ```
 
@@ -142,7 +168,7 @@ For each eligible VM:
 3. Append `{"scope": "hostname", "tag": "<digits>"}` to the existing tag list
 4. POST the FULL combined list back via the fabric `update_tags` action
 
-The apply manifest is written to `nsx_vm_logs/vm_tags_manifests/<host>/<TS>_apply.json`
+The apply manifest is written to `nsx_vm_files/vm_tags_manifests/<host>/<TS>_apply.json`
 with the exact (external_id, hostname_value) pairs that were added.
 **Keep this file** — it's the input to revert.
 
@@ -156,7 +182,7 @@ now carries the expected hostname tag.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/validate_hostname_tags.py \
   --manager nsx-lm1 \
-  --plan-dir nsx_vm_logs/vm_tags_plan/nsx-lm1.lab.local
+  --plan-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local
 ```
 
 Buckets in the report: `match`, `mismatch_wrong_value`,
@@ -176,11 +202,11 @@ preserved.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest nsx_vm_logs/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
+  --manifest nsx_vm_files/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
 ```
 
 A revert dry-run audit is written to
-`nsx_vm_logs/vm_tags_manifests/<host>/<TS>_revert_dryrun.json`.
+`nsx_vm_files/vm_tags_manifests/<host>/<TS>_revert_dryrun.json`.
 
 ---
 
@@ -189,7 +215,7 @@ A revert dry-run audit is written to
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest nsx_vm_logs/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
+  --manifest nsx_vm_files/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
   --apply
 ```
 
@@ -202,7 +228,7 @@ For each manifest entry with `status=success`:
 4. POST that list back via `update_tags`
 
 A revert apply audit is written to
-`nsx_vm_logs/vm_tags_manifests/<host>/<TS>_revert_apply.json`.
+`nsx_vm_files/vm_tags_manifests/<host>/<TS>_revert_apply.json`.
 
 ---
 
@@ -213,23 +239,26 @@ nsx-lm1 fabric (live VM tags)
         │
         │  1) dryrun_hostname_tags.py  (OR  2a) export + 2b) build-plan)
         ▼
-vm_tags_plan/<host>/
+vm_tags_plan/<host>/<TIMESTAMP>/
   ├── eligible.json
   ├── skip_has_tag.json          ← flagged for operator review
   ├── skip_invalid_name.json     ← flagged for operator review
+  ├── skip_too_many_tags.json    ← flagged for operator review
   ├── skip_edge.json
-  └── skip_other_type.json
+  ├── skip_other_type.json
+  ├── vm_tag_inventory.jsonl
+  └── plan.json
         │
         │  3) push --dry-run
         │  4) push --apply
         ▼
-nsx_vm_logs/vm_tags_manifests/<host>/<TS>_apply.json   ← revert input
+nsx_vm_files/vm_tags_manifests/<host>/<TS>_apply.json   ← revert input
         │
         │  5) validate
         │  6) revert --dry-run
         │  7) revert --apply
         ▼
-nsx_vm_logs/vm_tags_manifests/<host>/<TS>_revert_apply.json
+nsx_vm_files/vm_tags_manifests/<host>/<TS>_revert_apply.json
 ```
 
 ---

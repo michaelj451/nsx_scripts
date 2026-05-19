@@ -28,6 +28,25 @@ log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+_TS_DIR_RE = __import__("re").compile(r"^\d{8}_\d{6}$")
+
+
+def resolve_plan_dir(plan_dir: Path) -> Path:
+    """Accept host-level dir (auto-pick latest timestamped run) or a specific run dir."""
+    if (plan_dir / "eligible.json").exists():
+        return plan_dir
+    candidates = [
+        p for p in plan_dir.iterdir()
+        if p.is_dir() and _TS_DIR_RE.match(p.name) and (p / "eligible.json").exists()
+    ] if plan_dir.is_dir() else []
+    if not candidates:
+        raise SystemExit(
+            f"No eligible.json found in {plan_dir} and no timestamped run "
+            f"subdirs with eligible.json. Pass --plan-dir at the host-level "
+            f"dir or a specific timestamped run dir."
+        )
+    return sorted(candidates, key=lambda p: p.name)[-1]
+
 
 def setup_logging(tool: str) -> Path:
     log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
@@ -79,10 +98,11 @@ def main() -> None:
     if not manager_host:
         raise SystemExit(f"Manager not defined for {args.manager}.")
 
-    plan_dir = Path(args.plan_dir).expanduser().resolve()
+    plan_dir = resolve_plan_dir(Path(args.plan_dir).expanduser().resolve())
     eligible_path = plan_dir / "eligible.json"
     if not eligible_path.exists():
         raise SystemExit(f"eligible.json not found in {plan_dir}")
+    log.info("Using plan dir: %s", plan_dir)
     eligible = json.loads(eligible_path.read_text(encoding="utf-8")).get("vms") or []
 
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=False)

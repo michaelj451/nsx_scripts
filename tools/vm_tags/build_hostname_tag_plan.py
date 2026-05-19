@@ -119,6 +119,43 @@ def find_hostname_tag(tags: List[Dict[str, str]]) -> Optional[str]:
     return None
 
 
+def write_tag_inventory_jsonl(vms: List[Dict[str, Any]], out_path: Path) -> int:
+    """
+    Write one JSON object per line for EVERY VM (regardless of classification),
+    capturing display_name, external_id, type, tag_count, and the full tag list.
+
+    Format per line:
+      {
+        "display_name": "...",
+        "external_id": "...",
+        "type": "REGULAR" | "EDGE" | ...,
+        "tag_count": N,
+        "tags": [{"scope": "...", "tag": "..."}, ...]
+      }
+
+    Returns the number of lines written.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with out_path.open("w", encoding="utf-8") as fh:
+        # Sorted by display name for stable, diff-friendly output
+        for vm in sorted(vms, key=lambda v: (v.get("display_name") or "")):
+            tags = vm.get("tags") or []
+            row = {
+                "display_name": vm.get("display_name") or "",
+                "external_id": vm.get("external_id") or "",
+                "type": vm.get("type") or "UNKNOWN",
+                "tag_count": len(tags),
+                "tags": [
+                    {"scope": t.get("scope"), "tag": t.get("tag")}
+                    for t in tags if isinstance(t, dict)
+                ],
+            }
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            written += 1
+    return written
+
+
 def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
     """Classify a single VM. Returns a dict with classification + reasoning."""
     name = vm.get("display_name") or ""
@@ -201,12 +238,16 @@ def main() -> None:
         raise SystemExit(f"VM export not found: {src}")
 
     if args.output_dir:
-        out_dir = Path(args.output_dir).expanduser().resolve()
+        host_dir = Path(args.output_dir).expanduser().resolve()
     else:
         # Derive default from manager_host inside the export payload
         peek = json.loads(src.read_text(encoding="utf-8"))
         manager_host = peek.get("manager_host") or "unknown-manager"
-        out_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
+        host_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
+
+    # Per-run timestamped subdir so successive runs accumulate instead of
+    # overwriting each other.
+    out_dir = host_dir / RUN_TS
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(f"Output dir already exists: {out_dir}. Use --overwrite.")
@@ -238,6 +279,11 @@ def main() -> None:
         out.write_text(json.dumps({"count": len(rows), "vms": rows}, indent=2, sort_keys=True), encoding="utf-8")
         log.info("  %s: %d VM(s) -> %s", key, len(rows), out)
 
+    # Per-VM tag inventory (every VM, regardless of classification)
+    inv_path = out_dir / "vm_tag_inventory.jsonl"
+    inv_count = write_tag_inventory_jsonl(vms, inv_path)
+    log.info("  vm_tag_inventory: %d row(s) -> %s", inv_count, inv_path)
+
     summary = {
         "source_export": str(src),
         "source_manager": payload.get("manager"),
@@ -246,6 +292,7 @@ def main() -> None:
         "planned_at": datetime.now(timezone.utc).isoformat(),
         "vm_count_total": len(vms),
         "counts": {k: len(v) for k, v in buckets.items()},
+        "vm_tag_inventory": str(inv_path),
         "output_dir": str(out_dir),
         "log_file": str(log_file),
     }

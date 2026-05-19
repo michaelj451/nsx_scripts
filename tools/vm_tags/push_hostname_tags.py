@@ -51,6 +51,32 @@ log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+# Timestamp dir name pattern produced by dryrun/build-plan (matches RUN_TS).
+_TS_DIR_RE = __import__("re").compile(r"^\d{8}_\d{6}$")
+
+
+def resolve_plan_dir(plan_dir: Path) -> Path:
+    """
+    Accept either:
+      - a plan dir that contains eligible.json directly (back-compat), or
+      - a host-level dir whose children are timestamped subdirs — in which
+        case pick the most recent timestamp.
+    """
+    if (plan_dir / "eligible.json").exists():
+        return plan_dir
+    candidates = [
+        p for p in plan_dir.iterdir()
+        if p.is_dir() and _TS_DIR_RE.match(p.name) and (p / "eligible.json").exists()
+    ] if plan_dir.is_dir() else []
+    if not candidates:
+        raise SystemExit(
+            f"No eligible.json found in {plan_dir} and no timestamped run "
+            f"subdirs (YYYYMMDD_HHMMSS) with eligible.json inside. "
+            f"Pass --plan-dir at either the host-level dir or a specific "
+            f"timestamped run dir."
+        )
+    return sorted(candidates, key=lambda p: p.name)[-1]
+
 # Pacing between writes
 TAG_UPDATE_INTERVAL_SECONDS = 0.5
 
@@ -139,10 +165,11 @@ def main() -> None:
     if not manager_host:
         raise SystemExit(f"Manager not defined for {args.manager}.")
 
-    plan_dir = Path(args.plan_dir).expanduser().resolve()
+    plan_dir = resolve_plan_dir(Path(args.plan_dir).expanduser().resolve())
     eligible_path = plan_dir / "eligible.json"
     if not eligible_path.exists():
         raise SystemExit(f"eligible.json not found in {plan_dir}")
+    log.info("Using plan dir: %s", plan_dir)
 
     eligible_payload = json.loads(eligible_path.read_text(encoding="utf-8"))
     eligible = eligible_payload.get("vms") or []
