@@ -60,6 +60,20 @@ def supported_vm_types() -> Set[str]:
     return parsed or {"REGULAR"}
 
 
+def max_tags_per_vm() -> int:
+    """
+    Read VM_TAGS_MAX_TAGS_PER_VM from the environment. If a VM already has
+    >= this many tags, it falls into skip_too_many_tags and is not pushed
+    to. Default 30 (NSX's documented limit per VM).
+    """
+    raw = os.getenv("VM_TAGS_MAX_TAGS_PER_VM", "30")
+    try:
+        v = int(raw)
+        return v if v > 0 else 30
+    except ValueError:
+        return 30
+
+
 def setup_logging(tool: str) -> Path:
     log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +125,7 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
     ext_id = vm.get("external_id") or ""
     vm_type = vm.get("type") or "UNKNOWN"
     tags = vm.get("tags") or []
+    tag_count = len(tags)
     existing_hostname = find_hostname_tag(tags)
     proposed = extract_hostname_value(name)
 
@@ -119,6 +134,7 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
         "display_name": name,
         "type": vm_type,
         "existing_tags": tags,
+        "existing_tag_count": tag_count,
         "existing_hostname_tag": existing_hostname,
         "proposed_hostname_tag": proposed,
     }
@@ -142,13 +158,25 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
         base["reason"] = f"Already has hostname tag: {existing_hostname!r}"
         return base
 
+    cap = max_tags_per_vm()
+    if tag_count >= cap:
+        base["classification"] = "skip_too_many_tags"
+        base["reason"] = (
+            f"VM has {tag_count} tags (>= VM_TAGS_MAX_TAGS_PER_VM={cap}); "
+            f"refusing to add another to stay under the NSX limit"
+        )
+        return base
+
     if proposed is None:
         base["classification"] = "skip_invalid_name"
         base["reason"] = "Name does not end with 3-6 trailing digits"
         return base
 
     base["classification"] = "eligible"
-    base["reason"] = f"Will add hostname tag {proposed!r} (from trailing digits in name)"
+    base["reason"] = (
+        f"Will add hostname tag {proposed!r} "
+        f"(from trailing digits in name; current tag count={tag_count})"
+    )
     return base
 
 
@@ -197,6 +225,7 @@ def main() -> None:
     buckets: Dict[str, List[Dict[str, Any]]] = {
         "eligible": [],
         "skip_has_tag": [],
+        "skip_too_many_tags": [],
         "skip_invalid_name": [],
         "skip_edge": [],
         "skip_other_type": [],

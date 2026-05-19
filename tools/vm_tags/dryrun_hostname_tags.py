@@ -114,6 +114,7 @@ def main() -> None:
     buckets = {
         "eligible": [],
         "skip_has_tag": [],
+        "skip_too_many_tags": [],
         "skip_invalid_name": [],
         "skip_edge": [],
         "skip_other_type": [],
@@ -131,6 +132,7 @@ def main() -> None:
     flagged = (
         len(buckets["skip_has_tag"])
         + len(buckets["skip_invalid_name"])
+        + len(buckets["skip_too_many_tags"])
     )
 
     summary = {
@@ -150,7 +152,10 @@ def main() -> None:
     print(json.dumps(summary, indent=2, sort_keys=True))
 
     if flagged > 0:
-        log.warning("%d VM(s) flagged for review — see skip_has_tag.json / skip_invalid_name.json", flagged)
+        log.warning(
+            "%d VM(s) flagged for review — see skip_has_tag.json / skip_invalid_name.json / skip_too_many_tags.json",
+            flagged,
+        )
 
 
 if __name__ == "__main__":

@@ -155,11 +155,23 @@ def main() -> None:
     live = client.list_virtual_machines()
     live_by_id = {vm["external_id"]: vm for vm in live if vm.get("external_id")}
 
+    # Read the same cap the planner used. Defensive re-check below: if a VM's
+    # live tag count has crept up to the cap between plan and push, we refuse
+    # the push for that VM (don't push to a VM at or above the NSX limit).
+    import os
+    try:
+        max_tags_cap = int(os.getenv("VM_TAGS_MAX_TAGS_PER_VM", "30"))
+        if max_tags_cap <= 0:
+            max_tags_cap = 30
+    except ValueError:
+        max_tags_cap = 30
+
     manifest_entries: List[Dict[str, Any]] = []
     results = {
         "applied": [],
         "skipped_already_has_hostname_post_plan": [],
         "skipped_already_has_exact_tag": [],
+        "skipped_too_many_tags_post_plan": [],
         "missing_on_target": [],
         "errors": [],
     }
@@ -180,6 +192,26 @@ def main() -> None:
             continue
 
         current_tags = live_vm.get("tags") or []
+        current_tag_count = len(current_tags)
+
+        # Defensive: re-check the tag-count cap against live state in case
+        # tags grew between plan-build and push.
+        if current_tag_count >= max_tags_cap:
+            log.warning(
+                "[RACE] VM tag count reached cap since plan was built: %s now has %d tags (cap=%d) — skipping",
+                display, current_tag_count, max_tags_cap,
+            )
+            results["skipped_too_many_tags_post_plan"].append(
+                {
+                    "external_id": ext_id,
+                    "display_name": display,
+                    "current_tag_count": current_tag_count,
+                    "max_tags_cap": max_tags_cap,
+                    "plan_proposed_tag": proposed,
+                }
+            )
+            continue
+
         existing_hostname = _has_scope(current_tags, "hostname")
         if existing_hostname is not None:
             # Race: plan said no hostname tag, but one appeared between plan
@@ -267,9 +299,11 @@ def main() -> None:
             "applied": len(results["applied"]),
             "skipped_already_has_hostname_post_plan": len(results["skipped_already_has_hostname_post_plan"]),
             "skipped_already_has_exact_tag": len(results["skipped_already_has_exact_tag"]),
+            "skipped_too_many_tags_post_plan": len(results["skipped_too_many_tags_post_plan"]),
             "missing_on_target": len(results["missing_on_target"]),
             "errors": len(results["errors"]),
         },
+        "max_tags_cap": max_tags_cap,
         "results": results,
         "manifest_entries": manifest_entries,
     }
