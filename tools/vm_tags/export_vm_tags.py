@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_log_dir, resolve_manager
+from nsx.nsx_constants import nsx_vm_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
 
 log = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def setup_logging(tool: str) -> Path:
-    log_dir = Path(nsx_log_dir).expanduser().resolve()
+    log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = (log_dir / f"vm_tags_{tool}_{RUN_TS}.log").resolve()
     log_file.touch(exist_ok=True)

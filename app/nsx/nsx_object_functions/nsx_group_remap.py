@@ -27,9 +27,18 @@ LOG_FILE_NAME = "nsx_group_remap.log"
 CHANGES_FILE_NAME = "nsx_group_remap_changes.jsonl"
 
 
+def _resolve_log_dir() -> Path:
+    """Honor NSX_LOG_DIR env var; fall back to repo-relative nsx_logs."""
+    import os
+    env = os.getenv("NSX_LOG_DIR")
+    if env:
+        return Path(os.path.expandvars(os.path.expanduser(env))).resolve()
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / LOG_DIR_NAME
+
+
 def setup_logging() -> logging.Logger:
-    repo_root = Path(__file__).resolve().parents[3]  # .../app/nsx/nsx_object_functions -> repo root
-    log_dir = repo_root / LOG_DIR_NAME
+    log_dir = _resolve_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / LOG_FILE_NAME
 
@@ -61,8 +70,7 @@ logger = setup_logging()
 
 
 def _changes_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[3]
-    p = repo_root / LOG_DIR_NAME / CHANGES_FILE_NAME
+    p = _resolve_log_dir() / CHANGES_FILE_NAME
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 

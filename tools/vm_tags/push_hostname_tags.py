@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_log_dir, resolve_manager
+from nsx.nsx_constants import nsx_vm_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
 
 log = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ TAG_UPDATE_INTERVAL_SECONDS = 0.5
 
 
 def setup_logging(tool: str) -> Path:
-    log_dir = Path(nsx_log_dir).expanduser().resolve()
+    log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = (log_dir / f"vm_tags_{tool}_{RUN_TS}.log").resolve()
     log_file.touch(exist_ok=True)
@@ -253,7 +253,7 @@ def main() -> None:
             last_ts = time.monotonic()
 
     # Write manifest
-    manifests_dir = REPO_ROOT / "vm_tags_manifests" / manager_host
+    manifests_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_manifests" / manager_host
     manifests_dir.mkdir(parents=True, exist_ok=True)
     manifest_kind = "dryrun" if dry_run else "apply"
     manifest_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.json"

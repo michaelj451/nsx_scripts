@@ -30,14 +30,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_log_dir
+from nsx.nsx_constants import nsx_vm_log_dir
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -47,8 +48,20 @@ TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
 ELIGIBLE_DIGIT_LENGTHS = (3, 4, 5, 6)
 
 
+def supported_vm_types() -> Set[str]:
+    """
+    Read VM_TAGS_SUPPORTED_TYPES from the environment. Comma-separated list
+    of NSX VM type values that are eligible for hostname tagging.
+    Default: just REGULAR. Anything not in this list falls into
+    skip_other_type (or skip_edge for type=EDGE).
+    """
+    raw = os.getenv("VM_TAGS_SUPPORTED_TYPES", "REGULAR")
+    parsed = {t.strip().upper() for t in raw.split(",") if t.strip()}
+    return parsed or {"REGULAR"}
+
+
 def setup_logging(tool: str) -> Path:
-    log_dir = Path(nsx_log_dir).expanduser().resolve()
+    log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = (log_dir / f"vm_tags_{tool}_{RUN_TS}.log").resolve()
     log_file.touch(exist_ok=True)
@@ -115,9 +128,13 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
         base["reason"] = "NSX Edge VM (type=EDGE)"
         return base
 
-    if vm_type != "REGULAR":
+    supported = supported_vm_types()
+    if vm_type.upper() not in supported:
         base["classification"] = "skip_other_type"
-        base["reason"] = f"VM type is {vm_type!r}, not REGULAR"
+        base["reason"] = (
+            f"VM type {vm_type!r} is not in VM_TAGS_SUPPORTED_TYPES "
+            f"({sorted(supported)})"
+        )
         return base
 
     if existing_hostname is not None:

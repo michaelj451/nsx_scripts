@@ -58,7 +58,7 @@ Read live VM state from the NSX LM, classify every VM, produce a complete
 pre-change report. Makes no NSX writes.
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/dryrun_hostname_tags.py \
+python tools/vm_tags/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
   --output-dir vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
@@ -88,7 +88,7 @@ flow (so the export is reused across runs / fed into reports), use:
 ### 2a) Export VM state
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/export_vm_tags.py \
+python tools/vm_tags/export_vm_tags.py \
   --manager nsx-lm1 \
   --base-dir vm_tags_export
 ```
@@ -98,7 +98,7 @@ Output: `vm_tags_export/<host>/vms.json`
 ### 2b) Build the plan from the export
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/build_hostname_tag_plan.py \
+python tools/vm_tags/build_hostname_tag_plan.py \
   --vm-export vm_tags_export/nsx-lm1.lab.local/vms.json \
   --output-dir vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
@@ -122,7 +122,7 @@ PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
 Dry-run is the default — no `--apply` flag means no NSX writes.
 
 A dry-run manifest is written to:
-`vm_tags_manifests/<host>/<TS>_dryrun.json`
+`nsx_vm_logs/vm_tags_manifests/<host>/<TS>_dryrun.json`
 
 ---
 
@@ -142,7 +142,7 @@ For each eligible VM:
 3. Append `{"scope": "hostname", "tag": "<digits>"}` to the existing tag list
 4. POST the FULL combined list back via the fabric `update_tags` action
 
-The apply manifest is written to `vm_tags_manifests/<host>/<TS>_apply.json`
+The apply manifest is written to `nsx_vm_logs/vm_tags_manifests/<host>/<TS>_apply.json`
 with the exact (external_id, hostname_value) pairs that were added.
 **Keep this file** — it's the input to revert.
 
@@ -176,11 +176,11 @@ preserved.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
+  --manifest nsx_vm_logs/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
 ```
 
 A revert dry-run audit is written to
-`vm_tags_manifests/<host>/<TS>_revert_dryrun.json`.
+`nsx_vm_logs/vm_tags_manifests/<host>/<TS>_revert_dryrun.json`.
 
 ---
 
@@ -189,7 +189,7 @@ A revert dry-run audit is written to
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
+  --manifest nsx_vm_logs/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
   --apply
 ```
 
@@ -202,7 +202,7 @@ For each manifest entry with `status=success`:
 4. POST that list back via `update_tags`
 
 A revert apply audit is written to
-`vm_tags_manifests/<host>/<TS>_revert_apply.json`.
+`nsx_vm_logs/vm_tags_manifests/<host>/<TS>_revert_apply.json`.
 
 ---
 
@@ -223,13 +223,13 @@ vm_tags_plan/<host>/
         │  3) push --dry-run
         │  4) push --apply
         ▼
-vm_tags_manifests/<host>/<TS>_apply.json   ← revert input
+nsx_vm_logs/vm_tags_manifests/<host>/<TS>_apply.json   ← revert input
         │
         │  5) validate
         │  6) revert --dry-run
         │  7) revert --apply
         ▼
-vm_tags_manifests/<host>/<TS>_revert_apply.json
+nsx_vm_logs/vm_tags_manifests/<host>/<TS>_revert_apply.json
 ```
 
 ---

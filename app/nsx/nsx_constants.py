@@ -34,6 +34,12 @@ if not nsx_log_dir:
     # repo-relative default, but don't import REPO_ROOT here if you want to keep constants lean
     nsx_log_dir = str(Path("nsx_logs").resolve())
 
+# Separate log dir for VM-tagging tooling so its artifacts don't mix with
+# the DFW workflow's logs. Falls back to <repo>/nsx_vm_logs if not set.
+nsx_vm_log_dir = _expand_path(os.getenv("NSX_VM_LOG_DIR"))
+if not nsx_vm_log_dir:
+    nsx_vm_log_dir = str(Path("nsx_vm_logs").resolve())
+
 # ---- domains ----
 NSX_DOMAINS = [
     {
