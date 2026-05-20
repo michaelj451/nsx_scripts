@@ -1,30 +1,40 @@
-# Runbook B — Live-Member Resolution + CSV Remap on `nsx-lm1`
+# Runbook B — In-Place CSV Subnet Remap on `nsx-lm1`
 
 ## Summary
 
-Take `nsx-lm1`'s groups, flatten any dynamic/tag-based membership into
-static IPs by asking NSX for evaluated VM members, then apply a CSV subnet
-remap and push the result back to `nsx-lm1`.
+Take `nsx-lm1`'s groups, flatten any dynamic/tag-based membership into static
+IPs by asking NSX for evaluated VM members, then apply a CSV subnet remap
+and PATCH the result back to `nsx-lm1`. Groups-only push. Services,
+policies, and rules are not touched.
 
-Groups-only push. Services, policies, and rules are not touched.
+The workflow uses the same **three commands** as Runbook A, just with
+different flags on transform and push:
 
-With `--mapped-only` (used here), unmapped IPs are **dropped** from the
-result — only the CSV-mapped values are kept. Use this when you're staging
-a remapped configuration on `nsx-lm1` for testing, not as a production
-network-extension exercise.
+```text
+1) capture_nsx_state.py                            (touches nsx-lm1, GET only)
+        ↓  review the capture bundle
+2) transform_capture.py  --csv-remap CSV [--mapped-only]   (offline)
+        ↓  review the transformed bundle (changed groups only)
+3) push_from_capture.py  --target nsx-lm1 --groups-only [--dry-run|--apply]
+```
+
+With `--mapped-only`, unmapped IPs are **dropped** from each
+`IPAddressExpression` — only the CSV-mapped values are kept. Use this
+when you're staging a remapped configuration on `nsx-lm1` for testing.
 
 Manager roles:
 
-| Manager | Role | NSX impact |
-|---|---|---|
-| `nsx-lm1` | Source AND target — read membership, then PATCH groups back | Read + groups-only PATCH |
+| Manager   | Role                                                | NSX impact                                |
+|-----------|------------------------------------------------------|-------------------------------------------|
+| `nsx-lm1` | Source AND target — read membership, PATCH groups   | Read + groups-only PATCH (no services/policies/rules) |
 
 Properties:
 
-- Groups-only push (PATCH). Services, policies, rules untouched.
+- **Source manager (`nsx-lm1`) is touched in exactly two phases: capture, then push.** Transform is fully offline.
 - Live VM membership is resolved by NSX (not by Python tag parsing).
 - CSV remap is fully offline and reviewable before any push.
-- Dry-run is the default safe mode on the push step.
+- Dry-run is the default safe mode on the push step. `--apply` is required to actually mutate.
+- Every phase writes a `manifest.json` + `summary.txt` + per-step log files into its bundle directory.
 
 ---
 
@@ -39,143 +49,173 @@ export PYTHONPATH="$PWD/app"
 
 ---
 
-## B.1) Export `nsx-lm1`
-
-Captures the current state (also serves as the rollback snapshot for this workflow).
+## B.1) Capture — read-only snapshot of `nsx-lm1`
 
 ```bash
-python tools/nsx/export_nsx_objects.py \
-  --manager nsx-lm1 \
-  --base-dir nsx_export \
-  --domain-id default \
-  --output-format yaml
+python tools/nsx/capture_nsx_state.py \
+  --source nsx-lm1 \
+  --domain-id default
 ```
 
-Read-only against NSX. GETs are throttled (5 req/sec).
+This is the same capture step Runbook A uses. The capture bundle also
+serves as Workflow B's rollback baseline — the pre-remap state of
+`nsx-lm1` lives in `nsx_export/nsx-lm1.lab.local/` inside the bundle.
+
+Output bundle:
+
+```text
+nsx_capture/nsx-lm1.lab.local/<UTC_TS>/
+├── manifest.json
+├── summary.txt
+├── nsx_export/<host>/             ← raw NSX state (also serves as rollback baseline)
+├── groups_additive/               ← live-member-enriched groups (input for the CSV remap)
+├── segment_inventory/             ← optional; not used by Workflow B but harmless
+├── affected_rule_reports/         ← useful to gauge blast radius before push
+├── vm_tag_inventory/              ← VM tags (LM only)
+└── logs/
+```
+
+### Review gate
+
+- `summary.txt` — all steps OK
+- `manifest.json` — `"ok": true`
+- `affected_rule_reports/affected_rules_impact.json` — which rules touch the groups you're about to mutate
 
 ---
 
-## B.2) Resolve Live VM Membership → Additive Tree
-
-For each group on `nsx-lm1`, ask NSX who its evaluated VM members are right
-now, look up each VM's IPs via fabric VIFs, and append them as a static
-`IPAddressExpression` block. This flattens tag/condition expressions into
-static IP lists so the CSV remap in B.3 has concrete IPs to operate on.
+## B.2) Transform — offline CSV subnet remap
 
 ```bash
-python tools/nsx/build_group_ip_additive_from_live_members.py \
-  --source-manager nsx-lm1 \
-  --domain-id default \
-  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
-  --output-format yaml \
-  --copy-first \
-  --continue-on-group-error
-```
-
-Read-only against NSX. Writes group files locally.
-
----
-
-## B.3) Apply CSV Subnet Remap (Offline)
-
-Read the additive tree from B.2, apply the CSV mapping
-(`old_subnet,new_subnet` — longest-prefix match wins), and write the result
-to a separate tree. `--mapped-only` replaces each `IPAddressExpression` IP
-list with only the mapped values, dropping unmapped entries.
-
-```bash
-python tools/nsx/nsx_group_ip_remap_offline.py \
-  --export-root nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
-  --prepared-root nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --mapping-csv data/nonprod_map.csv \
-  --output-format yaml \
+python tools/nsx/transform_capture.py \
+  --capture nsx_capture/nsx-lm1.lab.local/<UTC_TS> \
+  --csv-remap data/nonprod_map.csv \
   --mapped-only
 ```
 
-Offline only. No NSX calls.
+**This step never contacts NSX.** Reads only files from the capture bundle.
 
-Result:
+What it does:
+
+- When `--csv-remap` is given and `--segment-mode` is not specified, segment-mode defaults to `skip` (Workflow B doesn't transform segments).
+- Runs `nsx_group_ip_remap_offline.py` against the capture's `groups_additive/` tree using the provided CSV.
+- Writes both:
+  - `groups_transformed/` — the full groups tree with CSV changes layered on top
+  - `groups_changed_only/` — only the groups that actually changed (Workflow B's push uses this subset by default)
+
+### CSV format
+
+Each row: `old_subnet,new_subnet`. Longest-prefix match wins. See `data/nonprod_map.csv` for the lab example.
+
+```csv
+old_subnet,new_subnet
+10.6.0.101/32,10.7.0.101/32
+10.6.1.0/24,10.7.1.0/24
+10.6.0.0/16,10.7.0.0/16
+```
+
+### Transform flags (Workflow B)
+
+| Flag                            | Default   | Purpose                                                                |
+|---------------------------------|-----------|------------------------------------------------------------------------|
+| `--capture <bundle>`            | (required)| Path to a capture bundle                                               |
+| `--csv-remap <csv>`             | (required for B) | Path to CSV mapping file                                        |
+| `--mapped-only`                 | off       | Drop unmapped IPs; keep only the CSV-mapped values                     |
+| `--bidirectional`               | off       | Treat each CSV row as a bidirectional mapping                          |
+| `--segment-mode {convert,strip,skip}` | skip (when --csv-remap is set) | Whether to also do a segment transform        |
+| `--source-groups {additive,raw}`| additive  | Use live-member-enriched groups (recommended) or raw export            |
+
+### Output bundle
 
 ```text
-nsx_groups_remapped/
-└── nsx-lm1.lab.local/
-    └── domains/default/
-        ├── groups/
-        └── reports/
-            └── group-ip-remap/
-                ├── summary_update.json
-                ├── groups_changed.json
-                ├── groups_unchanged.json
-                └── mapping_invalid_rows.json
+nsx_transformed/nsx-lm1.lab.local/<UTC_TS>/
+├── manifest.json                  ← transform metadata + link back to capture
+├── summary.txt                    ← per-step status, CSV remap counts
+├── groups_transformed/
+│   └── domains/default/groups/    ← full groups tree with CSV overlay (validation reference)
+├── groups_changed_only/
+│   └── domains/default/groups/    ← ONLY the changed groups (what gets pushed)
+├── transform_report/
+│   ├── csv_remap_manifest.json    ← per-group changes
+│   └── group-ip-remap/            ← summary/changed/unchanged/invalid CSV rows
+└── logs/
 ```
+
+### Review gate
+
+- `summary.txt` — counts of groups changed, IPs added/dropped
+- `transform_report/group-ip-remap/summary_update.json` — high-level stats
+- `transform_report/group-ip-remap/groups_changed.json` — per-group before/after
+- `transform_report/group-ip-remap/mapping_invalid_rows.json` — CSV rows that didn't parse
+- Diff the changed groups against the capture's additive tree if you want byte-level visibility:
+  ```bash
+  diff -r \
+    nsx_capture/nsx-lm1.lab.local/<TS>/groups_additive/domains/default/groups \
+    nsx_transformed/nsx-lm1.lab.local/<TS>/groups_transformed/domains/default/groups
+  ```
 
 ---
 
-## B.4) Review Reports (Optional)
+## B.3) Push — groups-only PATCH to `nsx-lm1`
+
+### B.3a) Dry-run (default — safe, no writes)
+
+```bash
+python tools/nsx/push_from_capture.py \
+  --target nsx-lm1 \
+  --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS> \
+  --groups-only
+```
+
+What this does, against `nsx-lm1`:
+
+1. **Baseline export of the target** (GET-only) — captures pre-push state for rollback. Lives at `<push bundle>/target_baseline/`.
+2. **Skipped** — groups-only mode does not assemble a complete payload.
+3. **Dry-run push using `push_additive_group_ips`** — every PATCH is logged but not sent. Pushes only the groups in `groups_changed_only/` (if CSV remap ran) or the full transformed tree.
+
+Output bundle:
 
 ```text
-nsx_groups_remapped/nsx-lm1.lab.local/domains/default/reports/group-ip-remap/
+nsx_push/nsx-lm1.lab.local/<UTC_TS>/
+├── manifest.json
+├── summary.txt
+├── target_baseline/               ← pre-push GET-only export of nsx-lm1 (rollback baseline)
+├── push_report/<ts>/              ← push_additive_group_ips' per-row results
+└── logs/
 ```
 
-| File | Purpose |
-|---|---|
-| `summary_update.json` | High-level counts: groups changed, IPs added, IPs dropped |
-| `groups_changed.json` | Per-group before/after listing |
-| `groups_unchanged.json` | Groups with no matching mapping rows |
-| `mapping_invalid_rows.json` | CSV rows that failed validation |
+### Review gate
 
-Optionally generate the affected-rules impact report:
+- `summary.txt` — step-by-step status, dry-run counts
+- `push_report/<ts>/summary.json` — full push tool output
+- `push_report/<ts>/groups.json` (or `.jsonl`) — per-group dry-run records
 
-```bash
-python tools/nsx/find_rules_affected_by_group_changes.py \
-  --additive-root nsx_groups_remapped \
-  --export-root nsx_export \
-  --output-dir nsx_logs/affected_rule_reports \
-  --verbose
-```
+### B.3b) Apply
 
----
-
-## B.5) Dry-Run Push to `nsx-lm1`
-
-Groups-only PATCH. Preview against the live `nsx-lm1`.
+When the dry-run looks clean, re-run with `--apply`:
 
 ```bash
-python tools/nsx/push_additive_group_ips.py \
+python tools/nsx/push_from_capture.py \
   --target nsx-lm1 \
-  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --domain-id default \
-  --dry-run
-```
-
----
-
-## B.6) Apply Push to `nsx-lm1`
-
-Real write requires `--apply`. Pushes only group PATCHes.
-
-```bash
-python tools/nsx/push_additive_group_ips.py \
-  --target nsx-lm1 \
-  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --domain-id default \
+  --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS> \
+  --groups-only \
   --apply
 ```
 
----
+After `--apply`:
 
-## B.7) Validate
+- The push actually PATCHes the changed groups on `nsx-lm1`
+- A live validation runs automatically (`validate_nsx_groups_live`) and mirrors its report into `<push bundle>/validate_report/`
 
-Read-only comparison of live `nsx-lm1` groups against the prepared
-remapped payload.
+### Push flags (Workflow B)
 
-```bash
-python tools/nsx/validate_nsx_groups_live.py \
-  --target nsx-lm1 \
-  --expected-root nsx_groups_remapped/nsx-lm1.lab.local \
-  --domain-id default
-```
+| Flag                       | Default     | Purpose                                                                |
+|----------------------------|-------------|------------------------------------------------------------------------|
+| `--target nsx-lm1`         | (required)  | Push target (Workflow B: same as the capture's source)                 |
+| `--transformed <bundle>`   | (required)  | Path to a transformed bundle                                           |
+| `--groups-only`            | (required for B) | Skip services/policies/rules; PATCH only changed groups            |
+| `--apply`                  | off         | Actually push (otherwise dry-run)                                      |
+| `--skip-baseline`          | off         | Skip the pre-push target export (NOT recommended)                      |
+| `--skip-validate`          | off         | Skip the post-apply live validation                                    |
 
 ---
 
@@ -183,68 +223,76 @@ python tools/nsx/validate_nsx_groups_live.py \
 
 ```text
 nsx-lm1 (source AND target)
-        │
-        │  B.1) export_nsx_objects.py
-        ▼
-nsx_export/nsx-lm1.lab.local/
-        │
-        │  B.2) build_group_ip_additive_from_live_members.py
-        ▼
-nsx_groups_additive_b/nsx-lm1.lab.local/
-        │
-        │  B.3) nsx_group_ip_remap_offline.py --mapped-only
-        ▼
-nsx_groups_remapped/nsx-lm1.lab.local/
-        │
-        │  B.4) (optional) review reports + impact analysis
-        │  B.5) push_additive_group_ips.py --dry-run
-        │  B.6) push_additive_group_ips.py --apply
-        │  B.7) validate_nsx_groups_live.py
-        ▼
-nsx-lm1 (live, updated)
+      ▲          │
+      │          │  B.1) capture_nsx_state.py
+      │          ▼
+      │     nsx_capture/nsx-lm1.lab.local/<TS>/
+      │        nsx_export/, groups_additive/, ...
+      │          │
+      │          │  B.2) transform_capture.py --csv-remap CSV [--mapped-only]  (OFFLINE)
+      │          ▼
+      │     nsx_transformed/nsx-lm1.lab.local/<TS>/
+      │        groups_transformed/, groups_changed_only/, transform_report/
+      │          │
+      │          │  B.3) push_from_capture.py --target nsx-lm1 --groups-only [--apply]
+      └──────────┘
+                 │
+                 ▼
+            nsx_push/nsx-lm1.lab.local/<TS>/
+               target_baseline/, push_report/, validate_report/
 ```
 
 ---
 
 ## Safety Characteristics
 
-| Step | NSX impact |
-|---|---|
-| B.1 — Export | Read-only |
-| B.2 — Live member resolution | Read-only (policy + fabric GETs on `nsx-lm1`) |
-| B.3 — CSV remap | Offline |
-| B.4 — Review reports | Offline |
-| B.5 — Dry-run push | Read-only (preview only) |
-| B.6 — Apply push | PATCH groups on `nsx-lm1` only — no services/policies/rules touched |
-| B.7 — Validate | Read-only |
+| Phase     | Touches NSX?           | What's touched                                |
+|-----------|------------------------|-----------------------------------------------|
+| Capture   | Yes — lm1, GET only    | Policy + fabric GETs                          |
+| Transform | **No**                 | Reads/writes local files only                 |
+| Push (dry-run)  | Yes — lm1, GET only | Read-only against `nsx-lm1`                  |
+| Push (apply)    | Yes — lm1, PATCH    | PATCH only the changed groups; services/policies/rules untouched |
 
 ---
 
 ## Rollback
 
-Revert `nsx-lm1` from the step B.1 snapshot using the groups-only revert
-script. It PATCHes each group's payload back to the snapshot state — which
-for Workflow B undoes the additive IPs added in B.2 + B.3.
+Workflow B only writes groups (PATCH), so the **groups-only revert** is the
+complete rollback. The push bundle's `target_baseline/` holds the pre-push
+GET-only export of `nsx-lm1` — pair it with `push_nsx_groups_revert.py`:
 
-Dry-run preview first:
+Dry-run preview:
 
 ```bash
-python tools/nsx/push_nsx_groups_revert.py \
+PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_export/nsx-lm1.lab.local \
+  --export-root nsx_push/nsx-lm1.lab.local/<TS>/target_baseline/nsx-lm1.lab.local \
   --domain-id default
 ```
 
-Then apply:
+Apply rollback:
 
 ```bash
-python tools/nsx/push_nsx_groups_revert.py \
+PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_export/nsx-lm1.lab.local \
+  --export-root nsx_push/nsx-lm1.lab.local/<TS>/target_baseline/nsx-lm1.lab.local \
   --domain-id default \
   --apply
 ```
 
-> Workflow B only writes groups (PATCH), so the groups-only revert is the
-> complete rollback. Use `push_complete_nsx_revert.py` instead if you ever
-> push services/policies/rules — see Runbook A.
+> **Why not `push_complete_nsx_revert.py`?** That's for Runbook A's full clone, which writes services/policies/rules onto a target. Workflow B only PATCHes groups, so the groups-only revert is sufficient and faster.
+
+---
+
+## Inner Tools (Advanced)
+
+Workflow B reuses Runbook A's three wrappers; the underlying primitives are:
+
+| Inner tool                                  | Phase     | Purpose                                                   |
+|---------------------------------------------|-----------|-----------------------------------------------------------|
+| `tools/nsx/export_nsx_objects.py`           | Capture   | Raw NSX state export                                      |
+| `tools/nsx/build_group_ip_additive_from_live_members.py` | Capture | Live VM-IP enrichment of groups            |
+| `tools/nsx/nsx_group_ip_remap_offline.py`   | Transform | The actual CSV subnet remap                               |
+| `tools/nsx/push_additive_group_ips.py`      | Push      | Groups-only PATCH                                         |
+| `tools/nsx/validate_nsx_groups_live.py`     | Push      | Compare live NSX state to expected files                  |
+| `tools/nsx/push_nsx_groups_revert.py`       | Rollback  | Groups-only revert to a snapshot                          |
