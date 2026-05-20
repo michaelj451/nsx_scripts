@@ -60,7 +60,7 @@ python tools/nsx/push_from_capture.py \
   --groups-only
 ```
 
-Output: `nsx_push/nsx-lm1.lab.local/<UTC_TS>/`. Review `summary.txt` and `push_report/<ts>/summary.json`.
+Output: `nsx_push/nsx-lm1.lab.local/` (overwritten each run). Review `summary.txt` and `push_report/summary_*.json`.
 
 ---
 
@@ -86,13 +86,13 @@ The push bundle's `target_baseline/` holds the pre-push GET-only export of nsx-l
 # Dry-run preview
 PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_push/nsx-lm1.lab.local/<UTC_TS>/target_baseline/nsx-lm1.lab.local \
+  --export-root nsx_push/nsx-lm1.lab.local/target_baseline/nsx-lm1.lab.local \
   --domain-id default
 
 # Apply rollback
 PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_push/nsx-lm1.lab.local/<UTC_TS>/target_baseline/nsx-lm1.lab.local \
+  --export-root nsx_push/nsx-lm1.lab.local/target_baseline/nsx-lm1.lab.local \
   --domain-id default \
   --apply
 ```

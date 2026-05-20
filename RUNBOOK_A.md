@@ -185,7 +185,7 @@ What this does, against `nsx-lm2`:
 Output bundle:
 
 ```text
-nsx_push/nsx-lm2.lab.local/<UTC_TS>/
+nsx_push/nsx-lm2.lab.local/             ← always reflects the LATEST push
 ├── manifest.json                  ← push metadata + links back to capture + transformed
 ├── summary.txt                    ← step status, push counts
 ├── target_baseline/               ← pre-push GET-only export of nsx-lm2
@@ -227,7 +227,7 @@ After `--apply`:
 | `--domain-id <id>`         | from manifest | Override the domain (rarely needed)                                  |
 | `--skip-baseline`          | off         | Skip the pre-push target export (NOT recommended)                      |
 | `--skip-validate`          | off         | Skip the post-apply live validation                                    |
-| `--output-dir <path>`      | auto        | Override the default `nsx_push/<target>/<UTC_TS>/` path                |
+| `--output-dir <path>`      | auto        | Override the default `nsx_push/<target>/` path. The default path is wiped at the start of every run; pass `--output-dir` to preserve specific bundles. |
 
 ---
 
@@ -249,7 +249,7 @@ nsx_transformed/nsx-lm1.lab.local/<TS>/                                   │
       │                                                                   │
       │  3a) push_from_capture.py            (dry-run, talks to nsx-lm2)  │
       ▼                                                                   │
-nsx_push/nsx-lm2.lab.local/<TS>/ ──────────────────────────────────────── ┤
+nsx_push/nsx-lm2.lab.local/      ─────────────────────────────────────── ┤  (wiped & rewritten each run)
    target_baseline/, nsx_build/, push_report/, validate_report/           │
 ```
 
@@ -279,7 +279,7 @@ python tools/nsx/push_from_capture.py \
   --transformed nsx_transformed/nsx-lm1.lab.local/<TS>
 ```
 
-Same transformed bundle, different target. The push bundle lands at `nsx_push/nsx-lm3.lab.local/<TS>/`.
+Same transformed bundle, different target. The push bundle lands at `nsx_push/nsx-lm3.lab.local/`.
 
 ---
 
@@ -292,7 +292,7 @@ Dry-run preview:
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/<TS>/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
   --domain-id default
 ```
 
@@ -301,7 +301,7 @@ Apply rollback:
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/<TS>/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
   --domain-id default \
   --apply
 ```

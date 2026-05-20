@@ -175,7 +175,7 @@ What this does, against `nsx-lm1`:
 Output bundle:
 
 ```text
-nsx_push/nsx-lm1.lab.local/<UTC_TS>/
+nsx_push/nsx-lm1.lab.local/             ← always reflects the LATEST push
 ├── manifest.json
 ├── summary.txt
 ├── target_baseline/               ← pre-push GET-only export of nsx-lm1 (rollback baseline)
@@ -238,7 +238,7 @@ nsx-lm1 (source AND target)
       └──────────┘
                  │
                  ▼
-            nsx_push/nsx-lm1.lab.local/<TS>/
+            nsx_push/nsx-lm1.lab.local/             ← always reflects the LATEST push
                target_baseline/, push_report/, validate_report/
 ```
 
@@ -266,7 +266,7 @@ Dry-run preview:
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_push/nsx-lm1.lab.local/<TS>/target_baseline/nsx-lm1.lab.local \
+  --export-root nsx_push/nsx-lm1.lab.local/target_baseline/nsx-lm1.lab.local \
   --domain-id default
 ```
 
@@ -275,7 +275,7 @@ Apply rollback:
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_push/nsx-lm1.lab.local/<TS>/target_baseline/nsx-lm1.lab.local \
+  --export-root nsx_push/nsx-lm1.lab.local/target_baseline/nsx-lm1.lab.local \
   --domain-id default \
   --apply
 ```

@@ -23,14 +23,19 @@ What it does:
 
 All artifacts land in:
 
-  nsx_push/<target-host>/<UTC_TS>/
-    manifest.json                  push metadata + links back to capture + transformed
-    summary.txt                    human-readable summary
-    target_baseline/               pre-push GET-only export of target
-    nsx_build/<target>/            assembled push payload
-    push_report/                   push tool's own JSON/JSONL artifacts
-    validate_report/               validate_nsx_groups_live's output
-    logs/                          per-step log files
+  nsx_push/<target-host>/                ← always reflects the LATEST push
+    manifest.json                          push metadata + links back to capture + transformed
+    summary.txt                            human-readable summary
+    target_baseline/                       pre-push GET-only export of target
+    nsx_build/<target>/                    assembled push payload
+    push_report/                           push tool's own JSON/JSONL artifacts
+    validate_report/                       validate_nsx_groups_live's output
+    logs/                                  per-step log files
+
+The default push bundle directory is wiped at the start of every run so it
+always reflects the most recent push. Per-run history lives in
+$NSX_LOG_DIR/push_from_capture_*_<UTC_TS>.log instead. Pass --output-dir to
+override the default and preserve specific bundles.
 
 Usage:
 
@@ -236,7 +241,12 @@ def main() -> int:
     p.add_argument("--apply", action="store_true", default=False,
                    help="Actually push to the target. Without this flag, runs as dry-run.")
     p.add_argument("--output-dir", default=None,
-                   help="Push bundle directory. Defaults to nsx_push/<target-host>/<UTC_TS>/.")
+                   help=(
+                       "Push bundle directory. Defaults to nsx_push/<target-host>/. "
+                       "On each run, the default path is wiped first so it always reflects "
+                       "the latest push (previous push artifacts are deleted). Pass an explicit "
+                       "--output-dir to preserve specific bundles."
+                   ))
     p.add_argument("--skip-baseline", action="store_true",
                    help="Skip the pre-push GET-only baseline export of the target (NOT recommended).")
     p.add_argument("--skip-validate", action="store_true",
@@ -271,10 +281,18 @@ def main() -> int:
     domain_id = args.domain_id or xf_manifest.get("domain_id") or cap_manifest["captured_from"]["domain_id"]
     source_host = cap_manifest["captured_from"]["manager_host"]
 
+    using_default_output = args.output_dir is None
     output_dir = Path(
         args.output_dir
-        or (REPO_ROOT / "nsx_push" / target_host / RUN_TS)
+        or (REPO_ROOT / "nsx_push" / target_host)
     ).expanduser().resolve()
+
+    # On the default path, wipe any previous push bundle so this directory
+    # always reflects the latest push. Custom --output-dir paths are left
+    # alone so the user can preserve specific bundles if they need to.
+    if using_default_output and output_dir.exists():
+        log.info("Wiping previous push bundle: %s", output_dir)
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logs_dir = output_dir / "logs"

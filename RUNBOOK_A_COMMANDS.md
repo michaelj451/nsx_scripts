@@ -96,7 +96,7 @@ python tools/nsx/push_from_capture.py \
   --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS>
 ```
 
-Output: `nsx_push/nsx-lm2.lab.local/<UTC_TS>/`. Review `summary.txt` and `push_report/<ts>/summary.json`.
+Output: `nsx_push/nsx-lm2.lab.local/` (overwritten each run). Review `summary.txt` and `push_report/summary_*.json`.
 
 ---
 
@@ -132,20 +132,20 @@ The push bundle's `target_baseline/` directory holds the pre-push GET-only expor
 # Dry-run preview
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/<UTC_TS>/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
   --domain-id default
 
 # Apply rollback
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/<UTC_TS>/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
   --domain-id default \
   --apply
 
 # Apply rollback including custom services
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/<UTC_TS>/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
   --domain-id default \
   --include-services \
   --apply
