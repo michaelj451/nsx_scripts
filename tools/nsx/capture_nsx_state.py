@@ -17,15 +17,20 @@ The bundle produced here can be:
 
 What's captured:
 
-  nsx_capture/<source-host>/<UTC_TS>/
-    manifest.json                 captured-at, captured-from, options, steps
-    summary.txt                   human-readable summary
-    nsx_export/<host>/            raw NSX state (groups + services + policies + rules)
-    groups_additive/              live-member-enriched groups (optional, GET-only)
-    segment_inventory/            every referenced segment + live segment details
-    affected_rule_reports/        cross-reference of rules ↔ groups (offline)
-    vm_tag_inventory/             VM + tag state (LM only, GET-only)
-    logs/                         per-step log files
+  nsx_capture/<source-host>/             ← always reflects the LATEST capture
+    manifest.json                          captured-at, captured-from, options, steps
+    summary.txt                            human-readable summary
+    nsx_export/<host>/                     raw NSX state (groups + services + policies + rules)
+    groups_additive/                       live-member-enriched groups (optional, GET-only)
+    segment_inventory/                     every referenced segment + live segment details
+    affected_rule_reports/                 cross-reference of rules ↔ groups (offline)
+    vm_tag_inventory/                      VM + tag state (LM only, GET-only)
+    logs/                                  per-step log files
+
+The default capture bundle directory is wiped at the start of every run so it
+always reflects the most recent capture. Per-run history lives in
+$NSX_LOG_DIR/capture_nsx_state_<UTC_TS>.log instead. Pass --output-dir to
+override the default and preserve specific bundles.
 
 Usage:
 
@@ -187,23 +192,23 @@ def main() -> int:
     p.add_argument("--federation-global", action="store_true",
                    help="Use the Global Manager API surface for the source. Required for GM source.")
     p.add_argument("--output-dir", default=None,
-                   help="Capture bundle directory. Defaults to nsx_capture/<source-host>/<UTC_TS>/.")
-    p.add_argument("--with-live-members", action="store_true", default=True,
-                   help="Run build_group_ip_additive_from_live_members (snapshots evaluated VM IPs). Default ON. GET-only.")
-    p.add_argument("--no-live-members", action="store_false", dest="with_live_members",
-                   help="Skip live-member enrichment; bundle's groups will preserve dynamic expressions as-is.")
-    p.add_argument("--with-segment-inventory", action="store_true", default=True,
-                   help="Build the segment reference inventory with live details (subnets, VLAN, TZ). Default ON. GET-only.")
-    p.add_argument("--no-segment-inventory", action="store_false", dest="with_segment_inventory",
-                   help="Skip segment inventory. Transform's --mode convert will not work without this.")
+                   help=(
+                       "Capture bundle directory. Defaults to nsx_capture/<source-host>/. "
+                       "On each run, the default path is wiped first so it always reflects "
+                       "the latest capture (previous capture artifacts are deleted). "
+                       "Pass --output-dir to preserve specific bundles."
+                   ))
+    # Live-member enrichment and segment inventory are MANDATORY — they're what
+    # makes the bundle self-sufficient for offline transform. Skipping them would
+    # leave dynamic groups without IPs and segment refs unresolvable.
     p.add_argument("--with-vm-tags", action="store_true", default=True,
                    help="Capture VM tag state (LM only). Default ON; ignored for GM.")
     p.add_argument("--no-vm-tags", action="store_false", dest="with_vm_tags",
-                   help="Skip VM-tag capture.")
+                   help="Skip VM-tag capture (not used by Workflow A/B transforms — safe to skip if only doing groups/policies).")
     p.add_argument("--with-impact-report", action="store_true", default=True,
                    help="Generate the affected-rules impact report (offline, reads export). Default ON.")
     p.add_argument("--no-impact-report", action="store_false", dest="with_impact_report",
-                   help="Skip the affected-rules impact report.")
+                   help="Skip the affected-rules impact report (review artifact only; doesn't affect transform).")
     args = p.parse_args()
 
     init_cli()
@@ -212,10 +217,19 @@ def main() -> int:
     if not source_host:
         raise SystemExit(f"Manager not defined for {args.source}.")
 
+    using_default_output = args.output_dir is None
     output_dir = Path(
         args.output_dir
-        or (REPO_ROOT / "nsx_capture" / source_host / RUN_TS)
+        or (REPO_ROOT / "nsx_capture" / source_host)
     ).expanduser().resolve()
+
+    # On the default path, wipe any previous capture so this directory
+    # always reflects the latest. Custom --output-dir paths are left
+    # alone so the user can preserve specific bundles if they need to.
+    if using_default_output and output_dir.exists():
+        log.info("Wiping previous capture bundle: %s", output_dir)
+        import shutil as _shutil
+        _shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logs_dir = output_dir / "logs"
@@ -226,8 +240,6 @@ def main() -> int:
     log.info("  Source manager   : %s (%s)", args.source, source_host)
     log.info("  Domain           : %s", args.domain_id)
     log.info("  Federation GM    : %s", args.federation_global)
-    log.info("  Live members     : %s", args.with_live_members)
-    log.info("  Segment inventory: %s", args.with_segment_inventory)
     log.info("  VM tags          : %s", args.with_vm_tags)
     log.info("  Impact report    : %s", args.with_impact_report)
     log.info("=" * 60)
@@ -256,39 +268,35 @@ def main() -> int:
     source_export_dir = export_root / source_host
     source_groups_dir = source_export_dir / "domains" / args.domain_id / "groups"
 
-    # 2. Optionally enrich groups with live evaluated member IPs (GET-only)
-    if args.with_live_members:
-        cmd = [
-            sys.executable, "tools/nsx/build_group_ip_additive_from_live_members.py",
-            "--source-manager", args.source,
-            "--domain-id", args.domain_id,
-            "--source-groups-dir", str(source_groups_dir),
-            "--output-groups-dir", str(additive_groups_dir),
-            "--output-format", "yaml",
-            "--copy-first",
-            "--continue-on-group-error",
-        ]
-        steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir))
-    else:
-        log.info("STEP 2 skipped (--no-live-members)")
+    # 2. Enrich groups with live evaluated member IPs (GET-only). MANDATORY:
+    # this is what gives the offline transform actual VM IPs to operate on.
+    cmd = [
+        sys.executable, "tools/nsx/build_group_ip_additive_from_live_members.py",
+        "--source-manager", args.source,
+        "--domain-id", args.domain_id,
+        "--source-groups-dir", str(source_groups_dir),
+        "--output-groups-dir", str(additive_groups_dir),
+        "--output-format", "yaml",
+        "--copy-first",
+        "--continue-on-group-error",
+    ]
+    steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir))
 
-    # 3. Segment inventory WITH live details so transform can run offline later
-    if args.with_segment_inventory:
-        cmd = [
-            sys.executable, "tools/nsx/find_segments_referenced.py",
-            "--export-root", str(export_root),
-            "--source-manager", args.source,
-            "--output-dir", str(segment_inv_dir),
-        ]
-        if args.federation_global:
-            cmd.append("--federation-global")
-        steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir))
-    else:
-        log.info("STEP 3 skipped (--no-segment-inventory) — offline transform will only support strip mode")
+    # 3. Segment inventory WITH live details so transform can run offline. MANDATORY:
+    # the segment-convert mode needs the cached segment_details.json from this step.
+    cmd = [
+        sys.executable, "tools/nsx/find_segments_referenced.py",
+        "--export-root", str(export_root),
+        "--source-manager", args.source,
+        "--output-dir", str(segment_inv_dir),
+    ]
+    if args.federation_global:
+        cmd.append("--federation-global")
+    steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir))
 
     # 4. Affected-rules impact report (offline, reads from local export + additive)
     if args.with_impact_report:
-        additive_root_for_impact = output_dir / "groups_additive" if args.with_live_members else export_root
+        additive_root_for_impact = output_dir / "groups_additive"
         cmd = [
             sys.executable, "tools/nsx/find_rules_affected_by_group_changes.py",
             "--additive-root", str(additive_root_for_impact),
@@ -323,8 +331,6 @@ def main() -> int:
             "domain_id": args.domain_id,
         },
         "options": {
-            "with_live_members": args.with_live_members,
-            "with_segment_inventory": args.with_segment_inventory,
             "with_vm_tags": args.with_vm_tags,
             "with_impact_report": args.with_impact_report,
         },
@@ -333,10 +339,10 @@ def main() -> int:
             "export_root": str(export_root),
             "source_export_dir": str(source_export_dir),
             "source_groups_dir": str(source_groups_dir),
-            "additive_groups_dir": str(additive_groups_dir) if args.with_live_members else None,
-            "segment_inventory_dir": str(segment_inv_dir) if args.with_segment_inventory else None,
-            "segment_details_file": str(segment_inv_dir / "segment_details.json") if args.with_segment_inventory else None,
-            "segments_inventory_file": str(segment_inv_dir / "segments_inventory.json") if args.with_segment_inventory else None,
+            "additive_groups_dir": str(additive_groups_dir),
+            "segment_inventory_dir": str(segment_inv_dir),
+            "segment_details_file": str(segment_inv_dir / "segment_details.json"),
+            "segments_inventory_file": str(segment_inv_dir / "segments_inventory.json"),
             "impact_report_dir": str(impact_report_dir) if args.with_impact_report else None,
             "vm_tags_export_root": str(vm_tags_export_root) if args.with_vm_tags and not args.federation_global else None,
             "logs_dir": str(logs_dir),

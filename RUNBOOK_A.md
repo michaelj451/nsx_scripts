@@ -67,7 +67,7 @@ What this does, in order, against `nsx-lm1` (every call is GET-only):
 Output bundle:
 
 ```text
-nsx_capture/nsx-lm1.lab.local/<UTC_TS>/
+nsx_capture/nsx-lm1.lab.local/             ← always reflects the LATEST capture
 ├── manifest.json                  ← captured-at, options, per-step status
 ├── summary.txt                    ← human-readable summary
 ├── nsx_export/<host>/             ← raw NSX state
@@ -85,11 +85,9 @@ nsx_capture/nsx-lm1.lab.local/<UTC_TS>/
 | `--source nsx-lm1`             | (required) | Which manager to capture from                            |
 | `--domain-id default`          | default | NSX policy domain                                            |
 | `--federation-global`          | off     | Use the Global Manager API surface (for GM source)           |
-| `--no-live-members`            | off     | Skip live VM-IP enrichment (groups stay as raw export)       |
-| `--no-segment-inventory`       | off     | Skip the segment inventory (transform's `convert` won't work)|
-| `--no-vm-tags`                 | off     | Skip VM tag capture                                          |
-| `--no-impact-report`           | off     | Skip the affected-rules impact report                        |
-| `--output-dir <path>`          | auto    | Override the default `nsx_capture/<host>/<UTC_TS>/` path     |
+| `--no-vm-tags`                 | off     | Skip VM tag capture (not used by A/B transforms)             |
+| `--no-impact-report`           | off     | Skip the affected-rules impact report (review artifact only) |
+| `--output-dir <path>`          | auto    | Override the default `nsx_capture/<host>/` path. The default path is wiped at the start of every run; pass `--output-dir` to preserve specific bundles. |
 
 ### Review gate
 
@@ -106,7 +104,7 @@ Before moving on, look at:
 
 ```bash
 python tools/nsx/transform_capture.py \
-  --capture nsx_capture/nsx-lm1.lab.local/<UTC_TS> \
+  --capture nsx_capture/nsx-lm1.lab.local \
   --segment-mode convert
 ```
 
@@ -131,7 +129,7 @@ If `convert` is requested but the capture didn't include segment details, the tr
 ### Output bundle
 
 ```text
-nsx_transformed/nsx-lm1.lab.local/<UTC_TS>/
+nsx_transformed/nsx-lm1.lab.local/
 ├── manifest.json                  ← transform metadata + link back to capture
 ├── summary.txt                    ← per-step status, transform counts
 ├── groups_transformed/
@@ -149,7 +147,7 @@ nsx_transformed/nsx-lm1.lab.local/<UTC_TS>/
 | `--segment-mode {convert,strip,skip}` | convert | How to handle segment references                                |
 | `--source-groups {additive,raw}`| additive  | Use the live-member-enriched groups (recommended) or raw export      |
 | `--domain-id <id>`              | from manifest | Override the domain (rarely needed)                              |
-| `--output-dir <path>`           | auto      | Override the default `nsx_transformed/<host>/<UTC_TS>/` path         |
+| `--output-dir <path>`           | auto      | Override the default `nsx_transformed/<host>/` path         |
 
 ### Review gate
 
@@ -160,8 +158,8 @@ Before moving on:
 - Diff the transformed groups against the input if you want byte-level visibility:
   ```bash
   diff -r \
-    nsx_capture/nsx-lm1.lab.local/<TS>/groups_additive/domains/default/groups \
-    nsx_transformed/nsx-lm1.lab.local/<TS>/groups_transformed/domains/default/groups
+    nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
+    nsx_transformed/nsx-lm1.lab.local/groups_transformed/domains/default/groups
   ```
 
 ---
@@ -173,12 +171,12 @@ Before moving on:
 ```bash
 python tools/nsx/push_from_capture.py \
   --target nsx-lm2 \
-  --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS>
+  --transformed nsx_transformed/nsx-lm1.lab.local
 ```
 
 What this does, against `nsx-lm2`:
 
-1. **Baseline export of the target** (GET-only) — captures pre-push state for rollback. Lives at `<push bundle>/target_baseline/`.
+1. **Baseline capture of the target** (GET-only) — full `capture_nsx_state` of nsx-lm2, written to `nsx_capture/nsx-lm2.lab.local/` (overwritten each run). This is the pre-push snapshot used for rollback.
 2. **Assemble the complete payload** offline — combines `nsx-lm1`'s services/policies/rules from the capture with the transformed groups from step 2 into `<push bundle>/nsx_build/`.
 3. **Dry-run push** — every PATCH/POST is logged but not sent. Output mirrored into `<push bundle>/push_report/`.
 
@@ -188,7 +186,7 @@ Output bundle:
 nsx_push/nsx-lm2.lab.local/             ← always reflects the LATEST push
 ├── manifest.json                  ← push metadata + links back to capture + transformed
 ├── summary.txt                    ← step status, push counts
-├── target_baseline/               ← pre-push GET-only export of nsx-lm2
+│   (pre-push baseline lives at nsx_capture/nsx-lm2.lab.local/ — see below)
 ├── nsx_build/nsx-lm2.lab.local/   ← assembled push payload
 ├── push_report/<ts>/              ← push tool's JSON/JSONL summary + per-row results
 └── logs/                          ← per-step log files
@@ -207,7 +205,7 @@ When the dry-run looks clean, re-run with `--apply`:
 ```bash
 python tools/nsx/push_from_capture.py \
   --target nsx-lm2 \
-  --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS> \
+  --transformed nsx_transformed/nsx-lm1.lab.local \
   --apply
 ```
 
@@ -239,18 +237,19 @@ nsx-lm1 (live)                                                  nsx-lm2 (target)
       │  1) capture_nsx_state.py                                          │  3b) push_from_capture.py --apply
       │                                                                   │
       ▼                                                                   │
-nsx_capture/nsx-lm1.lab.local/<TS>/                                       │
+nsx_capture/nsx-lm1.lab.local/                                            │
    nsx_export/, groups_additive/, segment_inventory/, vm_tag_inventory/   │
       │                                                                   │
       │  2) transform_capture.py  (OFFLINE — never touches NSX)           │
       ▼                                                                   │
-nsx_transformed/nsx-lm1.lab.local/<TS>/                                   │
+nsx_transformed/nsx-lm1.lab.local/                               │
    groups_transformed/, transform_report/                                 │
       │                                                                   │
       │  3a) push_from_capture.py            (dry-run, talks to nsx-lm2)  │
       ▼                                                                   │
+nsx_capture/nsx-lm2.lab.local/  (pre-push baseline of target)             │
 nsx_push/nsx-lm2.lab.local/      ─────────────────────────────────────── ┤  (wiped & rewritten each run)
-   target_baseline/, nsx_build/, push_report/, validate_report/           │
+   nsx_build/, push_report/, validate_report/                             │
 ```
 
 ---
@@ -276,7 +275,7 @@ Re-aim the push wrapper at it for end-to-end testing before touching `nsx-lm2`:
 ```bash
 python tools/nsx/push_from_capture.py \
   --target nsx-lm3 \
-  --transformed nsx_transformed/nsx-lm1.lab.local/<TS>
+  --transformed nsx_transformed/nsx-lm1.lab.local
 ```
 
 Same transformed bundle, different target. The push bundle lands at `nsx_push/nsx-lm3.lab.local/`.
@@ -285,14 +284,14 @@ Same transformed bundle, different target. The push bundle lands at `nsx_push/ns
 
 ## Rollback
 
-The push bundle's `target_baseline/` directory holds the pre-push GET-only export of the target. Pair it with `push_complete_nsx_revert.py` to roll back:
+The pre-push baseline of the target lives at `nsx_capture/<target-host>/` (full `capture_nsx_state` snapshot taken automatically at the start of the push). Pair it with `push_complete_nsx_revert.py` to roll back:
 
 Dry-run preview:
 
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_capture/nsx-lm2.lab.local/nsx_export/nsx-lm2.lab.local \
   --domain-id default
 ```
 
@@ -301,7 +300,7 @@ Apply rollback:
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
   --target nsx-lm2 \
-  --export-root nsx_push/nsx-lm2.lab.local/target_baseline/nsx-lm2.lab.local \
+  --export-root nsx_capture/nsx-lm2.lab.local/nsx_export/nsx-lm2.lab.local \
   --domain-id default \
   --apply
 ```

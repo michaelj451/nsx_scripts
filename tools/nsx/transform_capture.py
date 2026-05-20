@@ -15,24 +15,29 @@ just to evaluate options) without re-hitting the source NSX manager.
 
 What gets written:
 
-  nsx_transformed/<source-host>/<UTC_TS>/
-    manifest.json                    transform metadata + link back to capture
-    summary.txt                      human-readable summary
+  nsx_transformed/<source-host>/             ← always reflects the LATEST transform
+    manifest.json                              transform metadata + link back to capture
+    summary.txt                                human-readable summary
     groups_transformed/
-      domains/<domain>/groups/...    transformed group YAML files
+      domains/<domain>/groups/...              transformed group YAML files
     transform_report/
-      segments_stripped.json         per-group strip/convert detail
-    logs/                            per-step log files
+      segments_stripped.json                   per-group strip/convert detail
+    logs/                                      per-step log files
+
+The default transformed bundle directory is wiped at the start of every run so
+it always reflects the most recent transform. Per-run history lives in
+$NSX_LOG_DIR/transform_capture_<UTC_TS>.log instead. Pass --output-dir to
+override the default and preserve specific bundles.
 
 Usage:
 
   python tools/nsx/transform_capture.py \\
-    --capture nsx_capture/nsx-lm1.lab.local/20260520_153012 \\
+    --capture nsx_capture/nsx-lm1.lab.local \\
     --segment-mode convert
 
   # Just strip segment references (no CIDR substitution):
   python tools/nsx/transform_capture.py \\
-    --capture nsx_capture/nsx-lm1.lab.local/20260520_153012 \\
+    --capture nsx_capture/nsx-lm1.lab.local \\
     --segment-mode strip
 """
 from __future__ import annotations
@@ -198,7 +203,12 @@ def main() -> int:
     p.add_argument("--capture", required=True,
                    help="Path to a capture bundle (output of capture_nsx_state.py).")
     p.add_argument("--output-dir", default=None,
-                   help="Transformed bundle directory. Defaults to nsx_transformed/<source-host>/<UTC_TS>/.")
+                   help=(
+                       "Transformed bundle directory. Defaults to nsx_transformed/<source-host>/. "
+                       "On each run, the default path is wiped first so it always reflects "
+                       "the latest transform (previous transform artifacts are deleted). "
+                       "Pass --output-dir to preserve specific bundles."
+                   ))
     p.add_argument("--segment-mode", choices=["convert", "strip", "skip"], default=None,
                    help=(
                        "How to handle segment references in groups. "
@@ -244,10 +254,17 @@ def main() -> int:
     source_host = cap_manifest["captured_from"]["manager_host"]
     domain_id = args.domain_id or cap_manifest["captured_from"]["domain_id"]
 
+    using_default_output = args.output_dir is None
     output_dir = Path(
         args.output_dir
-        or (REPO_ROOT / "nsx_transformed" / source_host / RUN_TS)
+        or (REPO_ROOT / "nsx_transformed" / source_host)
     ).expanduser().resolve()
+
+    # On the default path, wipe any previous transform so this directory
+    # always reflects the latest. Custom --output-dir paths are left alone.
+    if using_default_output and output_dir.exists():
+        log.info("Wiping previous transformed bundle: %s", output_dir)
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logs_dir = output_dir / "logs"

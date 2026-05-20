@@ -64,7 +64,7 @@ serves as Workflow B's rollback baseline — the pre-remap state of
 Output bundle:
 
 ```text
-nsx_capture/nsx-lm1.lab.local/<UTC_TS>/
+nsx_capture/nsx-lm1.lab.local/             ← always reflects the LATEST capture
 ├── manifest.json
 ├── summary.txt
 ├── nsx_export/<host>/             ← raw NSX state (also serves as rollback baseline)
@@ -87,7 +87,7 @@ nsx_capture/nsx-lm1.lab.local/<UTC_TS>/
 
 ```bash
 python tools/nsx/transform_capture.py \
-  --capture nsx_capture/nsx-lm1.lab.local/<UTC_TS> \
+  --capture nsx_capture/nsx-lm1.lab.local \
   --csv-remap data/nonprod_map.csv \
   --mapped-only
 ```
@@ -127,7 +127,7 @@ old_subnet,new_subnet
 ### Output bundle
 
 ```text
-nsx_transformed/nsx-lm1.lab.local/<UTC_TS>/
+nsx_transformed/nsx-lm1.lab.local/
 ├── manifest.json                  ← transform metadata + link back to capture
 ├── summary.txt                    ← per-step status, CSV remap counts
 ├── groups_transformed/
@@ -149,8 +149,8 @@ nsx_transformed/nsx-lm1.lab.local/<UTC_TS>/
 - Diff the changed groups against the capture's additive tree if you want byte-level visibility:
   ```bash
   diff -r \
-    nsx_capture/nsx-lm1.lab.local/<TS>/groups_additive/domains/default/groups \
-    nsx_transformed/nsx-lm1.lab.local/<TS>/groups_transformed/domains/default/groups
+    nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
+    nsx_transformed/nsx-lm1.lab.local/groups_transformed/domains/default/groups
   ```
 
 ---
@@ -162,13 +162,13 @@ nsx_transformed/nsx-lm1.lab.local/<UTC_TS>/
 ```bash
 python tools/nsx/push_from_capture.py \
   --target nsx-lm1 \
-  --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS> \
+  --transformed nsx_transformed/nsx-lm1.lab.local \
   --groups-only
 ```
 
 What this does, against `nsx-lm1`:
 
-1. **Baseline export of the target** (GET-only) — captures pre-push state for rollback. Lives at `<push bundle>/target_baseline/`.
+1. **Baseline capture of the target** (GET-only) — full `capture_nsx_state` of nsx-lm1, written to `nsx_capture/nsx-lm1.lab.local/` (overwritten each run). This is the pre-push snapshot used for rollback. Note: for Workflow B the source and target are the same manager, so this re-captures lm1 immediately before push.
 2. **Skipped** — groups-only mode does not assemble a complete payload.
 3. **Dry-run push using `push_additive_group_ips`** — every PATCH is logged but not sent. Pushes only the groups in `groups_changed_only/` (if CSV remap ran) or the full transformed tree.
 
@@ -178,7 +178,7 @@ Output bundle:
 nsx_push/nsx-lm1.lab.local/             ← always reflects the LATEST push
 ├── manifest.json
 ├── summary.txt
-├── target_baseline/               ← pre-push GET-only export of nsx-lm1 (rollback baseline)
+│   (pre-push baseline lives at nsx_capture/nsx-lm1.lab.local/ — see Rollback)
 ├── push_report/<ts>/              ← push_additive_group_ips' per-row results
 └── logs/
 ```
@@ -196,7 +196,7 @@ When the dry-run looks clean, re-run with `--apply`:
 ```bash
 python tools/nsx/push_from_capture.py \
   --target nsx-lm1 \
-  --transformed nsx_transformed/nsx-lm1.lab.local/<UTC_TS> \
+  --transformed nsx_transformed/nsx-lm1.lab.local \
   --groups-only \
   --apply
 ```
@@ -226,12 +226,12 @@ nsx-lm1 (source AND target)
       ▲          │
       │          │  B.1) capture_nsx_state.py
       │          ▼
-      │     nsx_capture/nsx-lm1.lab.local/<TS>/
+      │     nsx_capture/nsx-lm1.lab.local/
       │        nsx_export/, groups_additive/, ...
       │          │
       │          │  B.2) transform_capture.py --csv-remap CSV [--mapped-only]  (OFFLINE)
       │          ▼
-      │     nsx_transformed/nsx-lm1.lab.local/<TS>/
+      │     nsx_transformed/nsx-lm1.lab.local/
       │        groups_transformed/, groups_changed_only/, transform_report/
       │          │
       │          │  B.3) push_from_capture.py --target nsx-lm1 --groups-only [--apply]
@@ -239,7 +239,7 @@ nsx-lm1 (source AND target)
                  │
                  ▼
             nsx_push/nsx-lm1.lab.local/             ← always reflects the LATEST push
-               target_baseline/, push_report/, validate_report/
+               push_report/, validate_report/  (baseline at nsx_capture/nsx-lm1.lab.local/)
 ```
 
 ---
@@ -258,15 +258,16 @@ nsx-lm1 (source AND target)
 ## Rollback
 
 Workflow B only writes groups (PATCH), so the **groups-only revert** is the
-complete rollback. The push bundle's `target_baseline/` holds the pre-push
-GET-only export of `nsx-lm1` — pair it with `push_nsx_groups_revert.py`:
+complete rollback. The pre-push baseline of `nsx-lm1` lives at
+`nsx_capture/nsx-lm1.lab.local/` (full capture taken automatically by the push
+step) — pair it with `push_nsx_groups_revert.py`:
 
 Dry-run preview:
 
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_push/nsx-lm1.lab.local/target_baseline/nsx-lm1.lab.local \
+  --export-root nsx_capture/nsx-lm1.lab.local/nsx_export/nsx-lm1.lab.local \
   --domain-id default
 ```
 
@@ -275,7 +276,7 @@ Apply rollback:
 ```bash
 PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_push/nsx-lm1.lab.local/target_baseline/nsx-lm1.lab.local \
+  --export-root nsx_capture/nsx-lm1.lab.local/nsx_export/nsx-lm1.lab.local \
   --domain-id default \
   --apply
 ```

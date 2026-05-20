@@ -26,16 +26,20 @@ All artifacts land in:
   nsx_push/<target-host>/                ← always reflects the LATEST push
     manifest.json                          push metadata + links back to capture + transformed
     summary.txt                            human-readable summary
-    target_baseline/                       pre-push GET-only export of target
     nsx_build/<target>/                    assembled push payload
     push_report/                           push tool's own JSON/JSONL artifacts
     validate_report/                       validate_nsx_groups_live's output
     logs/                                  per-step log files
 
-The default push bundle directory is wiped at the start of every run so it
-always reflects the most recent push. Per-run history lives in
+The pre-push baseline of the TARGET is captured separately at the top level:
+
+  nsx_capture/<target-host>/             ← full capture_nsx_state of the target
+                                            (pre-push snapshot used for rollback)
+
+Both the push bundle and the target baseline are wiped at the start of every
+run so they always reflect the most recent push. Per-run history lives in
 $NSX_LOG_DIR/push_from_capture_*_<UTC_TS>.log instead. Pass --output-dir to
-override the default and preserve specific bundles.
+override the default push-bundle path and preserve specific bundles.
 
 Usage:
 
@@ -336,25 +340,30 @@ def main() -> int:
         else:
             log.info("Groups-only push will use the full transformed tree: %s", push_groups_source)
 
-    target_baseline_dir = output_dir / "target_baseline"
+    # Target baseline = a full capture_nsx_state of the target, written to the
+    # top-level nsx_capture/<target>/ path (no timestamp). capture_nsx_state
+    # wipes that path automatically before writing, so it always reflects the
+    # PRE-PUSH state of the target — which is exactly what rollback needs.
+    target_baseline_dir = REPO_ROOT / "nsx_capture" / target_host
     build_dir = output_dir / "nsx_build" / target_host
     push_report_dir = output_dir / "push_report"
     validate_report_dir = output_dir / "validate_report"
 
     steps: List[Dict[str, Any]] = []
 
-    # 1. Baseline export of target (rollback insurance) — GET-only
+    # 1. Baseline capture of target (rollback insurance) — GET-only.
+    # Uses capture_nsx_state.py so the target gets a full bundle with the same
+    # shape as the source capture: nsx_export/, groups_additive/, etc.
     if not args.skip_baseline:
         cmd = [
-            sys.executable, "tools/nsx/export_nsx_objects.py",
-            "--manager", args.target,
-            "--base-dir", str(target_baseline_dir),
+            sys.executable, "tools/nsx/capture_nsx_state.py",
+            "--source", args.target,
             "--domain-id", domain_id,
-            "--output-format", "yaml",
+            "--no-impact-report",
         ]
         if args.federation_global:
             cmd.append("--federation-global")
-        steps.append(run_step("1_baseline_export_target", cmd, REPO_ROOT, logs_dir))
+        steps.append(run_step("1_baseline_capture_target", cmd, REPO_ROOT, logs_dir))
     else:
         log.warning("STEP 1 skipped — no target baseline (rollback will rely on previously captured state, if any)")
 
