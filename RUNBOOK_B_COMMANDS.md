@@ -1,6 +1,8 @@
 # Runbook B — Commands
 
-## Step B.0: Env — macOS / Linux
+Three commands, same as Runbook A — different flags. See `RUNBOOK_B.md` for the full explanation.
+
+## Step 0: Env
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -8,112 +10,89 @@ pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
 ```
 
-## Step B.0: Env — Windows (PowerShell)
+---
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r docker\requirements-pip.txt
-$env:PYTHONPATH = "$PWD\app"
-```
-
-## Step B.0: Env — Windows (Command Prompt)
-
-```cmd
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r docker\requirements-pip.txt
-set PYTHONPATH=%CD%\app
-```
-
-## Step B.1: Export nsx-lm1 (rollback snapshot)
+## B.1) Capture nsx-lm1 (read-only)
 
 ```bash
-python tools/nsx/export_nsx_objects.py \
-  --manager nsx-lm1 \
-  --base-dir nsx_export \
-  --domain-id default \
-  --output-format yaml
+python tools/nsx/capture_nsx_state.py \
+  --source nsx-lm1 \
+  --domain-id default
 ```
 
-## Step B.2: Resolve live VM membership → additive tree
+Output: `nsx_capture/nsx-lm1.lab.local/` (overwritten each run). Review `summary.txt` and `affected_rule_reports/affected_rules_impact.json` before continuing.
+
+---
+
+## B.2) Transform — CSV subnet remap (offline)
 
 ```bash
-python tools/nsx/build_group_ip_additive_from_live_members.py \
-  --source-manager nsx-lm1 \
-  --domain-id default \
-  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
-  --output-format yaml \
-  --copy-first \
-  --continue-on-group-error
-```
-
-## Step B.3: Apply CSV subnet remap (offline) — mapped-only
-
-```bash
-python tools/nsx/nsx_group_ip_remap_offline.py \
-  --export-root nsx_groups_additive_b/nsx-lm1.lab.local/domains/default/groups \
-  --prepared-root nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --mapping-csv data/nonprod_map.csv \
-  --output-format yaml \
+python tools/nsx/transform_capture.py \
+  --capture nsx_capture/nsx-lm1.lab.local \
+  --csv-remap data/nonprod_map.csv \
   --mapped-only
 ```
 
-## Step B.4: (Optional) Affected-rule impact report
+Output: `nsx_transformed/nsx-lm1.lab.local/`. Review `summary.txt` and `transform_report/group-ip-remap/summary_update.json` before pushing.
+
+### Transform variants
+
+Without `--mapped-only` (append CSV-mapped IPs, keep originals):
 
 ```bash
-python tools/nsx/find_rules_affected_by_group_changes.py \
-  --additive-root nsx_groups_remapped \
-  --export-root nsx_export \
-  --output-dir nsx_logs/affected_rule_reports \
-  --verbose
+python tools/nsx/transform_capture.py --capture <capture> --csv-remap data/nonprod_map.csv
 ```
 
-## Step B.5: Dry-run push to nsx-lm1
+Bidirectional mapping:
 
 ```bash
-python tools/nsx/push_additive_group_ips.py \
-  --target nsx-lm1 \
-  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --domain-id default \
-  --dry-run
+python tools/nsx/transform_capture.py --capture <capture> --csv-remap data/nonprod_map.csv --mapped-only --bidirectional
 ```
 
-## Step B.6: Apply push to nsx-lm1
+---
+
+## B.3a) Dry-run groups-only push to nsx-lm1
 
 ```bash
-python tools/nsx/push_additive_group_ips.py \
+python tools/nsx/push_from_capture.py \
   --target nsx-lm1 \
-  --groups-dir nsx_groups_remapped/nsx-lm1.lab.local/domains/default/groups \
-  --domain-id default \
+  --transformed nsx_transformed/nsx-lm1.lab.local \
+  --groups-only
+```
+
+Output: `nsx_push/nsx-lm1.lab.local/` (overwritten each run). Review `summary.txt` and `push_report/summary_*.json`.
+
+---
+
+## B.3b) Apply groups-only push to nsx-lm1
+
+```bash
+python tools/nsx/push_from_capture.py \
+  --target nsx-lm1 \
+  --transformed nsx_transformed/nsx-lm1.lab.local \
+  --groups-only \
   --apply
 ```
 
-## Step B.7: Validate live nsx-lm1 state
+Live validation runs automatically after `--apply`.
+
+---
+
+## Rollback (groups-only)
+
+The pre-push baseline of nsx-lm1 lives at `nsx_capture/nsx-lm1.lab.local/` (full capture taken automatically by the push step).
 
 ```bash
-python tools/nsx/validate_nsx_groups_live.py \
+# Dry-run preview
+PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --expected-root nsx_groups_remapped/nsx-lm1.lab.local \
+  --export-root nsx_capture/nsx-lm1.lab.local/nsx_export/nsx-lm1.lab.local \
   --domain-id default
-```
 
-## Rollback: Dry-run preview
-
-```bash
-python tools/nsx/push_nsx_groups_revert.py \
+# Apply rollback
+PYTHONPATH="$PWD/app" python tools/nsx/push_nsx_groups_revert.py \
   --target nsx-lm1 \
-  --export-root nsx_export/nsx-lm1.lab.local \
-  --domain-id default
-```
-
-## Rollback: Apply
-
-```bash
-python tools/nsx/push_nsx_groups_revert.py \
-  --target nsx-lm1 \
-  --export-root nsx_export/nsx-lm1.lab.local \
+  --export-root nsx_capture/nsx-lm1.lab.local/nsx_export/nsx-lm1.lab.local \
   --domain-id default \
   --apply
 ```

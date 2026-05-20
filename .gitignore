@@ -21,6 +21,11 @@ nsx_groups_remapped/
 nsx_groups_transformed/
 nsx_export_verify/
 
+# Workflow A bundle artifacts (capture / transform / push)
+nsx_capture/
+nsx_transformed/
+nsx_push/
+
 # VM Tag Logs
 nsx_vm_files/
 

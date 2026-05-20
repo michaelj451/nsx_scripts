@@ -7,7 +7,7 @@ import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
@@ -260,6 +260,21 @@ def main() -> None:
         help="Continue if one group membership lookup fails.",
     )
 
+    parser.add_argument(
+        "--no-live-query",
+        action="store_true",
+        help=(
+            "Do NOT contact the source NSX manager. Skip the VM IP index build "
+            "and the per-group evaluated-member lookup. The output tree is "
+            "produced by copying the source export only — group expressions "
+            "are preserved as-is, including any dynamic Condition / "
+            "PathExpression entries. Useful when the source manager is "
+            "unreachable, when you want a byte-for-byte clone of the export, "
+            "or when downstream tools depend on the output path existing. "
+            "Implies --copy-first behavior."
+        ),
+    )
+
     args = parser.parse_args()
 
     init_cli()
@@ -269,10 +284,13 @@ def main() -> None:
     if not source_host:
         raise RuntimeError(f"Manager not defined for {args.source_manager}")
 
-    client = NsxPolicyClient(
-        nsxmanager=source_host,
-        federation_global=False,
-    )
+    # Defer NSX client creation — only build it if we actually need to query.
+    client: Optional[NsxPolicyClient] = None
+    if not args.no_live_query:
+        client = NsxPolicyClient(
+            nsxmanager=source_host,
+            federation_global=False,
+        )
 
     source_groups_dir = Path(args.source_groups_dir).expanduser().resolve()
     output_groups_dir = Path(args.output_groups_dir).expanduser().resolve()
@@ -302,8 +320,12 @@ def main() -> None:
     log.info("Output format: %s", args.output_format)
     log.info("Copy first: %s", args.copy_first)
     log.info("Continue on group error: %s", args.continue_on_group_error)
+    log.info("No live query: %s", args.no_live_query)
 
-    if args.copy_first:
+    # --no-live-query implies copy-first — the output dir IS the result; there
+    # is no enrichment phase that writes individual files.
+    do_copy_first = args.copy_first or args.no_live_query
+    if do_copy_first:
         if output_groups_dir.exists():
             log.info("Deleting existing output dir: %s", output_groups_dir)
             shutil.rmtree(output_groups_dir)
@@ -315,9 +337,19 @@ def main() -> None:
         output_groups_dir.mkdir(parents=True, exist_ok=True)
         working_groups_dir = source_groups_dir
 
-    log.info("Building VM IP index from source manager: %s", args.source_manager)
-    vm_ip_index = client.build_vm_ip_index()
-    log.info("VMs with discovered IPs: %d", len(vm_ip_index))
+    # Build the VM IP index ONLY if we will actually do enrichment.
+    vm_ip_index: Dict[str, List[str]] = {}
+    if args.no_live_query:
+        log.warning(
+            "--no-live-query set: skipping VM IP index build and per-group "
+            "evaluated-member lookups. Output is the source export copied "
+            "as-is; group expressions are NOT enriched with static IPs."
+        )
+    else:
+        assert client is not None  # for type-checkers; created earlier when not --no-live-query
+        log.info("Building VM IP index from source manager: %s", args.source_manager)
+        vm_ip_index = client.build_vm_ip_index()
+        log.info("VMs with discovered IPs: %d", len(vm_ip_index))
 
     group_files = sorted(iter_group_files(working_groups_dir))
     log.info("Group files found: %d", len(group_files))
@@ -367,6 +399,19 @@ def main() -> None:
                 continue
 
             groups_seen += 1
+
+            # Offline shortcut: --no-live-query skips every NSX call. The
+            # source file is already copied to the output dir above; nothing
+            # else to do for this group.
+            if args.no_live_query:
+                skipped_rows.append({
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "group_file": str(group_file),
+                    "status": "skipped_no_live_query",
+                    "reason": "--no-live-query set; source expression preserved as-is",
+                })
+                continue
 
             try:
                 log.info("Processing group %s (%s)", group_name, group_id)

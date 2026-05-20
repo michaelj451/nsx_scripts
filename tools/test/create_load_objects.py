@@ -78,6 +78,63 @@ def _rule_path(domain_id: str, policy_id: str, rule_id: str) -> str:
     return f"/domains/{domain_id}/security-policies/{policy_id}/rules/{rule_id}"
 
 
+def _service_path(service_id: str) -> str:
+    return f"/services/{service_id}"
+
+
+def _make_service_payload(
+    service_id: str,
+    display_name: str,
+    l4_protocol: str,
+    destination_ports: List[str],
+) -> dict:
+    """
+    Build a Service with a single L4PortSetServiceEntry. l4_protocol is
+    TCP or UDP. destination_ports is a list of port strings (NSX accepts
+    "8080" or "8000-8100" — we use single ports here).
+    """
+    return {
+        "resource_type": "Service",
+        "id": service_id,
+        "display_name": display_name,
+        "service_entries": [
+            {
+                "resource_type": "L4PortSetServiceEntry",
+                "id": "entry-1",
+                "display_name": "entry-1",
+                "l4_protocol": l4_protocol,
+                "destination_ports": destination_ports,
+                "source_ports": [],
+            }
+        ],
+    }
+
+
+def _generate_service_ports(
+    service_count: int,
+    ports_per_service: int,
+    port_base: int,
+) -> List[List[str]]:
+    """
+    Allocate a unique contiguous block of port numbers per service.
+    Starts at port_base and walks upward. Raises if it would exceed 65535.
+    """
+    if ports_per_service < 1:
+        raise ValueError("ports_per_service must be >= 1")
+    out: List[List[str]] = []
+    cursor = port_base
+    for _ in range(service_count):
+        if cursor + ports_per_service - 1 > 65535:
+            raise ValueError(
+                f"Port space exhausted: requested {service_count} services × "
+                f"{ports_per_service} ports starting at {port_base}, "
+                f"would exceed 65535"
+            )
+        out.append([str(cursor + i) for i in range(ports_per_service)])
+        cursor += ports_per_service
+    return out
+
+
 def _make_group_payload(group_id: str, display_name: str, ip_entries: List[str]) -> dict:
     return {
         "resource_type": "Group",
@@ -264,6 +321,42 @@ def main() -> None:
     p.add_argument("--category", default="Application", help="Policy category (default Application)")
     p.add_argument("--prefix", default="loadtest", help="Object ID/display_name prefix")
     p.add_argument("--seed", type=int, default=1337, help="Random seed for rule group selection")
+
+    # ---- Custom services (optional) ----
+    p.add_argument(
+        "--services",
+        type=int,
+        default=0,
+        help="Number of custom L4 services to create (default 0 = use built-in ANY only).",
+    )
+    p.add_argument(
+        "--ports-per-service",
+        type=int,
+        default=1,
+        help="Destination ports per service (default 1).",
+    )
+    p.add_argument(
+        "--service-protocol",
+        choices=["TCP", "UDP"],
+        default="TCP",
+        help="L4 protocol for the generated services (default TCP).",
+    )
+    p.add_argument(
+        "--service-port-base",
+        type=int,
+        default=40000,
+        help="Starting port number for generated services (default 40000).",
+    )
+    p.add_argument(
+        "--services-per-rule",
+        type=int,
+        default=1,
+        help=(
+            "Number of custom services assigned to each rule (default 1). "
+            "Only applies when --services > 0; otherwise rules use ['ANY']. "
+            "Cannot exceed --services."
+        ),
+    )
     p.add_argument(
         "--throttle-rps",
         type=float,
@@ -282,6 +375,10 @@ def main() -> None:
 
     if args.groups_per_side > args.groups:
         print("--groups-per-side cannot exceed --groups", file=sys.stderr)
+        sys.exit(2)
+
+    if args.services > 0 and args.services_per_rule > args.services:
+        print("--services-per-rule cannot exceed --services", file=sys.stderr)
         sys.exit(2)
 
     random.seed(args.seed)
@@ -325,10 +422,36 @@ def main() -> None:
         group_ids.append(gid)
 
     # Rules reference full paths
+    infra_root = "global-infra" if args.mode == "gm" else "infra"
     group_paths = [
-        f"/{'global-infra' if args.mode == 'gm' else 'infra'}/domains/{domain_id}/groups/{gid}"
+        f"/{infra_root}/domains/{domain_id}/groups/{gid}"
         for gid in group_ids
     ]
+
+    # ---- Create Services (optional) ----
+    service_paths: List[str] = []
+    if args.services > 0:
+        print(
+            f"Creating {args.services} custom {args.service_protocol} service(s), "
+            f"{args.ports_per_service} port(s) each, starting at port {args.service_port_base}..."
+        )
+        port_blocks = _generate_service_ports(
+            service_count=args.services,
+            ports_per_service=args.ports_per_service,
+            port_base=args.service_port_base,
+        )
+        service_ids: List[str] = []
+        for i in range(1, args.services + 1):
+            sid = f"{args.prefix}-svc-{i:05d}"
+            payload = _make_service_payload(
+                service_id=sid,
+                display_name=sid,
+                l4_protocol=args.service_protocol,
+                destination_ports=port_blocks[i - 1],
+            )
+            _put(cfg, throttler, _service_path(sid), payload)
+            service_ids.append(sid)
+        service_paths = [f"/{infra_root}/services/{sid}" for sid in service_ids]
 
     # ---- Create Policies + Rules ----
     print(f"Creating {args.policies} policies, {args.rules_per_policy} rules/policy...")
@@ -346,6 +469,11 @@ def main() -> None:
             src = random.sample(group_paths, args.groups_per_side)
             dst = random.sample(group_paths, args.groups_per_side)
 
+            if service_paths:
+                rule_services = random.sample(service_paths, args.services_per_rule)
+            else:
+                rule_services = ["ANY"]
+
             seq = ridx * 10
             rule_payload = _make_rule_payload(
                 rule_id=rule_id,
@@ -353,7 +481,7 @@ def main() -> None:
                 seq=seq,
                 src_group_paths=src,
                 dst_group_paths=dst,
-                services=["ANY"],
+                services=rule_services,
                 action="ALLOW",
             )
             _put(cfg, throttler, _rule_path(domain_id, pol_id, rule_id), rule_payload)
@@ -363,7 +491,13 @@ def main() -> None:
                 print(f"  rules created: {rule_count}/{total_rules}")
 
     print("Done.")
-    print(f"Created/updated: groups={args.groups}, policies={args.policies}, rules={total_rules}")
+    print(
+        f"Created/updated: "
+        f"groups={args.groups}, "
+        f"services={args.services}, "
+        f"policies={args.policies}, "
+        f"rules={total_rules}"
+    )
     print(
         "Per-group entries: "
         f"subnets={args.subnets_per_group}, "
@@ -371,6 +505,14 @@ def main() -> None:
         f"range_width={args.range_width}, "
         f"single_ips={args.single_ips_per_group}"
     )
+    if args.services > 0:
+        print(
+            "Per-service: "
+            f"protocol={args.service_protocol}, "
+            f"ports_per_service={args.ports_per_service}, "
+            f"port_base={args.service_port_base}, "
+            f"services_per_rule={args.services_per_rule}"
+        )
     print("Note: re-running with same --prefix will update the same objects (idempotent PUT).")
 
 

@@ -274,6 +274,78 @@ def _transform_group(
 # Segment fetch from live NSX
 # =============================================================================
 
+def _index_segments_by_path(all_segments: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Index a list of segment objects by their NSX path. Falls back to id-derived paths."""
+    by_path: Dict[str, Dict[str, Any]] = {}
+    for seg in all_segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_path = seg.get("path") or seg.get("relative_path")
+        if isinstance(seg_path, str):
+            by_path[seg_path] = seg
+        seg_id = seg.get("id")
+        if isinstance(seg_id, str):
+            by_path.setdefault(f"/infra/segments/{seg_id}", seg)
+            by_path.setdefault(f"/global-infra/segments/{seg_id}", seg)
+    return by_path
+
+
+def _load_segments_from_file(
+    segments_file: Path,
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """
+    Load a cached segment map from a JSON file written by find_segments_referenced.py.
+
+    Accepts either:
+      - segment_details.json: a flat list of segment objects
+      - segments_inventory.json: the larger report with a "segments" array whose
+        items carry a "details" object
+
+    Returns ({}, "reason") on any failure.
+    """
+    try:
+        if not segments_file.exists():
+            return {}, f"Segments file does not exist: {segments_file}"
+        raw = json.loads(segments_file.read_text(encoding="utf-8"))
+
+        candidates: List[Dict[str, Any]] = []
+
+        if isinstance(raw, list):
+            candidates = [s for s in raw if isinstance(s, dict)]
+
+        elif isinstance(raw, dict) and isinstance(raw.get("segments"), list):
+            for entry in raw["segments"]:
+                if not isinstance(entry, dict):
+                    continue
+                details = entry.get("details")
+                if isinstance(details, dict):
+                    # segments_inventory.json puts the actual segment object under "details".
+                    # The segment_path key on the entry is authoritative — copy it onto the
+                    # detail object so _index_segments_by_path keys it correctly.
+                    seg_obj = dict(details)
+                    if "path" not in seg_obj and entry.get("segment_path"):
+                        seg_obj["path"] = entry["segment_path"]
+                    candidates.append(seg_obj)
+
+        else:
+            return {}, f"Unrecognized segments file shape: {segments_file}"
+
+        by_path = _index_segments_by_path(candidates)
+        log.info(
+            "Loaded %d segment object(s) from cached file %s",
+            len(candidates), segments_file,
+        )
+        return by_path, None
+
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        log.warning(
+            "Could not load segments from file %s — falling back to plain strip "
+            "behavior. Reason: %s", segments_file, msg,
+        )
+        return {}, msg
+
+
 def _fetch_segments_by_path(
     source_manager: Optional[str],
     federation_global: bool,
@@ -299,17 +371,7 @@ def _fetch_segments_by_path(
             manager_host, federation_global,
         )
         all_segments = client.list_segments()
-
-        by_path: Dict[str, Dict[str, Any]] = {}
-        for seg in all_segments:
-            seg_path = seg.get("path") or seg.get("relative_path")
-            if isinstance(seg_path, str):
-                by_path[seg_path] = seg
-            seg_id = seg.get("id")
-            if isinstance(seg_id, str):
-                by_path.setdefault(f"/infra/segments/{seg_id}", seg)
-                by_path.setdefault(f"/global-infra/segments/{seg_id}", seg)
-
+        by_path = _index_segments_by_path(all_segments)
         log.info("Fetched %d segment object(s) for conversion lookup", len(all_segments))
         return by_path, None
 
@@ -483,7 +545,21 @@ def main() -> None:
         "--source-manager",
         default=None,
         choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
-        help="Live NSX manager to fetch segment details from (required for --mode convert).",
+        help=(
+            "Live NSX manager to fetch segment details from. Used for --mode convert "
+            "when --segments-from is not provided."
+        ),
+    )
+
+    parser.add_argument(
+        "--segments-from",
+        default=None,
+        help=(
+            "Path to a cached segments file (segment_details.json or "
+            "segments_inventory.json from find_segments_referenced.py). When set with "
+            "--mode convert the transform runs FULLY OFFLINE — no NSX API call. "
+            "Takes precedence over --source-manager."
+        ),
     )
 
     parser.add_argument(
@@ -500,10 +576,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.mode == "convert" and not args.source_manager:
+    if args.mode == "convert" and not args.source_manager and not args.segments_from:
         raise SystemExit(
-            "--mode convert requires --source-manager (the live NSX manager "
-            "to fetch segment subnets from)."
+            "--mode convert requires either --segments-from <file> (offline) or "
+            "--source-manager (live fetch) to resolve segment subnets."
         )
 
     init_cli()
@@ -522,6 +598,7 @@ def main() -> None:
     log.info("Input dir:   %s", input_dir)
     log.info("Output dir:  %s", output_dir)
     log.info("Source mgr:  %s", args.source_manager or "(none)")
+    log.info("Segments from file: %s", args.segments_from or "(none)")
     log.info("Federation:  %s", args.federation_global)
     log.info("Overwrite:   %s", args.overwrite)
 
@@ -541,16 +618,26 @@ def main() -> None:
     fetch_error: Optional[str] = None
 
     if args.mode == "convert":
-        segments_by_path, fetch_error = _fetch_segments_by_path(
-            source_manager=args.source_manager,
-            federation_global=args.federation_global,
-        )
-        if not segments_by_path:
-            log.warning(
-                "Conversion requested but no segments fetched (reason: %s). "
-                "Falling back to plain strip behavior.",
-                fetch_error or "unknown",
+        if args.segments_from:
+            segments_file = Path(args.segments_from).expanduser().resolve()
+            segments_by_path, fetch_error = _load_segments_from_file(segments_file)
+            if fetch_error:
+                log.warning(
+                    "Conversion requested but offline segments load failed "
+                    "(file=%s, reason=%s). Falling back to plain strip behavior.",
+                    segments_file, fetch_error,
+                )
+        else:
+            segments_by_path, fetch_error = _fetch_segments_by_path(
+                source_manager=args.source_manager,
+                federation_global=args.federation_global,
             )
+            if not segments_by_path:
+                log.warning(
+                    "Conversion requested but no segments fetched (reason: %s). "
+                    "Falling back to plain strip behavior.",
+                    fetch_error or "unknown",
+                )
 
     report = _transform_tree(
         output_dir,
@@ -574,6 +661,7 @@ def main() -> None:
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "source_manager": args.source_manager,
+        "segments_from": args.segments_from,
         "federation_global": args.federation_global,
         "log_file": str(log_file),
         "reports_dir": str(reports_dir),
