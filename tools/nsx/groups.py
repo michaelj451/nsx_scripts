@@ -165,6 +165,22 @@ def _slugify(name: str, max_len: int = 40) -> str:
     return f"{s[:keep]}_{h}"
 
 
+def _short_id_filename(nsx_id: str) -> str:
+    """Deterministic, MAX_PATH-safe, collision-resistant filename stem.
+
+    Format:
+      - slug <= 10 chars:  "<slug>-<8hex>"
+      - else:              "<first5>-<last5>-<8hex>"
+    """
+    raw = (nsx_id or "").strip() or "unnamed"
+    s = re.sub(r"[^\w\-\.]+", "_", raw)
+    s = re.sub(r"_+", "_", s).strip("_") or "unnamed"
+    h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+    if len(s) <= 10:
+        return f"{s}-{h}"
+    return f"{s[:5]}-{s[-5:]}-{h}"
+
+
 def _load_file(p: Path) -> Dict[str, Any]:
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() in (".yaml", ".yml"):
@@ -439,8 +455,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             special_char_ids.append({"id": gid, "display_name": gname})
             log.warning("[%d/%d] special chars in id: %r (URL-encoded on push)", i, len(all_groups), gid)
 
-        suffix = gid[:8]
-        fname = f"{_slugify(gname)}__{suffix}.yaml"
+        fname = f"{_short_id_filename(gid)}.yaml"
         path = groups_dir / fname
 
         try:
