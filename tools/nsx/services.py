@@ -40,6 +40,7 @@ import re
 import shutil
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -55,6 +56,14 @@ log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 THROTTLE_SECONDS = 0.2
+
+# Char-class allowed in NSX object ids without any encoding concerns.
+# Anything else (parens, spaces, commas, ampersands, etc.) gets flagged.
+_SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
+
+
+def _has_special_chars(value: str) -> bool:
+    return not bool(_SAFE_ID_RE.match(str(value or "")))
 
 # Same field set the main exporter strips. Keeps payloads diff-stable and
 # avoids conflicting with the target's view of revisions, ownership, etc.
@@ -75,14 +84,23 @@ NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "n
 # Shared helpers
 # =============================================================================
 
-def _setup_logging(reports_dir: Path, label: str) -> Path:
-    """UTC, dual-write: per-run bundle log + global log dir."""
+def _setup_logging(reports_dir: Path, label: str) -> tuple[Path, Path]:
+    """
+    UTC, multi-write:
+      - Console (INFO+)
+      - bundle log file (INFO+, complete record)
+      - global log file (INFO+, complete record)
+      - bundle errors log file (ERROR+, only the failure detail — easier to scan)
+
+    Returns: (bundle_log, errors_log)
+    """
     global_log_dir = Path(nsx_log_dir).expanduser().resolve()
     global_log_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     bundle_log = (reports_dir / f"services_{label}_{RUN_TS}.log").resolve()
     global_log = (global_log_dir / f"services_{label}_{RUN_TS}.log").resolve()
+    errors_log = (reports_dir / f"services_{label}_{RUN_TS}.errors.log").resolve()
 
     logging.Formatter.converter = time.gmtime
     root = logging.getLogger()
@@ -90,12 +108,21 @@ def _setup_logging(reports_dir: Path, label: str) -> Path:
     for h in list(root.handlers):
         root.removeHandler(h)
     fmt = logging.Formatter("%(asctime)s UTC [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%dT%H:%M:%S")
+
+    # INFO+ handlers
     for h in (logging.StreamHandler(),
               logging.FileHandler(bundle_log, encoding="utf-8"),
               logging.FileHandler(global_log, encoding="utf-8")):
         h.setFormatter(fmt)
         root.addHandler(h)
-    return bundle_log
+
+    # ERROR+ handler — just the failures, with full tracebacks
+    eh = logging.FileHandler(errors_log, encoding="utf-8")
+    eh.setLevel(logging.ERROR)
+    eh.setFormatter(fmt)
+    root.addHandler(eh)
+
+    return bundle_log, errors_log
 
 
 def _is_system_object(obj: Dict[str, Any]) -> bool:
@@ -179,7 +206,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     services_dir = output_dir / "services"
     services_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = output_dir / "logs"
-    log_file = _setup_logging(logs_dir, "export")
+    log_file, errors_log = _setup_logging(logs_dir, "export")
 
     log.info("=" * 60)
     log.info("NSX SERVICES — EXPORT")
@@ -203,6 +230,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     skipped_system = 0
     skipped_no_id = 0
     errors = 0
+    special_char_ids: List[Dict[str, str]] = []  # ids containing chars outside [A-Za-z0-9._-]
 
     for i, svc in enumerate(all_services, start=1):
         sid = svc.get("id")
@@ -216,6 +244,10 @@ def cmd_export(args: argparse.Namespace) -> int:
             skipped_no_id += 1
             log.warning("[%d/%d] skip service with no id: display_name=%s", i, len(all_services), sname)
             continue
+
+        if _has_special_chars(sid):
+            special_char_ids.append({"id": sid, "display_name": sname})
+            log.warning("[%d/%d] special chars in id: %r (URL-encoded on push)", i, len(all_services), sid)
 
         suffix = sid[:8]
         fname = f"{_slugify(sname, max_len=40)}__{suffix}.yaml"
@@ -233,8 +265,15 @@ def cmd_export(args: argparse.Namespace) -> int:
             rows.append({"id": sid, "display_name": sname, "file": fname, "status": "ok"})
         except Exception as exc:
             errors += 1
+            tb = traceback.format_exc()
             log.exception("[%d/%d] FAILED writing %s", i, len(all_services), sid)
-            rows.append({"id": sid, "display_name": sname, "file": fname, "status": "failed", "error": str(exc)})
+            rows.append({
+                "id": sid, "display_name": sname, "file": fname,
+                "status": "failed",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "traceback": tb,
+            })
 
     manifest = {
         "command": "services.export",
@@ -246,14 +285,17 @@ def cmd_export(args: argparse.Namespace) -> int:
             "skipped_system_owned": skipped_system,
             "skipped_no_id": skipped_no_id,
             "errors": errors,
+            "ids_with_special_chars": len(special_char_ids),
         },
         "services": rows,
+        "ids_with_special_chars": special_char_ids,
         "paths": {
             "bundle_dir": str(output_dir),
             "services_dir": str(services_dir),
             "logs_dir": str(logs_dir),
         },
         "log_file": str(log_file),
+        "errors_log": str(errors_log),
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -288,7 +330,7 @@ def cmd_push(args: argparse.Namespace) -> int:
         raise SystemExit(f"Services dir does not exist: {services_dir}")
 
     reports_dir = Path(args.reports_dir or (services_dir.parent / "push_report")).expanduser().resolve()
-    log_file = _setup_logging(reports_dir, "push")
+    log_file, errors_log = _setup_logging(reports_dir, "push")
 
     mode = "APPLY" if args.apply else "DRY-RUN"
     log.info("=" * 60)
@@ -359,10 +401,16 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         except Exception as e:
             failed += 1
+            tb = traceback.format_exc()
             row["status"] = "failed"
             row["error"] = str(e)
-            log.error("[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s",
-                      i, len(files), ok, failed, skipped, row.get("id") or f.name, e)
+            row["error_type"] = type(e).__name__
+            row["traceback"] = tb
+            log.error(
+                "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
+                i, len(files), ok, failed, skipped,
+                row.get("id") or f.name, e, tb,
+            )
 
         rows.append(row)
 
@@ -380,6 +428,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "dry_run": dry_run_count,
         },
         "log_file": str(log_file),
+        "errors_log": str(errors_log),
     }
 
     (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
