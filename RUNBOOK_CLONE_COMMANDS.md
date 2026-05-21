@@ -72,7 +72,7 @@ python tools/nsx/groups.py push `
   --apply
 ```
 
-### Part 3 — add live VM IPs to dynamic groups
+### Part 3 — add captured VM IPs to dynamic groups (snapshot from capture, not re-fetched)
 
 ```sh
 python tools/nsx/groups.py push `

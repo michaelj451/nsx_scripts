@@ -12,7 +12,7 @@ next one starts:
 |---|---|---|
 | **1** | 1-for-1 copy of services, groups, policies, rules — **with segment refs stripped from groups** | Lets you confirm the structure landed cleanly before introducing any cross-manager dependencies |
 | **2** | Re-push groups with **segment refs replaced by CIDR subnets** | Resolves segment dependencies that the target doesn't have natively |
-| **3** | Re-push groups with **live-evaluated VM IPs added** (for dynamic / tag-based groups) | Freezes membership that only resolved on the source |
+| **3** | Re-push groups with **captured VM IPs added** (for dynamic / tag-based groups — IPs snapshotted at export time, not re-fetched at push) | Freezes membership that only resolved on the source |
 
 | Tool | Object class | Notes |
 |---|---|---|
@@ -41,7 +41,7 @@ export PYTHONPATH="$PWD/app"
 
 ---
 
-## Capture once (provides segment data + live VM IPs needed by Parts 2 & 3)
+## Capture once (provides segment data + captured-at-export VM IPs needed by Parts 2 & 3)
 
 ```bash
 # Source: nsx-lm1 → https://nsx-lm1.lab.local
@@ -187,9 +187,9 @@ segments_unresolved   = 0    ← if > 0, segment_details.json was missing entrie
 
 ---
 
-## PART 3 — add live VM IPs to groups
+## PART 3 — add captured VM IPs to groups
 
-Re-push groups but read from the **additive** tree produced by `capture_nsx_state.py` — those YAMLs already have an `IPAddressExpression` of live-evaluated VM IPs appended for each dynamic/tag-based group. Keep `--segments-mode convert` so segments stay translated to CIDRs in the same payload.
+Re-push groups but read from the **additive** tree produced by `capture_nsx_state.py` — those YAMLs already have an `IPAddressExpression` of VM IPs appended for each dynamic/tag-based group. Those IPs are the **snapshot** NSX returned when `capture_nsx_state.py` ran — they're stored on disk, not re-fetched at push time. Keep `--segments-mode convert` so segments stay translated to CIDRs in the same payload.
 
 ```bash
 python tools/nsx/groups.py push \
@@ -203,7 +203,7 @@ python tools/nsx/groups.py push \
 What's different from Part 2:
 
 - `--groups-dir` points at `groups_additive/` instead of the raw export.
-- The additive YAMLs are a strict superset of the raw export — same Conditions, same hard-coded IPs, plus an extra `IPAddressExpression` with the live VM IPs.
+- The additive YAMLs are a strict superset of the raw export — same Conditions, same hard-coded IPs, plus an extra `IPAddressExpression` with the captured VM IPs (snapshot from capture time).
 - After this PATCH, dynamic/tag-based groups on lm2 contain frozen IPs that resolved against lm1's VMs — independent of whether lm2 has any VMs at all.
 
 ---
@@ -452,7 +452,7 @@ Visibility and granularity. The single-shot push handles services + groups + pol
 Same reason. Part 1 confirms the basic clone works without segment dependencies muddying the picture. Part 2 isolates segment-CIDR translation. Part 3 isolates live-VM-IP freezing. If something breaks, you know which transformation was responsible.
 
 **Can I run Part 3 alone (skipping Part 2)?**
-Yes — Part 3's input (`groups_additive/`) is a strict superset of Part 2's. Running Part 3 directly after Part 1 gives you both the segment CIDRs AND the live VM IPs in a single re-push. The split is for observability, not data dependency.
+Yes — Part 3's input (`groups_additive/`) is a strict superset of Part 2's. Running Part 3 directly after Part 1 gives you both the segment CIDRs AND the captured VM IPs in a single re-push. The split is for observability, not data dependency.
 
 **Can I push only to a subset of policies/groups/etc.?**
 Today the tools push every file under the directory you point them at. To push a subset, copy the YAMLs you want into a side directory and pass that as `--policies-dir` / `--rules-dir` / etc. Per-object selection flags could be added if needed.

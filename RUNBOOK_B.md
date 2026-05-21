@@ -68,7 +68,7 @@ nsx_capture/nsx-lm1.lab.local/             ← always reflects the LATEST captur
 ├── manifest.json
 ├── summary.txt
 ├── nsx_export/<host>/             ← raw NSX state (also serves as rollback baseline)
-├── groups_additive/               ← live-member-enriched groups (input for the CSV remap)
+├── groups_additive/               ← groups with captured (snapshot-at-export-time) VM IPs (input for the CSV remap)
 ├── segment_inventory/             ← optional; not used by Workflow B but harmless
 ├── affected_rule_reports/         ← useful to gauge blast radius before push
 ├── vm_tag_inventory/              ← VM tags (LM only)
@@ -122,7 +122,7 @@ old_subnet,new_subnet
 | `--mapped-only`                 | off       | Drop unmapped IPs; keep only the CSV-mapped values                     |
 | `--bidirectional`               | off       | Treat each CSV row as a bidirectional mapping                          |
 | `--segment-mode {convert,strip,skip}` | skip (when --csv-remap is set) | Whether to also do a segment transform        |
-| `--source-groups {additive,raw}`| additive  | Use live-member-enriched groups (recommended) or raw export            |
+| `--source-groups {additive,raw}`| additive  | Use groups with captured (snapshot-at-export-time) VM IPs (recommended) or raw export            |
 
 ### Output bundle
 

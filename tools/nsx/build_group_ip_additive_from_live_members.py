@@ -65,10 +65,10 @@ def _default_reports_dir(output_groups_dir: Path) -> Path:
     # Expected layout:
     #   nsx_groups_additive/<manager>/domains/default/groups
     # Reports:
-    #   nsx_groups_additive/<manager>/domains/default/reports/live-member-ip-additive
+    #   nsx_groups_additive/<manager>/domains/default/reports/captured-member-ip-additive
     if output_groups_dir.name == "groups":
-        return output_groups_dir.parent / "reports" / "live-member-ip-additive"
-    return output_groups_dir / "reports" / "live-member-ip-additive"
+        return output_groups_dir.parent / "reports" / "captured-member-ip-additive"
+    return output_groups_dir / "reports" / "captured-member-ip-additive"
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -239,7 +239,7 @@ def main() -> None:
 
     parser.add_argument(
         "--reports-dir",
-        help="Optional reports directory. Default is beside output groups under reports/live-member-ip-additive.",
+        help="Optional reports directory. Default is beside output groups under reports/captured-member-ip-additive.",
     )
 
     parser.add_argument(
