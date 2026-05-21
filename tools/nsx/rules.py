@@ -182,6 +182,62 @@ def _iter_rule_files(rules_dir: Path) -> List[Path]:
 
 
 # =============================================================================
+# Baseline stack for revert
+# =============================================================================
+
+def _baselines_dir(reports_dir: Path) -> Path:
+    d = reports_dir / "baselines"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _capture_target_rules(client: NsxPolicyClient, domain_id: str) -> Dict[str, Dict[str, Any]]:
+    """Returns {"<policy_id>::<rule_id>": {"policy_id", "rule_id", "payload"}, ...}"""
+    out: Dict[str, Dict[str, Any]] = {}
+    pol_path = client._policy_path(f"/domains/{client._q(domain_id)}/security-policies")
+    for page in client._get_pages(pol_path):
+        for p in page.get("results", []) or []:
+            if _is_system_object(p):
+                continue
+            pid = p.get("id")
+            if not pid or pid in SKIP_POLICIES:
+                continue
+            rules_path = client._policy_path(
+                f"/domains/{client._q(domain_id)}/security-policies/{client._q(pid)}/rules"
+            )
+            try:
+                for rp in client._get_pages(rules_path):
+                    for r in rp.get("results", []) or []:
+                        if _is_system_object(r):
+                            continue
+                        rid = r.get("id")
+                        if rid:
+                            out[f"{pid}::{rid}"] = {
+                                "policy_id": pid, "rule_id": rid, "payload": _sanitize(r),
+                            }
+            except Exception as e:
+                log.warning("Could not list rules under %s: %s", pid, e)
+    return out
+
+
+def _append_baseline(reports_dir: Path, baseline: Dict[str, Dict[str, Any]]) -> Path:
+    bdir = _baselines_dir(reports_dir)
+    path = bdir / f"{RUN_TS}_target_baseline.json"
+    path.write_text(json.dumps(baseline, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def _latest_unreverted_baseline(reports_dir: Path) -> Path | None:
+    bdir = _baselines_dir(reports_dir)
+    candidates = sorted(p for p in bdir.glob("*_target_baseline.json"))
+    return candidates[-1] if candidates else None
+
+
+def _mark_baseline_reverted(path: Path) -> None:
+    path.rename(path.with_suffix(".json.reverted"))
+
+
+# =============================================================================
 # export
 # =============================================================================
 
@@ -375,6 +431,12 @@ def cmd_push(args: argparse.Namespace) -> int:
     log.info("Found %d rule file(s) across %d policy folder(s).", total, len(policy_dirs))
 
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
+    baseline_path = None
+    if args.apply:
+        log.info("Capturing target baseline (current customer rules on %s) ...", target_host)
+        baseline = _capture_target_rules(client, args.domain_id)
+        baseline_path = _append_baseline(reports_dir, baseline)
+        log.info("  Baseline: %d rule(s) across customer policies → %s", len(baseline), baseline_path)
 
     rows: List[Dict[str, Any]] = []
     ok = failed = skipped = dry_run_count = 0
@@ -470,6 +532,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "skipped": skipped,
             "dry_run": dry_run_count,
         },
+        "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
@@ -491,6 +554,139 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     print(json.dumps(summary, indent=2))
     return 0 if failed == 0 else 1
+
+
+# =============================================================================
+# revert
+# =============================================================================
+
+def cmd_revert(args: argparse.Namespace) -> int:
+    target_host = resolve_manager(args.target)
+    if not target_host:
+        raise SystemExit(f"Target manager not defined: {args.target}")
+
+    reports_dir = Path(args.reports_dir).expanduser().resolve() if args.reports_dir else None
+    if reports_dir is None:
+        candidates = sorted((REPO_ROOT / "nsx_rules_export").glob("*/push_report"))
+        if not candidates:
+            raise SystemExit("Could not auto-locate push_report. Pass --reports-dir.")
+        reports_dir = candidates[-1]
+    if not reports_dir.exists():
+        raise SystemExit(f"Reports dir does not exist: {reports_dir}")
+
+    log_file, errors_log = _setup_logging(reports_dir, "revert")
+    log.info("=" * 60)
+    log.info("NSX RULES — REVERT")
+    log.info("  Target          : %s (%s)", args.target, target_host)
+    log.info("  Domain          : %s", args.domain_id)
+    log.info("  Reports dir     : %s", reports_dir)
+    log.info("=" * 60)
+
+    if args.from_baseline:
+        baseline_path = Path(args.from_baseline).expanduser().resolve()
+    else:
+        baseline_path = _latest_unreverted_baseline(reports_dir)
+    if not baseline_path or not baseline_path.exists():
+        raise SystemExit(
+            f"No baseline file in {reports_dir / 'baselines'}/. "
+            "Run rules.py push --apply first, or pass --from-baseline <path>."
+        )
+
+    log.info("Using baseline: %s", baseline_path)
+    baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
+    log.info("  Baseline contains %d rule(s)", len(baseline))
+
+    client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
+    current = _capture_target_rules(client, args.domain_id)
+    log.info("  Currently %d rule(s) on target", len(current))
+
+    to_restore = [(k, v) for k, v in baseline.items()]
+    to_delete = [(k, current[k]) for k in current.keys() if k not in baseline]
+    log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
+
+    if not args.apply:
+        log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
+        for key, _ in to_restore: log.info("[DRY restore] %s", key)
+        for key, _ in to_delete:  log.info("[DRY delete]  %s", key)
+        return 0
+
+    rows: List[Dict[str, Any]] = []
+    restored_ok = restored_failed = deleted_ok = deleted_failed = 0
+
+    # DELETEs first
+    for i, (key, info) in enumerate(to_delete, start=1):
+        pid = info["policy_id"]
+        rid = info["rule_id"]
+        try:
+            client.delete_security_rule(security_policy_id=pid, rule_id=rid, domain_id=args.domain_id)
+            deleted_ok += 1
+            log.info("[DELETE %d/%d  ok=%d fail=%d] %s/%s",
+                     i, len(to_delete), deleted_ok, deleted_failed, pid, rid)
+            rows.append({"action": "delete", "policy_id": pid, "rule_id": rid, "status": "success"})
+            time.sleep(THROTTLE_SECONDS)
+        except Exception as e:
+            deleted_failed += 1
+            tb = traceback.format_exc()
+            log.error("[DELETE %d/%d FAIL] %s/%s — %s\n%s", i, len(to_delete), pid, rid, e, tb)
+            rows.append({"action": "delete", "policy_id": pid, "rule_id": rid, "status": "failed",
+                         "error": str(e), "error_type": type(e).__name__, "traceback": tb})
+
+    # RESTOREs
+    for i, (key, info) in enumerate(to_restore, start=1):
+        pid = info["policy_id"]
+        rid = info["rule_id"]
+        payload = info["payload"]
+        try:
+            try:
+                client.put_security_rule(security_policy_id=pid, rule_id=rid,
+                                         payload=payload, domain_id=args.domain_id)
+                rows.append({"action": "restore", "policy_id": pid, "rule_id": rid, "status": "success_put"})
+            except NsxApiError as e:
+                if _is_already_exists_error(e):
+                    client.patch_security_rule(security_policy_id=pid, rule_id=rid,
+                                               payload=payload, domain_id=args.domain_id)
+                    rows.append({"action": "restore", "policy_id": pid, "rule_id": rid, "status": "success_patch"})
+                else:
+                    raise
+            restored_ok += 1
+            log.info("[RESTORE %d/%d  ok=%d fail=%d] %s/%s",
+                     i, len(to_restore), restored_ok, restored_failed, pid, rid)
+            time.sleep(THROTTLE_SECONDS)
+        except Exception as e:
+            restored_failed += 1
+            tb = traceback.format_exc()
+            log.error("[RESTORE %d/%d FAIL] %s/%s — %s\n%s", i, len(to_restore), pid, rid, e, tb)
+            rows.append({"action": "restore", "policy_id": pid, "rule_id": rid, "status": "failed",
+                         "error": str(e), "error_type": type(e).__name__, "traceback": tb})
+
+    _mark_baseline_reverted(baseline_path)
+
+    summary = {
+        "command": "rules.revert",
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "target": {"alias": args.target, "host": target_host,
+                   "federation_global": args.federation_global, "domain_id": args.domain_id},
+        "baseline_file": str(baseline_path) + ".reverted",
+        "totals": {
+            "restored_ok": restored_ok, "restored_failed": restored_failed,
+            "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
+        },
+        "log_file": str(log_file),
+        "errors_log": str(errors_log),
+    }
+    revert_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    (reports_dir / f"revert_summary_{revert_ts}.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    (reports_dir / f"revert_actions_{revert_ts}.jsonl").write_text(
+        "\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n", encoding="utf-8")
+
+    log.info("=" * 60)
+    log.info("Revert complete — restored ok=%d/%d  deleted ok=%d/%d",
+             restored_ok, len(to_restore), deleted_ok, len(to_delete))
+    log.info("=" * 60)
+
+    print(json.dumps(summary, indent=2))
+    return 0 if (restored_failed == 0 and deleted_failed == 0) else 1
 
 
 # =============================================================================
@@ -525,6 +721,18 @@ def main() -> int:
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <rules-dir>/../push_report/.")
     pp.set_defaults(func=cmd_push)
+
+    pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")
+    pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
+    pr.add_argument("--domain-id", default="default")
+    pr.add_argument("--federation-global", action="store_true")
+    pr.add_argument("--apply", action="store_true", default=False,
+                    help="Actually revert. Without this, runs as dry-run.")
+    pr.add_argument("--reports-dir", default=None,
+                    help="Defaults to nsx_rules_export/<target-host>/push_report/.")
+    pr.add_argument("--from-baseline", default=None,
+                    help="Specific baseline file (overrides auto-selected latest).")
+    pr.set_defaults(func=cmd_revert)
 
     args = p.parse_args()
     init_cli()

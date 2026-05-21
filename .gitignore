@@ -29,6 +29,8 @@ nsx_services*/
 nsx_groups*/
 nsx_policies*/
 nsx_rules*/
+nsx_segments*/
+nsx_membership*/
 
 # VM Tag Logs
 nsx_vm_files/

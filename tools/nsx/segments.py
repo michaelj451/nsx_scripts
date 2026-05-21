@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 """
-tools/nsx/services.py
+tools/nsx/segments.py
 
-Single tool for the services-only round-trip: export from a source NSX
-manager into per-service YAMLs, and push those YAMLs to a target.
+Single tool for the segments round-trip. Same shape as
+services.py / groups.py / policies.py / rules.py.
 
 Two subcommands:
 
-  export  read /policy/api/v1/infra/services from a source manager and write
-          one YAML file per customer-defined service. Read-only.
+  export  read /policy/api/v1/infra/segments from a source manager and
+          write one YAML file per segment. ALSO produce reverse-reference
+          tables so you can answer: "which groups reference this segment?"
+          and "which segments does this group reference?"  Read-only.
 
-  push    read per-service YAML files from a directory and PUT/PATCH each
-          one to a target manager. Live per-service progress. Dry-run by
+  push    read per-segment YAML files from a directory and PUT/PATCH each
+          to a target manager. Live per-segment progress. Dry-run by
           default; --apply to actually write.
+
+⚠ Cross-manager push caveat: NSX segments reference a transport zone
+   (`transport_zone_path`) and usually a T0/T1 (`connectivity_path`). These
+   are manager-specific UUIDs — pushing a segment from lm1 to lm2 will fail
+   unless the target has matching infrastructure or you pre-edit the YAML.
+   The push tool itself just sends what's in the file; it doesn't try to
+   rewrite TZ/T1 references.
+
+Layout written by export (overwritten each run when default path is used):
+
+  nsx_segments_export/<source-host>/
+    segments/<slug>__<id>.yaml       one file per segment
+    segment_to_groups.json           per-segment view: which groups reference each segment
+    group_to_segments.json           per-group view:   which segments each group references
+    manifest.json
+    logs/segments_export_<UTC_TS>.log
+    logs/segments_export_<UTC_TS>.errors.log
 
 Examples:
 
-  # Export from nsx-lm1 (skips system-owned by default):
-  python tools/nsx/services.py export --source nsx-lm1
+  python tools/nsx/segments.py export --source nsx-lm1
 
-  # Dry-run push to nsx-lm2:
-  python tools/nsx/services.py push \\
+  python tools/nsx/segments.py push \\
     --target nsx-lm2 \\
-    --services-dir nsx_services_export/nsx-lm1.lab.local/services
-
-  # Apply push to nsx-lm2:
-  python tools/nsx/services.py push \\
-    --target nsx-lm2 \\
-    --services-dir nsx_services_export/nsx-lm1.lab.local/services \\
+    --segments-dir nsx_segments_export/nsx-lm1.lab.local/segments \\
     --apply
 """
 from __future__ import annotations
@@ -57,16 +69,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 THROTTLE_SECONDS = 0.2
 
-# Char-class allowed in NSX object ids without any encoding concerns.
-# Anything else (parens, spaces, commas, ampersands, etc.) gets flagged.
-_SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
-
-
-def _has_special_chars(value: str) -> bool:
-    return not bool(_SAFE_ID_RE.match(str(value or "")))
-
-# Same field set the main exporter strips. Keeps payloads diff-stable and
-# avoids conflicting with the target's view of revisions, ownership, etc.
 STRIP_KEYS = {
     "_create_time", "_create_user", "_last_modified_time", "_last_modified_user",
     "_revision", "revision", "_protection", "_system_owned",
@@ -76,31 +78,26 @@ STRIP_KEYS = {
 }
 
 EXCLUDED_FILENAMES = {"manifest.json", "summary.json", "summary.txt"}
-
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
 
+# Matches /infra/segments/<id>, /global-infra/segments/<id>, and any
+# /ports/... sub-resource path under those.
+SEGMENT_PATH_RE = re.compile(r"^/(?:global-)?infra/segments/([^/\s]+)(?:/.*)?$")
+_SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
 
-# =============================================================================
-# Shared helpers
-# =============================================================================
+
+def _has_special_chars(value: str) -> bool:
+    return not bool(_SAFE_ID_RE.match(str(value or "")))
+
 
 def _setup_logging(reports_dir: Path, label: str) -> tuple[Path, Path]:
-    """
-    UTC, multi-write:
-      - Console (INFO+)
-      - bundle log file (INFO+, complete record)
-      - global log file (INFO+, complete record)
-      - bundle errors log file (ERROR+, only the failure detail — easier to scan)
-
-    Returns: (bundle_log, errors_log)
-    """
     global_log_dir = Path(nsx_log_dir).expanduser().resolve()
     global_log_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    bundle_log = (reports_dir / f"services_{label}_{RUN_TS}.log").resolve()
-    global_log = (global_log_dir / f"services_{label}_{RUN_TS}.log").resolve()
-    errors_log = (reports_dir / f"services_{label}_{RUN_TS}.errors.log").resolve()
+    bundle_log = (reports_dir / f"segments_{label}_{RUN_TS}.log").resolve()
+    global_log = (global_log_dir / f"segments_{label}_{RUN_TS}.log").resolve()
+    errors_log = (reports_dir / f"segments_{label}_{RUN_TS}.errors.log").resolve()
 
     logging.Formatter.converter = time.gmtime
     root = logging.getLogger()
@@ -108,20 +105,15 @@ def _setup_logging(reports_dir: Path, label: str) -> tuple[Path, Path]:
     for h in list(root.handlers):
         root.removeHandler(h)
     fmt = logging.Formatter("%(asctime)s UTC [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%dT%H:%M:%S")
-
-    # INFO+ handlers
     for h in (logging.StreamHandler(),
               logging.FileHandler(bundle_log, encoding="utf-8"),
               logging.FileHandler(global_log, encoding="utf-8")):
         h.setFormatter(fmt)
         root.addHandler(h)
-
-    # ERROR+ handler — just the failures, with full tracebacks
     eh = logging.FileHandler(errors_log, encoding="utf-8")
     eh.setLevel(logging.ERROR)
     eh.setFormatter(fmt)
     root.addHandler(eh)
-
     return bundle_log, errors_log
 
 
@@ -134,7 +126,6 @@ def _is_system_object(obj: Dict[str, Any]) -> bool:
 
 
 def _sanitize(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively drop NSX-managed read-only fields."""
     def walk(x: Any) -> Any:
         if isinstance(x, dict):
             return {k: walk(v) for k, v in x.items() if k not in STRIP_KEYS}
@@ -144,8 +135,7 @@ def _sanitize(obj: Dict[str, Any]) -> Dict[str, Any]:
     return walk(obj)
 
 
-def _slugify(name: str, max_len: int = 50) -> str:
-    """Filename-safe slug capped at max_len to keep Windows MAX_PATH happy."""
+def _slugify(name: str, max_len: int = 40) -> str:
     s = re.sub(r"[^\w\-\.]+", "_", (name or "").strip())
     s = re.sub(r"_+", "_", s).strip("_") or "unnamed"
     if len(s) <= max_len:
@@ -162,12 +152,12 @@ def _load_file(p: Path) -> Dict[str, Any]:
     return json.loads(text)
 
 
-def _iter_service_files(services_dir: Path) -> List[Path]:
-    if not services_dir.exists():
+def _iter_segment_files(segments_dir: Path) -> List[Path]:
+    if not segments_dir.exists():
         return []
     files: List[Path] = []
     for ext in ("*.yaml", "*.yml", "*.json"):
-        for p in services_dir.rglob(ext):
+        for p in segments_dir.rglob(ext):
             if p.name in EXCLUDED_FILENAMES:
                 continue
             files.append(p)
@@ -175,7 +165,6 @@ def _iter_service_files(services_dir: Path) -> List[Path]:
 
 
 def _is_already_exists_error(e: Exception) -> bool:
-    """500127 / 500071 / 'already exists' / 'precondition_failed' / 'different version'."""
     msg = str(e)
     lower = msg.lower()
     return (
@@ -188,10 +177,27 @@ def _is_already_exists_error(e: Exception) -> bool:
     )
 
 
+def _segments_referenced_by_expression(expression: List[Any]) -> List[str]:
+    """Walk a group's expression list, return all segment-path strings found."""
+    refs: List[str] = []
+    if not isinstance(expression, list):
+        return refs
+    for item in expression:
+        if isinstance(item, dict) and item.get("resource_type") == "PathExpression":
+            for p in item.get("paths") or []:
+                if isinstance(p, str) and SEGMENT_PATH_RE.match(p.strip()):
+                    refs.append(p.strip())
+    return refs
+
+
+def _segment_id_from_path(path: str) -> str:
+    """Extract the segment id from /(global-)?infra/segments/<id> (possibly with subpath)."""
+    m = SEGMENT_PATH_RE.match(path.strip())
+    return m.group(1) if m else ""
+
+
 # =============================================================================
-# Baseline stack — captures target state before each push so revert can
-# undo. Each push appends a timestamped baseline file; revert pops the
-# most recent one.
+# Baseline stack for revert
 # =============================================================================
 
 def _baselines_dir(reports_dir: Path) -> Path:
@@ -200,17 +206,14 @@ def _baselines_dir(reports_dir: Path) -> Path:
     return d
 
 
-def _capture_target_services(client: NsxPolicyClient) -> Dict[str, Dict[str, Any]]:
-    """GET every customer service on the target. Returns {id: sanitized_payload}."""
+def _capture_target_segments(client: NsxPolicyClient) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
-    base = client._policy_path("/services")
-    for page in client._get_pages(base):
-        for s in page.get("results", []) or []:
-            if _is_system_object(s):
-                continue
-            sid = s.get("id")
-            if sid:
-                out[sid] = _sanitize(s)
+    for seg in client.list_segments():
+        if _is_system_object(seg):
+            continue
+        sid = seg.get("id")
+        if sid:
+            out[sid] = _sanitize(seg)
     return out
 
 
@@ -222,7 +225,6 @@ def _append_baseline(reports_dir: Path, baseline: Dict[str, Dict[str, Any]]) -> 
 
 
 def _latest_unreverted_baseline(reports_dir: Path) -> Path | None:
-    """Most-recently-created baseline that hasn't been reverted yet."""
     bdir = _baselines_dir(reports_dir)
     candidates = sorted(p for p in bdir.glob("*_target_baseline.json"))
     return candidates[-1] if candidates else None
@@ -242,19 +244,20 @@ def cmd_export(args: argparse.Namespace) -> int:
         raise SystemExit(f"Manager not defined for {args.source}.")
 
     using_default = args.output_dir is None
-    output_dir = Path(args.output_dir or (REPO_ROOT / "nsx_services_export" / source_host)).expanduser().resolve()
+    output_dir = Path(args.output_dir or (REPO_ROOT / "nsx_segments_export" / source_host)).expanduser().resolve()
     if using_default and output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    services_dir = output_dir / "services"
-    services_dir.mkdir(parents=True, exist_ok=True)
+    segs_dir = output_dir / "segments"
+    segs_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = output_dir / "logs"
     log_file, errors_log = _setup_logging(logs_dir, "export")
 
     log.info("=" * 60)
-    log.info("NSX SERVICES — EXPORT")
+    log.info("NSX SEGMENTS — EXPORT")
     log.info("  Source manager  : %s (%s)", args.source, source_host)
+    log.info("  Domain          : %s  (only used for group cross-ref)", args.domain_id)
     log.info("  Federation GM   : %s", args.federation_global)
     log.info("  Include system  : %s", args.include_system)
     log.info("  Output bundle   : %s", output_dir)
@@ -262,80 +265,129 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     client = NsxPolicyClient(nsxmanager=source_host, federation_global=args.federation_global)
 
-    log.info("Fetching services from %s ...", source_host)
-    base_path = client._policy_path("/services")
-    all_services: List[Dict[str, Any]] = []
-    for page in client._get_pages(base_path):
-        all_services.extend(page.get("results", []) or [])
-    log.info("Fetched %d service(s) from source.", len(all_services))
+    # --- 1. Fetch all segments
+    log.info("Step 1/2: Fetching segments ...")
+    all_segments = client.list_segments()
+    log.info("  Fetched %d segment(s) total.", len(all_segments))
 
+    # --- 2. Fetch all groups (so we can build segment→group cross-references)
+    log.info("Step 2/2: Fetching groups (for segment cross-reference) ...")
+    groups_path = client._policy_path(f"/domains/{client._q(args.domain_id)}/groups")
+    all_groups: List[Dict[str, Any]] = []
+    for page in client._get_pages(groups_path):
+        all_groups.extend(page.get("results", []) or [])
+    log.info("  Fetched %d group(s) total.", len(all_groups))
+
+    # Build segment_id -> [group_id, ...] and group_id -> [segment_path, ...]
+    segment_to_groups: Dict[str, List[str]] = {}
+    group_to_segments: Dict[str, List[str]] = {}
+    for g in all_groups:
+        gid = g.get("id")
+        if not gid:
+            continue
+        if not args.include_system and _is_system_object(g):
+            continue
+        seg_paths = _segments_referenced_by_expression(g.get("expression") or [])
+        if seg_paths:
+            group_to_segments[gid] = sorted(set(seg_paths))
+            for sp in seg_paths:
+                seg_id = _segment_id_from_path(sp)
+                if seg_id:
+                    segment_to_groups.setdefault(seg_id, []).append(gid)
+    for sid in list(segment_to_groups.keys()):
+        segment_to_groups[sid] = sorted(set(segment_to_groups[sid]))
+
+    # --- Write per-segment YAMLs + record details
     rows: List[Dict[str, Any]] = []
     written = 0
     skipped_system = 0
     skipped_no_id = 0
     errors = 0
-    special_char_ids: List[Dict[str, str]] = []  # ids containing chars outside [A-Za-z0-9._-]
+    special_char_ids: List[Dict[str, str]] = []
 
-    for i, svc in enumerate(all_services, start=1):
-        sid = svc.get("id")
-        sname = svc.get("display_name") or sid or "service"
+    for i, seg in enumerate(all_segments, start=1):
+        sid = seg.get("id")
+        sname = seg.get("display_name") or sid or "segment"
 
-        if not args.include_system and _is_system_object(svc):
+        if not args.include_system and _is_system_object(seg):
             skipped_system += 1
             continue
 
         if not sid:
             skipped_no_id += 1
-            log.warning("[%d/%d] skip service with no id: display_name=%s", i, len(all_services), sname)
+            log.warning("[%d/%d] segment has no id: display_name=%s", i, len(all_segments), sname)
             continue
 
         if _has_special_chars(sid):
             special_char_ids.append({"id": sid, "display_name": sname})
-            log.warning("[%d/%d] special chars in id: %r (URL-encoded on push)", i, len(all_services), sid)
+            log.warning("[%d/%d] special chars in id: %r (URL-encoded on push)", i, len(all_segments), sid)
 
         suffix = sid[:8]
-        fname = f"{_slugify(sname, max_len=40)}__{suffix}.yaml"
-        path = services_dir / fname
+        fname = f"{_slugify(sname)}__{suffix}.yaml"
+        path = segs_dir / fname
 
         try:
-            payload = _sanitize(svc)
+            payload = _sanitize(seg)
             path.write_text(
                 yaml.safe_dump(payload, sort_keys=False, default_flow_style=False),
                 encoding="utf-8",
             )
             written += 1
-            log.info("[%d/%d  ok=%d sys-skip=%d err=%d] %s",
-                     i, len(all_services), written, skipped_system, errors, sid)
-            rows.append({"id": sid, "display_name": sname, "file": fname, "status": "ok"})
+            ref_count = len(segment_to_groups.get(sid, []))
+            log.info("[%d/%d  ok=%d sys-skip=%d err=%d] %s — %d group ref(s)",
+                     i, len(all_segments), written, skipped_system, errors, sid, ref_count)
+            rows.append({
+                "id": sid, "display_name": sname, "file": fname, "status": "ok",
+                "subnets": [(sn.get("network") if isinstance(sn, dict) else None)
+                            for sn in (seg.get("subnets") or [])],
+                "vlan_ids": seg.get("vlan_ids"),
+                "transport_zone_path": seg.get("transport_zone_path"),
+                "connectivity_path": seg.get("connectivity_path"),
+                "type": seg.get("type"),
+                "referenced_by_groups": segment_to_groups.get(sid, []),
+                "referenced_by_groups_count": ref_count,
+            })
         except Exception as exc:
             errors += 1
             tb = traceback.format_exc()
-            log.exception("[%d/%d] FAILED writing %s", i, len(all_services), sid)
+            log.exception("[%d/%d] FAILED writing %s", i, len(all_segments), sid)
             rows.append({
                 "id": sid, "display_name": sname, "file": fname,
-                "status": "failed",
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-                "traceback": tb,
+                "status": "failed", "error": str(exc),
+                "error_type": type(exc).__name__, "traceback": tb,
             })
 
+    # --- Write cross-reference files
+    (output_dir / "segment_to_groups.json").write_text(
+        json.dumps(segment_to_groups, indent=2, sort_keys=True), encoding="utf-8",
+    )
+    (output_dir / "group_to_segments.json").write_text(
+        json.dumps(group_to_segments, indent=2, sort_keys=True), encoding="utf-8",
+    )
+
     manifest = {
-        "command": "services.export",
+        "command": "segments.export",
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "source": {"alias": args.source, "host": source_host, "federation_global": args.federation_global},
+        "source": {"alias": args.source, "host": source_host,
+                   "federation_global": args.federation_global, "domain_id": args.domain_id},
         "counts": {
-            "total_returned": len(all_services),
+            "segments_total": len(all_segments),
             "written": written,
             "skipped_system_owned": skipped_system,
             "skipped_no_id": skipped_no_id,
             "errors": errors,
             "ids_with_special_chars": len(special_char_ids),
+            "groups_scanned": len(all_groups),
+            "groups_with_segment_refs": len(group_to_segments),
+            "segments_referenced_by_at_least_one_group": len(segment_to_groups),
         },
-        "services": rows,
+        "segments": rows,
         "ids_with_special_chars": special_char_ids,
         "paths": {
             "bundle_dir": str(output_dir),
-            "services_dir": str(services_dir),
+            "segments_dir": str(segs_dir),
+            "segment_to_groups_file": str(output_dir / "segment_to_groups.json"),
+            "group_to_segments_file": str(output_dir / "group_to_segments.json"),
             "logs_dir": str(logs_dir),
         },
         "log_file": str(log_file),
@@ -345,18 +397,17 @@ def cmd_export(args: argparse.Namespace) -> int:
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
     log.info("=" * 60)
-    log.info("Export complete: written=%d  sys-skipped=%d  no-id-skipped=%d  errors=%d",
+    log.info("Segments export complete:")
+    log.info("  written=%d  sys-skipped=%d  no-id=%d  errors=%d",
              written, skipped_system, skipped_no_id, errors)
+    log.info("  groups scanned=%d  groups-with-seg-refs=%d  segments-with-refs=%d",
+             len(all_groups), len(group_to_segments), len(segment_to_groups))
     log.info("Bundle:   %s", output_dir)
     log.info("Manifest: %s", manifest_path)
     log.info("=" * 60)
 
-    print(json.dumps({
-        "bundle": str(output_dir),
-        "manifest": str(manifest_path),
-        "counts": manifest["counts"],
-    }, indent=2))
-
+    print(json.dumps({"bundle": str(output_dir), "manifest": str(manifest_path),
+                      "counts": manifest["counts"]}, indent=2))
     return 0 if errors == 0 else 1
 
 
@@ -369,44 +420,40 @@ def cmd_push(args: argparse.Namespace) -> int:
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
 
-    services_dir = Path(args.services_dir).expanduser().resolve()
-    if not services_dir.exists():
-        raise SystemExit(f"Services dir does not exist: {services_dir}")
+    segs_dir = Path(args.segments_dir).expanduser().resolve()
+    if not segs_dir.exists():
+        raise SystemExit(f"Segments dir does not exist: {segs_dir}")
 
-    reports_dir = Path(args.reports_dir or (services_dir.parent / "push_report")).expanduser().resolve()
+    reports_dir = Path(args.reports_dir or (segs_dir.parent / "push_report")).expanduser().resolve()
     log_file, errors_log = _setup_logging(reports_dir, "push")
 
     mode = "APPLY" if args.apply else "DRY-RUN"
     log.info("=" * 60)
-    log.info("NSX SERVICES — PUSH (%s)", mode)
+    log.info("NSX SEGMENTS — PUSH (%s)", mode)
     log.info("  Target          : %s (%s)", args.target, target_host)
     log.info("  Federation GM   : %s", args.federation_global)
-    log.info("  Services dir    : %s", services_dir)
+    log.info("  Segments dir    : %s", segs_dir)
     log.info("  Reports dir     : %s", reports_dir)
     log.info("=" * 60)
+    log.warning("Segments reference transport zones / T1 routers by manager-specific UUID. "
+                "If the target's transport zone path differs from the source's, NSX will "
+                "reject the PUT with a validation error — that's expected and shows up in "
+                "failures.json. Edit the YAML's transport_zone_path / connectivity_path if "
+                "you need to map them across managers.")
 
-    files = _iter_service_files(services_dir)
-    log.info("Found %d service file(s).", len(files))
+    files = _iter_segment_files(segs_dir)
+    log.info("Found %d segment file(s).", len(files))
 
-    if not args.apply:
-        log.info("Dry-run mode: will iterate every file, sanitize, and confirm id — no NSX calls.")
-        client = None
-        baseline_path = None
-    else:
-        client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
-
-        # --- Baseline capture for revert ---
-        log.info("Capturing target baseline (current customer services on %s) ...", target_host)
-        baseline = _capture_target_services(client)
+    client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
+    baseline_path = None
+    if args.apply:
+        log.info("Capturing target baseline (current customer segments on %s) ...", target_host)
+        baseline = _capture_target_segments(client)
         baseline_path = _append_baseline(reports_dir, baseline)
-        log.info("  Baseline: %d customer service(s) on target → %s",
-                 len(baseline), baseline_path)
+        log.info("  Baseline: %d customer segment(s) → %s", len(baseline), baseline_path)
 
     rows: List[Dict[str, Any]] = []
-    ok = 0
-    failed = 0
-    skipped = 0
-    dry_run_count = 0
+    ok = failed = skipped = dry_run_count = 0
 
     for i, f in enumerate(files, start=1):
         row = {
@@ -436,12 +483,13 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            path = client._policy_path(f"/segments/{client._q(sid)}")
             try:
-                client.put_service(sid, obj)
+                client._put(path, obj)
                 row["status"] = "success_put"
             except NsxApiError as e:
                 if _is_already_exists_error(e):
-                    client.patch_service(sid, obj)
+                    client._patch(path, obj)
                     row["status"] = "success_patch"
                 else:
                     raise
@@ -467,10 +515,11 @@ def cmd_push(args: argparse.Namespace) -> int:
         rows.append(row)
 
     summary = {
-        "command": "services.push",
+        "command": "segments.push",
         "ran_at": datetime.now(timezone.utc).isoformat(),
-        "target": {"alias": args.target, "host": target_host, "federation_global": args.federation_global},
-        "services_dir": str(services_dir),
+        "target": {"alias": args.target, "host": target_host,
+                   "federation_global": args.federation_global},
+        "segments_dir": str(segs_dir),
         "mode": mode,
         "totals": {
             "files_seen": len(files),
@@ -485,8 +534,8 @@ def cmd_push(args: argparse.Namespace) -> int:
     }
 
     (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    (reports_dir / "services.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
-    with (reports_dir / "services.jsonl").open("w", encoding="utf-8") as fh:
+    (reports_dir / "segments.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+    with (reports_dir / "segments.jsonl").open("w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, sort_keys=True) + "\n")
     if failed:
@@ -494,7 +543,7 @@ def cmd_push(args: argparse.Namespace) -> int:
         (reports_dir / "failures.json").write_text(json.dumps(failures, indent=2, sort_keys=True), encoding="utf-8")
 
     log.info("=" * 60)
-    log.info("Push services %s — ok=%d failed=%d skipped=%d (dry_run=%d) total=%d",
+    log.info("Push segments %s — ok=%d failed=%d skipped=%d (dry_run=%d) total=%d",
              mode, ok, failed, skipped, dry_run_count, len(files))
     log.info("Reports: %s", reports_dir)
     log.info("=" * 60)
@@ -514,62 +563,42 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     reports_dir = Path(args.reports_dir).expanduser().resolve() if args.reports_dir else None
     if reports_dir is None:
-        # Default: the standard push_report under the default services export dir
-        # If user used a custom services-dir, they must supply --reports-dir.
-        default = REPO_ROOT / "nsx_services_export" / "*"
-        log.warning("No --reports-dir given. Searching default location.")
-        # Be conservative — error out if we can't auto-find
-        candidates = sorted((REPO_ROOT / "nsx_services_export").glob("*/push_report"))
+        candidates = sorted((REPO_ROOT / "nsx_segments_export").glob("*/push_report"))
         if not candidates:
-            raise SystemExit(
-                "Could not auto-locate push_report. Pass --reports-dir explicitly "
-                "(e.g. nsx_services_export/<host>/push_report/)."
-            )
+            raise SystemExit("Could not auto-locate push_report. Pass --reports-dir.")
         reports_dir = candidates[-1]
-
     if not reports_dir.exists():
         raise SystemExit(f"Reports dir does not exist: {reports_dir}")
 
     log_file, errors_log = _setup_logging(reports_dir, "revert")
 
     log.info("=" * 60)
-    log.info("NSX SERVICES — REVERT")
+    log.info("NSX SEGMENTS — REVERT")
     log.info("  Target          : %s (%s)", args.target, target_host)
     log.info("  Reports dir     : %s", reports_dir)
     log.info("=" * 60)
 
-    # Pick the baseline to revert to
     if args.from_baseline:
         baseline_path = Path(args.from_baseline).expanduser().resolve()
     else:
         baseline_path = _latest_unreverted_baseline(reports_dir)
     if not baseline_path or not baseline_path.exists():
         raise SystemExit(
-            f"No baseline file found in {reports_dir / 'baselines'}/. "
-            "Either run services.py push --apply first (which writes one), or pass --from-baseline <path>."
+            f"No baseline file in {reports_dir / 'baselines'}/. "
+            "Run segments.py push --apply first, or pass --from-baseline <path>."
         )
 
     log.info("Using baseline: %s", baseline_path)
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
-    log.info("  Baseline contains %d customer service(s)", len(baseline))
+    log.info("  Baseline contains %d customer segment(s)", len(baseline))
 
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
-    log.info("Capturing CURRENT customer services on target ...")
-    current = _capture_target_services(client)
-    log.info("  Currently %d customer service(s) on target", len(current))
+    current = _capture_target_segments(client)
+    log.info("  Currently %d customer segment(s) on target", len(current))
 
-    to_restore = []  # exists in baseline (PUT/PATCH back)
-    to_delete = []   # exists on target but not in baseline (DELETE)
-    for sid, payload in baseline.items():
-        to_restore.append((sid, payload))
-    for sid in current.keys():
-        if sid not in baseline:
-            to_delete.append(sid)
-
+    to_restore = [(sid, payload) for sid, payload in baseline.items()]
+    to_delete = [sid for sid in current.keys() if sid not in baseline]
     log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
-
-    rows: List[Dict[str, Any]] = []
-    restored_ok = restored_failed = deleted_ok = deleted_failed = 0
 
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
@@ -579,10 +608,12 @@ def cmd_revert(args: argparse.Namespace) -> int:
             log.info("[DRY delete]  %s", sid)
         return 0
 
-    # --- DELETEs first (newly-created services that aren't in baseline) ---
+    rows: List[Dict[str, Any]] = []
+    restored_ok = restored_failed = deleted_ok = deleted_failed = 0
+
     for i, sid in enumerate(to_delete, start=1):
         try:
-            client.delete_service(sid)
+            client._delete(client._policy_path(f"/segments/{client._q(sid)}"))
             deleted_ok += 1
             log.info("[DELETE %d/%d  ok=%d fail=%d] %s",
                      i, len(to_delete), deleted_ok, deleted_failed, sid)
@@ -595,32 +626,22 @@ def cmd_revert(args: argparse.Namespace) -> int:
             rows.append({"action": "delete", "id": sid, "status": "failed",
                          "error": str(e), "error_type": type(e).__name__, "traceback": tb})
 
-    # --- RESTOREs (PUT back to baseline) ---
     for i, (sid, payload) in enumerate(to_restore, start=1):
         try:
-            client.put_service(sid, payload)
+            path = client._policy_path(f"/segments/{client._q(sid)}")
+            try:
+                client._put(path, payload)
+                rows.append({"action": "restore", "id": sid, "status": "success_put"})
+            except NsxApiError as e:
+                if _is_already_exists_error(e):
+                    client._patch(path, payload)
+                    rows.append({"action": "restore", "id": sid, "status": "success_patch"})
+                else:
+                    raise
             restored_ok += 1
             log.info("[RESTORE %d/%d  ok=%d fail=%d] %s",
                      i, len(to_restore), restored_ok, restored_failed, sid)
-            rows.append({"action": "restore", "id": sid, "status": "success_put"})
             time.sleep(THROTTLE_SECONDS)
-        except NsxApiError as e:
-            if _is_already_exists_error(e):
-                try:
-                    client.patch_service(sid, payload)
-                    restored_ok += 1
-                    log.info("[RESTORE %d/%d  ok=%d fail=%d] %s (patched)",
-                             i, len(to_restore), restored_ok, restored_failed, sid)
-                    rows.append({"action": "restore", "id": sid, "status": "success_patch"})
-                    time.sleep(THROTTLE_SECONDS)
-                    continue
-                except Exception as e2:
-                    e = e2
-            restored_failed += 1
-            tb = traceback.format_exc()
-            log.error("[RESTORE %d/%d FAIL] %s — %s\n%s", i, len(to_restore), sid, e, tb)
-            rows.append({"action": "restore", "id": sid, "status": "failed",
-                         "error": str(e), "error_type": type(e).__name__, "traceback": tb})
         except Exception as e:
             restored_failed += 1
             tb = traceback.format_exc()
@@ -628,13 +649,13 @@ def cmd_revert(args: argparse.Namespace) -> int:
             rows.append({"action": "restore", "id": sid, "status": "failed",
                          "error": str(e), "error_type": type(e).__name__, "traceback": tb})
 
-    # Mark the baseline as reverted so the next revert pops the next-most-recent
     _mark_baseline_reverted(baseline_path)
 
     summary = {
-        "command": "services.revert",
+        "command": "segments.revert",
         "ran_at": datetime.now(timezone.utc).isoformat(),
-        "target": {"alias": args.target, "host": target_host, "federation_global": args.federation_global},
+        "target": {"alias": args.target, "host": target_host,
+                   "federation_global": args.federation_global},
         "baseline_file": str(baseline_path) + ".reverted",
         "totals": {
             "restored_ok": restored_ok,
@@ -666,61 +687,40 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Export NSX services from a source / push them to a target. Two subcommands.",
+        description="Export NSX segments from a source / push them to a target. Includes group cross-reference.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    # --- export subcommand ---
-    pe = sub.add_parser(
-        "export",
-        help="Export services from a source manager into per-file YAMLs (read-only).",
-    )
-    pe.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES,
-                    help="NSX manager to export FROM (read-only).")
-    pe.add_argument("--federation-global", action="store_true",
-                    help="Treat --source as a Global Manager.")
+    pe = sub.add_parser("export", help="Export per-file segment YAMLs + segment↔group cross-reference (read-only).")
+    pe.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
+    pe.add_argument("--domain-id", default="default",
+                    help="Domain to scan for groups when building cross-references. Segments themselves are not domain-scoped.")
+    pe.add_argument("--federation-global", action="store_true")
     pe.add_argument("--output-dir", default=None,
-                    help="Output bundle directory. Defaults to nsx_services_export/<source-host>/. "
-                         "Default path is wiped on each run so it always reflects the latest export.")
+                    help="Defaults to nsx_segments_export/<source-host>/. Wiped on each run.")
     pe.add_argument("--include-system", action="store_true",
-                    help="Also export system-owned services (default: skip).")
+                    help="Also export system-owned segments (default: skip).")
     pe.set_defaults(func=cmd_export)
 
-    # --- push subcommand ---
-    pp = sub.add_parser(
-        "push",
-        help="Push per-file service YAMLs to a target. Dry-run by default; --apply to write.",
-    )
-    pp.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES,
-                    help="NSX manager to push TO.")
-    pp.add_argument("--services-dir", required=True,
-                    help="Directory containing per-service YAML/JSON files.")
-    pp.add_argument("--federation-global", action="store_true",
-                    help="Target is a Global Manager.")
+    pp = sub.add_parser("push", help="Push per-file segment YAMLs to a target. Dry-run by default.")
+    pp.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
+    pp.add_argument("--segments-dir", required=True)
+    pp.add_argument("--federation-global", action="store_true")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,
-                    help="Where to write the run's per-service report + log. "
-                         "Defaults to <services-dir>/../push_report/.")
+                    help="Defaults to <segments-dir>/../push_report/.")
     pp.set_defaults(func=cmd_push)
 
-    # --- revert subcommand ---
-    pr = sub.add_parser(
-        "revert",
-        help="Undo the most recent push. Uses the auto-captured target_baseline from push_report/baselines/.",
-    )
-    pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES,
-                    help="NSX manager to revert ON.")
-    pr.add_argument("--federation-global", action="store_true",
-                    help="Target is a Global Manager.")
+    pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")
+    pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
+    pr.add_argument("--federation-global", action="store_true")
     pr.add_argument("--apply", action="store_true", default=False,
-                    help="Actually perform the revert. Without this, runs as dry-run.")
+                    help="Actually revert. Without this, runs as dry-run.")
     pr.add_argument("--reports-dir", default=None,
-                    help="Where to find baselines and write the revert report. "
-                         "Defaults to nsx_services_export/<target-host>/push_report/.")
+                    help="Defaults to nsx_segments_export/<target-host>/push_report/.")
     pr.add_argument("--from-baseline", default=None,
-                    help="Specific baseline JSON file to revert to. Overrides "
-                         "the auto-selected latest unreverted baseline.")
+                    help="Specific baseline file (overrides auto-selected latest).")
     pr.set_defaults(func=cmd_revert)
 
     args = p.parse_args()

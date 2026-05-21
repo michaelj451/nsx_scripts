@@ -20,10 +20,12 @@ next one starts:
 | [tools/nsx/groups.py](tools/nsx/groups.py) | groups | `export`, `push` with `--segments-mode {keep,strip,convert}` and optional `--csv-remap` |
 | [tools/nsx/policies.py](tools/nsx/policies.py) | security-policies (no rules) | `export`, `push` |
 | [tools/nsx/rules.py](tools/nsx/rules.py) | security-rules (parent policy required) | `export`, `push` |
+| [tools/nsx/segments.py](tools/nsx/segments.py) | segments | `export` (with segment↔group cross-reference), `push` (⚠ transport-zone refs are manager-specific) |
 
-Plus one **shared** tool:
+Plus two **shared** tools (export-only, GET-only):
 
-- [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) — needed to produce `segment_details.json` (Parts 2 & 3) and `groups_additive/` (Part 3).
+- [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) — produces `segment_details.json` (Parts 2 & 3) and `groups_additive/` (Part 3).
+- [tools/nsx/membership.py](tools/nsx/membership.py) — produces VM ↔ group correlation files: `group_memberships.json`, `vm_group_membership.json`, `vm_ip_index.json`. Auditing and verification only — not consumed by any push step.
 
 > `--source` / `--target` are aliases resolved from `.env` (e.g. `NSX_LM1=nsx-lm1.lab.local`). Examples below use `nsx-lm1` → `nsx-lm2`.
 
@@ -61,10 +63,12 @@ nsx_capture/nsx-lm1.lab.local/
 ## Export everything else (per-tool, source-side, GET-only)
 
 ```bash
-python tools/nsx/services.py export --source nsx-lm1
-python tools/nsx/groups.py   export --source nsx-lm1
-python tools/nsx/policies.py export --source nsx-lm1
-python tools/nsx/rules.py    export --source nsx-lm1
+python tools/nsx/services.py   export --source nsx-lm1
+python tools/nsx/groups.py     export --source nsx-lm1
+python tools/nsx/policies.py   export --source nsx-lm1
+python tools/nsx/rules.py      export --source nsx-lm1
+python tools/nsx/segments.py   export --source nsx-lm1    # segments + segment↔group cross-reference
+python tools/nsx/membership.py export --source nsx-lm1    # VM↔group correlation (auditing)
 ```
 
 Outputs (overwritten each run when the default path is used):
@@ -76,6 +80,16 @@ nsx_policies_export/<source-host>/security-policies/<slug>/policy.yaml
                                                           + manifest.json + logs/
 nsx_rules_export/<source-host>/security-policies/<slug>/rules/0001_<slug>.yaml
                                                           + manifest.json + logs/
+nsx_segments_export/<source-host>/
+    segments/*.yaml                one file per segment (full payload)
+    segment_to_groups.json         per-segment: which groups reference each segment
+    group_to_segments.json         per-group:   which segments each group references
+    + manifest.json + logs/
+nsx_membership_export/<source-host>/
+    group_memberships.json     [{group_id, display_name, members:[{vm_id,name,ips}], ...}, ...]
+    vm_group_membership.json   [{vm_id, display_name, ips, groups:[...]}, ...]
+    vm_ip_index.json           {"<vm_id>": ["10.6.0.50", ...], ...}
+    + manifest.json + logs/
 ```
 
 All four export tools:
@@ -217,6 +231,55 @@ CSV remap composes with `--segments-mode` — e.g., `--csv-remap CSV --segments-
 
 ---
 
+## Using membership data for verification
+
+`membership.py export` doesn't push anything — it produces three correlation files that let you answer auditing questions before, during, or after a clone:
+
+```bash
+# Which VMs are members of group "vm-group-1"?
+python3 -c "
+import json
+g = next(x for x in json.load(open('nsx_membership_export/nsx-lm1.lab.local/group_memberships.json'))
+          if x['group_id'] == 'vm1')
+for m in g['members']:
+    print(f'{m[\"display_name\"]:40s}  {m[\"ips\"]}')
+"
+
+# Which groups does VM 'web-server-3' belong to?
+python3 -c "
+import json
+v = next(x for x in json.load(open('nsx_membership_export/nsx-lm1.lab.local/vm_group_membership.json'))
+          if x['display_name'] == 'web-server-3')
+print(v['groups'])
+"
+
+# Which VM owns IP 10.6.0.50?
+python3 -c "
+import json
+ix = json.load(open('nsx_membership_export/nsx-lm1.lab.local/vm_ip_index.json'))
+for vid, ips in ix.items():
+    if '10.6.0.50' in ips: print(vid, ips)
+"
+
+# Which groups reference segment <id>?
+python3 -c "
+import json
+s2g = json.load(open('nsx_segments_export/nsx-lm1.lab.local/segment_to_groups.json'))
+for sid, groups in s2g.items(): print(f'{sid}: {groups}')
+"
+
+# Which segments does group X reference?
+python3 -c "
+import json
+g2s = json.load(open('nsx_segments_export/nsx-lm1.lab.local/group_to_segments.json'))
+print(g2s.get('segment-group-1'))
+"
+```
+
+After Phase 4 (the live-VM-IPs push), you can verify by re-running `membership.py export` against the **target** (lm2) and diffing its `group_memberships.json` against the source's — the VM ids will differ (lm2 doesn't have the same VMs) but the per-group IP lists should match.
+
+---
+
 ## Live progress format (all four tools)
 
 ```
@@ -281,24 +344,102 @@ Filenames on disk are filesystem-safe regardless — slugified + `__<8-char-id-p
 
 ---
 
-## Rollback
+## Rollback — per-tool `revert` subcommand
 
-These four tools push but don't auto-capture a rollback baseline yet (the proposed per-tool `revert` subcommand isn't built — flag it for follow-up). Two practical paths today:
+Each push tool (`services.py`, `groups.py`, `policies.py`, `rules.py`, `segments.py`) has a built-in `revert` subcommand. Here's how it works:
 
-**Option A — Workflow A's wrapper handles rollback for you:**
-Use `tools/nsx/push_from_capture.py` instead of the four-tool sequence. It captures the target's pre-push state automatically and pairs with `push_complete_nsx_revert.py --include-services --apply` for a one-command rollback. Trade-off: no per-phase visibility, no per-object class control.
+### Auto-baseline on every `push --apply`
 
-**Option B — Surgical delete from the push reports:**
-The four push tools' JSONL reports list every id that landed. A one-liner can delete them in reverse dependency order:
+Before any PUT/PATCH lands, the tool fetches the target's current customer objects of its class and writes them to a **timestamped baseline file**:
 
-```python
-# Per-class delete loops, in this order:
-#   policies (cascades rules) → groups → services
-# Read each tool's <obj>.jsonl, filter where status starts with "success_",
-# call client._delete(f"/policy/api/v1/infra/domains/default/<class>/{client._q(id)}")
+```
+nsx_<obj>_export/<host>/push_report/baselines/<UTC_TS>_target_baseline.json
 ```
 
-The recommended permanent fix is to add `revert` subcommands to each tool that consume an auto-captured `target_baseline_<obj>.json` written at the start of every `--apply` push.
+Each subsequent `push --apply` appends a NEW baseline (does not overwrite previous ones). This forms a **baseline stack**: most recent at the top, oldest at the bottom.
+
+### `revert` pops the most recent baseline
+
+```bash
+python tools/nsx/<tool>.py revert --target nsx-lm2 [--apply]
+```
+
+What it does:
+1. Finds the most recent unreverted baseline in `push_report/baselines/`
+2. Fetches the CURRENT customer objects on the target
+3. Computes the diff:
+   - Objects in baseline → PUT/PATCH back (restores any modifications)
+   - Objects on target NOT in baseline → DELETE (undoes any creations)
+4. After successful revert, renames the baseline file with `.reverted` suffix so the next `revert` pops the next-most-recent
+5. Skips NSX system-owned objects and default policies
+
+Dry-run by default; pass `--apply` to actually mutate.
+
+### Reverting a multi-phase groups workflow
+
+Because groups gets pushed 3 times (Part 1 strip → Part 2 convert → Part 3 additive), each push appends a baseline. Reverts pop in LIFO order:
+
+| Action | Baseline state captured at push | What revert undoes |
+|---|---|---|
+| `groups.py push ... --segments-mode strip --apply` | Empty target | Push 1 (would DELETE all groups on revert) |
+| `groups.py push ... --segments-mode convert --apply` | Groups in "stripped" state | Push 2 (restores to stripped state on revert) |
+| `groups.py push ... --groups-dir <additive> ... --apply` | Groups in "converted" state | Push 3 (restores to converted state on revert) |
+
+**Note:** Phase 3 (`--groups-dir nsx_capture/<host>/groups_additive/...`) writes its baseline to a DIFFERENT `push_report/` than Phase 1/2 (because reports_dir defaults to `<groups-dir>/../push_report/`). Phase 1 and Phase 2 share the same stack (under `nsx_groups_export/<host>/push_report/`); Phase 3 has its own (under `nsx_capture/<host>/groups_additive/domains/default/push_report/`). To revert Phase 3 you point `--reports-dir` at the additive bundle's push_report; to revert Phase 2 then Phase 1, two consecutive reverts against the export bundle's push_report.
+
+### Recommended revert order for a full teardown
+
+Reverse dependency order — rules reference policies reference groups reference services:
+
+```bash
+# 1. Rules
+python tools/nsx/rules.py revert --target nsx-lm2 \
+  --reports-dir nsx_rules_export/nsx-lm1.lab.local/push_report --apply
+
+# 2. Policies (after rules are gone)
+python tools/nsx/policies.py revert --target nsx-lm2 \
+  --reports-dir nsx_policies_export/nsx-lm1.lab.local/push_report --apply
+
+# 3. Groups Phase 3 (pops the additive baseline; restores to "convert" state)
+python tools/nsx/groups.py revert --target nsx-lm2 \
+  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report --apply
+
+# 4. Groups Phase 2 (pops the convert baseline; restores to "strip" state)
+python tools/nsx/groups.py revert --target nsx-lm2 \
+  --reports-dir nsx_groups_export/nsx-lm1.lab.local/push_report --apply
+
+# 5. Groups Phase 1 (pops the strip baseline; baseline was empty target → DELETEs all groups)
+python tools/nsx/groups.py revert --target nsx-lm2 \
+  --reports-dir nsx_groups_export/nsx-lm1.lab.local/push_report --apply
+
+# 6. Services
+python tools/nsx/services.py revert --target nsx-lm2 \
+  --reports-dir nsx_services_export/nsx-lm1.lab.local/push_report --apply
+```
+
+(If you only ran Parts 1 + 2 + 4 + 5 of the clone — skipping Parts 2/3 — adjust accordingly.)
+
+### Revert reports
+
+Each `revert --apply` writes:
+
+```
+push_report/
+├── revert_summary_<UTC_TS>.json        totals: restored_ok, restored_failed, deleted_ok, deleted_failed
+├── revert_actions_<UTC_TS>.jsonl       one row per restored/deleted object
+├── <tool>_revert_<UTC_TS>.log          full progress log
+├── <tool>_revert_<UTC_TS>.errors.log   ERROR-only, with tracebacks
+└── baselines/
+    ├── <UTC_TS>_target_baseline.json            ← unreverted baselines (FIFO)
+    └── <UTC_TS>_target_baseline.json.reverted   ← already-reverted (kept for audit)
+```
+
+### Edge cases
+
+- **Failed revert:** if `--apply` revert fails mid-way, the baseline file is NOT renamed to `.reverted` (only renamed on success). Re-run after fixing the underlying issue.
+- **Explicit baseline:** `--from-baseline <path>` lets you revert to a specific snapshot (skips the auto-stack).
+- **Multiple targets:** baselines are per-target — `revert --target nsx-lm3` is a separate stack from `--target nsx-lm2`. (Implementation: the baseline file doesn't encode the target; if you push to multiple targets from the same reports_dir, use separate `--reports-dir` per target.)
+- **Stale baselines:** since the baseline captures the target's state at push time, if anything else mutated the target between push and revert, those changes get clobbered. Revert is "restore to baseline," not "diff and merge."
 
 ---
 
