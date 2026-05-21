@@ -149,6 +149,22 @@ def _slugify(name: str, max_len: int = 44) -> str:
     return f"{s[:keep]}_{h}"
 
 
+def _short_id_filename(nsx_id: str) -> str:
+    """Deterministic, MAX_PATH-safe, collision-resistant filename stem.
+
+    Format:
+      - slug <= 10 chars:  "<slug>-<8hex>"
+      - else:              "<first5>-<last5>-<8hex>"
+    """
+    raw = (nsx_id or "").strip() or "unnamed"
+    s = re.sub(r"[^\w\-\.]+", "_", raw)
+    s = re.sub(r"_+", "_", s).strip("_") or "unnamed"
+    h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+    if len(s) <= 10:
+        return f"{s}-{h}"
+    return f"{s[:5]}-{s[-5:]}-{h}"
+
+
 def _load_file(p: Path) -> Dict[str, Any]:
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() in (".yaml", ".yml"):
@@ -291,7 +307,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             policies_skipped_system += 1
             continue
 
-        pol_slug = _slugify(pid, max_len=40)
+        pol_slug = _short_id_filename(pid)
         rules_dir = policies_root / pol_slug / "rules"
         rules_dir.mkdir(parents=True, exist_ok=True)
 
@@ -326,7 +342,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 log.warning("[RULE %d/policy=%s] special chars in id: %r (URL-encoded on push)",
                             ri, pid, rid)
 
-            fname = f"{ri:04d}_{_slugify(rid, max_len=44)}.yaml"
+            fname = f"{ri:04d}_{_short_id_filename(rid)}.yaml"
             rule_path = rules_dir / fname
 
             try:

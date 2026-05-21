@@ -135,6 +135,22 @@ def _sanitize(obj: Dict[str, Any]) -> Dict[str, Any]:
     return walk(obj)
 
 
+def _short_id_filename(nsx_id: str) -> str:
+    """Deterministic, MAX_PATH-safe, collision-resistant filename stem.
+
+    Format:
+      - slug <= 10 chars:  "<slug>-<8hex>"
+      - else:              "<first5>-<last5>-<8hex>"
+    """
+    raw = (nsx_id or "").strip() or "unnamed"
+    s = re.sub(r"[^\w\-\.]+", "_", raw)
+    s = re.sub(r"_+", "_", s).strip("_") or "unnamed"
+    h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+    if len(s) <= 10:
+        return f"{s}-{h}"
+    return f"{s[:5]}-{s[-5:]}-{h}"
+
+
 def _slugify(name: str, max_len: int = 40) -> str:
     s = re.sub(r"[^\w\-\.]+", "_", (name or "").strip())
     s = re.sub(r"_+", "_", s).strip("_") or "unnamed"
@@ -278,7 +294,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             log.warning("[POL %d/%d] special chars in id: %r (URL-encoded on push)",
                         pi, len(all_policies), pid)
 
-        pol_slug = _slugify(pid)
+        pol_slug = _short_id_filename(pid)
         policy_dir = policies_root / pol_slug
         policy_dir.mkdir(parents=True, exist_ok=True)
         policy_yaml = policy_dir / "policy.yaml"

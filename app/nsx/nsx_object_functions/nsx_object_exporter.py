@@ -6,12 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Literal
 
+import hashlib
 import json
 import logging
 import re
 import yaml
 
-from utilities.file_utilities import write_json, write_yaml, manager_dirname
+from utilities.file_utilities import write_json, write_yaml, manager_dirname, short_id_filename
 
 log = logging.getLogger(__name__)
 
@@ -60,12 +61,20 @@ def sanitize_payload(raw: Dict[str, Any], strip_keys: Iterable[str] = DEFAULT_ST
     return _walk(raw)
 
 
-def slugify(name: str) -> str:
-    """Safe filename slug."""
-    name = (name or "").strip()
-    name = re.sub(r"[^\w\-\.]+", "_", name)
-    name = re.sub(r"_+", "_", name).strip("_")
-    return name or "unnamed"
+def slugify(name: str, max_len: int = 50) -> str:
+    """Filename-safe slug capped at max_len to keep Windows MAX_PATH happy.
+
+    Names longer than max_len are truncated and suffixed with a 7-char
+    MD5 hash of the original, so long display names can't collide and
+    can't blow past the 260-char path limit on Windows.
+    """
+    s = re.sub(r"[^\w\-\.]+", "_", (name or "").strip())
+    s = re.sub(r"_+", "_", s).strip("_") or "unnamed"
+    if len(s) <= max_len:
+        return s
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()[:7]
+    keep = max(1, max_len - len(h) - 1)
+    return f"{s[:keep]}_{h}"
 
 
 def yaml_dump(data: Any) -> str:
@@ -180,10 +189,8 @@ class NsxExporter:
                     self.skipped["groups_system"] += 1
                     continue
 
-                gname = g.get("display_name") or g.get("id") or "group"
-                gid = g.get("id") or ""
-                suffix = gid[:8] if gid else "noid"
-                fname = f"{slugify(gname)}__{suffix}"
+                gid = g.get("id") or g.get("display_name") or "group"
+                fname = short_id_filename(gid)
 
                 data = sanitize_payload(g, strip_keys=self.cfg.strip_keys)
                 self.write_object(out_dir, fname, data)
@@ -204,10 +211,8 @@ class NsxExporter:
                     self.skipped["services_system"] += 1
                     continue
 
-                sname = s.get("display_name") or s.get("id") or "service"
-                sid = s.get("id") or ""
-                suffix = sid[:8] if sid else "noid"
-                fname = f"{slugify(sname)}__{suffix}"
+                sid = s.get("id") or s.get("display_name") or "service"
+                fname = short_id_filename(sid)
 
                 data = sanitize_payload(s, strip_keys=self.cfg.strip_keys)
                 self.write_object(out_dir, fname, data)
@@ -234,7 +239,7 @@ class NsxExporter:
                     log.warning("Skipping policy with no ID")
                     continue
 
-                pol_slug = slugify(pol_id)
+                pol_slug = short_id_filename(pol_id)
                 policy_folder = pol_dir / pol_slug
                 rules_folder = policy_folder / "rules"
 
@@ -259,7 +264,7 @@ class NsxExporter:
                         rule_ids_in_order.append(rid)
 
                         seq += 1
-                        fname = f"{seq:04d}_{slugify(rid)}"
+                        fname = f"{seq:04d}_{short_id_filename(rid)}"
 
                         rule_data = sanitize_payload(r, strip_keys=self.cfg.strip_keys)
                         self.write_object(rules_folder, fname, rule_data)
