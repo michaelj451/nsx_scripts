@@ -25,6 +25,12 @@ nsx_export_verify/
 nsx_capture/
 nsx_transformed/
 nsx_push/
+nsx_services*/
+nsx_groups*/
+nsx_policies*/
+nsx_rules*/
+nsx_segments*/
+nsx_membership*/
 
 # VM Tag Logs
 nsx_vm_files/

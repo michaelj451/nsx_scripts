@@ -235,8 +235,8 @@ def main() -> int:
     p.add_argument("--source-groups", choices=["additive", "raw"], default="additive",
                    help=(
                        "Which groups in the capture to use as input. "
-                       "additive = the live-member-enriched groups (default; recommended). "
-                       "raw      = the raw exported groups (no live IP enrichment)."
+                       "additive = groups with captured VM IPs (snapshot at capture time; default; recommended). "
+                       "raw      = the raw exported groups (no captured-IP enrichment)."
                    ))
     args = p.parse_args()
 

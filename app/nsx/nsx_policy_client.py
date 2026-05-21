@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any, Dict, Iterator, List, Optional, Set
+from urllib.parse import quote as _urlquote
 
 import requests
 import urllib3
@@ -112,6 +113,26 @@ class NsxPolicyClient:
     # ---------------------------
     # Path helpers
     # ---------------------------
+
+    @staticmethod
+    def _q(value: Any) -> str:
+        """
+        URL-encode an object id for safe interpolation into a URL path segment.
+
+        NSX object ids legally include `(`, `)`, ` `, `,`, `&`, `+`, `'`, etc.
+        (e.g. `App_00731__-_PCFS_Loan_Manager_(Ext_servers_1)`). Some of those
+        are RFC 3986 "sub-delims" — technically allowed in paths but
+        inconsistently handled by NSX and various HTTP intermediaries. The
+        safest, most portable approach is to percent-encode every non-
+        unreserved char before building the URL.
+
+        Apply to every id-like value interpolated into a path:
+
+            path = self._policy_path(f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}")
+
+        Pure ASCII / alphanumeric / `.` / `_` / `-` / `~` pass through unchanged.
+        """
+        return _urlquote(str(value), safe="")
 
     def _url(self, path: str) -> str:
         if not path.startswith("/"):
@@ -254,7 +275,7 @@ class NsxPolicyClient:
         page_size: int = 1000,
         timeout: int = 60,
     ) -> List[Dict[str, Any]]:
-        path = self._policy_path(f"/domains/{domain_id}/groups")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/groups")
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
     def list_services(self, *, page_size: int = 1000, timeout: int = 60) -> List[Dict[str, Any]]:
@@ -279,7 +300,7 @@ class NsxPolicyClient:
         page_size: int = 1000,
         timeout: int = 60,
     ) -> List[Dict[str, Any]]:
-        path = self._policy_path(f"/domains/{domain_id}/security-policies")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/security-policies")
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
     def list_security_rules(
@@ -291,7 +312,7 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> List[Dict[str, Any]]:
         path = self._policy_path(
-            f"/domains/{domain_id}/security-policies/{security_policy_id}/rules"
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules"
         )
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
@@ -304,7 +325,7 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> List[Dict[str, Any]]:
         path = self._policy_path(
-            f"/domains/{domain_id}/groups/{group_id}/members/virtual-machines"
+            f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}/members/virtual-machines"
         )
         return self._get_all_results(path, page_size=page_size, timeout=timeout)
 
@@ -666,7 +687,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/groups/{group_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}")
         return self._get(path, timeout=timeout)
 
     def put_group(
@@ -676,7 +697,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/groups/{group_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}")
         return self._put(path, payload, timeout=timeout)
 
     def patch_group(
@@ -686,7 +707,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/groups/{group_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}")
         return self._patch(path, payload, timeout=timeout)
 
     def delete_group(
@@ -695,23 +716,23 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/groups/{group_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}")
         return self._delete(path, timeout=timeout)
 
     def get_service(self, service_id: str, timeout: int = 60) -> Dict[str, Any]:
-        path = self._policy_path(f"/services/{service_id}")
+        path = self._policy_path(f"/services/{self._q(service_id)}")
         return self._get(path, timeout=timeout)
 
     def put_service(self, service_id: str, payload: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
-        path = self._policy_path(f"/services/{service_id}")
+        path = self._policy_path(f"/services/{self._q(service_id)}")
         return self._put(path, payload, timeout=timeout)
 
     def patch_service(self, service_id: str, payload: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
-        path = self._policy_path(f"/services/{service_id}")
+        path = self._policy_path(f"/services/{self._q(service_id)}")
         return self._patch(path, payload, timeout=timeout)
 
     def delete_service(self, service_id: str, timeout: int = 60) -> Dict[str, Any]:
-        path = self._policy_path(f"/services/{service_id}")
+        path = self._policy_path(f"/services/{self._q(service_id)}")
         return self._delete(path, timeout=timeout)
 
     def get_security_policy(
@@ -720,7 +741,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/security-policies/{security_policy_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}")
         return self._get(path, timeout=timeout)
 
     def put_security_policy(
@@ -730,7 +751,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/security-policies/{security_policy_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}")
         return self._put(path, payload, timeout=timeout)
 
     def patch_security_policy(
@@ -740,7 +761,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/security-policies/{security_policy_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}")
         return self._patch(path, payload, timeout=timeout)
 
     def delete_security_policy(
@@ -749,7 +770,7 @@ class NsxPolicyClient:
         domain_id: str = "default",
         timeout: int = 60,
     ) -> Dict[str, Any]:
-        path = self._policy_path(f"/domains/{domain_id}/security-policies/{security_policy_id}")
+        path = self._policy_path(f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}")
         return self._delete(path, timeout=timeout)
 
     def get_security_rule(
@@ -760,7 +781,7 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> Dict[str, Any]:
         path = self._policy_path(
-            f"/domains/{domain_id}/security-policies/{security_policy_id}/rules/{rule_id}"
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules/{self._q(rule_id)}"
         )
         return self._get(path, timeout=timeout)
 
@@ -773,7 +794,7 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> Dict[str, Any]:
         path = self._policy_path(
-            f"/domains/{domain_id}/security-policies/{security_policy_id}/rules/{rule_id}"
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules/{self._q(rule_id)}"
         )
         return self._put(path, payload, timeout=timeout)
 
@@ -786,7 +807,7 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> Dict[str, Any]:
         path = self._policy_path(
-            f"/domains/{domain_id}/security-policies/{security_policy_id}/rules/{rule_id}"
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules/{self._q(rule_id)}"
         )
         return self._patch(path, payload, timeout=timeout)
 
@@ -798,6 +819,6 @@ class NsxPolicyClient:
         timeout: int = 60,
     ) -> Dict[str, Any]:
         path = self._policy_path(
-            f"/domains/{domain_id}/security-policies/{security_policy_id}/rules/{rule_id}"
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules/{self._q(rule_id)}"
         )
         return self._delete(path, timeout=timeout)

@@ -13,9 +13,9 @@ Why this exists:
   the target.
 
   Groups that reference segments are partially mitigated because the
-  live-member-resolution step in Workflow A snapshots resolved VM IPs as a
-  static IPAddressExpression. Rules that reference segments directly are
-  NOT mitigated.
+  capture step in Workflow A snapshots each group's evaluated VM IPs as a
+  static IPAddressExpression (read once from the live source manager and
+  frozen to disk). Rules that reference segments directly are NOT mitigated.
 
   This tool produces a list of every segment path your export depends on,
   so the network team can confirm presence on the target before push.

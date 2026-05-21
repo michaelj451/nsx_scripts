@@ -21,7 +21,7 @@ What's captured:
     manifest.json                          captured-at, captured-from, options, steps
     summary.txt                            human-readable summary
     nsx_export/<host>/                     raw NSX state (groups + services + policies + rules)
-    groups_additive/                       live-member-enriched groups (optional, GET-only)
+    groups_additive/                       groups with captured VM IPs (snapshot at capture time, GET-only)
     segment_inventory/                     every referenced segment + live segment details
     affected_rule_reports/                 cross-reference of rules ↔ groups (offline)
     vm_tag_inventory/                      VM + tag state (LM only, GET-only)
@@ -268,7 +268,10 @@ def main() -> int:
     source_export_dir = export_root / source_host
     source_groups_dir = source_export_dir / "domains" / args.domain_id / "groups"
 
-    # 2. Enrich groups with live evaluated member IPs (GET-only). MANDATORY:
+    # 2. Snapshot each group's evaluated VM members + their IPs (GET-only).
+    # Result is frozen to disk in groups_additive/ — push tools read from
+    # disk, NOT from NSX, so this is a one-time live read at capture time.
+    # MANDATORY:
     # this is what gives the offline transform actual VM IPs to operate on.
     cmd = [
         sys.executable, "tools/nsx/build_group_ip_additive_from_live_members.py",

@@ -262,7 +262,8 @@ def patch_group(client: NsxPolicyClient, group_id: str, payload: Dict[str, Any],
         return
 
     if hasattr(client, "_patch"):
-        path = f"/infra/domains/{domain_id}/groups/{group_id}"
+        q = getattr(client, "_q", lambda v: v)  # fall back if encoder is missing
+        path = f"/infra/domains/{q(domain_id)}/groups/{q(group_id)}"
         client._patch(path, payload)  # type: ignore[attr-defined]
         return
 

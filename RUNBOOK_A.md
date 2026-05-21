@@ -71,7 +71,7 @@ nsx_capture/nsx-lm1.lab.local/             ← always reflects the LATEST captur
 ├── manifest.json                  ← captured-at, options, per-step status
 ├── summary.txt                    ← human-readable summary
 ├── nsx_export/<host>/             ← raw NSX state
-├── groups_additive/               ← live-member-enriched groups
+├── groups_additive/               ← groups with captured (snapshot-at-export-time) VM IPs
 ├── segment_inventory/             ← segments_inventory.json, segment_details.json, segment_paths.txt
 ├── affected_rule_reports/         ← impact report
 ├── vm_tag_inventory/              ← VM tag JSONL + summary
@@ -145,7 +145,7 @@ nsx_transformed/nsx-lm1.lab.local/
 |---------------------------------|-----------|----------------------------------------------------------------------|
 | `--capture <bundle>`            | (required)| Path to a capture bundle                                             |
 | `--segment-mode {convert,strip,skip}` | convert | How to handle segment references                                |
-| `--source-groups {additive,raw}`| additive  | Use the live-member-enriched groups (recommended) or raw export      |
+| `--source-groups {additive,raw}`| additive  | Use the groups with captured (snapshot-at-export-time) VM IPs (recommended) or raw export      |
 | `--domain-id <id>`              | from manifest | Override the domain (rarely needed)                              |
 | `--output-dir <path>`           | auto      | Override the default `nsx_transformed/<host>/` path         |
 
