@@ -168,6 +168,19 @@ def _load_file(p: Path) -> Dict[str, Any]:
     return json.loads(text)
 
 
+def _is_missing_dependency_error(err_msg: str) -> bool:
+    """A 404 on PUT/PATCH means an object referenced inside the payload
+    (e.g. a group in `scope`) doesn't exist on the target yet. NSX surfaces
+    this as if the URL itself was missing. Queued and retried.
+    """
+    lower = err_msg.lower()
+    return (
+        "404" in err_msg
+        and "could not be found" in lower
+        and "object identifiers are case sensitive" in lower
+    )
+
+
 def _is_already_exists_error(e: Exception) -> bool:
     msg = str(e)
     lower = msg.lower()
@@ -460,17 +473,94 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         except Exception as e:
             pol_failed += 1
-            tb = traceback.format_exc()
-            row["status"] = "failed"
-            row["error"] = str(e)
+            err_msg = str(e)
+            row["error"] = err_msg
             row["error_type"] = type(e).__name__
-            row["traceback"] = tb
-            log.error(
-                "[%d/%d  POL ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
-                pi, len(policy_dirs), pol_ok, pol_failed, pol_skipped,
-                row.get("id") or policy_file.name, e, tb,
-            )
+            row["traceback"] = traceback.format_exc()
+
+            if _is_missing_dependency_error(err_msg):
+                row["status"] = "failed_pending_retry"
+                pending = sum(
+                    1 for r in policy_rows + [row]
+                    if r.get("status") == "failed_pending_retry"
+                )
+                log.warning(
+                    "[%d/%d  POL ok=%d fail=%d skip=%d] %s — referenced object missing (404); PENDING RETRY (queued=%d)",
+                    pi, len(policy_dirs), pol_ok, pol_failed, pol_skipped,
+                    row.get("id") or policy_file.name, pending,
+                )
+            else:
+                row["status"] = "failed"
+                log.error(
+                    "[%d/%d  POL ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
+                    pi, len(policy_dirs), pol_ok, pol_failed, pol_skipped,
+                    row.get("id") or policy_file.name, e, row["traceback"],
+                )
             policy_rows.append(row)
+
+    # ------------------------------------------------------------------
+    # Retry pass — policies reference groups in `scope`. If a group hasn't
+    # landed yet, the policy PUT 404s. Retry only failed_pending_retry rows;
+    # promote leftovers to "failed" if the loop can't make progress.
+    # ------------------------------------------------------------------
+    MAX_RETRY_ROUNDS = 5
+    retry_round = 0
+    retry_attempts = 0
+    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+        to_retry = [r for r in policy_rows if r.get("status") == "failed_pending_retry"]
+        if not to_retry:
+            break
+        retry_round += 1
+
+        log.info("=" * 60)
+        log.info("Retry round %d — %d policy/policies pending", retry_round, len(to_retry))
+        log.info("=" * 60)
+
+        progress = False
+        for row in to_retry:
+            retry_attempts += 1
+            policy_id = row.get("id") or ""
+            try:
+                policy = _sanitize(_load_file(Path(row["file"])))
+                try:
+                    client.put_security_policy(policy_id, policy, domain_id=args.domain_id)
+                    row["status"] = "success_put_retry"
+                except NsxApiError as e:
+                    if _is_already_exists_error(e):
+                        client.patch_security_policy(policy_id, policy, domain_id=args.domain_id)
+                        row["status"] = "success_patch_retry"
+                    else:
+                        raise
+                row["retry_round"] = retry_round
+                row.pop("error", None)
+                row.pop("error_type", None)
+                row.pop("traceback", None)
+                pol_ok += 1
+                pol_failed -= 1
+                progress = True
+                log.info("[retry-%d] %s — %s", retry_round, policy_id, row["status"])
+                time.sleep(THROTTLE_SECONDS)
+            except Exception as e:
+                err_msg = str(e)
+                row["error"] = err_msg
+                row["error_type"] = type(e).__name__
+                row["retry_round"] = retry_round
+                if _is_missing_dependency_error(err_msg):
+                    log.warning("[retry-%d] %s — still pending (dep still missing)", retry_round, policy_id)
+                else:
+                    row["status"] = "failed"
+                    row["traceback"] = traceback.format_exc()
+                    log.error("[retry-%d] %s — FAILED: %s", retry_round, policy_id, err_msg)
+
+        if not progress:
+            log.warning("Retry round %d made no progress — promoting %d remaining pending row(s) to FAILED.",
+                        retry_round,
+                        sum(1 for r in policy_rows if r.get("status") == "failed_pending_retry"))
+            break
+
+    for r in policy_rows:
+        if r.get("status") == "failed_pending_retry":
+            r["status"] = "failed"
 
     summary = {
         "command": "policies.push",
@@ -485,6 +575,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             "failed": pol_failed,
             "skipped": pol_skipped,
             "dry_run": pol_dry,
+            "retry_rounds": retry_round,
+            "retry_attempts": retry_attempts,
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
