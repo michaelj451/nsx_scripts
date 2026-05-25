@@ -180,6 +180,19 @@ def _iter_segment_files(segments_dir: Path) -> List[Path]:
     return sorted(files)
 
 
+def _is_missing_dependency_error(err_msg: str) -> bool:
+    """A 404 on PUT/PATCH means an object referenced inside the segment payload
+    (transport-zone path, segment profiles, etc.) doesn't exist on the target.
+    NSX surfaces this as if the URL itself was missing. Queued and retried.
+    """
+    lower = err_msg.lower()
+    return (
+        "404" in err_msg
+        and "could not be found" in lower
+        and "object identifiers are case sensitive" in lower
+    )
+
+
 def _is_already_exists_error(e: Exception) -> bool:
     msg = str(e)
     lower = msg.lower()
@@ -516,18 +529,96 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         except Exception as e:
             failed += 1
-            tb = traceback.format_exc()
-            row["status"] = "failed"
-            row["error"] = str(e)
+            err_msg = str(e)
+            row["error"] = err_msg
             row["error_type"] = type(e).__name__
-            row["traceback"] = tb
-            log.error(
-                "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
-                i, len(files), ok, failed, skipped,
-                row.get("id") or f.name, e, tb,
-            )
+            row["traceback"] = traceback.format_exc()
+
+            if _is_missing_dependency_error(err_msg):
+                row["status"] = "failed_pending_retry"
+                pending = sum(
+                    1 for r in rows + [row]
+                    if r.get("status") == "failed_pending_retry"
+                )
+                log.warning(
+                    "[%d/%d  ok=%d fail=%d skip=%d] %s — referenced object missing (404); PENDING RETRY (queued=%d)",
+                    i, len(files), ok, failed, skipped,
+                    row.get("id") or f.name, pending,
+                )
+            else:
+                row["status"] = "failed"
+                log.error(
+                    "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
+                    i, len(files), ok, failed, skipped,
+                    row.get("id") or f.name, e, row["traceback"],
+                )
 
         rows.append(row)
+
+    # ------------------------------------------------------------------
+    # Retry pass — segments rarely have inter-segment deps, but transport
+    # zone / profile references can 404 if the target is missing them.
+    # Retry only failed_pending_retry rows; promote leftovers to "failed".
+    # ------------------------------------------------------------------
+    MAX_RETRY_ROUNDS = 5
+    retry_round = 0
+    retry_attempts = 0
+    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+        to_retry = [r for r in rows if r.get("status") == "failed_pending_retry"]
+        if not to_retry:
+            break
+        retry_round += 1
+
+        log.info("=" * 60)
+        log.info("Retry round %d — %d segment(s) pending", retry_round, len(to_retry))
+        log.info("=" * 60)
+
+        progress = False
+        for row in to_retry:
+            retry_attempts += 1
+            sid = row.get("id") or ""
+            try:
+                obj = _sanitize(_load_file(Path(row["file"])))
+                path = client._policy_path(f"/segments/{client._q(sid)}")
+                try:
+                    client._put(path, obj)
+                    row["status"] = "success_put_retry"
+                except NsxApiError as e:
+                    if _is_already_exists_error(e):
+                        client._patch(path, obj)
+                        row["status"] = "success_patch_retry"
+                    else:
+                        raise
+                row["retry_round"] = retry_round
+                row.pop("error", None)
+                row.pop("error_type", None)
+                row.pop("traceback", None)
+                ok += 1
+                failed -= 1
+                progress = True
+                log.info("[retry-%d] %s — %s", retry_round, sid, row["status"])
+                time.sleep(THROTTLE_SECONDS)
+            except Exception as e:
+                err_msg = str(e)
+                row["error"] = err_msg
+                row["error_type"] = type(e).__name__
+                row["retry_round"] = retry_round
+                if _is_missing_dependency_error(err_msg):
+                    log.warning("[retry-%d] %s — still pending (dep still missing)", retry_round, sid)
+                else:
+                    row["status"] = "failed"
+                    row["traceback"] = traceback.format_exc()
+                    log.error("[retry-%d] %s — FAILED: %s", retry_round, sid, err_msg)
+
+        if not progress:
+            log.warning("Retry round %d made no progress — promoting %d remaining pending row(s) to FAILED.",
+                        retry_round,
+                        sum(1 for r in rows if r.get("status") == "failed_pending_retry"))
+            break
+
+    for r in rows:
+        if r.get("status") == "failed_pending_retry":
+            r["status"] = "failed"
 
     summary = {
         "command": "segments.push",
@@ -542,6 +633,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             "failed": failed,
             "skipped": skipped,
             "dry_run": dry_run_count,
+            "retry_rounds": retry_round,
+            "retry_attempts": retry_attempts,
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),

@@ -96,6 +96,20 @@ NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "n
 # /ports/... sub-resource path under those.
 SEGMENT_PATH_RE = re.compile(r"^/(?:global-)?infra/segments/[^/\s]+(?:/.*)?$")
 
+# Fabric-layer paths NSX exposes under /infra/sites/<site>/enforcement-points/<ep>/...
+# These are bound to actual physical/virtual infrastructure on a specific manager
+# (hypervisors prepared as host-transport-nodes, edge nodes, etc.) and CANNOT be
+# cloned across managers because the UUIDs only exist in the source manager's DB.
+# When a group's PathExpression references them, push to the target manager will
+# 400 with "is invalid" — there is no recoverable workaround. We strip them and
+# log each strip to fabric_paths_stripped.json so an operator can rebuild the
+# membership manually on the target side if needed.
+FABRIC_PATH_RE = re.compile(
+    r"^/(?:global-)?infra/sites/[^/\s]+/enforcement-points/[^/\s]+/"
+    r"(?:host-transport-nodes|edge-transport-nodes|edge-clusters|transport-zones)"
+    r"/[^/\s]+(?:/.*)?$"
+)
+
 # Char-class allowed in NSX object ids without any encoding concerns.
 # Anything else (parens, spaces, commas, ampersands, etc.) gets flagged.
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
@@ -200,6 +214,20 @@ def _iter_group_files(groups_dir: Path) -> List[Path]:
     return sorted(files)
 
 
+def _is_missing_dependency_error(err_msg: str) -> bool:
+    """A 404 on PUT/PATCH means an object referenced inside the payload (e.g.
+    a nested group PathExpression, or a member group) doesn't exist on the
+    target yet. NSX surfaces this confusingly as if the URL itself was missing.
+    These get queued and retried once dependencies have landed.
+    """
+    lower = err_msg.lower()
+    return (
+        "404" in err_msg
+        and "could not be found" in lower
+        and "object identifiers are case sensitive" in lower
+    )
+
+
 def _is_already_exists_error(e: Exception) -> bool:
     msg = str(e)
     lower = msg.lower()
@@ -285,6 +313,58 @@ def _load_segment_cidr_map(path: Path) -> Dict[str, List[str]]:
             out.setdefault(f"/infra/segments/{sid}", cidrs)
             out.setdefault(f"/global-infra/segments/{sid}", cidrs)
     return out
+
+
+def _strip_fabric_paths_in_expression(
+    expression: List[Any],
+) -> Tuple[List[Any], List[str]]:
+    """Walk a group's expression list and remove any PathExpression entry whose
+    `paths` reference fabric objects (host/edge transport nodes, edge clusters,
+    transport zones). These can't be cloned across managers — the source
+    manager's UUIDs don't exist on the target.
+
+    Returns:
+      (new_expression, paths_stripped)
+        new_expression — expression with fabric paths removed; PathExpressions
+            left empty are dropped entirely
+        paths_stripped — list of every fabric path that was stripped (forensic
+            log written to fabric_paths_stripped.json at end of push)
+    """
+    if not isinstance(expression, list):
+        return expression, []
+
+    stripped: List[str] = []
+    new_items: List[Any] = []
+    indices_to_drop: set = set()
+
+    for i, item in enumerate(expression):
+        if not (isinstance(item, dict) and item.get("resource_type") == "PathExpression"):
+            new_items.append(item)
+            continue
+
+        paths = item.get("paths") or []
+        kept_paths: List[str] = []
+        for p in paths:
+            if isinstance(p, str) and FABRIC_PATH_RE.match(p.strip()):
+                stripped.append(p.strip())
+            else:
+                kept_paths.append(p)
+
+        if not kept_paths:
+            indices_to_drop.add(i)
+            new_items.append(None)
+        else:
+            cloned = dict(item)
+            cloned["paths"] = kept_paths
+            new_items.append(cloned)
+
+    # Drop ConjunctionOperator entries that became orphaned by adjacent drops.
+    final: List[Any] = []
+    for i, item in enumerate(new_items):
+        if item is None:
+            continue
+        final.append(item)
+    return final, stripped
 
 
 def _transform_segments_in_expression(
@@ -592,6 +672,8 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_unresolved = 0
     total_csv_changed = 0
     total_csv_added = 0
+    total_fabric_stripped = 0
+    total_fabric_groups_affected = 0
 
     for i, f in enumerate(files, start=1):
         row = {
@@ -648,6 +730,27 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row["segments_converted"] = converted_here
                 row["segments_unresolved"] = unresolved_here
 
+            # --- Strip un-cloneable fabric paths (host/edge transport-nodes etc.) ---
+            # These reference physical/virtual infrastructure bound to the source
+            # NSX manager. The target has different UUIDs. We strip them, push
+            # whatever remains (possibly an empty group), and log each strip so
+            # an operator can rebuild membership manually on the target side.
+            fabric_stripped_here: List[str] = []
+            if isinstance(obj.get("expression"), list):
+                new_expr2, fabric_stripped_here = _strip_fabric_paths_in_expression(obj["expression"])
+                if fabric_stripped_here:
+                    obj["expression"] = new_expr2
+                    row["fabric_paths_stripped"] = list(fabric_stripped_here)
+                    row["empty_after_strip"] = (len(obj["expression"]) == 0)
+                    total_fabric_stripped += len(fabric_stripped_here)
+                    total_fabric_groups_affected += 1
+                    log.warning(
+                        "[%d/%d] %s — stripped %d fabric path(s) (host/edge TN or transport-zone); "
+                        "group will land %s",
+                        i, len(files), gid, len(fabric_stripped_here),
+                        "as EMPTY (no remaining membership)" if not obj["expression"] else "with reduced membership",
+                    )
+
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -660,6 +763,10 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            # Capture the post-transform payload so retry can re-send it
+            # without re-doing CSV/segment transforms (they're deterministic
+            # but extra work). Stripped before JSON serialization below.
+            row["_payload"] = obj
             try:
                 client.put_group(gid, obj, domain_id=args.domain_id)
                 row["status"] = "success_put"
@@ -681,18 +788,109 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         except Exception as e:
             failed += 1
-            tb = traceback.format_exc()
-            row["status"] = "failed"
-            row["error"] = str(e)
+            err_msg = str(e)
+            row["error"] = err_msg
             row["error_type"] = type(e).__name__
-            row["traceback"] = tb
-            log.error(
-                "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
-                i, len(files), ok, failed, skipped,
-                row.get("id") or f.name, e, tb,
-            )
+            row["traceback"] = traceback.format_exc()
+
+            if _is_missing_dependency_error(err_msg):
+                row["status"] = "failed_pending_retry"
+                pending = sum(
+                    1 for r in rows + [row]
+                    if r.get("status") == "failed_pending_retry"
+                )
+                log.warning(
+                    "[%d/%d  ok=%d fail=%d skip=%d] %s — referenced object missing (404); PENDING RETRY (queued=%d)",
+                    i, len(files), ok, failed, skipped,
+                    row.get("id") or f.name, pending,
+                )
+            else:
+                row["status"] = "failed"
+                log.error(
+                    "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
+                    i, len(files), ok, failed, skipped,
+                    row.get("id") or f.name, e, row["traceback"],
+                )
 
         rows.append(row)
+
+    # ------------------------------------------------------------------
+    # Retry pass — groups can reference other groups (PathExpression /
+    # nested members), which 404 if the referenced group hasn't been
+    # pushed yet. Retry only rows marked failed_pending_retry; loop
+    # until clean or no progress; promote any leftover to "failed".
+    # ------------------------------------------------------------------
+    MAX_RETRY_ROUNDS = 5
+    retry_round = 0
+    retry_attempts = 0
+    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+        to_retry = [r for r in rows if r.get("status") == "failed_pending_retry"]
+        if not to_retry:
+            break
+        retry_round += 1
+
+        log.info("=" * 60)
+        log.info("Retry round %d — %d group(s) pending", retry_round, len(to_retry))
+        log.info("=" * 60)
+
+        progress = False
+        for row in to_retry:
+            retry_attempts += 1
+            gid = row.get("id") or ""
+            # Re-use the captured post-transform payload to avoid re-running
+            # CSV remap + segment-mode transform.
+            obj = row.get("_payload")
+            if obj is None:
+                # Fallback: re-load + re-sanitize. Skips transforms but better
+                # than failing the retry entirely.
+                try:
+                    obj = _sanitize(_load_file(Path(row["file"])))
+                except Exception as e:
+                    log.error("[retry-%d] %s — could not reload payload: %s", retry_round, gid, e)
+                    continue
+            try:
+                try:
+                    client.put_group(gid, obj, domain_id=args.domain_id)
+                    row["status"] = "success_put_retry"
+                except NsxApiError as e:
+                    if _is_already_exists_error(e):
+                        client.patch_group(gid, obj, domain_id=args.domain_id)
+                        row["status"] = "success_patch_retry"
+                    else:
+                        raise
+                row["retry_round"] = retry_round
+                row.pop("error", None)
+                row.pop("error_type", None)
+                row.pop("traceback", None)
+                ok += 1
+                failed -= 1
+                progress = True
+                log.info("[retry-%d] %s — %s", retry_round, gid, row["status"])
+                time.sleep(THROTTLE_SECONDS)
+            except Exception as e:
+                err_msg = str(e)
+                row["error"] = err_msg
+                row["error_type"] = type(e).__name__
+                row["retry_round"] = retry_round
+                if _is_missing_dependency_error(err_msg):
+                    log.warning("[retry-%d] %s — still pending (dep still missing)", retry_round, gid)
+                else:
+                    row["status"] = "failed"
+                    row["traceback"] = traceback.format_exc()
+                    log.error("[retry-%d] %s — FAILED: %s", retry_round, gid, err_msg)
+
+        if not progress:
+            log.warning("Retry round %d made no progress — promoting %d remaining pending row(s) to FAILED.",
+                        retry_round,
+                        sum(1 for r in rows if r.get("status") == "failed_pending_retry"))
+            break
+
+    # Final cleanup: any leftover pending become real failures, and strip
+    # the in-memory _payload field before serialization.
+    for r in rows:
+        if r.get("status") == "failed_pending_retry":
+            r["status"] = "failed"
+        r.pop("_payload", None)
 
     summary = {
         "command": "groups.push",
@@ -713,11 +911,15 @@ def cmd_push(args: argparse.Namespace) -> int:
             "failed": failed,
             "skipped": skipped,
             "dry_run": dry_run_count,
+            "retry_rounds": retry_round,
+            "retry_attempts": retry_attempts,
             "segment_paths_seen": total_paths_seen,
             "segments_converted": total_converted,
             "segments_unresolved": total_unresolved,
             "csv_groups_changed": total_csv_changed,
             "csv_total_added_values": total_csv_added,
+            "fabric_paths_stripped": total_fabric_stripped,
+            "fabric_groups_affected": total_fabric_groups_affected,
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
@@ -733,11 +935,51 @@ def cmd_push(args: argparse.Namespace) -> int:
         failures = [r for r in rows if r.get("status") == "failed"]
         (reports_dir / "failures.json").write_text(json.dumps(failures, indent=2, sort_keys=True), encoding="utf-8")
 
+    if total_fabric_groups_affected:
+        fabric_report = {
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "target": target_host,
+            "summary": {
+                "groups_affected": total_fabric_groups_affected,
+                "paths_stripped_total": total_fabric_stripped,
+            },
+            "groups": [
+                {
+                    "id": r.get("id"),
+                    "display_name": r.get("display_name"),
+                    "file": r.get("file"),
+                    "status": r.get("status"),
+                    "empty_after_strip": r.get("empty_after_strip", False),
+                    "fabric_paths_stripped": r.get("fabric_paths_stripped", []),
+                }
+                for r in rows
+                if r.get("fabric_paths_stripped")
+            ],
+            "notes": (
+                "These groups referenced fabric objects (host/edge transport-nodes, edge-clusters, "
+                "or transport-zones) that exist only on the source NSX manager. The references were "
+                "stripped at push time so the groups could land on the target. To reproduce the "
+                "original membership on the target manager, an operator must add equivalent fabric "
+                "references — these are tied to specific hardware/edge nodes and cannot be cloned "
+                "automatically across managers."
+            ),
+        }
+        (reports_dir / "fabric_paths_stripped.json").write_text(
+            json.dumps(fabric_report, indent=2, sort_keys=True), encoding="utf-8",
+        )
+        log.warning(
+            "Wrote fabric_paths_stripped.json — %d group(s), %d path(s) stripped. "
+            "Operator action may be needed to reproduce membership on the target.",
+            total_fabric_groups_affected, total_fabric_stripped,
+        )
+
     log.info("=" * 60)
     log.info("Push groups %s — ok=%d failed=%d skipped=%d (dry_run=%d) total=%d "
-             "[segments_mode=%s paths_seen=%d converted=%d unresolved=%d]",
+             "[segments_mode=%s paths_seen=%d converted=%d unresolved=%d "
+             "fabric_stripped=%d in %d group(s)]",
              mode, ok, failed, skipped, dry_run_count, len(files),
-             args.segments_mode, total_paths_seen, total_converted, total_unresolved)
+             args.segments_mode, total_paths_seen, total_converted, total_unresolved,
+             total_fabric_stripped, total_fabric_groups_affected)
     log.info("Reports: %s", reports_dir)
     log.info("=" * 60)
 

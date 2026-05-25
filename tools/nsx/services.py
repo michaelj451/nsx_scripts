@@ -204,6 +204,23 @@ def _is_already_exists_error(e: Exception) -> bool:
     )
 
 
+def _is_missing_dependency_error(err_msg: str) -> bool:
+    """A 404 on PUT means a NestedServiceServiceEntry inside the payload points
+    at a service that doesn't exist on the target yet. The 404 isn't about the
+    URL itself — NSX surfaces it as 'The requested object : /infra/services/X
+    could not be found. Object identifiers are case sensitive.'
+
+    Pushing in file order means a service can land before its leaf dependency.
+    The push retries these until the dependency tree resolves.
+    """
+    lower = err_msg.lower()
+    return (
+        "404" in err_msg
+        and "could not be found" in lower
+        and "object identifiers are case sensitive" in lower
+    )
+
+
 # =============================================================================
 # Baseline stack — captures target state before each push so revert can
 # undo. Each push appends a timestamped baseline file; revert pops the
@@ -468,18 +485,103 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         except Exception as e:
             failed += 1
-            tb = traceback.format_exc()
-            row["status"] = "failed"
-            row["error"] = str(e)
+            err_msg = str(e)
+            row["error"] = err_msg
             row["error_type"] = type(e).__name__
-            row["traceback"] = tb
-            log.error(
-                "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
-                i, len(files), ok, failed, skipped,
-                row.get("id") or f.name, e, tb,
-            )
+            row["traceback"] = traceback.format_exc()
+
+            if _is_missing_dependency_error(err_msg):
+                # Expected pattern when nested services land before their leaves —
+                # queue for retry without dumping a traceback to the console.
+                row["status"] = "failed_pending_retry"
+                pending = sum(
+                    1 for r in rows + [row]
+                    if r.get("status") == "failed_pending_retry"
+                )
+                log.warning(
+                    "[%d/%d  ok=%d fail=%d skip=%d] %s — nested dep missing (404); PENDING RETRY (queued=%d)",
+                    i, len(files), ok, failed, skipped,
+                    row.get("id") or f.name, pending,
+                )
+            else:
+                row["status"] = "failed"
+                log.error(
+                    "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
+                    i, len(files), ok, failed, skipped,
+                    row.get("id") or f.name, e, row["traceback"],
+                )
 
         rows.append(row)
+
+    # ------------------------------------------------------------------
+    # Retry pass — services that nest other services can 404 on first
+    # push if their leaf dependency lands later in the file iteration
+    # order. Retry only rows marked failed_pending_retry, looping until
+    # either every retryable failure clears or a pass makes zero progress.
+    # Any pending rows still failing after the cap get promoted to "failed".
+    # ------------------------------------------------------------------
+    MAX_RETRY_ROUNDS = 5
+    retry_round = 0
+    retry_attempts = 0
+    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+        to_retry = [r for r in rows if r.get("status") == "failed_pending_retry"]
+        if not to_retry:
+            break
+        retry_round += 1
+
+        log.info("=" * 60)
+        log.info("Retry round %d — %d service(s) pending", retry_round, len(to_retry))
+        log.info("=" * 60)
+
+        progress = False
+        for row in to_retry:
+            retry_attempts += 1
+            f = Path(row["file"])
+            sid = row.get("id") or ""
+            try:
+                obj = _sanitize(_load_file(f))
+                try:
+                    client.put_service(sid, obj)
+                    row["status"] = "success_put_retry"
+                except NsxApiError as e:
+                    if _is_already_exists_error(e):
+                        client.patch_service(sid, obj)
+                        row["status"] = "success_patch_retry"
+                    else:
+                        raise
+                row["retry_round"] = retry_round
+                row.pop("error", None)
+                row.pop("error_type", None)
+                row.pop("traceback", None)
+                ok += 1
+                failed -= 1
+                progress = True
+                log.info("[retry-%d] %s — %s", retry_round, sid, row["status"])
+                time.sleep(THROTTLE_SECONDS)
+            except Exception as e:
+                err_msg = str(e)
+                row["error"] = err_msg
+                row["error_type"] = type(e).__name__
+                row["retry_round"] = retry_round
+                if _is_missing_dependency_error(err_msg):
+                    # Still a dependency miss — keep pending for next round.
+                    log.warning("[retry-%d] %s — still pending (dep still missing)", retry_round, sid)
+                else:
+                    # Now a real error — promote to failed and capture traceback.
+                    row["status"] = "failed"
+                    row["traceback"] = traceback.format_exc()
+                    log.error("[retry-%d] %s — FAILED: %s", retry_round, sid, err_msg)
+
+        if not progress:
+            log.warning("Retry round %d made no progress — promoting %d remaining pending row(s) to FAILED.",
+                        retry_round,
+                        sum(1 for r in rows if r.get("status") == "failed_pending_retry"))
+            break
+
+    # Any rows still flagged as pending after the retry loop become real failures.
+    for r in rows:
+        if r.get("status") == "failed_pending_retry":
+            r["status"] = "failed"
 
     summary = {
         "command": "services.push",
@@ -493,6 +595,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             "failed": failed,
             "skipped": skipped,
             "dry_run": dry_run_count,
+            "retry_rounds": retry_round,
+            "retry_attempts": retry_attempts,
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
