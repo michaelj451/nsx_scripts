@@ -1,331 +1,339 @@
-# Runbook A — Clone `nsx-lm1` (live) → `nsx-lm2` (new)
+# Runbook A — Clone `nsx-lm1` → `nsx-lm2` (broken-out scripts, 3 push phases)
 
 ## Summary
 
-Clone the policy configuration from the **original live** NSX Local Manager
-(`nsx-lm1` — has the real VMs and evaluated group memberships) onto the
-**new** NSX Local Manager (`nsx-lm2`).
+Clone the customer-defined NSX firewall configuration from a source Local
+Manager (`nsx-lm1`) onto a target Local Manager (`nsx-lm2`). One-time
+read-only **export** off the source, then **push in three phases**, each
+of which is independently revertible.
 
-The workflow is **three commands** with two human-review gates between them:
+| Phase | What it does | Why split |
+|---|---|---|
+| **EXPORT** | 7 read-only commands against the source — captures every object class + the segment / VM-IP snapshots needed by later phases | Source is never written to after this |
+| **PUSH Part 1** | 1-for-1 copy of services, groups, policies, rules — **with segment refs stripped from groups** | Confirms the structure landed cleanly without cross-manager dependencies muddying the result |
+| **PUSH Part 2** | Re-push groups with **segment refs replaced by IPAddressExpression CIDRs** | Resolves segment dependencies the target doesn't have natively |
+| **PUSH Part 3** | Re-push groups with **captured VM IPs added** — IPs snapshotted on the source at export time, NOT re-fetched at push | Freezes dynamic/tag-based membership that only resolves on the source |
 
-```text
-1) capture_nsx_state.py      → bundle of read-only artifacts        (touches nsx-lm1, GET only)
-        ↓  review the capture bundle
-2) transform_capture.py      → bundle of push-ready artifacts       (offline, never touches NSX)
-        ↓  review the transformed bundle
-3) push_from_capture.py      → push to nsx-lm2  (dry-run, then apply)  (touches nsx-lm2 only)
-```
-
-Manager roles:
-
-| Manager   | Role                                  | NSX impact                                   |
-|-----------|---------------------------------------|----------------------------------------------|
-| `nsx-lm1` | Original live — read-only source      | Read-only (only in step 1)                   |
-| `nsx-lm2` | New manager — apply target            | PATCH/POST via file payload (only in step 3) |
-| `nsx-lm3` | Throwaway sandbox — optional testing  | None unless you choose to test against it    |
-
-Properties:
-
-- **Source manager (`nsx-lm1`) is touched in exactly one phase: capture.** Every other step works from the on-disk bundle.
-- Transform is **fully offline** — uses segment data cached by capture. You can re-transform with different options as many times as you want without re-hitting NSX.
-- Dry-run is the default safe mode on push. `--apply` is required to actually mutate the target.
-- Every phase writes a `manifest.json` + `summary.txt` + per-step log files into its bundle directory.
-
-Safe to repeat. Suitable for CAB-reviewed execution.
+Each push step **auto-captures a baseline** of the target's pre-push state.
+Reverts are independent and LIFO — the full clone can be unwound in reverse
+dependency order, or just one phase.
 
 ---
 
-## 0) Environment Setup
+## Tools
+
+| Tool | Used in | Purpose |
+|---|---|---|
+| [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) | EXPORT | Orchestrator: raw policy dump + segment inventory + VM-IP snapshot + impact reports |
+| [tools/nsx/services.py](tools/nsx/services.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` services |
+| [tools/nsx/groups.py](tools/nsx/groups.py) | EXPORT, PUSH 1/2/3, REVERT | `export` / `push` / `revert` groups. Push accepts `--segments-mode {keep,strip,convert,add-mapped}` |
+| [tools/nsx/policies.py](tools/nsx/policies.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` security policies |
+| [tools/nsx/rules.py](tools/nsx/rules.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` rules (children of policies) |
+| [tools/nsx/segments.py](tools/nsx/segments.py) | EXPORT (optional PUSH) | `export` segments + segment↔group cross-reference. `push` is optional (only useful when target has matching transport zones). |
+| [tools/nsx/membership.py](tools/nsx/membership.py) | EXPORT | Auditing only: VM ↔ group correlation. Not consumed by any push step. |
+
+> `--source` / `--target` are aliases resolved from `.env` (e.g. `NSX_LM1=nsx-lm1.lab.local`). Examples below use `nsx-lm1` → `nsx-lm2`.
+
+---
+
+## Env
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
 ```
 
-`$NSX_LOG_DIR` (from `.env`) is where global log files land. Bundle artifacts always also live inside the bundle directory itself.
+PowerShell equivalent:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "$PWD\app"
+```
 
 ---
 
-## 1) Capture — read-only snapshot of `nsx-lm1`
+## EXPORT — 7 commands, source-side, GET-only (run once)
 
 ```bash
-python tools/nsx/capture_nsx_state.py \
-  --source nsx-lm1 \
-  --domain-id default
+python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/services.py    export --source nsx-lm1
+python tools/nsx/groups.py      export --source nsx-lm1
+python tools/nsx/policies.py    export --source nsx-lm1
+python tools/nsx/rules.py       export --source nsx-lm1
+python tools/nsx/segments.py    export --source nsx-lm1
+python tools/nsx/membership.py  export --source nsx-lm1
 ```
 
-What this does, in order, against `nsx-lm1` (every call is GET-only):
+Outputs (overwritten each run when default `--output-dir` is used):
 
-1. **`export_nsx_objects`** — raw groups, services, policies, rules
-2. **`build_group_ip_additive_from_live_members`** — snapshots evaluated VM IPs into static `IPAddressExpression` entries (so dynamic-membership groups still resolve correctly on `nsx-lm2`)
-3. **`find_segments_referenced`** — lists every referenced segment path **and fetches each segment's live details (subnet CIDRs, VLAN, transport zone)** so transform can later run offline
-4. **`find_rules_affected_by_group_changes`** — offline impact report
-5. **`export_vm_tags`** — VM tag state (LM only)
+```
+nsx_capture/<source-host>/
+├── nsx_export/<source-host>/                  ← raw policy export
+├── groups_additive/domains/default/groups/    ← Part 3 input — VM-IP-frozen groups (snapshot at capture time)
+├── segment_inventory/segment_details.json     ← Parts 2 & 3 input — path → CIDR map
+└── manifest.json, summary.txt, logs/, ...
 
-Output bundle:
-
-```text
-nsx_capture/nsx-lm1.lab.local/             ← always reflects the LATEST capture
-├── manifest.json                  ← captured-at, options, per-step status
-├── summary.txt                    ← human-readable summary
-├── nsx_export/<host>/             ← raw NSX state
-├── groups_additive/               ← groups with captured (snapshot-at-export-time) VM IPs
-├── segment_inventory/             ← segments_inventory.json, segment_details.json, segment_paths.txt
-├── affected_rule_reports/         ← impact report
-├── vm_tag_inventory/              ← VM tag JSONL + summary
-└── logs/                          ← per-step log files
+nsx_services_export/<source-host>/services/<short-id>.yaml             + manifest.json + logs/
+nsx_groups_export/<source-host>/groups/<short-id>.yaml                 + manifest.json + logs/
+nsx_policies_export/<source-host>/security-policies/<short-id>/policy.yaml
+                                                                       + manifest.json + logs/
+nsx_rules_export/<source-host>/security-policies/<short-id>/rules/<seq>_<short-id>.yaml
+                                                                       + manifest.json + logs/
+nsx_segments_export/<source-host>/segments/<short-id>.yaml             + manifest.json + logs/
+nsx_membership_export/<source-host>/{group_memberships,vm_group_membership,vm_ip_index}.json
+                                                                       + manifest.json + logs/
 ```
 
-### Capture flags
+Each export bundle writes its own `manifest.json` + `summary.txt` + `logs/` and a machine-readable `<type>.json` / `<type>.jsonl` for downstream consumption. Re-running is idempotent (default output dirs are wiped first).
 
-| Flag                           | Default | Purpose                                                      |
-|--------------------------------|---------|--------------------------------------------------------------|
-| `--source nsx-lm1`             | (required) | Which manager to capture from                            |
-| `--domain-id default`          | default | NSX policy domain                                            |
-| `--federation-global`          | off     | Use the Global Manager API surface (for GM source)           |
-| `--no-vm-tags`                 | off     | Skip VM tag capture (not used by A/B transforms)             |
-| `--no-impact-report`           | off     | Skip the affected-rules impact report (review artifact only) |
-| `--output-dir <path>`          | auto    | Override the default `nsx_capture/<host>/` path. The default path is wiped at the start of every run; pass `--output-dir` to preserve specific bundles. |
+### Review gates after EXPORT
 
-### Review gate
-
-Before moving on, look at:
-
-- `summary.txt` — eyeball each step's status
-- `manifest.json` — confirm `"ok": true`
-- `affected_rule_reports/affected_rules_impact.json` — rules touched by the changed groups
-- `segment_inventory/segment_paths.txt` — segment paths your export depends on (hand to the network team to confirm presence on `nsx-lm2`)
+- `nsx_capture/<host>/summary.txt` — all five sub-steps OK
+- `nsx_capture/<host>/affected_rule_reports/affected_rules_impact.json` — which rules touch which groups (forensic, optional)
+- Each per-tool `summary.json` shows: `written`, `errors`, `ids_with_special_chars`
 
 ---
 
-## 2) Transform — offline conversion of the capture into a push-ready bundle
+## PUSH — target-side
+
+> All pushes default to **dry-run**. Add `--apply` to actually write.
+>
+> Every `--apply` push **first** captures the target's pre-push state into
+> `<reports_dir>/baselines/<RUN_TS>_target_baseline.json`. This baseline is
+> what `revert` reads to undo the push.
+
+### Part 1 — 1-for-1 clone with segments stripped
+
+Pushes services, groups (with segment paths removed), policies, and rules
+to the target.
 
 ```bash
-python tools/nsx/transform_capture.py \
-  --capture nsx_capture/nsx-lm1.lab.local \
-  --segment-mode convert
-```
+python tools/nsx/services.py push --target nsx-lm2 \
+  --services-dir nsx_services_export/nsx-lm1.lab.local/services \
+  --apply
 
-**This step never contacts NSX.** It reads only files from the capture bundle and writes a new transformed bundle.
+python tools/nsx/groups.py push --target nsx-lm2 \
+  --groups-dir nsx_groups_export/nsx-lm1.lab.local/groups \
+  --segments-mode strip \
+  --apply
 
-What it does:
+python tools/nsx/policies.py push --target nsx-lm2 \
+  --policies-dir nsx_policies_export/nsx-lm1.lab.local/security-policies \
+  --apply
 
-- Runs `transform_group_segments.py` against the capture's `groups_additive/` tree
-- For `--segment-mode convert`, the transform uses the **cached `segment_details.json`** from the capture, so segment paths get replaced with `IPAddressExpression` CIDRs without a single NSX call
-- Writes a fresh, dated bundle so you can re-run with different options without overwriting anything
-
-### Segment modes
-
-| Mode        | Behavior                                                                                           | Needs `segment_inventory`? |
-|-------------|----------------------------------------------------------------------------------------------------|----------------------------|
-| `convert`   | Replace each `/infra/segments/<id>` reference with an `IPAddressExpression` of the segment's CIDRs | Yes (from capture)         |
-| `strip`     | Remove segment references entirely, drop empty `PathExpression` nodes, clean up operators          | No                         |
-| `skip`      | Leave segment references untouched (groups will still need those segments to exist on the target)  | No                         |
-
-If `convert` is requested but the capture didn't include segment details, the transform falls back to `strip` and logs why.
-
-### Output bundle
-
-```text
-nsx_transformed/nsx-lm1.lab.local/
-├── manifest.json                  ← transform metadata + link back to capture
-├── summary.txt                    ← per-step status, transform counts
-├── groups_transformed/
-│   └── domains/default/groups/    ← transformed group files
-├── transform_report/
-│   └── segments_stripped.json     ← per-group strip/convert detail
-└── logs/                          ← per-step log files
-```
-
-### Transform flags
-
-| Flag                            | Default   | Purpose                                                              |
-|---------------------------------|-----------|----------------------------------------------------------------------|
-| `--capture <bundle>`            | (required)| Path to a capture bundle                                             |
-| `--segment-mode {convert,strip,skip}` | convert | How to handle segment references                                |
-| `--source-groups {additive,raw}`| additive  | Use the groups with captured (snapshot-at-export-time) VM IPs (recommended) or raw export      |
-| `--domain-id <id>`              | from manifest | Override the domain (rarely needed)                              |
-| `--output-dir <path>`           | auto      | Override the default `nsx_transformed/<host>/` path         |
-
-### Review gate
-
-Before moving on:
-
-- `summary.txt` — counts of files modified, segments converted, unresolved paths
-- `transform_report/segments_stripped.json` — per-group detail of what got transformed
-- Diff the transformed groups against the input if you want byte-level visibility:
-  ```bash
-  diff -r \
-    nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
-    nsx_transformed/nsx-lm1.lab.local/groups_transformed/domains/default/groups
-  ```
-
----
-
-## 3) Push — apply the transformed bundle to `nsx-lm2`
-
-### 3a) Dry-run (default — safe, no writes)
-
-```bash
-python tools/nsx/push_from_capture.py \
-  --target nsx-lm2 \
-  --transformed nsx_transformed/nsx-lm1.lab.local
-```
-
-What this does, against `nsx-lm2`:
-
-1. **Baseline capture of the target** (GET-only) — full `capture_nsx_state` of nsx-lm2, written to `nsx_capture/nsx-lm2.lab.local/` (overwritten each run). This is the pre-push snapshot used for rollback.
-2. **Assemble the complete payload** offline — combines `nsx-lm1`'s services/policies/rules from the capture with the transformed groups from step 2 into `<push bundle>/nsx_build/`.
-3. **Dry-run push** — every PATCH/POST is logged but not sent. Output mirrored into `<push bundle>/push_report/`.
-
-Output bundle:
-
-```text
-nsx_push/nsx-lm2.lab.local/             ← always reflects the LATEST push
-├── manifest.json                  ← push metadata + links back to capture + transformed
-├── summary.txt                    ← step status, push counts
-│   (pre-push baseline lives at nsx_capture/nsx-lm2.lab.local/ — see below)
-├── nsx_build/nsx-lm2.lab.local/   ← assembled push payload
-├── push_report/<ts>/              ← push tool's JSON/JSONL summary + per-row results
-└── logs/                          ← per-step log files
-```
-
-### Review gate
-
-- `summary.txt` — step-by-step status, dry-run counts
-- `push_report/<ts>/summary.json` — full push tool output
-- `push_report/<ts>/rules.json`, `groups.json`, `services.json`, `policies.json` — per-object dry-run records
-
-### 3b) Apply
-
-When the dry-run looks clean, re-run with `--apply`:
-
-```bash
-python tools/nsx/push_from_capture.py \
-  --target nsx-lm2 \
-  --transformed nsx_transformed/nsx-lm1.lab.local \
+python tools/nsx/rules.py push --target nsx-lm2 \
+  --rules-dir nsx_rules_export/nsx-lm1.lab.local/security-policies \
   --apply
 ```
 
-After `--apply`:
+After this phase, groups on the target have all non-segment expressions
+intact (`Condition`, `IPAddressExpression`, references to other groups,
+etc.). Segment-based PathExpressions have been removed.
 
-- The push step actually PATCHes/POSTs to `nsx-lm2`
-- A live validation runs automatically (`validate_nsx_groups_live`) and mirrors its report into `<push bundle>/validate_report/`
+### Part 2 — replace segment refs with their CIDR equivalents
 
-### Push flags
-
-| Flag                       | Default     | Purpose                                                                |
-|----------------------------|-------------|------------------------------------------------------------------------|
-| `--target nsx-lm2`         | (required)  | Which manager to push to                                               |
-| `--transformed <bundle>`   | (required)  | Path to a transformed bundle                                           |
-| `--apply`                  | off         | Actually push (otherwise dry-run)                                      |
-| `--federation-global`      | off         | Target is a Global Manager                                             |
-| `--domain-id <id>`         | from manifest | Override the domain (rarely needed)                                  |
-| `--skip-baseline`          | off         | Skip the pre-push target export (NOT recommended)                      |
-| `--skip-validate`          | off         | Skip the post-apply live validation                                    |
-| `--output-dir <path>`      | auto        | Override the default `nsx_push/<target>/` path. The default path is wiped at the start of every run; pass `--output-dir` to preserve specific bundles. |
-
----
-
-## Workflow Diagram
-
-```text
-nsx-lm1 (live)                                                  nsx-lm2 (target)
-      │                                                                   ▲
-      │  1) capture_nsx_state.py                                          │  3b) push_from_capture.py --apply
-      │                                                                   │
-      ▼                                                                   │
-nsx_capture/nsx-lm1.lab.local/                                            │
-   nsx_export/, groups_additive/, segment_inventory/, vm_tag_inventory/   │
-      │                                                                   │
-      │  2) transform_capture.py  (OFFLINE — never touches NSX)           │
-      ▼                                                                   │
-nsx_transformed/nsx-lm1.lab.local/                               │
-   groups_transformed/, transform_report/                                 │
-      │                                                                   │
-      │  3a) push_from_capture.py            (dry-run, talks to nsx-lm2)  │
-      ▼                                                                   │
-nsx_capture/nsx-lm2.lab.local/  (pre-push baseline of target)             │
-nsx_push/nsx-lm2.lab.local/      ─────────────────────────────────────── ┤  (wiped & rewritten each run)
-   nsx_build/, push_report/, validate_report/                             │
-```
-
----
-
-## Safety Characteristics
-
-| Phase     | Touches NSX?           | What's touched                                |
-|-----------|------------------------|-----------------------------------------------|
-| Capture   | Yes — source only      | GET-only on `nsx-lm1` (policy + fabric)       |
-| Transform | **No**                 | Reads/writes local files only                 |
-| Push (dry-run) | Yes — target only | Read-only against `nsx-lm2`; no PATCH/POST    |
-| Push (apply)   | Yes — target only | PATCH/POST against `nsx-lm2` only             |
-
-**Source manager (`nsx-lm1`) is touched only by `capture_nsx_state.py`.** Once the capture bundle is on disk, every subsequent operation is either offline or aimed at the target.
-
----
-
-## Sandbox testing against `nsx-lm3`
-
-`nsx-lm3` is a throwaway manager — safe to break, experiment on, or wipe.
-Re-aim the push wrapper at it for end-to-end testing before touching `nsx-lm2`:
+Re-pushes groups, this time replacing each `/infra/segments/<id>`
+PathExpression with an `IPAddressExpression` containing the segment's
+native CIDR (looked up from `segment_details.json`).
 
 ```bash
-python tools/nsx/push_from_capture.py \
-  --target nsx-lm3 \
-  --transformed nsx_transformed/nsx-lm1.lab.local
-```
-
-Same transformed bundle, different target. The push bundle lands at `nsx_push/nsx-lm3.lab.local/`.
-
----
-
-## Rollback
-
-The pre-push baseline of the target lives at `nsx_capture/<target-host>/` (full `capture_nsx_state` snapshot taken automatically at the start of the push). Pair it with `push_complete_nsx_revert.py` to roll back:
-
-Dry-run preview:
-
-```bash
-PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
-  --target nsx-lm2 \
-  --export-root nsx_capture/nsx-lm2.lab.local/nsx_export/nsx-lm2.lab.local \
-  --domain-id default
-```
-
-Apply rollback:
-
-```bash
-PYTHONPATH="$PWD/app" python tools/nsx/push_complete_nsx_revert.py \
-  --target nsx-lm2 \
-  --export-root nsx_capture/nsx-lm2.lab.local/nsx_export/nsx-lm2.lab.local \
-  --domain-id default \
+python tools/nsx/groups.py push --target nsx-lm2 \
+  --groups-dir nsx_groups_export/nsx-lm1.lab.local/groups \
+  --segments-mode convert \
+  --segments-from nsx_capture/nsx-lm1.lab.local/segment_inventory/segment_details.json \
   --apply
 ```
 
-Add `--include-services` if the original push created services on the target that weren't there before (e.g., pushing to a brand-new manager). System-owned NSX objects are always preserved.
+### Part 3 — add captured VM IPs to dynamic groups
 
-> **Why not `push_nsx_groups_revert.py`?** That script is groups-only and can't delete groups that are still referenced by the policies/rules from a Workflow-A push. It's the correct tool for Runbook B's groups-only rollback. Use `push_complete_nsx_revert.py` here.
+Re-pushes groups using the `groups_additive/` bundle, which contains the
+same groups but with VM-IP snapshots embedded. These IPs were captured on
+the source at export time; **they are not re-resolved at push time**.
+
+```bash
+python tools/nsx/groups.py push --target nsx-lm2 \
+  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
+  --segments-mode convert \
+  --segments-from nsx_capture/nsx-lm1.lab.local/segment_inventory/segment_details.json \
+  --apply
+```
+
+This is what makes a dynamic (tag-based) group on the target match the
+same VMs it matched on the source even though the target may have
+different VMs / different membership-resolution behavior.
+
+### Review gates after each push
+
+- `summary.json` — counts of ok/failed/skipped, retry_rounds, fabric_paths_stripped
+- `<tool>.jsonl` — per-row records
+- `<tool>_push_<ts>.log` — interleaved INFO log of every PUT/PATCH
+- `<tool>_push_<ts>.errors.log` — ERROR-only filtered file with tracebacks
+- `failures.json` — present only when there were real failures (after retry exhaustion)
+- `fabric_paths_stripped.json` — present only when any group had un-cloneable fabric refs stripped
 
 ---
 
-## Inner Tools (Advanced)
+## Safety nets baked into every push
 
-The three wrappers compose a set of underlying scripts. Most operators never need to invoke these directly, but they are the primitives — if you need a non-standard flow (e.g., transforming an existing capture from a year ago, or re-running just the segment inventory), call them directly:
+These all fire automatically with no operator action; they're called out
+here so you know what to expect when you see them in the logs/reports.
 
-| Inner tool                                  | What it does                                                | Phase     |
-|---------------------------------------------|-------------------------------------------------------------|-----------|
-| `tools/nsx/export_nsx_objects.py`           | Raw NSX state export                                        | Capture   |
-| `tools/nsx/build_group_ip_additive_from_live_members.py` | Live VM-IP enrichment of groups                | Capture   |
-| `tools/nsx/find_segments_referenced.py`     | Segment reference inventory (with live detail fetch)        | Capture   |
-| `tools/nsx/find_rules_affected_by_group_changes.py` | Offline rule-impact report                          | Capture   |
-| `tools/vm_tags/export_vm_tags.py`           | VM tag inventory                                            | Capture   |
-| `tools/nsx/transform_group_segments.py`     | Strip/convert segment references in group files             | Transform |
-| `tools/nsx/build_complete_nsx_payload.py`   | Assemble services + policies + rules + groups into one tree | Push      |
-| `tools/nsx/push_complete_nsx_payload.py`    | The actual push to NSX                                      | Push      |
-| `tools/nsx/validate_nsx_groups_live.py`     | Compare live NSX state to expected files                    | Push      |
-| `tools/nsx/push_complete_nsx_revert.py`     | Roll back to a captured baseline                            | Rollback  |
+### Dependency-404 trap + retry
 
-`transform_group_segments.py` accepts `--segments-from <path>` to consume the capture's cached `segment_details.json` — this is how `transform_capture.py` keeps the transform fully offline.
+When a service nests another service, or a group nests another group, the
+nested object may be pushed later in the iteration than its parent. NSX
+returns a 404 saying "the requested object … could not be found." The
+push tools **silently trap** these (no traceback dump), queue the row
+with `status: failed_pending_retry`, and re-attempt after the main pass.
+Up to 5 retry rounds, then any leftover pending rows promote to `failed`.
+
+Surfaces in the log as:
+
+```
+[17/803  ok=16 fail=1 skip=0] FCB_Commvault_(Intra_Media_Agent) —
+nested dep missing (404); PENDING RETRY (queued=1)
+```
+
+### Fabric-path strip (groups only)
+
+Groups can reference host-transport-nodes, edge-TNs, edge-clusters,
+transport-zones in their expressions (often vRNI-generated). These are
+fabric objects bound to specific hardware on a specific manager — they
+**cannot be cloned**. `groups.py push` detects any path matching the
+fabric pattern, strips it from the group, lets the group land with
+whatever's left (possibly empty), and writes a forensic record to
+`fabric_paths_stripped.json` so an operator can rebuild membership
+manually on the target if needed.
+
+### Special-character object IDs
+
+Every ID interpolated into a URL is URL-encoded via
+`NsxPolicyClient._q()`. IDs containing parens, spaces, commas, etc.
+push and revert cleanly without manual escaping.
+
+### Windows MAX_PATH protection
+
+All exported filenames go through `short_id_filename()` which produces
+deterministic 22-ish-character filenames (`<first5>-<last5>-<8hex>.yaml`).
+This keeps full paths under 260 chars even with deep `nsx_capture/...`
+nesting.
+
+---
+
+## REVERT — reverse dependency order, LIFO baseline pop
+
+> Each push captures a baseline before mutating. `revert --apply` pops the
+> **most recent** unreverted baseline in the given `--reports-dir` and
+> restores the target to that snapshot.
+
+Run in reverse dependency order so a parent is never deleted before its
+children:
+
+```bash
+# 1. rules (must precede policies — rules are children of policies)
+python tools/nsx/rules.py revert --target nsx-lm2 \
+  --reports-dir nsx_rules_export/nsx-lm1.lab.local/push_report \
+  --apply
+
+# 2. policies (parent of rules)
+python tools/nsx/policies.py revert --target nsx-lm2 \
+  --reports-dir nsx_policies_export/nsx-lm1.lab.local/push_report \
+  --apply
+
+# 3. groups Part 3 — additive baseline (in the nsx_capture path)
+python tools/nsx/groups.py revert --target nsx-lm2 \
+  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report \
+  --apply
+
+# 4. groups Part 2 — pops the convert baseline (newer, LIFO)
+python tools/nsx/groups.py revert --target nsx-lm2 \
+  --reports-dir nsx_groups_export/nsx-lm1.lab.local/push_report \
+  --apply
+
+# 5. groups Part 1 — pops the strip baseline (older). Since the strip baseline
+#    captured an empty target, this DELETES every group we pushed.
+python tools/nsx/groups.py revert --target nsx-lm2 \
+  --reports-dir nsx_groups_export/nsx-lm1.lab.local/push_report \
+  --apply
+
+# 6. services
+python tools/nsx/services.py revert --target nsx-lm2 \
+  --reports-dir nsx_services_export/nsx-lm1.lab.local/push_report \
+  --apply
+```
+
+After the chain finishes, every `*_target_baseline.json` should be
+renamed to `*_target_baseline.json.reverted`. You can verify with:
+
+```bash
+find nsx_*_export nsx_capture -path "*/push_report/baselines/*.json" -not -name "*.reverted" 2>/dev/null
+# (empty output = clean revert stack)
+```
+
+---
+
+## SEGMENTS — optional, only when the target has matching transport zones
+
+```bash
+python tools/nsx/segments.py push --target nsx-lm2 \
+  --segments-dir nsx_segments_export/nsx-lm1.lab.local/segments \
+  --apply
+
+# Revert if needed
+python tools/nsx/segments.py revert --target nsx-lm2 \
+  --reports-dir nsx_segments_export/nsx-lm1.lab.local/push_report \
+  --apply
+```
+
+Segments are environment-specific (different UUIDs and transport zones
+per manager). In a typical lm1→lm2 migration, you do **not** push
+segments; Parts 2 + 3 of the groups push handle segment-derived
+membership by converting to CIDRs and adding captured VM IPs.
+
+---
+
+## Common questions
+
+**Why split into per-object scripts instead of one monolithic push?**
+Visibility and granularity. The legacy single-shot push (`push_from_capture.py`) handles services + groups + policies + rules in one process with one set of counters. At production scale (1000s of groups, 100s of policies), one failure cascades into thousands of dependent-object errors and the primary cause gets buried. With the broken-out flow you see exactly which class failed, with detailed per-row tracebacks, and you can re-run just that class.
+
+**Why three parts instead of one push?**
+Each part isolates a distinct transformation. Part 1 confirms the basic clone works without segment dependencies muddying the picture. Part 2 isolates segment-CIDR translation. Part 3 isolates captured-VM-IP freezing. If something breaks, you know which transformation was responsible.
+
+**Can I run Part 3 alone (skipping Part 2)?**
+Yes — Part 3's input (`groups_additive/`) is a strict superset of Part 2's. Running Part 3 directly after Part 1 gives you both the segment CIDRs AND the captured VM IPs in a single re-push. The split is for observability, not data dependency.
+
+**What if a rule's parent policy isn't on the target yet?**
+The dep-404 retry loop handles it automatically as long as the parent will be pushed during the same run. If the parent isn't in the export bundle at all, the rule lands in `failures.json` with the underlying NSX error.
+
+**What if I want a re-IP at the same time as the clone (Workflow A + IP remap)?**
+Add `--csv-remap data/<map>.csv` to the groups push. The CSV runs after segment-convert, so segment-derived CIDRs get remapped along with everything else. See [RUNBOOK_B.md](RUNBOOK_B.md) for CSV-remap mechanics — the flag works the same in Workflow A.
+
+---
+
+## File layout reference
+
+```
+nsx_capture/<source-host>/                     ← capture orchestrator output
+├── nsx_export/<source-host>/                  ← raw policy dump
+├── groups_additive/                           ← VM-IP-frozen groups (Part 3 input)
+│   └── domains/default/groups/<short>.yaml
+├── segment_inventory/segment_details.json     ← path → CIDR map (Parts 2&3 input)
+├── affected_rule_reports/                     ← which rules touch which groups
+├── vm_tag_inventory/                          ← VM tag dump
+└── logs/, manifest.json, summary.txt
+
+nsx_<class>_export/<source-host>/              ← per-tool exports
+├── <class>/<short>.yaml                       ← object data
+├── push_report/                               ← created on first push
+│   ├── baselines/<RUN_TS>_target_baseline.json[.reverted]
+│   ├── <class>_push_<ts>.log
+│   ├── <class>_push_<ts>.errors.log
+│   ├── summary.json, <class>.json, <class>.jsonl
+│   ├── failures.json                          ← only if any real failures
+│   └── fabric_paths_stripped.json             ← only if groups push stripped any fabric refs
+├── manifest.json
+└── logs/
+```

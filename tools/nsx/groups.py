@@ -367,6 +367,88 @@ def _strip_fabric_paths_in_expression(
     return final, stripped
 
 
+def _add_mapped_segment_cidrs_in_expression(
+    expression: List[Any],
+    *,
+    segments_by_path: Dict[str, List[str]],
+    csv_mapping: Any,                            # PrefixMappingTable from nsx_group_ip_remap_offline
+) -> Tuple[List[Any], int, int, List[Dict[str, Any]]]:
+    """For each segment path in a group's PathExpression, look up the segment's
+    native CIDR, run it through the CSV remap, and (if the CSV maps it) splice
+    a new IPAddressExpression after the PathExpression — joined with OR — that
+    contains ONLY the mapped CIDR. The original PathExpression is left intact.
+
+    Skip behavior:
+      - segment path not in segments_by_path → recorded as unmapped (segment lookup failed)
+      - CIDR not in CSV → recorded as unmapped (CSV didn't match)
+      - Either way, no IPAddressExpression is added for that segment — operator
+        sees the result in the forensic JSON `segments_unmapped.json` report
+
+    Returns:
+      (new_expression, mapped_count, unmapped_segments_count, unmapped_records)
+    """
+    if not isinstance(expression, list):
+        return expression, 0, 0, []
+
+    mapped_count = 0
+    unmapped_records: List[Dict[str, Any]] = []
+    inserts: Dict[int, List[str]] = {}   # index -> list of mapped CIDRs to splice in after that index
+
+    for i, item in enumerate(expression):
+        if not (isinstance(item, dict) and item.get("resource_type") == "PathExpression"):
+            continue
+
+        paths = item.get("paths") or []
+        added_for_this_pathexpr: List[str] = []
+        seen: set = set()
+
+        for p in paths:
+            if not (isinstance(p, str) and SEGMENT_PATH_RE.match(p.strip())):
+                continue
+            sp = p.strip()
+            native_cidrs = segments_by_path.get(sp)
+            if not native_cidrs:
+                unmapped_records.append({
+                    "segment_path": sp,
+                    "reason": "segment not in segment_details.json (segment_paths_lookup_miss)",
+                })
+                continue
+            for native in native_cidrs:
+                mapped_list, row = csv_mapping.map_token(native)
+                if not mapped_list:
+                    unmapped_records.append({
+                        "segment_path": sp,
+                        "native_cidr": native,
+                        "reason": "no CSV row covers this CIDR",
+                    })
+                    continue
+                for m in mapped_list:
+                    if m not in seen:
+                        seen.add(m)
+                        added_for_this_pathexpr.append(m)
+                        mapped_count += 1
+
+        if added_for_this_pathexpr:
+            inserts[i] = added_for_this_pathexpr
+
+    if not inserts:
+        return expression, 0, len(unmapped_records), unmapped_records
+
+    # Splice inserts: walk expression, for each index in `inserts` insert
+    # `OR + IPAddressExpression(mapped_cidrs)` right after the original entry.
+    result: List[Any] = []
+    for idx, item in enumerate(expression):
+        result.append(item)
+        if idx in inserts:
+            result.append({"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"})
+            result.append({
+                "resource_type": "IPAddressExpression",
+                "ip_addresses": inserts[idx],
+            })
+
+    return result, mapped_count, len(unmapped_records), unmapped_records
+
+
 def _transform_segments_in_expression(
     expression: List[Any],
     *,
@@ -622,6 +704,15 @@ def cmd_push(args: argparse.Namespace) -> int:
         if not seg_path.exists():
             raise SystemExit(f"--segments-from file not found: {seg_path}")
         segments_by_path = _load_segment_cidr_map(seg_path)
+    elif args.segments_mode == "add-mapped":
+        if not args.segments_from:
+            raise SystemExit("--segments-mode add-mapped requires --segments-from <segment_details.json>")
+        if not args.csv_remap:
+            raise SystemExit("--segments-mode add-mapped requires --csv-remap <csv>")
+        seg_path = Path(args.segments_from).expanduser().resolve()
+        if not seg_path.exists():
+            raise SystemExit(f"--segments-from file not found: {seg_path}")
+        segments_by_path = _load_segment_cidr_map(seg_path)
 
     # Validate / load CSV remap if requested
     csv_mapping = None
@@ -674,6 +765,10 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_csv_added = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
+    total_mapped_segments_added = 0
+    total_unmapped_segments = 0
+    add_mapped_unmapped_log: List[Dict[str, Any]] = []
+    total_add_mapped_groups_affected = 0
 
     for i, f in enumerate(files, start=1):
         row = {
@@ -729,6 +824,39 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row["segments_seen"] = paths_seen
                 row["segments_converted"] = converted_here
                 row["segments_unresolved"] = unresolved_here
+
+            # --- add-mapped: keep segment PathExpressions, splice an extra
+            # IPAddressExpression containing the CSV-mapped CIDR(s). Used by
+            # Workflow B to make lm1's groups also recognise the lm2-equivalent
+            # subnet ranges.
+            if args.segments_mode == "add-mapped" and isinstance(obj.get("expression"), list):
+                new_expr3, mapped_here, unmapped_count_here, unmapped_records_here = \
+                    _add_mapped_segment_cidrs_in_expression(
+                        obj["expression"],
+                        segments_by_path=segments_by_path,
+                        csv_mapping=csv_mapping,
+                    )
+                if mapped_here or unmapped_count_here:
+                    obj["expression"] = new_expr3
+                    total_mapped_segments_added += mapped_here
+                    total_unmapped_segments += unmapped_count_here
+                    if mapped_here:
+                        total_add_mapped_groups_affected += 1
+                    row["mapped_segments_added"] = mapped_here
+                    row["unmapped_segments"] = unmapped_count_here
+                    if unmapped_records_here:
+                        for rec in unmapped_records_here:
+                            rec_with_group = {
+                                "group_id": gid,
+                                "group_display_name": obj.get("display_name"),
+                                **rec,
+                            }
+                            add_mapped_unmapped_log.append(rec_with_group)
+                    log.info(
+                        "[%d/%d] %s — add-mapped: +%d mapped CIDR(s)%s",
+                        i, len(files), gid, mapped_here,
+                        f", {unmapped_count_here} unmapped (see segments_unmapped.json)" if unmapped_count_here else "",
+                    )
 
             # --- Strip un-cloneable fabric paths (host/edge transport-nodes etc.) ---
             # These reference physical/virtual infrastructure bound to the source
@@ -920,6 +1048,9 @@ def cmd_push(args: argparse.Namespace) -> int:
             "csv_total_added_values": total_csv_added,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
+            "add_mapped_cidrs_added":      total_mapped_segments_added,
+            "add_mapped_groups_affected":  total_add_mapped_groups_affected,
+            "add_mapped_unmapped_lookups": total_unmapped_segments,
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
@@ -934,6 +1065,32 @@ def cmd_push(args: argparse.Namespace) -> int:
     if failed:
         failures = [r for r in rows if r.get("status") == "failed"]
         (reports_dir / "failures.json").write_text(json.dumps(failures, indent=2, sort_keys=True), encoding="utf-8")
+
+    if add_mapped_unmapped_log:
+        addmapped_report = {
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "target": target_host,
+            "summary": {
+                "groups_with_mapped_cidrs_added": total_add_mapped_groups_affected,
+                "mapped_cidrs_added_total":      total_mapped_segments_added,
+                "unmapped_segment_lookups":      total_unmapped_segments,
+            },
+            "unmapped": add_mapped_unmapped_log,
+            "notes": (
+                "These segment paths could not produce a mapped IPAddressExpression. "
+                "Either the segment was not in segment_details.json, or its native "
+                "CIDR did not match any row in the CSV. The original PathExpression "
+                "was left intact; no IPAddressExpression was added for these. "
+                "An operator may need to extend the CSV or recapture segment_details."
+            ),
+        }
+        (reports_dir / "segments_unmapped.json").write_text(
+            json.dumps(addmapped_report, indent=2, sort_keys=True), encoding="utf-8",
+        )
+        log.warning(
+            "Wrote segments_unmapped.json — %d unmapped lookup(s) across %d group(s). %d mapped CIDR(s) were added successfully.",
+            total_unmapped_segments, total_add_mapped_groups_affected, total_mapped_segments_added,
+        )
 
     if total_fabric_groups_affected:
         fabric_report = {
@@ -1140,12 +1297,17 @@ def main() -> int:
     pp.add_argument("--federation-global", action="store_true")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
-    pp.add_argument("--segments-mode", choices=["keep", "strip", "convert"], default="keep",
+    pp.add_argument("--segments-mode", choices=["keep", "strip", "convert", "add-mapped"], default="keep",
                     help="How to handle /infra/segments/* refs in groups: "
                          "keep (default) = push as-is; "
                          "strip = remove segment paths from PathExpression entries (phase 1); "
                          "convert = replace segment refs with IPAddressExpression CIDRs read from "
-                         "--segments-from (phase 2). Other expression types are always preserved.")
+                         "--segments-from (phase 2); "
+                         "add-mapped = KEEP segment paths AND splice an extra IPAddressExpression "
+                         "containing only the CSV-mapped equivalent of each segment's CIDR. "
+                         "Requires both --segments-from AND --csv-remap. Unmapped CIDRs are "
+                         "skipped and logged to segments_unmapped.json. "
+                         "Other expression types are always preserved.")
     pp.add_argument("--segments-from", default=None,
                     help="Path to segment_details.json (e.g. nsx_capture/<host>/segment_inventory/"
                          "segment_details.json). Required when --segments-mode=convert.")
