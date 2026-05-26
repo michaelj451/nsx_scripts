@@ -1,10 +1,11 @@
-# Runbook B — Commands (in-place against `nsx-lm1`)
+# Runbook B — Commands (in-place against `nsx-lm1`) — Windows PowerShell
 
-Bare commands only. See [RUNBOOK_B.md](RUNBOOK_B.md) for explanations,
-or [RUNBOOK_B_COMMANDS_PS.md](RUNBOOK_B_COMMANDS_PS.md) for the Windows PowerShell variant.
+Bare commands only, PowerShell variant. See [RUNBOOK_B.md](RUNBOOK_B.md) for explanations,
+or [RUNBOOK_B_COMMANDS.md](RUNBOOK_B_COMMANDS.md) for the bash/zsh equivalent.
 
 > Workflow B operates **in-place on `nsx-lm1`**. No clone happens.
 > Use `groups.py push --csv-remap` to rewrite IPs in existing `IPAddressExpression` entries (re-IP).
+> Line continuation in PowerShell is the backtick `` ` `` at end of line.
 
 ## Env
 
@@ -14,18 +15,11 @@ python -m venv .venv
 $env:PYTHONPATH = "$PWD\app"
 ```
 
-```bash
-# bash/zsh equivalent
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r docker/requirements-pip.txt
-export PYTHONPATH="$PWD/app"
-```
-
 ---
 
 ## CAPTURE — read-only baseline of `nsx-lm1` (run once)
 
-```sh
+```powershell
 python tools/nsx/capture_nsx_state.py --source nsx-lm1
 ```
 
@@ -47,7 +41,7 @@ Rewrites every IP in `IPAddressExpression` entries via the CSV mapping.
 `--mapped-only` keeps only the mapped values (re-IP); without it, mapped
 values are appended alongside the originals (additive).
 
-```sh
+```powershell
 python tools/nsx/groups.py push `
   --target nsx-lm1 `
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups `
@@ -63,7 +57,7 @@ python tools/nsx/groups.py push `
 Each `revert` pops the most recent unreverted baseline. Workflow B
 typically runs one push at a time, so one revert undoes that push.
 
-```sh
+```powershell
 python tools/nsx/groups.py revert --target nsx-lm1 `
   --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report `
   --apply
@@ -73,7 +67,11 @@ Multiple stacked B pushes? Each revert pops the latest. Repeat as needed.
 
 To confirm the revert stack is fully drained:
 
-```sh
-find nsx_capture/nsx-lm1.lab.local/groups_additive -path "*/baselines/*.json" -not -name "*.reverted"
-# (empty output = all baselines consumed)
+```powershell
+Get-ChildItem -Recurse `
+  -Path nsx_capture/nsx-lm1.lab.local/groups_additive `
+  -Filter "*_target_baseline.json" -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -like "*\baselines\*" } |
+  Select-Object FullName
+# (no output = all baselines consumed)
 ```
