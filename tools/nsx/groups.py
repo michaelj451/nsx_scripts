@@ -825,39 +825,6 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row["segments_converted"] = converted_here
                 row["segments_unresolved"] = unresolved_here
 
-            # --- add-mapped: keep segment PathExpressions, splice an extra
-            # IPAddressExpression containing the CSV-mapped CIDR(s). Used by
-            # Workflow B to make lm1's groups also recognise the lm2-equivalent
-            # subnet ranges.
-            if args.segments_mode == "add-mapped" and isinstance(obj.get("expression"), list):
-                new_expr3, mapped_here, unmapped_count_here, unmapped_records_here = \
-                    _add_mapped_segment_cidrs_in_expression(
-                        obj["expression"],
-                        segments_by_path=segments_by_path,
-                        csv_mapping=csv_mapping,
-                    )
-                if mapped_here or unmapped_count_here:
-                    obj["expression"] = new_expr3
-                    total_mapped_segments_added += mapped_here
-                    total_unmapped_segments += unmapped_count_here
-                    if mapped_here:
-                        total_add_mapped_groups_affected += 1
-                    row["mapped_segments_added"] = mapped_here
-                    row["unmapped_segments"] = unmapped_count_here
-                    if unmapped_records_here:
-                        for rec in unmapped_records_here:
-                            rec_with_group = {
-                                "group_id": gid,
-                                "group_display_name": obj.get("display_name"),
-                                **rec,
-                            }
-                            add_mapped_unmapped_log.append(rec_with_group)
-                    log.info(
-                        "[%d/%d] %s — add-mapped: +%d mapped CIDR(s)%s",
-                        i, len(files), gid, mapped_here,
-                        f", {unmapped_count_here} unmapped (see segments_unmapped.json)" if unmapped_count_here else "",
-                    )
-
             # --- Strip un-cloneable fabric paths (host/edge transport-nodes etc.) ---
             # These reference physical/virtual infrastructure bound to the source
             # NSX manager. The target has different UUIDs. We strip them, push

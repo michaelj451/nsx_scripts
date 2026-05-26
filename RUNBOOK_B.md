@@ -1,25 +1,24 @@
-# Runbook B — In-place on `nsx-lm1` (broken-out scripts)
+# Runbook B — In-place CSV subnet remap on `nsx-lm1` (broken-out scripts)
 
 ## Summary
 
 Workflow B operates **in-place against `nsx-lm1`** — no clone happens.
-It's used to mutate `nsx-lm1`'s groups in two complementary ways:
+It's used to mutate `nsx-lm1`'s groups by re-IPing the IPs inside their
+`IPAddressExpression` entries via a CSV subnet map. Groups-only; services,
+policies, rules, and segments themselves are not touched.
 
 | Pattern | What it does | Workflow B use case |
 |---|---|---|
-| **CSV IP remap** | Rewrite IPs inside existing `IPAddressExpression` entries via a subnet-mapping CSV | Stand up a nonprod copy by re-IPing prod groups (`--mapped-only`) or augment with the new IP space (default additive) |
-| **`add-mapped` segment CIDRs** | For each segment path in a group's `PathExpression`, look up the segment's native CIDR, run it through the CSV, splice the mapped CIDR as an OR'd `IPAddressExpression` alongside the original ref | Make `nsx-lm1`'s groups also recognise the lm2-equivalent subnet ranges without removing the existing segment membership |
-
-Both patterns are exposed by the **same** broken-out tool — `groups.py push` — and can be combined in a single run. Groups-only; services, policies, rules, and segments themselves are not touched.
+| **CSV IP remap** | Rewrite IPs inside existing `IPAddressExpression` entries via a subnet-mapping CSV. Default is additive (originals + mapped); `--mapped-only` keeps only the mapped values. | Stand up a nonprod copy by re-IPing prod groups |
 
 The workflow is **two steps** with one human-review gate between them:
 
 ```text
 1) capture_nsx_state.py                            (touches nsx-lm1, GET only)
         ↓  review the capture bundle
-2) groups.py push --target nsx-lm1 ...             (in-place PATCH on nsx-lm1)
+2) groups.py push --target nsx-lm1 --csv-remap ... (in-place PATCH on nsx-lm1)
         ↓  review the push report
-3) groups.py revert --target nsx-lm1 ... (optional, if you need to roll back)
+3) groups.py revert --target nsx-lm1 ...           (optional, if you need to roll back)
 ```
 
 Manager roles:
@@ -30,7 +29,7 @@ Manager roles:
 
 Properties:
 
-- **Source manager is only touched in two phases: capture, then push.** Everything between (`groups_additive` synthesis, CSV remap, segment lookup) is offline.
+- **Source manager is only touched in two phases: capture, then push.** Everything between (`groups_additive` synthesis, CSV remap) is offline.
 - Live VM membership is resolved by NSX at capture time and frozen to disk in `groups_additive/`.
 - All transformations are deterministic and reviewable in the bundle before push.
 - Dry-run is the default safe mode. `--apply` is required to actually mutate.
@@ -42,8 +41,8 @@ Properties:
 
 | Tool | Used in | Purpose |
 |---|---|---|
-| [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) | CAPTURE | Orchestrator: produces `groups_additive/` + `segment_details.json` |
-| [tools/nsx/groups.py](tools/nsx/groups.py) | PUSH, REVERT | `push` with `--csv-remap` and/or `--segments-mode add-mapped`. `revert` pops the captured baseline. |
+| [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) | CAPTURE | Orchestrator: produces `groups_additive/` (the Workflow B push input) |
+| [tools/nsx/groups.py](tools/nsx/groups.py) | PUSH, REVERT | `push` with `--csv-remap`. `revert` pops the captured baseline. |
 
 That's it. Workflow B is groups-only by design.
 
@@ -82,7 +81,7 @@ nsx_capture/nsx-lm1.lab.local/
 ├── nsx_export/<host>/                   ← raw NSX policy state
 ├── groups_additive/                     ← groups with captured (snapshot-at-export-time) VM IPs
 │   └── domains/default/groups/<short>.yaml
-├── segment_inventory/                   ← path → CIDR map (required by add-mapped)
+├── segment_inventory/                   ← path → CIDR map (informational; not used by Workflow B)
 │   └── segment_details.json
 ├── affected_rule_reports/                ← rules ↔ groups impact reference
 ├── vm_tag_inventory/
@@ -99,7 +98,7 @@ nsx_capture/nsx-lm1.lab.local/
 
 ## B.2) Push — in-place against `nsx-lm1`
 
-### Pattern 1 — CSV IP remap (re-IP existing static IPs)
+### CSV IP remap (re-IP existing static IPs)
 
 Rewrites every IP in `IPAddressExpression` entries using the CSV. Default
 behavior is **additive** (mapped values appended alongside originals).
@@ -121,58 +120,6 @@ python tools/nsx/groups.py push --target nsx-lm1 \
   --apply
 ```
 
-### Pattern 2 — `add-mapped` segment CIDRs
-
-For each segment path in a group's `PathExpression`, look up the segment's
-CIDR (from `segment_details.json`), run it through the CSV, and **add**
-the mapped CIDR as a new `IPAddressExpression` after the PathExpression
-(joined by `OR`). The original PathExpression is left intact.
-
-Requires both `--segments-from` and `--csv-remap`.
-
-```bash
-python tools/nsx/groups.py push --target nsx-lm1 \
-  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
-  --segments-mode add-mapped \
-  --segments-from nsx_capture/nsx-lm1.lab.local/segment_inventory/segment_details.json \
-  --csv-remap data/nonprod_map.csv \
-  --apply
-```
-
-What the group looks like after:
-
-```yaml
-# Before:
-expression:
-  - resource_type: PathExpression
-    paths: [/infra/segments/<id-A>]    # native CIDR 10.6.1.0/24
-
-# After add-mapped:
-expression:
-  - resource_type: PathExpression
-    paths: [/infra/segments/<id-A>]    # unchanged — still matches lm1-side VMs
-  - resource_type: ConjunctionOperator
-    conjunction_operator: OR
-  - resource_type: IPAddressExpression
-    ip_addresses: [10.7.1.0/24]        # NEW — CSV-mapped equivalent of the segment's CIDR
-```
-
-**Unmapped segments** (CIDR not covered by any CSV row, or segment not in `segment_details.json`) are skipped — no IPAddressExpression is added for them — and recorded in `<push_report>/segments_unmapped.json` for operator follow-up. The original PathExpression entry stays.
-
-### Pattern 3 — Both at once
-
-CSV remap of existing IP expressions AND add-mapped for segment-referencing groups in one push:
-
-```bash
-python tools/nsx/groups.py push --target nsx-lm1 \
-  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
-  --segments-mode add-mapped \
-  --segments-from nsx_capture/nsx-lm1.lab.local/segment_inventory/segment_details.json \
-  --csv-remap data/nonprod_map.csv \
-  --mapped-only \
-  --apply
-```
-
 ### Push flags (Workflow B)
 
 | Flag | Default | Purpose |
@@ -182,17 +129,15 @@ python tools/nsx/groups.py push --target nsx-lm1 \
 | `--csv-remap <csv>` | off | Apply CSV subnet mapping to `IPAddressExpression` IPs |
 | `--mapped-only` | off | With `--csv-remap`: replace each IPAddressExpression with only the mapped values; drop unmapped originals |
 | `--bidirectional` | off | With `--csv-remap`: treat each CSV row as a bidirectional mapping |
-| `--segments-mode {keep,strip,convert,add-mapped}` | `keep` | `add-mapped` is the Workflow B mode that splices CSV-mapped CIDRs after `PathExpression` |
-| `--segments-from <json>` | (required for convert / add-mapped) | Path to `segment_details.json` from the capture bundle |
+| `--segments-mode {keep,strip,convert}` | `keep` | For Workflow B, leave at `keep` (default) so segment refs in groups aren't disturbed |
 | `--apply` | off | Required to actually mutate. Default is dry-run. |
 
 ### Review gates after push
 
-- `<push_report>/summary.json` — totals: ok / failed / skipped / dry_run / `csv_groups_changed` / `add_mapped_groups_affected` / `add_mapped_unmapped_lookups` / `retry_rounds`
+- `<push_report>/summary.json` — totals: ok / failed / skipped / dry_run / `csv_groups_changed` / `csv_total_added_values` / `retry_rounds`
 - `<push_report>/groups.jsonl` — per-group rows
 - `<push_report>/<tool>_push_<ts>.log` — interleaved INFO log
 - `<push_report>/<tool>_push_<ts>.errors.log` — ERROR-only filtered file
-- `<push_report>/segments_unmapped.json` — present only when `add-mapped` couldn't resolve a CSV mapping for some segment
 - `<push_report>/fabric_paths_stripped.json` — present only if any group had host/edge-TN refs auto-stripped
 - `<push_report>/baselines/<RUN_TS>_target_baseline.json` — pre-push snapshot used by revert
 
@@ -250,14 +195,13 @@ nsx-lm1 (source AND target)
       │        nsx_export/, groups_additive/, segment_inventory/, ...
       │          │
       │          │  B.2) groups.py push --target nsx-lm1
-      │          │       [--csv-remap | --segments-mode add-mapped | both]
+      │          │       --csv-remap <csv> [--mapped-only]
       │          │       [--apply]
       └──────────┤
                  ▼
             <push_report>/
                summary.json, groups.jsonl, push.log, push.errors.log
                baselines/<ts>_target_baseline.json
-               segments_unmapped.json   (if add-mapped had unresolved CIDRs)
                fabric_paths_stripped.json  (if any host/edge-TN refs auto-stripped)
                  │
                  │  B.3) groups.py revert --target nsx-lm1 (optional)
@@ -282,19 +226,13 @@ nsx-lm1 (source AND target)
 ## Common questions
 
 **Why is `--segments-mode keep` the default?**
-Workflow B operates in-place on the source manager. Stripping or converting segment paths there would lose useful membership criteria. The default `keep` leaves segment references untouched. Use `add-mapped` to **add** mapped CIDRs alongside.
+Workflow B operates in-place on the source manager. Stripping or converting segment paths there would lose useful membership criteria. The default `keep` leaves segment references untouched.
 
 **Can I combine Workflow A and Workflow B style transforms?**
-Yes — `groups.py push` doesn't care about the labels. You can target lm2 with `--segments-mode convert --csv-remap …` for a re-IP at clone time. CSV runs after segment-convert, so segment-derived CIDRs get remapped.
+Yes — `groups.py push` doesn't care about the labels. You can target lm2 with `--segments-mode convert --csv-remap …` for a re-IP at clone time.
 
 **What if a CSV mapping conflicts (e.g., `10.6.0.0/16` and `10.6.0.0/24` both present)?**
 Longest-prefix match wins. The `/24` is more specific, so a token like `10.6.0.50` matches the `/24` row, not the `/16`.
-
-**Does `add-mapped` work with `--mapped-only`?**
-The `--mapped-only` flag applies to the CSV-remap step (Pattern 1). `add-mapped` always produces only the mapped CIDR — it doesn't add the native one, so `--mapped-only` is a no-op for the add-mapped pass.
-
-**What if the CSV doesn't cover one of the segment CIDRs?**
-The path is skipped — no IPAddressExpression is added for it — and the segment's native CIDR is logged to `segments_unmapped.json`. The original PathExpression stays so the group still resolves to its lm1-side segment members.
 
 **Are nested-group dependency 404s and fabric-path strips still handled in Workflow B?**
 Yes — same `groups.py push` code path. The retry trap for missing-dep 404s and the fabric-path auto-strip with forensic JSON both apply.
@@ -314,9 +252,8 @@ nsx_capture/nsx-lm1.lab.local/                     ← capture bundle
 │           ├── groups_push_<ts>.errors.log
 │           ├── summary.json, groups.json, groups.jsonl
 │           ├── failures.json                      ← only if real failures
-│           ├── fabric_paths_stripped.json         ← only if any host/edge-TN refs auto-stripped
-│           └── segments_unmapped.json             ← only if add-mapped had unresolved CIDRs
-├── segment_inventory/segment_details.json        ← required by --segments-mode add-mapped
+│           └── fabric_paths_stripped.json         ← only if any host/edge-TN refs auto-stripped
+├── segment_inventory/segment_details.json        ← informational; not used by Workflow B
 ├── affected_rule_reports/
 ├── vm_tag_inventory/
 ├── logs/, manifest.json, summary.txt
