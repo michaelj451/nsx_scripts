@@ -307,9 +307,55 @@ def cmd_export(args: argparse.Namespace) -> int:
         all_groups.extend(page.get("results", []) or [])
     log.info("  Fetched %d group(s) total.", len(all_groups))
 
-    # Build segment_id -> [group_id, ...] and group_id -> [segment_path, ...]
+    # Index segments by canonical path AND by id, so per-reference lookups
+    # work whether a group points at /infra/segments/<id> or /global-infra/...
+    segments_by_path: Dict[str, Dict[str, Any]] = {}
+    segments_by_id: Dict[str, Dict[str, Any]] = {}
+    for s in all_segments:
+        sid = s.get("id")
+        sp = s.get("path")
+        if sid:
+            segments_by_id[sid] = s
+        if sp:
+            segments_by_path[sp.strip()] = s
+            segments_by_path.setdefault(f"/infra/segments/{sid}", s)
+            segments_by_path.setdefault(f"/global-infra/segments/{sid}", s)
+
+    def _segment_detail(seg_path: str) -> Dict[str, Any]:
+        """Build the per-reference detail block: id, display_name, subnets (CIDRs),
+        VLAN, transport zone, type. Returns a stub with unresolved=True if we
+        can't find the segment in the source's segment list."""
+        seg = segments_by_path.get(seg_path.strip())
+        if seg is None:
+            seg_id = _segment_id_from_path(seg_path)
+            if seg_id:
+                seg = segments_by_id.get(seg_id)
+        if seg is None:
+            return {
+                "segment_path":  seg_path,
+                "segment_id":    _segment_id_from_path(seg_path),
+                "display_name":  None,
+                "subnets":       [],
+                "vlan_ids":      None,
+                "transport_zone_path": None,
+                "type":          None,
+                "unresolved":    True,
+            }
+        return {
+            "segment_path":        seg.get("path") or seg_path,
+            "segment_id":          seg.get("id"),
+            "display_name":        seg.get("display_name"),
+            "subnets":             [(sn.get("network") if isinstance(sn, dict) else None)
+                                    for sn in (seg.get("subnets") or [])],
+            "vlan_ids":            seg.get("vlan_ids"),
+            "transport_zone_path": seg.get("transport_zone_path"),
+            "type":                seg.get("type"),
+        }
+
+    # Build segment_id -> [group_id, ...] and group_id -> [enriched-segment, ...]
     segment_to_groups: Dict[str, List[str]] = {}
-    group_to_segments: Dict[str, List[str]] = {}
+    group_to_segments: Dict[str, Dict[str, Any]] = {}
+    total_segment_refs = 0
     for g in all_groups:
         gid = g.get("id")
         if not gid:
@@ -318,7 +364,15 @@ def cmd_export(args: argparse.Namespace) -> int:
             continue
         seg_paths = _segments_referenced_by_expression(g.get("expression") or [])
         if seg_paths:
-            group_to_segments[gid] = sorted(set(seg_paths))
+            uniq_paths = sorted(set(seg_paths))
+            segments_detail = [_segment_detail(sp) for sp in uniq_paths]
+            group_to_segments[gid] = {
+                "group_id":             gid,
+                "group_display_name":   g.get("display_name"),
+                "segments_referenced":  len(segments_detail),
+                "segments":             segments_detail,
+            }
+            total_segment_refs += len(uniq_paths)
             for sp in seg_paths:
                 seg_id = _segment_id_from_path(sp)
                 if seg_id:
@@ -389,8 +443,19 @@ def cmd_export(args: argparse.Namespace) -> int:
     (output_dir / "segment_to_groups.json").write_text(
         json.dumps(segment_to_groups, indent=2, sort_keys=True), encoding="utf-8",
     )
+    group_to_segments_doc = {
+        "summary": {
+            "generated_at":             datetime.now(timezone.utc).isoformat(),
+            "source_manager":           source_host,
+            "domain_id":                args.domain_id,
+            "groups_scanned":           len(all_groups),
+            "groups_with_segment_refs": len(group_to_segments),
+            "total_segment_references": total_segment_refs,
+        },
+        "groups": group_to_segments,
+    }
     (output_dir / "group_to_segments.json").write_text(
-        json.dumps(group_to_segments, indent=2, sort_keys=True), encoding="utf-8",
+        json.dumps(group_to_segments_doc, indent=2, sort_keys=True), encoding="utf-8",
     )
 
     manifest = {
