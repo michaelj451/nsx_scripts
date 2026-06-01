@@ -50,6 +50,23 @@ python tools/nsx/groups.py push `
   --apply
 ```
 
+### Interactive batch mode (`--batch-size N`)
+
+Pass `--batch-size N` to step through the push and approve each batch. At each
+prompt: `Y`/Enter (continue same size), `n` (reset to 1), `x` (clean exit), or
+`<number>` (change size). See [RUNBOOK_B.md](RUNBOOK_B.md) for full details.
+
+```powershell
+# Start cautious at 1-at-a-time; bump higher at any prompt
+python tools/nsx/groups.py push `
+  --target nsx-lm1 `
+  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups `
+  --csv-remap data/nonprod_map.csv `
+  --mapped-only `
+  --batch-size 1 `
+  --apply
+```
+
 ---
 
 ## REVERT — restore `nsx-lm1` to its pre-push state

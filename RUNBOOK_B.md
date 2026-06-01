@@ -130,7 +130,52 @@ python tools/nsx/groups.py push --target nsx-lm1 \
 | `--mapped-only` | off | With `--csv-remap`: replace each IPAddressExpression with only the mapped values; drop unmapped originals |
 | `--bidirectional` | off | With `--csv-remap`: treat each CSV row as a bidirectional mapping |
 | `--segments-mode {keep,strip,convert}` | `keep` | For Workflow B, leave at `keep` (default) so segment refs in groups aren't disturbed |
+| `--batch-size N` | `0` (off) | **Interactive batching.** Pauses every `N` applied updates, prints a compact per-group diff (status, +added/-removed IPs, segment/CSV/fabric notes), and prompts. Default `0` = fully automated. Set to `1` to step through every change; bump higher as confidence grows. Only takes effect with `--apply`. See below. |
 | `--apply` | off | Required to actually mutate. Default is dry-run. |
+
+### Interactive batch mode (`--batch-size N`)
+
+Pass `--batch-size N` (any positive integer) to step through the push and
+review what's changing before NSX is allowed to do more. Useful for a
+first-run sanity pass on production-shaped data.
+
+At each prompt the operator can answer:
+
+| Input | Effect |
+|---|---|
+| `Y` / `y` / `<Enter>` | Approve the batch you just saw and continue at the current batch size |
+| `n` / `no` | Continue, but **reset batch size to 1** (one-at-a-time going forward — be conservative) |
+| `<positive integer>` | Continue with a **new** batch size (e.g. `25` to bump from `1`) |
+| `x` / `exit` / `q` | **Stop cleanly** — finalize reports, write the baseline (revert still works on what landed), exit non-zero |
+
+Each batch printout shows one line per applied group:
+
+```
+[1] netwo-k-6-0   success_patch   +2/-0 IPs   added=[10.7.0.101, 10.7.0.102]  csv_added=2
+[2] vm1           success_patch   +3/-0 IPs   added=[10.7.0.101, 10.7.1.101, 10.7.2.101]  csv_added=3
+[3] vm2           success_patch   +3/-0 IPs   added=[10.7.0.102, 10.7.1.102, 10.7.2.102]  csv_added=3
+```
+
+Notes:
+- The diff is computed against the auto-captured baseline (state of each group BEFORE the push), so `added=` is exactly what NSX received that wasn't there before.
+- If stdin is not a TTY (piped/non-interactive shell), prompts auto-approve at the current batch size to keep CI/test runs unblocked.
+- The push summary records `interactive_mode`, `interactive_batch_size_initial`, `interactive_batch_size_final`, and `interactive_exit_requested` so the audit trail captures what happened.
+
+Example:
+
+```bash
+# Start cautious — one-at-a-time review
+python tools/nsx/groups.py push --target nsx-lm1 \
+  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
+  --csv-remap data/nonprod_map.csv \
+  --mapped-only \
+  --batch-size 1 \
+  --apply
+
+# At the first prompt, type "25" to jump to 25-per-batch.
+# Type "n" if a batch looked off — drops you back to 1.
+# Type "x" to stop pushing remaining groups (already-applied changes stay, revert is available).
+```
 
 ### Review gates after push
 

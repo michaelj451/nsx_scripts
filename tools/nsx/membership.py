@@ -51,7 +51,15 @@ from nsx.nsx_policy_client import NsxPolicyClient
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-THROTTLE_SECONDS = 0.2
+
+# Default per-group throttle (overridable via --throttle-seconds).
+# 0.2s = ~5 req/s, fine for the lab. Customer environments with thousands
+# of groups + a tight NSX rate limit usually want 0.5-1.0s.
+DEFAULT_THROTTLE_SECONDS = 0.2
+# Default retry/backoff behaviour for 429 / 503 / 504 / transient connection errors.
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_BASE = 2.0   # seconds; attempts wait 2, 4, 8 ... (capped)
+DEFAULT_BACKOFF_CAP  = 60.0  # seconds; never sleep longer than this between retries
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
@@ -59,6 +67,56 @@ NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "n
 
 def _has_special_chars(value: str) -> bool:
     return not bool(_SAFE_ID_RE.match(str(value or "")))
+
+
+def _is_rate_limit_or_transient(exc: Exception) -> bool:
+    """Recognise errors NSX returns when it wants us to back off:
+      - HTTP 429 (Too Many Requests)
+      - HTTP 503 / 504 (Service Unavailable / Gateway Timeout — usually transient)
+      - HTTP 502 (Bad Gateway — frontend hiccup)
+      - Lower-level connection errors (timeouts, reset)
+    Returns False for everything else (auth errors, 4xx body issues, etc.)
+    """
+    msg = str(exc)
+    lower = msg.lower()
+    if "[http 429]" in lower or " 429 " in msg or "too many requests" in lower:
+        return True
+    if "[http 503]" in lower or " 503 " in msg or "service unavailable" in lower:
+        return True
+    if "[http 504]" in lower or " 504 " in msg or "gateway timeout" in lower:
+        return True
+    if "[http 502]" in lower or " 502 " in msg or "bad gateway" in lower:
+        return True
+    # requests / urllib3 transport errors that we should retry rather than fail on
+    name = type(exc).__name__.lower()
+    if "timeout" in name or "connectionerror" in name or "remotedisconnected" in name:
+        return True
+    if "connection reset" in lower or "broken pipe" in lower or "read timed out" in lower:
+        return True
+    return False
+
+
+def _call_with_backoff(fn, *, label: str, max_retries: int, backoff_base: float,
+                       backoff_cap: float, retry_stats: Dict[str, int],
+                       **kwargs):
+    """Invoke `fn(**kwargs)` with exponential backoff on rate-limit / transient
+    errors. Other errors surface immediately. `retry_stats` is mutated with
+    counters so the caller can report what NSX pushed back on.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn(**kwargs)
+        except Exception as exc:
+            if not _is_rate_limit_or_transient(exc) or attempt >= max_retries:
+                raise
+            attempt += 1
+            wait = min(backoff_base * (2 ** (attempt - 1)), backoff_cap)
+            retry_stats["retries_attempted"] = retry_stats.get("retries_attempted", 0) + 1
+            retry_stats["total_backoff_seconds"] = retry_stats.get("total_backoff_seconds", 0.0) + wait
+            log.warning("RATE-LIMIT/TRANSIENT on %s (attempt %d/%d): %s — sleeping %.1fs then retrying.",
+                        label, attempt, max_retries, type(exc).__name__, wait)
+            time.sleep(wait)
 
 
 def _setup_logging(reports_dir: Path, label: str) -> tuple[Path, Path]:
@@ -134,14 +192,36 @@ def cmd_export(args: argparse.Namespace) -> int:
             "Run against an LM source — federation_global is GM-only."
         )
 
+    # Retry/backoff bookkeeping — initialised here so the bulk calls below
+    # (build_vm_ip_index, list_virtual_machines) are also covered.
+    retry_stats: Dict[str, Any] = {
+        "retries_attempted": 0,
+        "total_backoff_seconds": 0.0,
+        "max_retries": int(args.max_retries),
+        "backoff_base": float(args.backoff_base),
+        "throttle_seconds": float(args.throttle_seconds),
+    }
+    log.info("Throttle: %.2fs between groups  •  max_retries=%d  •  backoff_base=%.1fs (capped %.1fs)",
+             args.throttle_seconds, args.max_retries, args.backoff_base, DEFAULT_BACKOFF_CAP)
+
     # --- 1. Build VM IP index (fabric VMs + VIFs)  ---------------------------------
     log.info("Step 1/3: Building VM IP index from fabric VMs + VIFs ...")
-    vm_ip_index: Dict[str, List[str]] = client.build_vm_ip_index()
+    vm_ip_index: Dict[str, List[str]] = _call_with_backoff(
+        client.build_vm_ip_index,
+        label="build_vm_ip_index",
+        max_retries=args.max_retries, backoff_base=args.backoff_base,
+        backoff_cap=DEFAULT_BACKOFF_CAP, retry_stats=retry_stats,
+    )
     log.info("  Indexed IPs for %d VM(s)", len(vm_ip_index))
 
     # --- 2. Build VM metadata index (display_name, external_id, etc.) --------------
     log.info("Step 2/3: Fetching VM metadata inventory ...")
-    raw_vms = list(client.list_virtual_machines())
+    raw_vms = list(_call_with_backoff(
+        client.list_virtual_machines,
+        label="list_virtual_machines",
+        max_retries=args.max_retries, backoff_base=args.backoff_base,
+        backoff_cap=DEFAULT_BACKOFF_CAP, retry_stats=retry_stats,
+    ))
     vm_meta: Dict[str, Dict[str, Any]] = {}
     for vm in raw_vms:
         vid = _vm_external_id(vm)
@@ -186,12 +266,20 @@ def cmd_export(args: argparse.Namespace) -> int:
             continue
 
         try:
-            member_vm_ids = client.list_group_member_vm_ids(group_id=gid, domain_id=args.domain_id)
+            member_vm_ids = _call_with_backoff(
+                client.list_group_member_vm_ids,
+                label=f"list_group_members({gid})",
+                max_retries=args.max_retries,
+                backoff_base=args.backoff_base,
+                backoff_cap=DEFAULT_BACKOFF_CAP,
+                retry_stats=retry_stats,
+                group_id=gid, domain_id=args.domain_id,
+            )
         except Exception as exc:
             groups_errors += 1
             tb = traceback.format_exc()
-            log.error("[%d/%d] FAILED listing members of %s: %s\n%s",
-                      gi, len(all_groups), gid, exc, tb)
+            log.error("[%d/%d] FAILED listing members of %s (after %d retries): %s\n%s",
+                      gi, len(all_groups), gid, args.max_retries, exc, tb)
             group_rows.append({
                 "group_id": gid, "display_name": gname,
                 "status": "failed", "error": str(exc),
@@ -225,7 +313,8 @@ def cmd_export(args: argparse.Namespace) -> int:
         log.info("[%d/%d  ok=%d sys-skip=%d err=%d] %s — %d member VM(s), %d IP(s)",
                  gi, len(all_groups), groups_processed, groups_skipped_system, groups_errors,
                  gid, len(members), total_member_ips)
-        time.sleep(THROTTLE_SECONDS)
+        if args.throttle_seconds > 0:
+            time.sleep(args.throttle_seconds)
 
     # --- Assemble vm_group_membership.json (flipped view) ---------------------------
     vm_membership_rows: List[Dict[str, Any]] = []
@@ -262,6 +351,14 @@ def cmd_export(args: argparse.Namespace) -> int:
             "vms_indexed_for_ips": len(vm_ip_index),
             "vms_with_metadata": len(vm_meta),
             "vms_in_at_least_one_group": len(vm_to_groups),
+            "retries_attempted": retry_stats["retries_attempted"],
+            "total_backoff_seconds": round(retry_stats["total_backoff_seconds"], 2),
+        },
+        "throttle": {
+            "throttle_seconds": retry_stats["throttle_seconds"],
+            "max_retries":      retry_stats["max_retries"],
+            "backoff_base":     retry_stats["backoff_base"],
+            "backoff_cap":      DEFAULT_BACKOFF_CAP,
         },
         "paths": {
             "bundle_dir": str(output_dir),
@@ -284,6 +381,8 @@ def cmd_export(args: argparse.Namespace) -> int:
     log.info("  VMs with IPs           : %d", len(vm_ip_index))
     log.info("  VMs with metadata      : %d", len(vm_meta))
     log.info("  VMs in 1+ group        : %d", len(vm_to_groups))
+    log.info("  retries attempted      : %d  (total backoff: %.1fs)",
+             retry_stats["retries_attempted"], retry_stats["total_backoff_seconds"])
     log.info("Bundle:   %s", output_dir)
     log.info("Manifest: %s", manifest_path)
     log.info("=" * 60)
@@ -312,6 +411,17 @@ def main() -> int:
                     help="Defaults to nsx_membership_export/<source-host>/. Wiped on each run.")
     pe.add_argument("--include-system", action="store_true",
                     help="Also include system-owned groups (default: skip).")
+    pe.add_argument("--throttle-seconds", type=float, default=DEFAULT_THROTTLE_SECONDS,
+                    help=f"Seconds to sleep between per-group member queries (default: "
+                         f"{DEFAULT_THROTTLE_SECONDS}). Increase to ~0.5-1.0 for large customer "
+                         f"environments that trip NSX rate-limits.")
+    pe.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                    help=f"How many times to retry a single API call when NSX returns 429/503/504 "
+                         f"or a transient connection error (default: {DEFAULT_MAX_RETRIES}). "
+                         f"Exponential backoff between attempts (~2s, 4s, 8s, capped at 60s).")
+    pe.add_argument("--backoff-base", type=float, default=DEFAULT_BACKOFF_BASE,
+                    help=f"Base seconds for exponential backoff (default: {DEFAULT_BACKOFF_BASE}). "
+                         f"Attempt N waits min(base * 2^(N-1), 60s).")
     pe.set_defaults(func=cmd_export)
 
     args = p.parse_args()
