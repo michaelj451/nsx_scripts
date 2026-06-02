@@ -11,13 +11,13 @@ the **rule** level rather than mixed inside one group's expression.
 
 | Before (additive Workflow A Part 3) | After (Workflow C) |
 |---|---|
-| Group `vm1` has both a `Condition` (Tag=`1\|vm`) AND an `IPAddressExpression` ([10.6.0.101, ...]) | Group `vm1` has **only** the `Condition`. Group `vm1_svb_m3` has **only** the IPs. |
+| Group `vm1` has both a `Condition` (Tag=`1\|vm`) AND an `IPAddressExpression` ([10.6.0.101, ...]) | Group `vm1` has **only** the `Condition`. Group `vm1_sibling` has **only** the IPs. |
 | Mixed-mode group — harder to reason about; changing the IP list edits the same object that the tag criterion lives on | One-criterion-per-group. The original is canonical, the sibling is the IP snapshot |
 | To remap IPs, you risk editing the tag side | Remap the sibling without ever touching the tag group |
-| Rule says "match vm1" | Rule says "match vm1 OR match vm1_svb_m3" — both groups appear in `source_groups` / `destination_groups` / `scope` |
+| Rule says "match vm1" | Rule says "match vm1 OR match vm1_sibling" — both groups appear in `source_groups` / `destination_groups` / `scope` |
 
 The sibling name is `<original_id><OBJECT_APPENDIX>` where `OBJECT_APPENDIX`
-is read from `.env` (e.g. `_svb_m3`). Override per run with `--appendix`.
+is read from `.env` (e.g. `_sibling`). Override per run with `--appendix`.
 
 Everything is **strict-additive** except the explicit "strip IPs out of
 tagged originals" step, which is gated behind `--intentional-ip-removal`
@@ -273,8 +273,8 @@ Each rule gets one row in `amend_refs.json` / `amend_refs.jsonl`:
     "scope": {
       "before": ["/infra/.../groups/hardware-subnet", "/infra/.../groups/network-6-0"],
       "after":  ["/infra/.../groups/hardware-subnet", "/infra/.../groups/network-6-0",
-                 "/infra/.../groups/network-6-0_svb_m3"],
-      "added":  ["/infra/.../groups/network-6-0_svb_m3"]
+                 "/infra/.../groups/network-6-0_sibling"],
+      "added":  ["/infra/.../groups/network-6-0_sibling"]
     },
     "source_groups": {...},
     "destination_groups": {...}
@@ -321,4 +321,4 @@ No. `ANY` never matches a sibling map entry — only specific group paths trigge
 The amend step ignores it — only references that map to a sibling are touched. Rules that don't reference any tagged-with-IPs group get reported `no_change`.
 
 **Why the appendix in display_name as well as id?**
-So the sibling is visually distinguishable in the NSX UI without having to compare IDs character-by-character. Matches the id pattern: `vm1` → `vm-group-1` (display) → `vm-group-1_svb_m3` (sibling display).
+So the sibling is visually distinguishable in the NSX UI without having to compare IDs character-by-character. Matches the id pattern: `vm1` → `vm-group-1` (display) → `vm-group-1_sibling` (sibling display).

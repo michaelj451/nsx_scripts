@@ -27,7 +27,7 @@ INPUTS:
 
 OPTIONS:
   --appendix <str>     Override the sibling-id suffix. Defaults to
-                       OBJECT_APPENDIX from .env (e.g. "_svb_m3").
+                       OBJECT_APPENDIX from .env (e.g. "_sibling").
   --output-base <dir>  Root for the two output bundles. Default:
                        repo root (so outputs land at
                        nsx_sibling_groups/<host>/ and
@@ -193,6 +193,9 @@ def split_group(orig_group: Dict[str, Any], appendix: str, include_empty: bool =
                         f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} "
                         f"by build_sibling_groups.py"),
         "resource_type": "Group",
+        # Mark as an IP-address-typed group so NSX surfaces it as IP-only in the
+        # UI and other consumers (e.g. ip-address-group on lm1 carries this).
+        "group_type": ["IPAddress"],
         "expression": [
             {
                 "resource_type": "IPAddressExpression",
