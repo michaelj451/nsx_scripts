@@ -43,33 +43,34 @@ nsx_capture/nsx-lm1.lab.local/
 
 > All pushes default to **dry-run**. Add `--apply` to actually write. Baseline captured for revert.
 
-Rewrites every IP in `IPAddressExpression` entries via the CSV mapping.
-`--mapped-only` keeps only the mapped values (re-IP); without it, mapped
-values are appended alongside the originals (additive).
+Rewrites every IP in `IPAddressExpression` entries via the CSV mapping —
+**strict-additive**: originals are kept, mapped values are appended,
+**no IP is ever removed**. `--mapped-only` is refused with `--csv-remap`.
+`--batch-size` defaults to **1** when `--csv-remap` is set (step-through
+every change; bump higher at any prompt).
 
 ```sh
 python tools/nsx/groups.py push `
   --target nsx-lm1 `
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups `
   --csv-remap data/nonprod_map.csv `
-  --mapped-only `
   --apply
 ```
 
 ### Interactive batch mode (`--batch-size N`)
 
-Pass `--batch-size N` to step through the push and approve each batch. At each
-prompt: `Y`/Enter (continue same size), `n` (reset to 1), `x` (clean exit), or
+When `--csv-remap` is set, `--batch-size` defaults to **1** automatically.
+Pass `--batch-size N` to start at a different size. At each prompt:
+`Y`/Enter (continue same size), `n` (reset to 1), `x` (clean exit), or
 `<number>` (change size). See [RUNBOOK_B.md](RUNBOOK_B.md) for full details.
 
 ```sh
-# Start cautious at 1-at-a-time; bump higher at any prompt
+# Start at 10 instead of the default 1
 python tools/nsx/groups.py push `
   --target nsx-lm1 `
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups `
   --csv-remap data/nonprod_map.csv `
-  --mapped-only `
-  --batch-size 1 `
+  --batch-size 10 `
   --apply
 ```
 

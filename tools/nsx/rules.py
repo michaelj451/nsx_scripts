@@ -809,6 +809,276 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
 
 # =============================================================================
+# amend-refs: append IP-only sibling-group refs to every rule that already
+# references the original tag-based group.
+#
+# Strict-additive by design — never removes a ref. If a sibling is already
+# listed alongside the original (idempotency), the rule is skipped.
+# =============================================================================
+
+class _AmendInteractiveExit(Exception):
+    pass
+
+
+def _amend_prompt(applied: int, current: int) -> int:
+    while True:
+        try:
+            ans = input(
+                f"\nApplied {applied} rule update(s). "
+                f"Continue with current batch_size={current}? "
+                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
+            ).strip().lower()
+        except EOFError:
+            log.warning("Non-interactive stdin at batch boundary; auto-approving (batch_size=%d).", current)
+            return current
+        if ans in ("", "y", "yes"):
+            return current
+        if ans in ("n", "no"):
+            log.warning("Operator chose RESET-TO-1 after %d applied update(s).", applied)
+            return 1
+        if ans in ("x", "exit", "q", "quit"):
+            log.warning("Operator chose EXIT after %d applied update(s).", applied)
+            raise _AmendInteractiveExit()
+        try:
+            n = int(ans)
+            if n <= 0:
+                print("Please enter a positive integer.")
+                continue
+            log.info("Operator changed batch_size from %d to %d.", current, n)
+            return n
+        except ValueError:
+            print("Please enter Y / Enter, n, x, or a positive integer.")
+
+
+def _build_path_pair_map(sibling_map_doc: Dict[str, Any], domain_id: str) -> Dict[str, str]:
+    """Build {original_group_path: sibling_group_path} for both /infra and
+    /global-infra variants — rules can reference either."""
+    pairs: Dict[str, str] = {}
+    for entry in sibling_map_doc.get("map", []) or []:
+        orig = entry.get("original_id")
+        sib  = entry.get("sibling_id")
+        if not (orig and sib):
+            continue
+        for prefix in ("/infra", "/global-infra"):
+            pairs[f"{prefix}/domains/{domain_id}/groups/{orig}"] = (
+                f"{prefix}/domains/{domain_id}/groups/{sib}"
+            )
+    return pairs
+
+
+def cmd_amend_refs(args: argparse.Namespace) -> int:
+    """For every customer rule on --target, append sibling-group paths
+    alongside any matching original-group path in source_groups /
+    destination_groups / scope. Strict-additive: nothing is ever removed.
+    """
+    target_host = resolve_manager(args.target)
+    if not target_host:
+        raise SystemExit(f"Target manager not defined: {args.target}")
+
+    sib_map_path = Path(args.sibling_map).expanduser().resolve()
+    if not sib_map_path.exists():
+        raise SystemExit(f"--sibling-map file not found: {sib_map_path}")
+    sibling_doc = json.loads(sib_map_path.read_text(encoding="utf-8"))
+    domain_id = args.domain_id or sibling_doc.get("domain_id") or "default"
+    pair_map = _build_path_pair_map(sibling_doc, domain_id)
+    if not pair_map:
+        raise SystemExit("sibling_map.json has no entries — nothing to amend.")
+
+    reports_dir = Path(args.reports_dir or
+                       (REPO_ROOT / "nsx_rules_export" / target_host / "push_report"))\
+        .expanduser().resolve()
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    log_file, errors_log = _setup_logging(reports_dir, "amend_refs")
+
+    log.info("=" * 60)
+    log.info("RULES — AMEND-REFS (%s)", "APPLY" if args.apply else "DRY-RUN")
+    log.info("  Target          : %s (%s)", args.target, target_host)
+    log.info("  Domain          : %s", args.domain_id or domain_id)
+    log.info("  Sibling map     : %s  (%d original→sibling pair(s))",
+             sib_map_path, len(sibling_doc.get("map", []) or []))
+    log.info("  Reports dir     : %s", reports_dir)
+    log.info("=" * 60)
+
+    # Resolve batch size — default to 1 in apply mode for the same reasons as groups.py push.
+    if args.batch_size is None:
+        resolved_batch_size = 1 if args.apply else 0
+        if args.apply:
+            log.info("Auto-defaulting --batch-size to 1 (rule amend is additive; "
+                     "step-through is safer). Bump higher at any prompt as confidence grows.")
+    else:
+        resolved_batch_size = int(args.batch_size)
+    batch_size = resolved_batch_size
+    interactive_mode = args.apply and batch_size > 0
+    applied_in_batch = 0
+    batch_summary_rows: List[Dict[str, Any]] = []
+    interactive_exit_requested = False
+
+    client = None
+    baseline_path = None
+    baseline: Dict[str, Dict[str, Any]] = {}
+    if args.apply:
+        client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
+        log.info("Capturing target baseline (current customer rules on %s) ...", target_host)
+        baseline = _capture_target_rules(client, domain_id)
+        baseline_path = _append_baseline(reports_dir, baseline)
+        log.info("  Baseline: %d rule(s) across customer policies → %s", len(baseline), baseline_path)
+    else:
+        # Dry-run: still need to read the live target state.
+        client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
+        log.info("Listing target rules (dry-run, no baseline written) ...")
+        baseline = _capture_target_rules(client, domain_id)
+        log.info("  Live target has %d customer rule(s).", len(baseline))
+
+    rows: List[Dict[str, Any]] = []
+    ok = no_change = failed = 0
+
+    for key, entry in baseline.items():
+        pid = entry["policy_id"]
+        rid = entry["rule_id"]
+        rule = entry["payload"]
+        row: Dict[str, Any] = {
+            "policy_id": pid, "rule_id": rid,
+            "display_name": rule.get("display_name"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Walk source_groups / destination_groups / scope.
+        per_field_diff: Dict[str, Dict[str, Any]] = {}
+        for field in ("source_groups", "destination_groups", "scope"):
+            current = list(rule.get(field, []) or [])
+            sibs_present_already: set = set(current)
+            to_add: List[str] = []
+            for ref in current:
+                sib = pair_map.get(ref)
+                if sib and sib not in sibs_present_already and sib not in to_add:
+                    to_add.append(sib)
+            if to_add:
+                per_field_diff[field] = {
+                    "before": current,
+                    "after":  current + to_add,
+                    "added":  to_add,
+                }
+
+        if not per_field_diff:
+            no_change += 1
+            row["status"] = "no_change"
+            row["refs_added_total"] = 0
+            rows.append(row)
+            continue
+
+        # Compose updated payload.
+        new_rule = dict(rule)
+        added_total = 0
+        for field, d in per_field_diff.items():
+            new_rule[field] = d["after"]
+            added_total += len(d["added"])
+        row["per_field_diff"] = per_field_diff
+        row["refs_added_total"] = added_total
+
+        if not args.apply:
+            row["status"] = "dry_run"
+            log.info("[DRY] %s/%s — would add %d ref(s) across %d field(s)",
+                     pid, rid, added_total, len(per_field_diff))
+            rows.append(row)
+            continue
+
+        # Apply.
+        try:
+            client.patch_security_rule(
+                security_policy_id=pid, rule_id=rid,
+                payload=new_rule, domain_id=domain_id,
+            )
+            row["status"] = "success_patch"
+            ok += 1
+            added_summary = ", ".join(
+                f"{f}: +{len(d['added'])}" for f, d in per_field_diff.items()
+            )
+            log.info("[ok=%d  no_change=%d  fail=%d] %s/%s — +%d refs (%s)",
+                     ok, no_change, failed, pid, rid, added_total, added_summary)
+            rows.append(row)
+        except Exception as exc:
+            failed += 1
+            row["status"] = "failed"
+            row["error"] = str(exc)
+            row["error_type"] = type(exc).__name__
+            row["traceback"] = traceback.format_exc()
+            log.error("[ok=%d  no_change=%d  fail=%d] %s/%s — FAILED: %s",
+                      ok, no_change, failed, pid, rid, exc)
+            rows.append(row)
+            continue
+
+        # Interactive batch boundary.
+        if interactive_mode:
+            applied_in_batch += 1
+            batch_summary_rows.append(row)
+            if applied_in_batch >= batch_size:
+                log.info("=" * 60)
+                log.info("BATCH REVIEW — %d rule update(s) just applied:", applied_in_batch)
+                for j, br in enumerate(batch_summary_rows, start=1):
+                    notes = ", ".join(
+                        f"{f}: +{len(d['added'])}"
+                        for f, d in (br.get("per_field_diff") or {}).items()
+                    )
+                    log.info("  [%d] %s/%s  %s  refs_added=%d  (%s)",
+                             j, br.get("policy_id"), br.get("rule_id"),
+                             br.get("status"), br.get("refs_added_total", 0), notes)
+                log.info("=" * 60)
+                try:
+                    batch_size = _amend_prompt(applied_in_batch, batch_size)
+                except _AmendInteractiveExit:
+                    interactive_exit_requested = True
+                    break
+                applied_in_batch = 0
+                batch_summary_rows = []
+
+        time.sleep(THROTTLE_SECONDS)
+
+    # Reports
+    summary = {
+        "command": "rules.amend_refs",
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "target": {"alias": args.target, "host": target_host,
+                   "federation_global": args.federation_global, "domain_id": domain_id},
+        "sibling_map": str(sib_map_path),
+        "mode": "APPLY" if args.apply else "DRY-RUN",
+        "totals": {
+            "rules_seen": len(baseline),
+            "ok": ok,
+            "no_change": no_change,
+            "failed": failed,
+            "interactive_batch_size_initial": resolved_batch_size,
+            "interactive_batch_size_final":   batch_size if interactive_mode else 0,
+            "interactive_exit_requested":     interactive_exit_requested,
+        },
+        "baseline_file": str(baseline_path) if baseline_path else None,
+        "log_file": str(log_file),
+        "errors_log": str(errors_log),
+    }
+    (reports_dir / "amend_refs_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    (reports_dir / "amend_refs.json").write_text(
+        json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+    with (reports_dir / "amend_refs.jsonl").open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, sort_keys=True) + "\n")
+    if failed:
+        (reports_dir / "amend_refs_failures.json").write_text(
+            json.dumps([r for r in rows if r.get("status") == "failed"],
+                       indent=2, sort_keys=True), encoding="utf-8")
+
+    log.info("=" * 60)
+    log.info("Amend-refs %s — ok=%d no_change=%d failed=%d (rules seen=%d)",
+             "APPLY" if args.apply else "DRY-RUN", ok, no_change, failed, len(baseline))
+    if interactive_exit_requested:
+        log.warning("INTERACTIVE EXIT — operator stopped after %d applied update(s).", ok)
+    log.info("Reports: %s", reports_dir)
+    log.info("=" * 60)
+
+    print(json.dumps(summary, indent=2))
+    return 0 if (failed == 0 and not interactive_exit_requested) else 1
+
+
+# =============================================================================
 # CLI dispatch
 # =============================================================================
 
@@ -852,6 +1122,30 @@ def main() -> int:
     pr.add_argument("--from-baseline", default=None,
                     help="Specific baseline file (overrides auto-selected latest).")
     pr.set_defaults(func=cmd_revert)
+
+    pa = sub.add_parser("amend-refs",
+                        help="For every customer rule on the target, append IP-only "
+                             "sibling-group refs (from a sibling_map.json) alongside any "
+                             "matching original-group ref in source_groups / "
+                             "destination_groups / scope. Strict-additive — never removes.")
+    pa.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
+    pa.add_argument("--sibling-map", required=True,
+                    help="Path to sibling_map.json produced by build_sibling_groups.py "
+                         "(e.g. nsx_sibling_groups/<host>/sibling_map.json).")
+    pa.add_argument("--domain-id", default=None,
+                    help="NSX domain. Defaults to whatever sibling_map.json recorded.")
+    pa.add_argument("--federation-global", action="store_true")
+    pa.add_argument("--apply", action="store_true", default=False,
+                    help="Actually amend rules on the target. Without this, dry-run.")
+    pa.add_argument("--reports-dir", default=None,
+                    help="Where to write the amend reports + baseline. Defaults to "
+                         "nsx_rules_export/<target-host>/push_report/.")
+    pa.add_argument("--batch-size", type=int, default=None,
+                    help="Interactive batching: pause every N applied updates. Defaults "
+                         "to 1 in apply mode (step-through). Set to 0 for fully automated. "
+                         "At each prompt: Y/Enter=continue, n=reset to 1, x=exit, "
+                         "<number>=change size.")
+    pa.set_defaults(func=cmd_amend_refs)
 
     args = p.parse_args()
     init_cli()

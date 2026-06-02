@@ -9,7 +9,7 @@ policies, rules, and segments themselves are not touched.
 
 | Pattern | What it does | Workflow B use case |
 |---|---|---|
-| **CSV IP remap** | Rewrite IPs inside existing `IPAddressExpression` entries via a subnet-mapping CSV. Default is additive (originals + mapped); `--mapped-only` keeps only the mapped values. | Stand up a nonprod copy by re-IPing prod groups |
+| **CSV IP remap** | Rewrite IPs inside existing `IPAddressExpression` entries via a subnet-mapping CSV. **Strict-additive contract**: originals are always preserved, mapped values are appended. `--mapped-only` is now refused when combined with `--csv-remap` (the destructive mode is unreachable via CSV remap). | Add the nonprod IP equivalents alongside prod IPs on the source manager |
 
 The workflow is **two steps** with one human-review gate between them:
 
@@ -98,27 +98,81 @@ nsx_capture/nsx-lm1.lab.local/
 
 ## B.2) Push — in-place against `nsx-lm1`
 
-### CSV IP remap (re-IP existing static IPs)
+### CSV IP remap (add mapped IPs alongside originals — strict-additive)
 
-Rewrites every IP in `IPAddressExpression` entries using the CSV. Default
-behavior is **additive** (mapped values appended alongside originals).
-With `--mapped-only`, only the mapped values are kept (true re-IP, drops
-originals).
+Rewrites every IP in `IPAddressExpression` entries using the CSV.
+**Strict-additive by contract**: originals are kept, mapped values are
+appended, **no IP is ever removed**. The destructive `--mapped-only`
+flag is **refused** when combined with `--csv-remap` (the only way to
+remove IPs is `groups.py revert`, which restores the auto-captured
+baseline).
+
+When `--csv-remap` is in play, `--batch-size` **defaults to 1** so you
+step through every change one at a time. Bump higher at any prompt as
+confidence grows (`5`, `25`, `100`, `500` …). Type `n` to reset to 1.
+Type `x` for a clean exit.
 
 ```bash
 # Dry-run (default — safe, no writes)
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
-  --csv-remap data/nonprod_map.csv \
-  --mapped-only
+  --csv-remap data/nonprod_map.csv
 
-# Apply
+# Apply — defaults to --batch-size 1 (step through every group)
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
   --csv-remap data/nonprod_map.csv \
-  --mapped-only \
+  --apply
+
+# Or start at a higher batch size and bump from there at prompts
+python tools/nsx/groups.py push --target nsx-lm1 \
+  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
+  --csv-remap data/nonprod_map.csv \
+  --batch-size 10 \
   --apply
 ```
+
+### Additive-only contract — what's enforced
+
+Three independent guard rails make destruction by CSV remap operationally impossible:
+
+1. **CLI rejection** — `--mapped-only` combined with `--csv-remap` exits non-zero before any NSX call.
+2. **Per-row contract check** — if a row's diff shows `ips_removed > 0`, that group is **never** PATCHed. Marked `failed_contract_violation` with a clear error.
+3. **End-of-run assertion** — the total `ips_removed` across all rows must be `0`. If anything slipped, exit code is non-zero and the log emits `ADDITIVE-ONLY contract: VIOLATED — N IP(s) removed across M violating row(s).`
+
+The `summary.json` always carries:
+
+```json
+"totals": {
+  ...
+  "contract_violations": 0,
+  "total_ips_removed": 0,
+  "additive_only_contract": "pass"
+}
+```
+
+If a violation is ever observed, the most likely cause is **drift between capture and push** — IPs were added to the target after the bundle was captured. Re-capture and re-run.
+
+### Per-row before/after audit trail
+
+Every row in `groups.json` / `groups.jsonl` carries the full IP state:
+
+```json
+{
+  "id": "ip-address-group",
+  "status": "success_patch",
+  "before_ip_count": 3,
+  "after_ip_count":  7,
+  "ips_before": ["10.7.0.50", "10.7.0.51", "10.7.1.0/24"],
+  "ips_after":  ["10.6.0.50", "10.6.0.51", "10.6.0.52-10.6.0.53",
+                 "10.6.1.0/24", "10.7.0.50", "10.7.0.51", "10.7.1.0/24"],
+  "ips_added":   ["10.6.0.50", "10.6.0.51", "10.6.0.52-10.6.0.53", "10.6.1.0/24"],
+  "ips_removed": [],
+  "csv_added_count": 3
+}
+```
+
+That's a self-contained replayable record per group — diff `ips_before` against `ips_after` and you have exactly what the push did.
 
 ### Push flags (Workflow B)
 
@@ -126,8 +180,8 @@ python tools/nsx/groups.py push --target nsx-lm1 \
 |---|---|---|
 | `--target nsx-lm1` | (required) | Push target — for Workflow B, same as the capture source |
 | `--groups-dir <bundle>` | (required) | Path to the groups directory inside the capture bundle |
-| `--csv-remap <csv>` | off | Apply CSV subnet mapping to `IPAddressExpression` IPs |
-| `--mapped-only` | off | With `--csv-remap`: replace each IPAddressExpression with only the mapped values; drop unmapped originals |
+| `--csv-remap <csv>` | off | Apply CSV subnet mapping to `IPAddressExpression` IPs. Strict-additive: originals kept, mapped values appended |
+| `--mapped-only` | off | **Refused** when combined with `--csv-remap` (destructive mode is blocked by contract). Only meaningful without `--csv-remap` |
 | `--bidirectional` | off | With `--csv-remap`: treat each CSV row as a bidirectional mapping |
 | `--segments-mode {keep,strip,convert}` | `keep` | For Workflow B, leave at `keep` (default) so segment refs in groups aren't disturbed |
 | `--batch-size N` | `0` (off) | **Interactive batching.** Pauses every `N` applied updates, prints a compact per-group diff (status, +added/-removed IPs, segment/CSV/fabric notes), and prompts. Default `0` = fully automated. Set to `1` to step through every change; bump higher as confidence grows. Only takes effect with `--apply`. See below. |

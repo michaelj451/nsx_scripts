@@ -799,7 +799,29 @@ def cmd_push(args: argparse.Namespace) -> int:
     # Validate / load CSV remap if requested
     csv_mapping = None
     csv_invalid_rows: List[Dict[str, Any]] = []
+    # --- INTENTIONAL-IP-REMOVAL × CSV-REMAP rejection ------------------------
+    # These two flags model opposite intents and must never coexist:
+    #   --csv-remap                = strict-additive, never remove
+    #   --intentional-ip-removal   = decomposition, removal is expected
+    if args.intentional_ip_removal and args.csv_remap:
+        raise SystemExit(
+            "--intentional-ip-removal cannot be combined with --csv-remap. "
+            "CSV remap is strict-additive by design (never removes IPs), while "
+            "--intentional-ip-removal explicitly allows removal. Pick one workflow."
+        )
     if args.csv_remap:
+        # --- ADDITIVE-ONLY CONTRACT (CSV remap) ----------------------------
+        # CSV remap is strict-additive by design. Refuse --mapped-only;
+        # never let a CSV-remap push remove an IP. The only path that can
+        # remove anything is `cmd_revert`, which reads the auto-captured
+        # baseline (a different code path entirely).
+        if args.mapped_only:
+            raise SystemExit(
+                "--mapped-only is not allowed with --csv-remap. "
+                "CSV remap is strict-additive by design: originals are kept, "
+                "mapped values are appended. Removing IPs is only available "
+                "via `groups.py revert`, which restores the auto-captured baseline."
+            )
         csv_path = Path(args.csv_remap).expanduser().resolve()
         if not csv_path.exists():
             raise SystemExit(f"--csv-remap file not found: {csv_path}")
@@ -836,9 +858,22 @@ def cmd_push(args: argparse.Namespace) -> int:
         baseline_path = _append_baseline(reports_dir, baseline_dict)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
 
-    # Interactive batch state (--batch-size N enables it; 0 = disabled)
-    interactive_mode = args.apply and int(args.batch_size or 0) > 0
-    batch_size = int(args.batch_size or 0)
+    # Interactive batch state.
+    # Default behaviour:
+    #   --csv-remap set  AND  --batch-size not specified  → batch_size = 1  (step-through)
+    #   --csv-remap unset AND --batch-size not specified  → batch_size = 0  (fully automated)
+    #   --batch-size N explicitly passed                  → batch_size = N
+    if args.batch_size is None:
+        resolved_batch_size = 1 if (args.csv_remap or args.intentional_ip_removal) else 0
+        if (args.csv_remap or args.intentional_ip_removal) and args.apply:
+            reason = "CSV remap" if args.csv_remap else "intentional IP removal"
+            log.info("Auto-defaulting --batch-size to 1 (%s in play; step-through is safer). "
+                     "Bump higher at any prompt as confidence grows; type 'n' to reset to 1; 'x' to exit.",
+                     reason)
+    else:
+        resolved_batch_size = int(args.batch_size)
+    interactive_mode = args.apply and resolved_batch_size > 0
+    batch_size = resolved_batch_size
     applied_in_batch = 0
     batch_summary_rows: List[Dict[str, Any]] = []  # rows collected since last prompt
     interactive_exit_requested = False
@@ -956,15 +991,59 @@ def cmd_push(args: argparse.Namespace) -> int:
             row["_payload"] = obj
 
             # Per-row IP diff against the captured baseline (used by interactive
-            # batch mode for human-readable per-row preview).
+            # batch mode for human-readable per-row preview, and recorded in
+            # full in the row's JSON/JSONL for forensic auditability).
             before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
             after_ips  = _extract_ip_entries(obj)
             ips_added   = sorted(set(after_ips)  - set(before_ips))
             ips_removed = sorted(set(before_ips) - set(after_ips))
+            row["ips_before"]      = before_ips    # full list, for audit replayability
+            row["ips_after"]       = after_ips     # full list, for audit replayability
             row["before_ip_count"] = len(before_ips)
             row["after_ip_count"]  = len(after_ips)
             row["ips_added"]       = ips_added
             row["ips_removed"]     = ips_removed
+
+            # --- ADDITIVE-ONLY CONTRACT ENFORCEMENT --------------------------
+            # When CSV remap is in play, the run must never remove an IP from
+            # any group. If a per-row diff shows IPs would be removed, refuse
+            # to push that group, mark it failed, and let the end-of-run
+            # assertion fail the overall exit code. The most likely cause is
+            # drift between the source bundle and the target — e.g. someone
+            # added IPs to the target after the bundle was captured. The fix
+            # is to re-capture so source and target match before remapping.
+            if ips_removed and not args.intentional_ip_removal:
+                if csv_mapping is not None:
+                    contract_violation_msg = (
+                        f"ADDITIVE-ONLY contract violated: pushing this group "
+                        f"would REMOVE {len(ips_removed)} IP(s) from the target. "
+                        f"Removed list: {ips_removed}. "
+                        f"Likely cause: target drift between capture and push. "
+                        f"Action: re-capture (or re-export from target) and re-run."
+                    )
+                else:
+                    contract_violation_msg = (
+                        f"IP removal blocked: pushing this group would REMOVE "
+                        f"{len(ips_removed)} IP(s) from the target ({ips_removed}). "
+                        f"If this is the decomposition workflow (stripping IPs out of "
+                        f"tagged groups into siblings), re-run with "
+                        f"--intentional-ip-removal. Otherwise the YAML you're pushing "
+                        f"is out of sync with the target — re-export from the target "
+                        f"and re-build before pushing."
+                    )
+                row["status"] = "failed_contract_violation"
+                row["error"] = contract_violation_msg
+                row["error_type"] = "IpRemovalBlocked"
+                failed += 1
+                log.error("[%d/%d  ok=%d fail=%d skip=%d] %s — %s",
+                          i, len(files), ok, failed, skipped, gid, contract_violation_msg)
+                rows.append(row)
+                continue   # skip the put/patch entirely — nothing reaches NSX for this group
+
+            # Operator opted in to removal: log loudly so it shows up in the audit trail.
+            if ips_removed and args.intentional_ip_removal:
+                log.warning("[%d/%d] %s — INTENTIONAL IP REMOVAL: %d IP(s) %s",
+                            i, len(files), gid, len(ips_removed), ips_removed)
 
             try:
                 client.put_group(gid, obj, domain_id=args.domain_id)
@@ -1152,7 +1231,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
             "interactive_mode":          interactive_mode,
-            "interactive_batch_size_initial": int(args.batch_size or 0),
+            "interactive_batch_size_initial": resolved_batch_size,
             "interactive_batch_size_final":   batch_size if interactive_mode else 0,
             "interactive_exit_requested":     interactive_exit_requested,
         },
@@ -1218,12 +1297,52 @@ def cmd_push(args: argparse.Namespace) -> int:
     if interactive_exit_requested:
         log.warning("INTERACTIVE EXIT — operator stopped after %d applied update(s); "
                     "%d file(s) NOT processed.", ok, len(files) - (ok + failed + skipped + dry_run_count))
+
+    # --- ADDITIVE-ONLY end-of-run assertion --------------------------------
+    # Belt-and-suspenders: independent of per-row gating, sum every row's
+    # ips_removed across the whole run. If anything was non-zero, the
+    # additive-only contract was violated. Fail loudly and exit non-zero.
+    total_ips_removed_count = sum(len(r.get("ips_removed", []) or []) for r in rows)
+    contract_violations = sum(1 for r in rows if r.get("status") == "failed_contract_violation")
+    # Contract status interpretation:
+    #   --csv-remap                : must have 0 removed and 0 violations
+    #   --intentional-ip-removal   : violations must be 0; removals are expected and recorded
+    #   neither flag               : a remove on a per-row diff is a violation (same as csv-remap path)
+    contract_ok = (contract_violations == 0) and (
+        (csv_mapping is not None and total_ips_removed_count == 0)
+        or args.intentional_ip_removal
+        or (csv_mapping is None and total_ips_removed_count == 0)
+    )
+    if args.intentional_ip_removal:
+        log.warning("INTENTIONAL-IP-REMOVAL mode: %d IP(s) removed across %d row(s) "
+                    "(decomposition workflow). Contract: %s.",
+                    total_ips_removed_count,
+                    sum(1 for r in rows if r.get("ips_removed")),
+                    "pass" if contract_violations == 0 else "violated")
+    elif csv_mapping is not None or any(r.get("ips_removed") for r in rows):
+        if contract_ok:
+            log.info("ADDITIVE-ONLY contract: PASS — 0 IPs removed across %d row(s).", len(rows))
+        else:
+            log.error("ADDITIVE-ONLY contract: VIOLATED — %d IP(s) removed across %d violating row(s). "
+                      "See failures.json for per-row detail.",
+                      total_ips_removed_count, contract_violations)
+    summary["totals"]["contract_violations"]      = contract_violations
+    summary["totals"]["total_ips_removed"]        = total_ips_removed_count
+    summary["totals"]["intentional_ip_removal"]   = bool(args.intentional_ip_removal)
+    summary["totals"]["additive_only_contract"]   = (
+        "n/a (intentional-ip-removal)" if args.intentional_ip_removal
+        else ("pass" if contract_ok else "violated")
+    )
+    # Rewrite summary.json with the contract status appended (initial write above happened before this).
+    (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
     log.info("Reports: %s", reports_dir)
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
     # Non-zero exit if there were real failures OR operator aborted partway through
-    return 0 if (failed == 0 and not interactive_exit_requested) else 1
+    # OR the additive-only contract was violated.
+    return 0 if (failed == 0 and not interactive_exit_requested and contract_ok) else 1
 
 
 # =============================================================================
@@ -1399,17 +1518,28 @@ def main() -> int:
                          "values before pushing. Used for Workflow B (in-place subnet remap).")
     pp.add_argument("--mapped-only", action="store_true",
                     help="With --csv-remap: replace each IPAddressExpression with only the mapped "
-                         "values, dropping unmapped originals. Default: append mapped values.")
+                         "values, dropping unmapped originals. **REJECTED when --csv-remap is set** "
+                         "— CSV remap is strict-additive by design (never removes IPs). Only "
+                         "applies when transforming exported YAMLs without CSV remap.")
     pp.add_argument("--bidirectional", action="store_true",
                     help="With --csv-remap: treat each CSV row as a bidirectional mapping.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <groups-dir>/../push_report/.")
-    pp.add_argument("--batch-size", type=int, default=0,
+    pp.add_argument("--batch-size", type=int, default=None,
                     help="Interactive batching: pause every N applied updates and prompt to "
                          "continue (y/Enter), reset-to-1 (n), exit (x), or change to a new size "
-                         "(<number>). Default 0 = off, fully automated. Set to 1 to step "
-                         "through every change and bump higher as confidence grows. "
+                         "(<number>). When --csv-remap or --intentional-ip-removal is set, "
+                         "defaults to 1 (step through every change). Otherwise defaults to 0 "
+                         "(fully automated). Set to any positive integer to start at that batch "
+                         "size; you can bump higher (or lower) at any prompt during the run. "
                          "Only takes effect with --apply.")
+    pp.add_argument("--intentional-ip-removal", action="store_true",
+                    help="Allow this push to REMOVE IPs from groups on the target. Required for "
+                         "the decomposition workflow (e.g. pushing the stripped-original bundle "
+                         "from build_sibling_groups.py, which has IPAddressExpression entries "
+                         "removed). Without this flag, any per-row diff showing removed IPs is "
+                         "refused and marked as a contract failure. Cannot be combined with "
+                         "--csv-remap (those workflows have opposite intents).")
     pp.set_defaults(func=cmd_push)
 
     pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")
