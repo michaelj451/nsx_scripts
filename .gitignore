@@ -22,6 +22,8 @@ nsx_groups_transformed/
 nsx_export_verify/
 
 # Workflow A bundle artifacts (capture / transform / push)
+nsx_sibling_groups/
+nsx_stripped_groups/
 nsx_capture/
 nsx_transformed/
 nsx_push/

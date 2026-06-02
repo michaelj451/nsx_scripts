@@ -66,6 +66,27 @@ python tools/nsx/segments.py    export --source nsx-lm1
 python tools/nsx/membership.py  export --source nsx-lm1
 ```
 
+**`membership.py` is the highest-API-call-volume export.** It issues one
+`/members/virtual-machines` query per customer group plus the
+`build_vm_ip_index()` walk over every VM. Customer environments with
+thousands of groups or a tight NSX rate limit can trip HTTP 429
+("Too Many Requests"). Three knobs are exposed:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--throttle-seconds N` | `0.2` | Seconds to sleep between per-group queries. Bump to `0.5` or `1.0` to pace large runs. `0` disables. |
+| `--max-retries N` | `3` | How many times to retry a single call on 429 / 502 / 503 / 504 or a transient connection error. |
+| `--backoff-base N` | `2.0` | Seconds base for exponential backoff. Attempt N waits `min(base * 2^(N-1), 60s)`. So defaults give ~2s, ~4s, ~8s between attempts. |
+
+Example: pace conservatively for a customer-scale env that's previously hit rate limits:
+
+```bash
+python tools/nsx/membership.py export --source nsx-lm1 \
+  --throttle-seconds 1.0 --max-retries 5 --backoff-base 3.0
+```
+
+The manifest (`nsx_membership_export/<host>/manifest.json`) records `retries_attempted` and `total_backoff_seconds` so you can see how hard NSX pushed back during the run. The default output directory is wiped on every run — re-running after a partial / rate-limited failure always produces a clean, complete bundle.
+
 Outputs (overwritten each run when default `--output-dir` is used):
 
 ```
