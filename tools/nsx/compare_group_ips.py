@@ -30,10 +30,17 @@ TARGET (one of):
                                  nsx_groups_export/<target-host>/groups/).
                                Skips the NSX call.
 
-OUTPUT:
-  nsx_drift_report/<target-host>/
-    drift_report.json           per-group rows + summary
-    drift_report.jsonl          one row per line (greppable)
+OUTPUT (default: $NSX_LOG_DIR from .env, falls back to <repo>/nsx_logs/):
+  <log-dir>/nsx_drift_report/<target-host>/
+    drift_report.json           per-group rows + summary (full IP lists)
+    drift_report.jsonl          one row per line (greppable, full)
+    drift_changes.json          drift-only rows: {group_id, display_name,
+                                  should_be (reference_ips), is (current_ips),
+                                  ips_added, ips_removed, only_in_reference,
+                                  only_on_target} — side-by-side view of
+                                  what each drifted group should contain vs
+                                  what's actually on the target
+    drift_changes.jsonl         same, one row per line
     drift_summary.json          totals only
     logs/
 
@@ -194,7 +201,9 @@ def main() -> int:
     p.add_argument("--federation-global", action="store_true",
                    help="Hit the GM API surface (federation-global=True).")
     p.add_argument("--output-base", default=None,
-                   help="Output root; default: repo root → nsx_drift_report/<target-label>/")
+                   help="Output root; default: $NSX_LOG_DIR from .env "
+                        "(falls back to <repo>/nsx_logs/) → "
+                        "<output-base>/nsx_drift_report/<target-label>/")
     args = p.parse_args()
 
     init_cli()
@@ -221,7 +230,8 @@ def main() -> int:
         target_mode = "from_disk"
         target_path_or_alias = str(td)
 
-    output_base = Path(args.output_base).expanduser().resolve() if args.output_base else REPO_ROOT
+    output_base = (Path(args.output_base).expanduser().resolve()
+                   if args.output_base else Path(nsx_log_dir))
     reports_dir = output_base / "nsx_drift_report" / target_label
     log_file = _setup_logging(reports_dir / "logs")
 
@@ -311,6 +321,28 @@ def main() -> int:
     (reports_dir / "drift_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8",
     )
+
+    changes = [
+        {
+            "group_id":          r["group_id"],
+            "display_name":      r["display_name"],
+            "should_be":         r["reference_ips"],  # what the reference says it should contain
+            "is":                r["current_ips"],    # what's actually on the target right now
+            "ips_added":         r["ips_added"],      # on target but not in reference (operator added)
+            "ips_removed":       r["ips_removed"],    # in reference but not on target (operator removed)
+            "only_in_reference": (r["in_reference"] and not r["on_target"]),
+            "only_on_target":    (r["on_target"]    and not r["in_reference"]),
+        }
+        for r in rows if r["has_drift"]
+    ]
+    (reports_dir / "drift_changes.json").write_text(
+        json.dumps({"groups_with_drift": len(changes), "rows": changes},
+                   indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    with (reports_dir / "drift_changes.jsonl").open("w", encoding="utf-8") as fh:
+        for c in changes:
+            fh.write(json.dumps(c, sort_keys=True) + "\n")
 
     log.info("=" * 60)
     log.info("DRIFT SUMMARY")
