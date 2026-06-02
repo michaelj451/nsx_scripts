@@ -17,10 +17,29 @@ $env:PYTHONPATH = "$PWD\app"
 
 ---
 
-## 0. (optional) Detect IP drift on the target
+## 0a. (recommended) Detect IP drift on the SOURCE since last capture
 
-Compare the groups_additive bundle that WF-A Part 3 was built from against
-the live state of the target. Exit non-zero on any drift.
+Before re-pushing from an existing capture bundle, verify lm1 itself
+hasn't drifted in production since the bundle was generated. **Reference
+the raw `nsx_groups_export\...` bundle, not `groups_additive\`** — the
+additive bundle contains injected VM IPs that don't appear in the static
+live GET, so it produces false positives. If drift is detected, re-capture
+(`capture_nsx_state.py --source nsx-lm1` + per-tool exports) before
+proceeding.
+
+```powershell
+python tools/nsx/compare_group_ips.py `
+  --reference nsx_groups_export/nsx-lm1.lab.local/groups `
+  --target nsx-lm1
+```
+
+Report lands in `$env:NSX_LOG_DIR\nsx_drift_report\nsx-lm1.lab.local\`.
+
+## 0b. (optional) Detect IP drift on the TARGET
+
+After WF-A Part 3 has been live on the target, IPs may have been added/
+removed by other actors. Reference the `groups_additive` bundle here
+(that's what Part 3 pushed) and target lm2.
 
 ```powershell
 python tools/nsx/compare_group_ips.py `
@@ -28,7 +47,7 @@ python tools/nsx/compare_group_ips.py `
   --target nsx-lm2
 ```
 
-Report lands in `nsx_drift_report/<target-host>/`.
+Report lands in `$env:NSX_LOG_DIR\nsx_drift_report\<target-host>\`.
 
 ## 1. Capture (read-only, source side)
 
