@@ -130,17 +130,63 @@ def _is_ip_expression(expr_entry: Dict[str, Any]) -> bool:
     )
 
 
+def _is_nested_expression(expr_entry: Dict[str, Any]) -> bool:
+    return (
+        isinstance(expr_entry, dict)
+        and expr_entry.get("resource_type") == "NestedExpression"
+    )
+
+
+def _has_condition_anywhere(expression: List[Any]) -> bool:
+    """True if any Condition exists at the top level OR inside any
+    NestedExpression at any depth. NSX wraps complex tag policies in
+    NestedExpression, so top-level-only checks miss them."""
+    for e in expression or []:
+        if _is_tag_condition(e):
+            return True
+        if _is_nested_expression(e) and _has_condition_anywhere(e.get("expressions")):
+            return True
+    return False
+
+
 def _collect_ips(expression: List[Any]) -> List[str]:
-    """Flatten ip_addresses across every IPAddressExpression entry."""
+    """Flatten ip_addresses across every IPAddressExpression entry, recursing
+    into NestedExpression bodies."""
     seen: set = set()
     out: List[str] = []
+
+    def _walk(items: List[Any]) -> None:
+        for e in items or []:
+            if _is_ip_expression(e):
+                for ip in (e.get("ip_addresses") or []):
+                    if isinstance(ip, str) and ip not in seen:
+                        seen.add(ip)
+                        out.append(ip)
+            elif _is_nested_expression(e):
+                _walk(e.get("expressions"))
+
+    _walk(expression)
+    return out
+
+
+def _strip_ip_expressions(expression: List[Any]) -> List[Any]:
+    """Recursively remove IPAddressExpression entries at any depth. Empty
+    NestedExpressions (those that contained only IPs) are dropped entirely
+    so they don't leave a hollow shell behind. Orphan ConjunctionOperators
+    inside surviving NestedExpressions are cleaned up locally."""
+    out: List[Any] = []
     for e in expression or []:
-        if not _is_ip_expression(e):
+        if _is_ip_expression(e):
             continue
-        for ip in (e.get("ip_addresses") or []):
-            if isinstance(ip, str) and ip not in seen:
-                seen.add(ip)
-                out.append(ip)
+        if _is_nested_expression(e):
+            cleaned = _strip_orphan_operators(_strip_ip_expressions(e.get("expressions") or []))
+            if not cleaned:
+                continue  # nested expression went empty — drop it
+            new_e = dict(e)
+            new_e["expressions"] = cleaned
+            out.append(new_e)
+            continue
+        out.append(e)
     return out
 
 
@@ -176,7 +222,7 @@ def split_group(orig_group: Dict[str, Any], appendix: str, include_empty: bool =
     if not isinstance(expression, list):
         return None, None, []
 
-    has_condition = any(_is_tag_condition(e) for e in expression)
+    has_condition = _has_condition_anywhere(expression)
     ips = _collect_ips(expression)
 
     if not has_condition:
@@ -204,9 +250,10 @@ def split_group(orig_group: Dict[str, Any], appendix: str, include_empty: bool =
         ],
     })
 
-    # Stripped original: same payload sans IPAddressExpression entries (and orphan
-    # ConjunctionOperators that were sandwiching them).
-    new_expression = [e for e in expression if not _is_ip_expression(e)]
+    # Stripped original: same payload sans IPAddressExpression entries at any
+    # depth (NestedExpression bodies are also descended into and cleaned).
+    # Orphan ConjunctionOperators left after IP removal are dropped.
+    new_expression = _strip_ip_expressions(expression)
     new_expression = _strip_orphan_operators(new_expression)
     stripped = _sanitize({**orig_group, "expression": new_expression})
 
