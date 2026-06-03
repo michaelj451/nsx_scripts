@@ -14,7 +14,7 @@ the **rule** level rather than mixed inside one group's expression.
 | Group `vm1` has both a `Condition` (Tag=`1\|vm`) AND an `IPAddressExpression` ([10.6.0.101, ...]) | Group `vm1` has **only** the `Condition`. Group `vm1_sibling` has **only** the IPs. |
 | Mixed-mode group — harder to reason about; changing the IP list edits the same object that the tag criterion lives on | One-criterion-per-group. The original is canonical, the sibling is the IP snapshot |
 | To remap IPs, you risk editing the tag side | Remap the sibling without ever touching the tag group |
-| Rule says "match vm1" | Rule says "match vm1 OR match vm1_sibling" — both groups appear in `source_groups` / `destination_groups` / `scope` |
+| Rule says "match vm1" | Rule says "match vm1 OR match vm1_sibling" — both groups appear in `source_groups` / `destination_groups` (and optionally `scope` via `--include-scope`) |
 
 The sibling name is `<original_id><OBJECT_APPENDIX>` where `OBJECT_APPENDIX`
 is read from `.env` (e.g. `_sibling`). Override per run with `--appendix`.
@@ -93,7 +93,7 @@ Steps 3, 4, and 5 each capture a baseline and are independently revertible.
 | [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) | 1 | Standard capture (existing). Produces `groups_additive/` and `segment_inventory/` which the transform reads |
 | [tools/nsx/build_sibling_groups.py](tools/nsx/build_sibling_groups.py) | 2 | **NEW** — offline transform. Decomposes tag+IP groups into IP-only sibling + stripped original. Outputs two bundles + sibling_map.json |
 | [tools/nsx/groups.py](tools/nsx/groups.py) `push` | 3, 4 | Existing push tool. Step 3 is plain additive. Step 4 requires `--intentional-ip-removal` to allow IPs being removed from the originals |
-| [tools/nsx/rules.py](tools/nsx/rules.py) `amend-refs` | 5 | **NEW** subcommand. For every customer rule on the target, appends sibling-group paths alongside any matching original-group path in `source_groups` / `destination_groups` / `scope`. Strict-additive |
+| [tools/nsx/rules.py](tools/nsx/rules.py) `amend-refs` | 5 | **NEW** subcommand. For every customer rule on the target, appends sibling-group paths alongside any matching original-group path in `source_groups` / `destination_groups` (and optionally `scope` via `--include-scope`). Strict-additive |
 
 ---
 
@@ -239,11 +239,22 @@ Summary block records:
 
 ## Step 5 — `rules.py amend-refs`
 
-For every customer rule on the target, walks `source_groups` / `destination_groups` / `scope`. For each entry that matches an `original_id` in `sibling_map.json`, **appends** the corresponding `sibling_id` to the same field. Idempotent: if the sibling is already listed, the rule is reported `no_change` and no PATCH is sent.
+For every customer rule on the target, walks the rule's **match-criteria** fields (`source_groups` and `destination_groups` by default). For each entry that matches an `original_id` in `sibling_map.json`, **appends** the corresponding `sibling_id` to the same field. Idempotent: if the sibling is already listed, the rule is reported `no_change` and no PATCH is sent.
+
+The rule's `scope` field (the applied-to / enforcement target) is **opt-in** via `--include-scope`. By default it is **not** amended — broadening enforcement to IP-only siblings usually isn't wanted, since the sibling carries IPs from the tag group but the rule was originally scoped to be enforced wherever the tag dynamically matches.
 
 ```bash
 python tools/nsx/rules.py amend-refs --target nsx-lm2 \
   --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json \
+  --apply
+```
+
+Add `--include-scope` if you want the sibling appended to the rule's `scope` field too:
+
+```bash
+python tools/nsx/rules.py amend-refs --target nsx-lm2 \
+  --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json \
+  --include-scope \
   --apply
 ```
 
@@ -257,30 +268,32 @@ Strict-additive — never removes a reference. Captures a baseline at `nsx_rules
 | `--sibling-map <path>` | required | Path to `sibling_map.json` from step 2 |
 | `--domain-id` | from sibling_map | NSX domain |
 | `--batch-size N` | `1` when `--apply` | Step through every rule update. Same prompt vocabulary as `groups.py push`: Y/Enter/n/x/<number> |
+| `--include-scope` | off | Also append sibling refs to the rule's `scope` (applied-to) field. Default off — see note above. |
 | `--apply` | off (dry-run) | Required to actually PATCH rules |
 
 ### Per-row record
 
-Each rule gets one row in `amend_refs.json` / `amend_refs.jsonl`:
+Each rule gets one row in `amend_refs.json` / `amend_refs.jsonl`. With the default (no `--include-scope`), only `source_groups` and `destination_groups` show up in `per_field_diff`:
 
 ```json
 {
   "policy_id": "Start_Policy",
   "rule_id": "allow-icmp-network-0",
   "status": "success_patch",
-  "refs_added_total": 3,
+  "refs_added_total": 2,
   "per_field_diff": {
-    "scope": {
+    "source_groups": {
       "before": ["/infra/.../groups/hardware-subnet", "/infra/.../groups/network-6-0"],
       "after":  ["/infra/.../groups/hardware-subnet", "/infra/.../groups/network-6-0",
                  "/infra/.../groups/network-6-0_sibling"],
       "added":  ["/infra/.../groups/network-6-0_sibling"]
     },
-    "source_groups": {...},
     "destination_groups": {...}
   }
 }
 ```
+
+With `--include-scope`, a third `scope` entry appears in `per_field_diff` for any rule whose `scope` references an original-group that has a sibling.
 
 ---
 
