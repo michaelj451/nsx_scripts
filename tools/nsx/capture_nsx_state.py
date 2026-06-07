@@ -209,6 +209,15 @@ def main() -> int:
                    help="Generate the affected-rules impact report (offline, reads export). Default ON.")
     p.add_argument("--no-impact-report", action="store_false", dest="with_impact_report",
                    help="Skip the affected-rules impact report (review artifact only; doesn't affect transform).")
+    p.add_argument("--with-ip-report", action="store_true", default=True,
+                   help="Run report_groups_with_ips.py against the captured groups bundle. "
+                        "Produces a per-group classification (pure-ip / pure-tag / tag+ip "
+                        "hybrid / nested / segment) + optional CSV-mapping coverage. Default ON.")
+    p.add_argument("--no-ip-report", action="store_false", dest="with_ip_report",
+                   help="Skip the groups-with-IPs report.")
+    p.add_argument("--ip-report-csv", default=None,
+                   help="Path to a 2-col CSV (old,new) to cross-reference IP coverage in "
+                        "the IP report. Optional; report runs without it if omitted.")
     args = p.parse_args()
 
     init_cli()
@@ -242,6 +251,8 @@ def main() -> int:
     log.info("  Federation GM    : %s", args.federation_global)
     log.info("  VM tags          : %s", args.with_vm_tags)
     log.info("  Impact report    : %s", args.with_impact_report)
+    log.info("  IP report        : %s%s", args.with_ip_report,
+             f" (csv={args.ip_report_csv})" if args.with_ip_report and args.ip_report_csv else "")
     log.info("=" * 60)
 
     # Per-step output paths inside the bundle
@@ -321,6 +332,20 @@ def main() -> int:
     elif args.with_vm_tags and args.federation_global:
         log.info("STEP 5 skipped — VM tag fabric API is LM-only (--federation-global is GM)")
 
+    # 6. Groups-with-IPs report (offline, reads the just-captured source groups)
+    #    Read-only against NSX. Produces a per-group classification + CSV coverage
+    #    summary under $NSX_LOG_DIR/groups_ip_report/<source_host>/.
+    if args.with_ip_report:
+        cmd = [
+            sys.executable, "tools/nsx/report_groups_with_ips.py",
+            "--groups-dir", str(source_groups_dir),
+            "--label", source_host,
+            "--domain-id", args.domain_id,
+        ]
+        if args.ip_report_csv:
+            cmd.extend(["--csv", args.ip_report_csv])
+        steps.append(run_step("6_report_groups_with_ips", cmd, REPO_ROOT, logs_dir))
+
     # Manifest
     ok = all(s["ok"] for s in steps)
     manifest = {
@@ -336,6 +361,8 @@ def main() -> int:
         "options": {
             "with_vm_tags": args.with_vm_tags,
             "with_impact_report": args.with_impact_report,
+            "with_ip_report": args.with_ip_report,
+            "ip_report_csv": args.ip_report_csv,
         },
         "bundle_dir": str(output_dir),
         "paths": {
