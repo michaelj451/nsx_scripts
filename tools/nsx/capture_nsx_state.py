@@ -218,6 +218,19 @@ def main() -> int:
     p.add_argument("--ip-report-csv", default=None,
                    help="Path to a 2-col CSV (old,new) to cross-reference IP coverage in "
                         "the IP report. Optional; report runs without it if omitted.")
+    p.add_argument("--emit-flat-exports", action="store_true", default=True,
+                   help="Also copy the captured groups / services / policies / rules to the "
+                        "standalone-export paths (nsx_groups_export/<host>/groups/, "
+                        "nsx_services_export/<host>/services/, "
+                        "nsx_policies_export/<host>/security-policies/, "
+                        "nsx_rules_export/<host>/security-policies/). Default ON — "
+                        "lets RUNBOOK_A / RUNBOOK_D push commands run verbatim against a "
+                        "single capture, without their own export step. Existing "
+                        "push_report/baselines/ subdirectories inside those flat-export "
+                        "trees are preserved (only the data subdir is replaced).")
+    p.add_argument("--no-flat-exports", action="store_false", dest="emit_flat_exports",
+                   help="Skip the flat-exports copy (sub-step 7). Capture bundle "
+                        "still contains all the data internally.")
     args = p.parse_args()
 
     init_cli()
@@ -253,6 +266,7 @@ def main() -> int:
     log.info("  Impact report    : %s", args.with_impact_report)
     log.info("  IP report        : %s%s", args.with_ip_report,
              f" (csv={args.ip_report_csv})" if args.with_ip_report and args.ip_report_csv else "")
+    log.info("  Flat exports     : %s", args.emit_flat_exports)
     log.info("=" * 60)
 
     # Per-step output paths inside the bundle
@@ -346,6 +360,95 @@ def main() -> int:
             cmd.extend(["--csv", args.ip_report_csv])
         steps.append(run_step("6_report_groups_with_ips", cmd, REPO_ROOT, logs_dir))
 
+    # 7. Flat-export emit — copy captured groups/services/policies/rules to the
+    #    standalone-export paths so RUNBOOK_A / RUNBOOK_D commands can run
+    #    verbatim against a single capture (no separate `groups.py export`,
+    #    `services.py export`, etc. needed). Preserves any existing
+    #    push_report/baselines/ subdirectories in the destination trees so
+    #    revert history is never lost.
+    flat_exports_summary: Dict[str, Any] = {}
+    if args.emit_flat_exports:
+        log.info("STEP 7: emit flat-export bundles (RUNBOOK_A/D compatibility)")
+        services_src   = source_export_dir / "domains" / args.domain_id / "services"
+        policies_src   = source_export_dir / "domains" / args.domain_id / "security-policies"
+        groups_src     = source_groups_dir  # already set above
+
+        copy_targets = [
+            (groups_src,   REPO_ROOT / "nsx_groups_export"   / source_host / "groups",            "groups",   False),
+            (services_src, REPO_ROOT / "nsx_services_export" / source_host / "services",          "services", False),
+            (policies_src, REPO_ROOT / "nsx_policies_export" / source_host / "security-policies", "policies", False),
+            (policies_src, REPO_ROOT / "nsx_rules_export"    / source_host / "security-policies", "rules",    True),
+        ]
+        emitted: List[Dict[str, Any]] = []
+        for src, dst, label_name, inject_parent_policy_id in copy_targets:
+            if not src.exists():
+                log.warning("  flat-export skip: source missing %s (label=%s)", src, label_name)
+                emitted.append({"label": label_name, "ok": False, "reason": "source missing",
+                                "source": str(src), "destination": str(dst)})
+                continue
+            try:
+                if dst.exists():
+                    # Wipe only the DATA subdirectory; preserve push_report/baselines/ etc.
+                    import shutil as _shutil
+                    _shutil.rmtree(dst)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                import shutil as _shutil
+                _shutil.copytree(src, dst)
+                file_count = sum(1 for _ in dst.rglob("*") if _.is_file())
+                # The rules push tool consumes `_parent_policy_id` to know which
+                # policy a rule belongs to (the folder name is a slugified hash
+                # that doesn't survive a round-trip). The standalone rules.py
+                # export injects this field; capture's export_nsx_objects.py
+                # doesn't. So we inject it ourselves into the rules-tree copy.
+                injected = 0
+                if inject_parent_policy_id:
+                    import yaml as _yaml
+                    for rule_yaml in dst.rglob("rules/*.yaml"):
+                        try:
+                            data = _yaml.safe_load(rule_yaml.read_text(encoding="utf-8"))
+                            if not isinstance(data, dict) or "_parent_policy_id" in data:
+                                continue
+                            pp = data.get("parent_path") or ""
+                            # parent_path looks like /infra/domains/<d>/security-policies/<policy-id>
+                            if "/security-policies/" not in pp:
+                                continue
+                            policy_id = pp.rsplit("/security-policies/", 1)[1].split("/", 1)[0]
+                            if not policy_id:
+                                continue
+                            data["_parent_policy_id"] = policy_id
+                            rule_yaml.write_text(_yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+                            injected += 1
+                        except Exception:
+                            log.exception("  flat-export: could not inject _parent_policy_id into %s", rule_yaml)
+                    log.info("  flat-export ok: %s → %s (%d files, %d rules had _parent_policy_id injected)",
+                             label_name, dst, file_count, injected)
+                else:
+                    log.info("  flat-export ok: %s → %s (%d files)", label_name, dst, file_count)
+                emitted.append({"label": label_name, "ok": True,
+                                "source": str(src), "destination": str(dst),
+                                "file_count": file_count,
+                                "parent_policy_ids_injected": injected if inject_parent_policy_id else None})
+            except Exception as exc:
+                log.exception("  flat-export FAILED: %s → %s", src, dst)
+                emitted.append({"label": label_name, "ok": False, "reason": str(exc),
+                                "source": str(src), "destination": str(dst)})
+        flat_exports_summary = {
+            "emitted":            emitted,
+            "ok":                 all(e["ok"] for e in emitted),
+            "destinations": {
+                "groups":   str(REPO_ROOT / "nsx_groups_export"   / source_host / "groups"),
+                "services": str(REPO_ROOT / "nsx_services_export" / source_host / "services"),
+                "policies": str(REPO_ROOT / "nsx_policies_export" / source_host / "security-policies"),
+                "rules":    str(REPO_ROOT / "nsx_rules_export"    / source_host / "security-policies"),
+            },
+        }
+        # Synthetic step entry so the manifest reflects this work
+        steps.append({
+            "label":   "7_emit_flat_exports",
+            "ok":      flat_exports_summary["ok"],
+            "summary": flat_exports_summary,
+        })
+
     # Manifest
     ok = all(s["ok"] for s in steps)
     manifest = {
@@ -363,6 +466,7 @@ def main() -> int:
             "with_impact_report": args.with_impact_report,
             "with_ip_report": args.with_ip_report,
             "ip_report_csv": args.ip_report_csv,
+            "emit_flat_exports": args.emit_flat_exports,
         },
         "bundle_dir": str(output_dir),
         "paths": {

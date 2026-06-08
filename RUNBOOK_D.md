@@ -422,10 +422,97 @@ change to `--target nsx-lm3`.
 
 | | State |
 |---|---|
-| `RUNBOOK_D.md` (this doc) | drafted 2026-06-06 |
-| `RUNBOOK_D_COMMANDS.md` / `_PS.md` | pending |
-| `tools/nsx/build_sibling_groups.py` flag additions (`--csv-remap`, `--include-pure-ip`, `--no-stripped-originals`, `--skip-uncovered`, `--skip-segment-groups`) | **not yet implemented** |
-| Empty-groups + segment-skip reports (in build output) | **not yet implemented** |
+| `RUNBOOK_D.md` (this doc) | shipped 2026-06-06, refined 2026-06-07 |
+| `RUNBOOK_D_COMMANDS.md` / `_PS.md` | shipped 2026-06-06 |
+| `tools/nsx/build_sibling_groups.py` flag additions (`--csv-remap`, `--include-pure-ip`, `--no-stripped-originals`, `--skip-uncovered`, `--skip-segment-groups`) | **shipped 2026-06-07** |
+| Audit reports (`skipped_segments.json`, `empty_groups.json`, `skipped_uncovered.json`) in build output | **shipped 2026-06-07** |
+| Enriched `sibling_map.json` per-row audit (`ips_source` / `ips_sibling_mapped` / `ips_uncovered`) | **shipped 2026-06-07** |
 | `data/nonprod_map.csv` | populated 2026-06-06: 17 mappings, /16-/32, covering all in-scope 10.6.x.x → 10.7.x.x |
 | Pre-flight IP-report integration | shipped 2026-06-06 (sub-step 6 in `capture_nsx_state.py`) |
-| Lab validation | pending — recommend running against fully-restored lm2 with the script extensions before pointing at any prod manager |
+| **End-to-end lab validation on lm3** | **PASSED 2026-06-07** — 7 siblings created with mapped 10.7.x.x IPs only, 0 prod IP leakage, 0 collateral group changes, 0 contract violations, clean LIFO revert via single command. See "Lab validation" section below. |
+| Range-in-CIDR matching in `PrefixMappingTable` | optional follow-up — would let CIDR mappings cover range-form source IPs (e.g. `10.6.0.52/31` would auto-cover `10.6.0.52-10.6.0.53`) |
+
+## Lab validation (2026-06-07)
+
+End-to-end test of the full WF-D pipeline against `nsx-lm3` (blank target,
+mirrors the "fresh prod manager" scenario for banks lab):
+
+### Phase 1 — build (offline)
+
+```bash
+python tools/nsx/build_sibling_groups.py --source nsx-lm1 \
+  --csv-remap data/nonprod_map.csv --include-pure-ip \
+  --skip-segment-groups --no-stripped-originals \
+  --label nsx-lm3.lab.local
+```
+
+Result: 7 siblings written, 0 stripped (suppressed), 1 segment skipped
+(`segment-group-1`), 3 groups skipped as no-mapped-IPs (out-of-scope IPs
+like 1.1.1.1, 10.2.1.0/24, 10.0.0.0/8), 16 mapped IPs total in siblings,
+8 uncovered IPs surfaced in audit. No `nsx_stripped_groups/` directory on
+disk.
+
+### Phase 2 — dry-run
+
+```bash
+python tools/nsx/groups.py push --target nsx-lm3 \
+  --groups-dir nsx_sibling_groups/nsx-lm3.lab.local/groups
+```
+
+Mode `DRY-RUN`, files_seen=7, dry_run=7, ok=0, failed=0,
+contract_violations=0, additive_only_contract=`pass`,
+total_ips_removed=0. No baseline captured (dry-run only).
+
+### Phase 3 — apply
+
+```bash
+python tools/nsx/groups.py push --target nsx-lm3 \
+  --groups-dir nsx_sibling_groups/nsx-lm3.lab.local/groups --apply
+```
+
+Mode `APPLY`, ok=7, failed=0, contract_violations=0,
+additive_only_contract=`pass`, total_ips_removed=0. Baseline captured at
+`nsx_sibling_groups/nsx-lm3.lab.local/push_report/baselines/<ts>_target_baseline.json`.
+
+### Phase 4 — post-apply audit
+
+| Check | Expected | Actual |
+|---|---|---|
+| Total customer groups on lm3 | 7 (siblings only) | **7** ✓ |
+| Non-sibling customer groups (collateral) | 0 | **0** ✓ |
+| All siblings carry `group_type: [IPAddress]` | yes | **yes** ✓ |
+| All IPs in siblings are 10.7.x.x (mapped) | yes | **16/16** ✓ |
+| Prod IPs (10.6.x.x) leaked into any sibling | none | **0** ✓ |
+
+Per-sibling content (all confirmed live on lm3):
+
+| Sibling | IPs |
+|---|---|
+| `network-6-0_sibling` | 10.7.0.101, 10.7.0.102 |
+| `network-6-1_sibling` | 10.7.1.101, 10.7.1.102 |
+| `network-2_sibling` | 10.7.2.101, 10.7.2.102 |
+| `vm1_sibling` | 10.7.0.101, 10.7.1.101, 10.7.2.101 |
+| `vm2_sibling` | 10.7.0.102, 10.7.1.102, 10.7.2.102 |
+| `ip-address-group_sibling` | 10.7.0.50, 10.7.0.51, 10.7.1.0/24 |
+| `super-nested-group_sibling` | 10.7.1.101 (partial — 10.2.3.0/24 and 10.5.20.5 were out of scope) |
+
+### Phase 5 — revert
+
+```bash
+python tools/nsx/groups.py revert --target nsx-lm3 \
+  --reports-dir nsx_sibling_groups/nsx-lm3.lab.local/push_report --apply
+```
+
+Result: deleted_ok=7, deleted_failed=0, restored_ok=0 (baseline captured
+"no customer groups present", so revert correctly deletes-all rather than
+restoring anything). Baseline file renamed to `*.reverted`.
+
+Post-revert lm3 inventory: 0 customer groups, 3 NSX system-owned only —
+exact same state as before the WF-D push.
+
+### Backward-compatibility sanity check (same session)
+
+Running `build_sibling_groups.py --source nsx-lm1` with **no WF-D flags**
+produced an unchanged WF-C bundle: 6 siblings + 6 stripped originals + 5
+skipped_no_condition + `nsx_stripped_groups/` bundle present on disk —
+identical counts to pre-WF-D code.
