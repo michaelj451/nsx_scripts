@@ -16,14 +16,30 @@ Phases:
 1. **Capture** lm1 (read-only) — produces capture bundle, IP report with
    CSV coverage, and flat-export bundles (`nsx_groups_export/`,
    `nsx_services_export/`, `nsx_policies_export/`, `nsx_rules_export/`)
-2. **Clone** lm1 → target (WF-A Parts 1+2+3) using the flat exports
-3. **WF-D** — build mapped-IP siblings, dry-run, apply
-4. **Revert** if needed — single command deletes the siblings
+2. **Clone structure** lm1 → target (WF-A Part 1 ONLY — services, tag groups stripped of IPs,
+   policies, rules)
+3. **WF-D additive** — build mapped-IP siblings, dry-run, apply (groups stay untouched)
+4. **(separate change window)** Amend rules to reference siblings alongside originals — strict additive, never removes
+5. **(optional, FORCED separate change window)** Phase 2 — move IPs from originals to siblings via `--intentional-ip-removal`
+6. **Revert** any phase via a single command per phase
+
+**Contracts the toolkit enforces:**
+
+- **Rules amend is strict additive.** Sibling refs are appended; existing refs are never removed; rules themselves are never deleted.
+- **Groups are never deleted by any push command.** Group deletion happens only via `groups.py revert` against a baseline that captured "group did not exist." There is no other DELETE path in any push tool.
+- **IP removal from group payloads requires `--intentional-ip-removal`.** The strict-additive contract rejects any row that would remove an IP. The flag is the explicit force gate.
+
+> **WF-D end state.** Tag groups on the target carry only their
+> `Condition` (zero IPs); the new `*_sibling` groups carry only the
+> CSV-mapped IPs (zero conditions). **No group ends up with both** —
+> that's the whole point of this process. To preserve that property,
+> only WF-A Part 1 is run; Parts 2 and 3 would bake IPs back into the
+> tag groups and break the separation.
 
 > **Segments are not pushed.** WF-D's `--skip-segment-groups` skips any
-> group that has a `PathExpression`. WF-A Part 2's `--segments-mode
-> convert` materializes segment paths into CIDRs *inside* the group
-> payloads on the target — no segment objects are pushed.
+> group that has a `PathExpression`. Part 1's `--segments-mode strip`
+> removes segment refs from the target's tag-group payloads. No segment
+> objects are pushed.
 
 ---
 
@@ -84,9 +100,15 @@ Inspect:
 
 ---
 
-## 3. WF-A clone → target (Parts 1 + 2 + 3)
+## 3. WF-A clone → target (Part 1 only by default — see warning before doing more)
 
 ### Part 1 — services + groups (strip) + policies + rules
+
+This is the **only WF-A step you should run when WF-D is the goal.**
+It lands services, groups (Condition-only after strip), policies, and
+rules on the target. Tag groups arrive with **zero IPs in their
+expression** — exactly the state WF-D needs to add IP-only siblings
+alongside.
 
 ```bash
 python tools/nsx/services.py push --target $DST \
@@ -103,19 +125,45 @@ python tools/nsx/rules.py push --target $DST \
   --rules-dir nsx_rules_export/$SRC_HOST/security-policies --apply
 ```
 
-### Part 2 — segment paths → CIDRs (inside group payloads, no segment objects pushed)
+**STOP here and proceed to step 4 (WF-D build).** Do NOT run Parts 2
+or 3 unless you have a specific reason — see the warning below.
+
+### ⚠️  WARNING: Do NOT run Parts 2 or 3 when WF-D is the goal
+
+> **The whole point of WF-D is to eliminate `Condition + IPAddressExpression`
+> mixing inside groups.** Parts 2 and 3 of WF-A do the opposite: they
+> bake IPs INTO the tag groups' expression on the target. After Parts
+> 2+3 run, the originals carry both a `Condition` AND an
+> `IPAddressExpression` — the exact mixed state WF-D is trying to
+> avoid. WF-D faithfully **adds** IP-only siblings, but it does not
+> (and on prod cannot) strip IPs from existing originals. The result
+> is "tag-only + IP-only siblings + still-mixed originals" — not the
+> clean separation you wanted.
+
+| WF-A step | Effect on target tag groups | Compatible with WF-D's intent? |
+|---|---|---|
+| Part 1 (`--segments-mode strip`) | Condition only, zero IPs | ✓ this is the correct state for WF-D |
+| Part 2 (`--segments-mode convert`) | `Condition + IPAddressExpression(segment-CIDRs)` | ✗ creates mixing |
+| Part 3 (additive, from `groups_additive/`) | `Condition + IPAddressExpression(segment-CIDRs + VM-IPs)` | ✗ creates worse mixing |
+
+### When you DO want Parts 2 + 3 (alternative mode — not the WF-D path)
+
+If you want the target to be a **full functional clone** of the source
+(useful for some lab tests where you need rules to actually match
+something without first migrating those rules to use siblings), run
+Parts 2 and 3. But understand: the target's tag groups will then be
+in mixed mode, and any subsequent WF-D run will produce siblings
+**alongside** that mixed state — not a clean separation.
 
 ```bash
+# Part 2 — segment paths → CIDRs (inside group payloads, no segment objects pushed)
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_groups_export/$SRC_HOST/groups \
   --segments-mode convert \
   --segments-from nsx_capture/$SRC_HOST/segment_inventory/segment_details.json \
   --apply
-```
 
-### Part 3 — additive VM IPs (from the additive bundle)
-
-```bash
+# Part 3 — additive VM IPs (from the additive bundle)
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_capture/$SRC_HOST/groups_additive/domains/default/groups \
   --segments-mode convert \
@@ -123,76 +171,122 @@ python tools/nsx/groups.py push --target $DST \
   --apply
 ```
 
-After this, the target should mirror the source's mixed (`Condition + IPAddressExpression`) state.
-
-### Skip Part 2 + Part 3 if you don't want a full clone
-
-If you only want WF-D mapped siblings (no IP materialization on the
-target's tag groups), run Part 1 only and proceed to step 4.
-
 ---
 
-## 4. WF-D — build mapped-IP siblings (offline)
+## 4. WF-D — build mapped-IP siblings + pure-IP remap bundle (offline)
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
   --source $SRC \
   --csv-remap data/nonprod_map.csv \
-  --include-pure-ip \
   --skip-segment-groups \
   --no-stripped-originals \
   --label $SRC_HOST
 ```
 
-Outputs land at `nsx_sibling_groups/$SRC_HOST/` with:
-- `groups/<id>_sibling.yaml` — IP-only siblings carrying CSV-mapped IPs
-- `sibling_map.json` — per-row audit (`ips_source`, `ips_sibling_mapped`, `ips_uncovered`)
-- `reports/skipped_segments.json` — segment-related groups left alone
-- `reports/empty_groups.json` — groups with no IPs
+> **Note: `--include-pure-ip` is deprecated.** Pure-IP groups (no
+> `Condition`) are NEVER decomposed into siblings any more. Doing so
+> would empty the original group after a Phase-2 strip, which violates
+> the "no empty groups" contract. Instead, the build now writes pure-IP
+> groups to a separate `nsx_pure_ip_remap/<host>/groups/` bundle, ready
+> for `groups.py push --csv-remap` which adds the mapped IPs in place
+> (strict-additive).
 
-To label the bundle by the **target** manager instead of the source
-(useful when planning runs against multiple targets):
+Outputs land at:
+- `nsx_sibling_groups/$SRC_HOST/groups/<id>_sibling.yaml` — IP-only
+  siblings for **tag-based mixed groups only** (Condition + IPs).
+  Carries CSV-mapped IPs.
+- `nsx_sibling_groups/$SRC_HOST/sibling_map.json` — per-row audit
+  (`ips_source`, `ips_sibling_mapped`, `ips_uncovered`)
+- `nsx_pure_ip_remap/$SRC_HOST/groups/<id>.yaml` — **NEW** — pure-IP
+  groups, ready for in-place CSV-remap push (step 5b)
+- `nsx_pure_ip_remap/$SRC_HOST/manifest.json` — per-group audit
+- `reports/skipped_segments.json` — segment-related groups left alone
+- `reports/empty_groups.json` — groups with no IPs (no sibling, no
+  remap entry — left untouched)
+
+To label the bundle by the **target** manager instead of the source:
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
   --source $SRC \
   --csv-remap data/nonprod_map.csv \
-  --include-pure-ip --skip-segment-groups --no-stripped-originals \
+  --skip-segment-groups --no-stripped-originals \
   --label $DST.lab.local
 ```
 
-(Then the bundle is at `nsx_sibling_groups/$DST.lab.local/`.)
-
 ---
 
-## 5. WF-D — push siblings to target
+## 5. WF-D — push to target
 
-### 5a. Dry-run (always first)
+### 5a. Siblings (required for WF-D) — dry-run + apply
 
 ```bash
+# Dry-run
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_sibling_groups/$SRC_HOST/groups
-```
-
-Confirm in the JSON output:
-- `"mode": "DRY-RUN"`
-- `additive_only_contract: "pass"`
-- `total_ips_removed: 0`
-- `contract_violations: 0`
-- `dry_run` count matches the number of siblings you expect
-
-### 5b. Apply
-
-```bash
+# Apply
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_sibling_groups/$SRC_HOST/groups --apply
 ```
 
-Baseline captured at `nsx_sibling_groups/$SRC_HOST/push_report/baselines/`.
+Confirm: `additive_only_contract: "pass"`, `total_ips_removed: 0`,
+`contract_violations: 0`. Baseline captured at
+`nsx_sibling_groups/$SRC_HOST/push_report/baselines/`.
+
+### 5b. Pure-IP remap (**OPTIONAL** — separate change window)
+
+> This step is **optional**. Skip it if you don't want mapped IPs added
+> to your pure-IP groups on the target right now — the bundle on disk
+> is harmless if unused. The step is meant to be its own change window
+> so it can be staged separately from the sibling push.
+
+When to **run** 5b:
+
+- Your CSV covers IPs that appear in pure-IP groups (e.g.,
+  `ip-address-group` has `10.6.0.50` which the CSV maps to `10.7.0.50`)
+- You want rules referencing pure-IP groups to match the non-prod IP
+  range too
+- You want all WF-D scope changes in a single window
+
+When to **skip** 5b:
+
+- Your CSV doesn't cover any IPs in your pure-IP groups (5b would be
+  a no-op anyway)
+- You want a phased rollout: land siblings first, validate, run 5b
+  later in its own change window
+- The non-prod target's rules don't need to match against mapped IPs
+
+Pushes the source's pure-IP groups (like `ip-address-group`,
+`hardware-subnet`) back to the target with `--csv-remap`. **Strict
+additive**: mapped IPs added alongside existing IPs; nothing removed.
+
+```bash
+# Dry-run
+python tools/nsx/groups.py push --target $DST \
+  --groups-dir nsx_pure_ip_remap/$SRC_HOST/groups \
+  --csv-remap data/nonprod_map.csv
+# Apply
+python tools/nsx/groups.py push --target $DST \
+  --groups-dir nsx_pure_ip_remap/$SRC_HOST/groups \
+  --csv-remap data/nonprod_map.csv --apply
+```
+
+Confirm: `additive_only_contract: "pass"`, `total_ips_removed: 0`,
+`csv_groups_changed > 0`. Baseline at
+`nsx_pure_ip_remap/$SRC_HOST/push_report/baselines/`.
+
+### Summary of post-push states
+
+| After step 5a only | After step 5a + 5b |
+|---|---|
+| Siblings created with mapped IPs | Siblings created with mapped IPs |
+| Pure-IP groups: original IPs only | Pure-IP groups: original IPs + mapped IPs |
+| Segment groups: untouched | Segment groups: untouched |
 
 ---
 
-## 6. (optional, separate change window) Amend rules to reference siblings
+## 6. (optional, separate change window) Amend rules to reference siblings — **strict additive, never removes**
 
 NOT part of WF-D itself. Run when CAB approves the rule-side activation:
 
@@ -204,9 +298,89 @@ python tools/nsx/rules.py amend-refs --target $DST \
   --sibling-map nsx_sibling_groups/$SRC_HOST/sibling_map.json --apply
 ```
 
-Default: appends sibling refs to `source_groups` and `destination_groups`
-only (NOT `scope`). Add `--include-scope` if you want enforcement
-broadened too.
+Default behavior is **strict-additive** — appends sibling refs to
+`source_groups` and `destination_groups` of every rule that references
+an original. **Never removes any existing reference, never removes
+any rule, never touches `scope` unless `--include-scope` is set.**
+
+After this step, rules continue to match via the tag groups AND also
+match via the IP-only siblings — the "match anything that hits either
+path" behavior. This is the recommended steady state for production.
+
+---
+
+## 7. (optional, FORCED, separate change window) Phase 2 — move IPs from originals to siblings
+
+> ⚠️  **This is the only flow in the toolkit that REMOVES IPs from
+> existing groups.** It is gated behind an explicit `--intentional-ip-removal`
+> force flag. The strict-additive contract is **deliberately overridden**
+> for this one push. Use only when:
+>
+> 1. WF-D additive (steps 4–5) has been applied and validated
+> 2. amend-refs (step 6) has been applied and rules are matching via siblings
+> 3. You have CAB approval to strip IPs from the tag-side originals so that
+>    enforcement migrates fully to the sibling groups
+>
+> **Groups are never deleted by this step.** Only `IPAddressExpression`
+> entries inside existing group payloads are removed. The groups
+> themselves stay (Condition-only after the strip). To delete a group,
+> use `groups.py revert` against a baseline that captured "group did
+> not exist" — that is the **only** path the toolkit offers to delete
+> a group.
+
+### 7a. Rebuild the bundle WITH stripped originals
+
+The default WF-D build uses `--no-stripped-originals` to suppress the
+strip bundle. For Phase 2, rebuild **without** that flag so
+`nsx_stripped_groups/<host>/groups/` is produced:
+
+```bash
+python tools/nsx/build_sibling_groups.py \
+  --source $SRC \
+  --csv-remap data/nonprod_map.csv \
+  --include-pure-ip \
+  --skip-segment-groups \
+  --label $SRC_HOST
+  # NOTE: --no-stripped-originals deliberately OMITTED so the stripped
+  # bundle is produced alongside the sibling bundle.
+```
+
+### 7b. Push the stripped originals — REQUIRES `--intentional-ip-removal`
+
+```bash
+# DRY RUN first — confirm the per-row IP-removal counts look right
+python tools/nsx/groups.py push --target $DST \
+  --groups-dir nsx_stripped_groups/$SRC_HOST/groups \
+  --intentional-ip-removal
+
+# Then apply
+python tools/nsx/groups.py push --target $DST \
+  --groups-dir nsx_stripped_groups/$SRC_HOST/groups \
+  --intentional-ip-removal \
+  --apply
+```
+
+Without `--intentional-ip-removal`, every row would be rejected as a
+`contract_violation` — that is the strict-additive contract refusing
+the push. The flag must be passed explicitly to override it.
+
+### 7c. Net effect
+
+| Object | Before Phase 2 | After Phase 2 |
+|---|---|---|
+| Tag-side original (`vm1`) | `Condition + IPAddressExpression([10.6.0.101, ...])` (mixed if Parts 2+3 had run, or already Condition-only from Part 1) | `Condition` only — IPs removed |
+| Sibling (`vm1_sibling`) | `IPAddressExpression([10.7.0.101, ...])` (mapped IPs) | unchanged — still holds mapped IPs |
+| Rules referencing `vm1` | match via tag + (optionally via sibling if amend-refs ran) | match via tag (members empty if no realized) + sibling IPs |
+| Group `vm1` itself | exists | **still exists** — only its IP entries were stripped |
+
+### 7d. Revert Phase 2 — single command
+
+```bash
+python tools/nsx/groups.py revert --target $DST \
+  --reports-dir nsx_stripped_groups/$SRC_HOST/push_report --apply
+```
+
+Restores the pre-Phase-2 IP content to the originals.
 
 ---
 

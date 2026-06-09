@@ -430,6 +430,7 @@ change to `--target nsx-lm3`.
 | `data/nonprod_map.csv` | populated 2026-06-06: 17 mappings, /16-/32, covering all in-scope 10.6.x.x → 10.7.x.x |
 | Pre-flight IP-report integration | shipped 2026-06-06 (sub-step 6 in `capture_nsx_state.py`) |
 | **End-to-end lab validation on lm3** | **PASSED 2026-06-07** — 7 siblings created with mapped 10.7.x.x IPs only, 0 prod IP leakage, 0 collateral group changes, 0 contract violations, clean LIFO revert via single command. See "Lab validation" section below. |
+| **End-to-end "clone + WF-D" lab validation on lm3** | **PASSED 2026-06-08** — single-capture flow via [RUNBOOK_FROM_CAPTURE.md](RUNBOOK_FROM_CAPTURE.md) clones lm1 to lm3 (WF-A Part 1 only — NOT Parts 2/3, which would create mixed-mode originals) and then runs WF-D. End state: 5 tag-only originals (zero IPs) + 7 IP-only siblings (mapped 10.7.x.x). **Crucial correction: WF-A Parts 2 and 3 must be skipped when WF-D is the goal.** They inject IPs into the tag groups' expression on the target — the exact mixed state WF-D is designed to eliminate. RUNBOOK_FROM_CAPTURE.md now makes Part 1 the default with a prominent warning against Parts 2+3. |
 | Range-in-CIDR matching in `PrefixMappingTable` | optional follow-up — would let CIDR mappings cover range-form source IPs (e.g. `10.6.0.52/31` would auto-cover `10.6.0.52-10.6.0.53`) |
 
 ## Lab validation (2026-06-07)

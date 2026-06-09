@@ -508,7 +508,14 @@ def main() -> int:
                         "stay only on the original group, which on WF-D's prod "
                         "path is left completely untouched). Use with WF-D.")
     p.add_argument("--include-pure-ip", action="store_true",
-                   help="Relax the Condition-required gate so pure-IP groups "
+                   help="DEPRECATED — kept only as a no-op for back-compat. "
+                        "Pure-IP groups are never decomposed into siblings any more "
+                        "(that left an empty original after a Phase-2 strip). They "
+                        "are instead emitted to nsx_pure_ip_remap/<host>/groups/, "
+                        "ready for `groups.py push --csv-remap` which adds the mapped "
+                        "IPs in place. Old help text below for reference; the flag "
+                        "no longer changes behavior:\n"
+                        "(was) Relax the Condition-required gate so pure-IP groups "
                         "(IPAddressExpression only, no Condition) also produce "
                         "siblings. Required by WF-D's 'decompose pure-IP groups too' "
                         "policy. Has no effect under WF-C semantics.")
@@ -557,15 +564,16 @@ def main() -> int:
         csv_path_resolved = str(csv_path)
 
     output_base = Path(args.output_base).expanduser().resolve() if args.output_base else REPO_ROOT
-    sibling_root  = output_base / "nsx_sibling_groups"  / label
-    stripped_root = output_base / "nsx_stripped_groups" / label
+    sibling_root      = output_base / "nsx_sibling_groups"  / label
+    stripped_root     = output_base / "nsx_stripped_groups" / label
+    pure_ip_remap_root = output_base / "nsx_pure_ip_remap"  / label
     # Carry the label forward so log/manifest reads use it consistently.
     source_host = label
 
     # Wipe previous run's output dirs (idempotent — they're regenerable).
     # When --no-stripped-originals is set, we still wipe the stripped dir so
     # an old WF-C bundle doesn't get accidentally pushed during a WF-D run.
-    dirs_to_prepare = [sibling_root]
+    dirs_to_prepare = [sibling_root, pure_ip_remap_root]
     if not args.no_stripped_originals:
         dirs_to_prepare.append(stripped_root)
     for d in dirs_to_prepare:
@@ -577,8 +585,9 @@ def main() -> int:
     if args.no_stripped_originals and stripped_root.exists():
         shutil.rmtree(stripped_root)
 
-    sibling_groups_dir  = sibling_root  / "groups"
-    stripped_groups_dir = stripped_root / "groups"
+    sibling_groups_dir      = sibling_root      / "groups"
+    stripped_groups_dir     = stripped_root     / "groups"
+    pure_ip_remap_groups_dir = pure_ip_remap_root / "groups"
     reports_dir = sibling_root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(reports_dir)
@@ -609,6 +618,7 @@ def main() -> int:
         "files_seen": 0,
         "siblings_written": 0,
         "stripped_written": 0,
+        "pure_ip_remap_written": 0,
         "skipped_no_condition": 0,
         "skipped_empty_ips": 0,
         "skipped_segment_groups": 0,
@@ -618,6 +628,7 @@ def main() -> int:
         "total_ips_in_siblings": 0,
         "total_uncovered_ips":   0,
     }
+    pure_ip_remap: List[Dict[str, Any]] = []
 
     for src_yaml in sorted(groups_in.glob("*.yaml")):
         counted["files_seen"] += 1
@@ -636,12 +647,16 @@ def main() -> int:
             log.warning("[%d] %s — no id in payload, skipping", counted["files_seen"], src_yaml.name)
             continue
 
+        # NOTE: --include-pure-ip is now a deprecated no-op (kept only for
+        # back-compat). Pure-IP groups are NEVER decomposed into siblings
+        # any more; they are emitted to the pure_ip_remap bundle instead so
+        # `groups.py push --csv-remap` can add mapped IPs in place.
         sibling, stripped, info = split_group(
             orig,
             appendix=appendix,
             include_empty=args.include_empty,
             csv_mapping=csv_mapping,
-            include_pure_ip=args.include_pure_ip,
+            include_pure_ip=False,                            # forced off
             skip_segment_groups=args.skip_segment_groups,
             skip_uncovered=args.skip_uncovered,
         )
@@ -668,10 +683,32 @@ def main() -> int:
                 counted["skipped_no_condition"] += 1
                 rows.append({**audit_payload, "status": "skipped",
                              "reason": "no Condition (not a tag-based group)"})
-                if not info["ips_source"]:
+                # A no-Condition group that has IPs and no PathExpression is a
+                # pure-IP group. Copy it to the pure_ip_remap bundle so the
+                # operator can push it with `groups.py push --csv-remap` to add
+                # mapped IPs in place (no sibling, no empty original).
+                # Pure-segment groups (has PathExpression) and empty groups are
+                # NOT emitted to the remap bundle.
+                if info["ips_source"] and not info["has_path_expression"]:
+                    rmp_path = pure_ip_remap_groups_dir / f"{short_id_filename(orig_id)}.yaml"
+                    _write_yaml(rmp_path, _sanitize(orig))
+                    pure_ip_remap.append({
+                        "original_id":   orig_id,
+                        "display_name":  orig.get("display_name"),
+                        "ip_count":      len(info["ips_source"]),
+                        "ips_source":    info["ips_source"],
+                        "remap_file":    str(rmp_path),
+                    })
+                    counted["pure_ip_remap_written"] += 1
+                    log.info("[%d] %s — skipped sibling (pure-IP); emitted to remap bundle (%d IPs)",
+                             counted["files_seen"], orig_id, len(info["ips_source"]))
+                elif not info["ips_source"]:
                     empty_groups.append(audit_payload)
-                log.info("[%d] %s — skipped (no Condition (not a tag-based group))",
-                         counted["files_seen"], orig_id)
+                    log.info("[%d] %s — skipped (empty / no IPs)",
+                             counted["files_seen"], orig_id)
+                else:
+                    log.info("[%d] %s — skipped (no Condition (not a tag-based group))",
+                             counted["files_seen"], orig_id)
             elif reason == "empty_ips":
                 counted["skipped_empty_ips"] += 1
                 rows.append({**audit_payload, "status": "skipped",
@@ -781,6 +818,21 @@ def main() -> int:
         "source_host":   source_host,
         "groups":        skipped_uncovered,
     }, indent=2, sort_keys=True), encoding="utf-8")
+    # The pure-IP remap bundle ships with a manifest of its own (used by
+    # the operator to know what's in it) so it can be pushed standalone
+    # via `groups.py push --groups-dir nsx_pure_ip_remap/<host>/groups
+    # --csv-remap <path> --apply`.
+    (pure_ip_remap_root / "manifest.json").write_text(json.dumps({
+        "command":       "build_sibling_groups.pure_ip_remap",
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "source_host":   source_host,
+        "count":         len(pure_ip_remap),
+        "groups":        pure_ip_remap,
+        "next_step":     ("Push this bundle with `groups.py push --groups-dir "
+                          f"nsx_pure_ip_remap/{source_host}/groups --csv-remap "
+                          "<path> --apply`. The push is strict-additive (mapped "
+                          "IPs are added alongside existing IPs; nothing is removed)."),
+    }, indent=2, sort_keys=True), encoding="utf-8")
 
     # Write a per-row manifest mirroring the existing tool style.
     manifest = {
@@ -800,6 +852,7 @@ def main() -> int:
         "paths": {
             "sibling_bundle": str(sibling_root),
             "stripped_bundle": str(stripped_root) if not args.no_stripped_originals else None,
+            "pure_ip_remap_bundle": str(pure_ip_remap_root),
             "sibling_map": str(sibling_map_path),
             "skipped_segments_report": str(reports_dir / "skipped_segments.json"),
             "empty_groups_report":     str(reports_dir / "empty_groups.json"),
@@ -825,6 +878,8 @@ def main() -> int:
     log.info("  skipped: empty IPs       : %d", counted["skipped_empty_ips"])
     log.info("  skipped: segment groups  : %d  (see reports/skipped_segments.json)", counted["skipped_segment_groups"])
     log.info("  empty groups (no IPs)    : %d  (see reports/empty_groups.json)", len(empty_groups))
+    log.info("  pure-IP remap bundle     : %d groups → %s/groups/  (push with --csv-remap to add mapped IPs in place)",
+             counted["pure_ip_remap_written"], pure_ip_remap_root)
     if csv_mapping is not None:
         log.info("  skipped: uncovered IPs   : %d  (see reports/skipped_uncovered.json)", counted["skipped_uncovered_ips"])
         log.info("  skipped: no mapped IPs   : %d", counted["skipped_no_mapped_ips"])

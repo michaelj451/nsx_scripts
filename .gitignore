@@ -33,6 +33,7 @@ nsx_policies*/
 nsx_rules*/
 nsx_segments*/
 nsx_membership*/
+nsx_pure_ip_remap*/
 
 # VM Tag Logs
 nsx_vm_files/
