@@ -130,17 +130,103 @@ def _is_ip_expression(expr_entry: Dict[str, Any]) -> bool:
     )
 
 
+def _is_nested_expression(expr_entry: Dict[str, Any]) -> bool:
+    return (
+        isinstance(expr_entry, dict)
+        and expr_entry.get("resource_type") == "NestedExpression"
+    )
+
+
+def _is_path_expression(expr_entry: Dict[str, Any]) -> bool:
+    return (
+        isinstance(expr_entry, dict)
+        and expr_entry.get("resource_type") == "PathExpression"
+    )
+
+
+def _has_path_expression_anywhere(expression: List[Any]) -> bool:
+    """True if any PathExpression exists at the top level OR inside any
+    NestedExpression at any depth. Used by --skip-segment-groups in WF-D
+    to leave any segment-related group untouched."""
+    for e in expression or []:
+        if _is_path_expression(e):
+            return True
+        if _is_nested_expression(e) and _has_path_expression_anywhere(e.get("expressions")):
+            return True
+    return False
+
+
+def _apply_csv_mapping(ips: List[str], csv_mapping: Any) -> Tuple[List[str], List[str]]:
+    """Run each source IP through the CSV mapping table.
+
+    Returns (mapped_ips, uncovered_ips). Order is preserved relative to the
+    input list. Duplicates in the mapped output are deduped.
+    """
+    mapped: List[str] = []
+    uncovered: List[str] = []
+    seen: set = set()
+    for ip in ips:
+        mapped_list, _row = csv_mapping.map_token(ip)
+        if not mapped_list:
+            uncovered.append(ip)
+            continue
+        for m in mapped_list:
+            if m not in seen:
+                seen.add(m)
+                mapped.append(m)
+    return mapped, uncovered
+
+
+def _has_condition_anywhere(expression: List[Any]) -> bool:
+    """True if any Condition exists at the top level OR inside any
+    NestedExpression at any depth. NSX wraps complex tag policies in
+    NestedExpression, so top-level-only checks miss them."""
+    for e in expression or []:
+        if _is_tag_condition(e):
+            return True
+        if _is_nested_expression(e) and _has_condition_anywhere(e.get("expressions")):
+            return True
+    return False
+
+
 def _collect_ips(expression: List[Any]) -> List[str]:
-    """Flatten ip_addresses across every IPAddressExpression entry."""
+    """Flatten ip_addresses across every IPAddressExpression entry, recursing
+    into NestedExpression bodies."""
     seen: set = set()
     out: List[str] = []
+
+    def _walk(items: List[Any]) -> None:
+        for e in items or []:
+            if _is_ip_expression(e):
+                for ip in (e.get("ip_addresses") or []):
+                    if isinstance(ip, str) and ip not in seen:
+                        seen.add(ip)
+                        out.append(ip)
+            elif _is_nested_expression(e):
+                _walk(e.get("expressions"))
+
+    _walk(expression)
+    return out
+
+
+def _strip_ip_expressions(expression: List[Any]) -> List[Any]:
+    """Recursively remove IPAddressExpression entries at any depth. Empty
+    NestedExpressions (those that contained only IPs) are dropped entirely
+    so they don't leave a hollow shell behind. Orphan ConjunctionOperators
+    inside surviving NestedExpressions are cleaned up locally."""
+    out: List[Any] = []
     for e in expression or []:
-        if not _is_ip_expression(e):
+        if _is_ip_expression(e):
             continue
-        for ip in (e.get("ip_addresses") or []):
-            if isinstance(ip, str) and ip not in seen:
-                seen.add(ip)
-                out.append(ip)
+        if _is_nested_expression(e):
+            cleaned = _strip_orphan_operators(_strip_ip_expressions(e.get("expressions") or []))
+            if not cleaned:
+                continue  # nested expression went empty — drop it
+            new_e = dict(e)
+            new_e["expressions"] = cleaned
+            out.append(new_e)
+            continue
+        out.append(e)
     return out
 
 
@@ -160,29 +246,111 @@ def _strip_orphan_operators(expression: List[Any]) -> List[Any]:
     return out
 
 
-def split_group(orig_group: Dict[str, Any], appendix: str, include_empty: bool = False
-                ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[str]]:
-    """Decompose one group into (sibling_payload, stripped_original_payload, ips).
+def split_group(
+    orig_group: Dict[str, Any],
+    appendix: str,
+    include_empty: bool = False,
+    csv_mapping: Any = None,
+    include_pure_ip: bool = False,
+    skip_segment_groups: bool = False,
+    skip_uncovered: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Decompose one group into (sibling_payload, stripped_original_payload, info).
 
-    Returns (None, None, []) when no decomposition applies — i.e. when the
-    group has no Condition (so there's no tag to separate from) OR has no
-    captured IPs (and --include-empty wasn't asked for).
+    `info` is always a dict with these keys:
+        source_id            : the original group id
+        ips_source           : list of IPs collected from the source group
+        ips_sibling          : list of IPs that end up in the sibling
+                               (== ips_source when csv_mapping is None,
+                                else the CSV-mapped equivalents only)
+        ips_uncovered        : source IPs without a CSV mapping
+                               (empty when csv_mapping is None or all mapped)
+        has_condition        : did the source have a Condition anywhere?
+        has_path_expression  : did the source have a PathExpression anywhere?
+        has_nested_expression: did the source have a NestedExpression anywhere?
+        skip_reason          : None if decomposed; otherwise one of
+                               "no_condition" | "empty_ips" | "segment_group"
+                               | "uncovered_ips" | "no_mapped_ips"
+
+    Returns (None, None, info) when no decomposition applies.
+
+    Behavior switches:
+      include_empty        : emit siblings for tagged groups with empty IPs.
+      csv_mapping          : when provided (a PrefixMappingTable), the
+                             sibling's IPAddressExpression carries the MAPPED
+                             IPs only. Source IPs are NOT included in the
+                             sibling. Audit detail is recorded in info.
+      include_pure_ip      : relax the no-Condition gate; pure-IP groups
+                             (and other gate-1 skips except segment-skip)
+                             produce siblings too.
+      skip_segment_groups  : skip the group entirely if ANY PathExpression
+                             exists at any depth. WF-D's safety stance for
+                             never touching segment-related groups.
+      skip_uncovered       : when csv_mapping is provided, skip the group
+                             entirely if any source IP lacks a mapping.
     """
     orig_id = orig_group.get("id")
+    info: Dict[str, Any] = {
+        "source_id": orig_id,
+        "ips_source": [],
+        "ips_sibling": [],
+        "ips_uncovered": [],
+        "has_condition": False,
+        "has_path_expression": False,
+        "has_nested_expression": False,
+        "skip_reason": None,
+    }
     if not orig_id:
-        return None, None, []
+        info["skip_reason"] = "no_id"
+        return None, None, info
 
     expression = orig_group.get("expression") or []
     if not isinstance(expression, list):
-        return None, None, []
+        info["skip_reason"] = "no_id"
+        return None, None, info
 
-    has_condition = any(_is_tag_condition(e) for e in expression)
-    ips = _collect_ips(expression)
+    has_condition = _has_condition_anywhere(expression)
+    has_path      = _has_path_expression_anywhere(expression)
+    has_nested    = any(_is_nested_expression(e) for e in expression)
+    src_ips       = _collect_ips(expression)
+    info.update({
+        "has_condition": has_condition,
+        "has_path_expression": has_path,
+        "has_nested_expression": has_nested,
+        "ips_source": src_ips,
+    })
 
-    if not has_condition:
-        return None, None, []          # pure-IP / pure-path groups — nothing to split
-    if not ips and not include_empty:
-        return None, None, []          # tagged but no captured IPs — sibling would be empty
+    # Gate 0 (WF-D): skip any group with a PathExpression at any depth.
+    if skip_segment_groups and has_path:
+        info["skip_reason"] = "segment_group"
+        return None, None, info
+
+    # Gate 1: must have a Condition somewhere — unless --include-pure-ip
+    # relaxes this so pure-IP groups can produce siblings too.
+    if not has_condition and not include_pure_ip:
+        info["skip_reason"] = "no_condition"
+        return None, None, info
+
+    # Gate 2: must have at least one IP — unless --include-empty relaxes it.
+    if not src_ips and not include_empty:
+        info["skip_reason"] = "empty_ips"
+        return None, None, info
+
+    # CSV mapping (optional) — sibling carries only the mapped equivalents.
+    if csv_mapping is not None:
+        mapped_ips, uncovered = _apply_csv_mapping(src_ips, csv_mapping)
+        info["ips_uncovered"] = uncovered
+        if skip_uncovered and uncovered:
+            info["skip_reason"] = "uncovered_ips"
+            return None, None, info
+        if not mapped_ips:
+            info["skip_reason"] = "no_mapped_ips"
+            return None, None, info
+        sibling_ips = mapped_ips
+    else:
+        sibling_ips = list(src_ips)
+
+    info["ips_sibling"] = sibling_ips
 
     sibling_id = f"{orig_id}{appendix}"
     sibling_display = f"{orig_group.get('display_name') or orig_id}{appendix}"
@@ -199,18 +367,19 @@ def split_group(orig_group: Dict[str, Any], appendix: str, include_empty: bool =
         "expression": [
             {
                 "resource_type": "IPAddressExpression",
-                "ip_addresses": ips,
+                "ip_addresses": sibling_ips,
             }
         ],
     })
 
-    # Stripped original: same payload sans IPAddressExpression entries (and orphan
-    # ConjunctionOperators that were sandwiching them).
-    new_expression = [e for e in expression if not _is_ip_expression(e)]
+    # Stripped original: same payload sans IPAddressExpression entries at any
+    # depth (NestedExpression bodies are also descended into and cleaned).
+    # Orphan ConjunctionOperators left after IP removal are dropped.
+    new_expression = _strip_ip_expressions(expression)
     new_expression = _strip_orphan_operators(new_expression)
     stripped = _sanitize({**orig_group, "expression": new_expression})
 
-    return sibling, stripped, ips
+    return sibling, stripped, info
 
 
 # =============================================================================
@@ -331,6 +500,41 @@ def main() -> int:
     p.add_argument("--include-empty", action="store_true",
                    help="Also emit siblings for tagged groups whose captured IPs "
                         "list is empty. Off by default (skipped — useless).")
+    # ---- WF-D flags (default off so WF-C behavior is unchanged) ----
+    p.add_argument("--csv-remap", default=None,
+                   help="Path to a 2-col CSV (old,new) of IP/subnet mappings. "
+                        "When set, each sibling's IPAddressExpression carries the "
+                        "MAPPED equivalents of the source IPs only (source IPs "
+                        "stay only on the original group, which on WF-D's prod "
+                        "path is left completely untouched). Use with WF-D.")
+    p.add_argument("--include-pure-ip", action="store_true",
+                   help="DEPRECATED — kept only as a no-op for back-compat. "
+                        "Pure-IP groups are never decomposed into siblings any more "
+                        "(that left an empty original after a Phase-2 strip). They "
+                        "are instead emitted to nsx_pure_ip_remap/<host>/groups/, "
+                        "ready for `groups.py push --csv-remap` which adds the mapped "
+                        "IPs in place. Old help text below for reference; the flag "
+                        "no longer changes behavior:\n"
+                        "(was) Relax the Condition-required gate so pure-IP groups "
+                        "(IPAddressExpression only, no Condition) also produce "
+                        "siblings. Required by WF-D's 'decompose pure-IP groups too' "
+                        "policy. Has no effect under WF-C semantics.")
+    p.add_argument("--skip-segment-groups", action="store_true",
+                   help="Skip any group that has a PathExpression anywhere in its "
+                        "expression (top-level or nested). WF-D's safety default "
+                        "for never touching segment-related groups on a live prod "
+                        "target. Skipped groups are recorded in reports/skipped_segments.json.")
+    p.add_argument("--no-stripped-originals", action="store_true",
+                   help="Do NOT write the nsx_stripped_groups/<host>/ bundle. "
+                        "WF-D uses this — the prod path never pushes the strip step, "
+                        "so producing the bundle is wasted work + extra cleanup. "
+                        "WF-C should NOT use this (it needs the stripped originals "
+                        "for step 4).")
+    p.add_argument("--skip-uncovered", action="store_true",
+                   help="When --csv-remap is provided, skip a group entirely if ANY "
+                        "of its source IPs has no CSV mapping. Default: emit a "
+                        "partial sibling (only the mapped IPs) and surface the "
+                        "uncovered IPs in sibling_map.json for audit.")
     args = p.parse_args()
 
     init_cli()
@@ -343,21 +547,49 @@ def main() -> int:
 
     groups_in, label = _resolve_input(args)
 
+    # Load CSV mapping early so a missing/bad CSV fails before we touch disk.
+    csv_mapping = None
+    csv_path_resolved: Optional[str] = None
+    if args.csv_remap:
+        # Imported lazily so the optional dependency doesn't penalize the
+        # common WF-C path that doesn't use --csv-remap.
+        from nsx_group_ip_remap_offline import _load_mapping_csv  # type: ignore
+        csv_path = Path(args.csv_remap).expanduser().resolve()
+        if not csv_path.exists():
+            raise SystemExit(f"--csv-remap file not found: {csv_path}")
+        csv_mapping, csv_invalid = _load_mapping_csv(csv_path, bidirectional=False)
+        if csv_invalid:
+            log.warning("CSV had %d invalid row(s) — they were skipped. See report below.",
+                        len(csv_invalid))
+        csv_path_resolved = str(csv_path)
+
     output_base = Path(args.output_base).expanduser().resolve() if args.output_base else REPO_ROOT
-    sibling_root  = output_base / "nsx_sibling_groups"  / label
-    stripped_root = output_base / "nsx_stripped_groups" / label
+    sibling_root      = output_base / "nsx_sibling_groups"  / label
+    stripped_root     = output_base / "nsx_stripped_groups" / label
+    pure_ip_remap_root = output_base / "nsx_pure_ip_remap"  / label
     # Carry the label forward so log/manifest reads use it consistently.
     source_host = label
 
     # Wipe previous run's output dirs (idempotent — they're regenerable).
-    for d in (sibling_root, stripped_root):
+    # When --no-stripped-originals is set, we still wipe the stripped dir so
+    # an old WF-C bundle doesn't get accidentally pushed during a WF-D run.
+    dirs_to_prepare = [sibling_root, pure_ip_remap_root]
+    if not args.no_stripped_originals:
+        dirs_to_prepare.append(stripped_root)
+    for d in dirs_to_prepare:
         if d.exists():
             shutil.rmtree(d)
         (d / "groups").mkdir(parents=True, exist_ok=True)
+    # If WF-D suppressed the stripped bundle, also wipe any stale dir on disk
+    # so a previous run's artifact isn't mistaken for fresh output.
+    if args.no_stripped_originals and stripped_root.exists():
+        shutil.rmtree(stripped_root)
 
-    sibling_groups_dir  = sibling_root  / "groups"
-    stripped_groups_dir = stripped_root / "groups"
+    sibling_groups_dir      = sibling_root      / "groups"
+    stripped_groups_dir     = stripped_root     / "groups"
+    pure_ip_remap_groups_dir = pure_ip_remap_root / "groups"
     reports_dir = sibling_root / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(reports_dir)
 
     log.info("=" * 60)
@@ -366,21 +598,37 @@ def main() -> int:
     log.info("  Groups input      : %s", groups_in)
     log.info("  Appendix          : %s", appendix)
     log.info("  Sibling bundle    : %s", sibling_root)
-    log.info("  Stripped bundle   : %s", stripped_root)
+    if args.no_stripped_originals:
+        log.info("  Stripped bundle   : (suppressed by --no-stripped-originals)")
+    else:
+        log.info("  Stripped bundle   : %s", stripped_root)
     log.info("  Include empty     : %s", args.include_empty)
+    log.info("  Include pure-IP   : %s", args.include_pure_ip)
+    log.info("  Skip segments     : %s", args.skip_segment_groups)
+    log.info("  Skip uncovered    : %s", args.skip_uncovered)
+    log.info("  CSV remap         : %s", csv_path_resolved or "(none)")
     log.info("=" * 60)
 
     rows: List[Dict[str, Any]] = []
     sibling_map: List[Dict[str, Any]] = []
+    skipped_segments: List[Dict[str, Any]] = []
+    empty_groups: List[Dict[str, Any]] = []
+    skipped_uncovered: List[Dict[str, Any]] = []
     counted = {
         "files_seen": 0,
         "siblings_written": 0,
         "stripped_written": 0,
+        "pure_ip_remap_written": 0,
         "skipped_no_condition": 0,
         "skipped_empty_ips": 0,
+        "skipped_segment_groups": 0,
+        "skipped_uncovered_ips": 0,
+        "skipped_no_mapped_ips": 0,
         "errors": 0,
         "total_ips_in_siblings": 0,
+        "total_uncovered_ips":   0,
     }
+    pure_ip_remap: List[Dict[str, Any]] = []
 
     for src_yaml in sorted(groups_in.glob("*.yaml")):
         counted["files_seen"] += 1
@@ -399,49 +647,143 @@ def main() -> int:
             log.warning("[%d] %s — no id in payload, skipping", counted["files_seen"], src_yaml.name)
             continue
 
-        sibling, stripped, ips = split_group(orig, appendix=appendix, include_empty=args.include_empty)
+        # NOTE: --include-pure-ip is now a deprecated no-op (kept only for
+        # back-compat). Pure-IP groups are NEVER decomposed into siblings
+        # any more; they are emitted to the pure_ip_remap bundle instead so
+        # `groups.py push --csv-remap` can add mapped IPs in place.
+        sibling, stripped, info = split_group(
+            orig,
+            appendix=appendix,
+            include_empty=args.include_empty,
+            csv_mapping=csv_mapping,
+            include_pure_ip=False,                            # forced off
+            skip_segment_groups=args.skip_segment_groups,
+            skip_uncovered=args.skip_uncovered,
+        )
 
         if sibling is None:
-            # classify the skip reason for the report
-            has_condition = any(_is_tag_condition(e) for e in (orig.get("expression") or []))
-            if not has_condition:
+            reason = info.get("skip_reason")
+            audit_payload = {
+                "source_file":         str(src_yaml),
+                "id":                  orig_id,
+                "display_name":        orig.get("display_name"),
+                "has_condition":       info["has_condition"],
+                "has_path_expression": info["has_path_expression"],
+                "ips_source":          info["ips_source"],
+                "ips_uncovered":       info["ips_uncovered"],
+            }
+            if reason == "segment_group":
+                counted["skipped_segment_groups"] += 1
+                rows.append({**audit_payload, "status": "skipped",
+                             "reason": "has PathExpression (--skip-segment-groups)"})
+                skipped_segments.append(audit_payload)
+                log.info("[%d] %s — skipped: segment group (PathExpression present)",
+                         counted["files_seen"], orig_id)
+            elif reason == "no_condition":
                 counted["skipped_no_condition"] += 1
-                rows.append({"source_file": str(src_yaml), "id": orig_id,
-                             "status": "skipped", "reason": "no Condition (not a tag-based group)"})
-            else:
+                rows.append({**audit_payload, "status": "skipped",
+                             "reason": "no Condition (not a tag-based group)"})
+                # A no-Condition group that has IPs and no PathExpression is a
+                # pure-IP group. Copy it to the pure_ip_remap bundle so the
+                # operator can push it with `groups.py push --csv-remap` to add
+                # mapped IPs in place (no sibling, no empty original).
+                # Pure-segment groups (has PathExpression) and empty groups are
+                # NOT emitted to the remap bundle.
+                if info["ips_source"] and not info["has_path_expression"]:
+                    rmp_path = pure_ip_remap_groups_dir / f"{short_id_filename(orig_id)}.yaml"
+                    _write_yaml(rmp_path, _sanitize(orig))
+                    pure_ip_remap.append({
+                        "original_id":   orig_id,
+                        "display_name":  orig.get("display_name"),
+                        "ip_count":      len(info["ips_source"]),
+                        "ips_source":    info["ips_source"],
+                        "remap_file":    str(rmp_path),
+                    })
+                    counted["pure_ip_remap_written"] += 1
+                    log.info("[%d] %s — skipped sibling (pure-IP); emitted to remap bundle (%d IPs)",
+                             counted["files_seen"], orig_id, len(info["ips_source"]))
+                elif not info["ips_source"]:
+                    empty_groups.append(audit_payload)
+                    log.info("[%d] %s — skipped (empty / no IPs)",
+                             counted["files_seen"], orig_id)
+                else:
+                    log.info("[%d] %s — skipped (no Condition (not a tag-based group))",
+                             counted["files_seen"], orig_id)
+            elif reason == "empty_ips":
                 counted["skipped_empty_ips"] += 1
-                rows.append({"source_file": str(src_yaml), "id": orig_id,
-                             "status": "skipped", "reason": "no captured IPs (and --include-empty not set)"})
-            log.info("[%d] %s — skipped (%s)", counted["files_seen"], orig_id, rows[-1]["reason"])
+                rows.append({**audit_payload, "status": "skipped",
+                             "reason": "no captured IPs (and --include-empty not set)"})
+                empty_groups.append(audit_payload)
+                log.info("[%d] %s — skipped (no captured IPs)",
+                         counted["files_seen"], orig_id)
+            elif reason == "uncovered_ips":
+                counted["skipped_uncovered_ips"] += 1
+                rows.append({**audit_payload, "status": "skipped",
+                             "reason": "at least one source IP has no CSV mapping (--skip-uncovered)"})
+                skipped_uncovered.append(audit_payload)
+                counted["total_uncovered_ips"] += len(info["ips_uncovered"])
+                log.info("[%d] %s — skipped: %d uncovered IP(s) (--skip-uncovered)",
+                         counted["files_seen"], orig_id, len(info["ips_uncovered"]))
+            elif reason == "no_mapped_ips":
+                counted["skipped_no_mapped_ips"] += 1
+                rows.append({**audit_payload, "status": "skipped",
+                             "reason": "no source IPs had a CSV mapping"})
+                counted["total_uncovered_ips"] += len(info["ips_uncovered"])
+                log.info("[%d] %s — skipped: none of %d source IPs had a CSV mapping",
+                         counted["files_seen"], orig_id, len(info["ips_source"]))
+            else:
+                # Fallback (shouldn't happen — but record so nothing slips through silently)
+                counted["errors"] += 1
+                rows.append({**audit_payload, "status": "skipped",
+                             "reason": f"unknown ({reason})"})
+                log.warning("[%d] %s — skipped with unknown reason: %s",
+                            counted["files_seen"], orig_id, reason)
             continue
 
         sibling_id = sibling["id"]
-        sib_path = sibling_groups_dir  / f"{short_id_filename(sibling_id)}.yaml"
-        str_path = stripped_groups_dir / f"{short_id_filename(orig_id)}.yaml"
+        sib_path = sibling_groups_dir / f"{short_id_filename(sibling_id)}.yaml"
         _write_yaml(sib_path, sibling)
-        _write_yaml(str_path, stripped)
         counted["siblings_written"] += 1
-        counted["stripped_written"] += 1
-        counted["total_ips_in_siblings"] += len(ips)
+        counted["total_ips_in_siblings"] += len(info["ips_sibling"])
+        if info["ips_uncovered"]:
+            counted["total_uncovered_ips"] += len(info["ips_uncovered"])
 
-        log.info("[%d] %s → sibling %s (+%d IPs)  •  stripped original written",
-                 counted["files_seen"], orig_id, sibling_id, len(ips))
+        str_path: Optional[Path] = None
+        if not args.no_stripped_originals:
+            str_path = stripped_groups_dir / f"{short_id_filename(orig_id)}.yaml"
+            _write_yaml(str_path, stripped)
+            counted["stripped_written"] += 1
+
+        log.info("[%d] %s → sibling %s (+%d IPs)%s%s%s",
+                 counted["files_seen"], orig_id, sibling_id, len(info["ips_sibling"]),
+                 f"  •  stripped original written" if str_path else "",
+                 f"  •  source had {len(info['ips_source'])} IPs, mapped to {len(info['ips_sibling'])}"
+                 if csv_mapping is not None and len(info['ips_source']) != len(info['ips_sibling']) else "",
+                 f"  •  {len(info['ips_uncovered'])} uncovered" if info['ips_uncovered'] else "")
+
         rows.append({
-            "source_file": str(src_yaml),
-            "id": orig_id,
-            "sibling_id": sibling_id,
-            "sibling_file": str(sib_path),
-            "stripped_file": str(str_path),
-            "ip_count": len(ips),
-            "ips": ips,
-            "status": "ok",
+            "source_file":         str(src_yaml),
+            "id":                  orig_id,
+            "sibling_id":          sibling_id,
+            "sibling_file":        str(sib_path),
+            "stripped_file":       str(str_path) if str_path else None,
+            "ip_count_source":     len(info["ips_source"]),
+            "ip_count_sibling":    len(info["ips_sibling"]),
+            "ips_source":          info["ips_source"],
+            "ips_sibling_mapped":  info["ips_sibling"] if csv_mapping is not None else None,
+            "ips_uncovered":       info["ips_uncovered"],
+            "status":              "ok",
         })
         sibling_map.append({
-            "original_id": orig_id,
-            "sibling_id":  sibling_id,
+            "original_id":           orig_id,
+            "sibling_id":            sibling_id,
             "original_display_name": orig.get("display_name"),
             "sibling_display_name":  sibling["display_name"],
-            "ip_count": len(ips),
+            "ip_count_source":       len(info["ips_source"]),
+            "ip_count_sibling":      len(info["ips_sibling"]),
+            "ips_source":            info["ips_source"],
+            "ips_sibling_mapped":    info["ips_sibling"] if csv_mapping is not None else None,
+            "ips_uncovered":         info["ips_uncovered"],
         })
 
     # Write the machine-readable map for the rule-amend step.
@@ -451,8 +793,45 @@ def main() -> int:
         "source_host":  source_host,
         "domain_id":    args.domain_id,
         "appendix":     appendix,
+        "csv_mapping":  csv_path_resolved,
         "count":        len(sibling_map),
         "map":          sibling_map,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+
+    # Audit reports — every skipped category gets its own file so CAB / ops
+    # can grep / link directly without parsing the full manifest.
+    (reports_dir / "skipped_segments.json").write_text(json.dumps({
+        "count":         len(skipped_segments),
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "source_host":   source_host,
+        "groups":        skipped_segments,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    (reports_dir / "empty_groups.json").write_text(json.dumps({
+        "count":         len(empty_groups),
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "source_host":   source_host,
+        "groups":        empty_groups,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    (reports_dir / "skipped_uncovered.json").write_text(json.dumps({
+        "count":         len(skipped_uncovered),
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "source_host":   source_host,
+        "groups":        skipped_uncovered,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    # The pure-IP remap bundle ships with a manifest of its own (used by
+    # the operator to know what's in it) so it can be pushed standalone
+    # via `groups.py push --groups-dir nsx_pure_ip_remap/<host>/groups
+    # --csv-remap <path> --apply`.
+    (pure_ip_remap_root / "manifest.json").write_text(json.dumps({
+        "command":       "build_sibling_groups.pure_ip_remap",
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "source_host":   source_host,
+        "count":         len(pure_ip_remap),
+        "groups":        pure_ip_remap,
+        "next_step":     ("Push this bundle with `groups.py push --groups-dir "
+                          f"nsx_pure_ip_remap/{source_host}/groups --csv-remap "
+                          "<path> --apply`. The push is strict-additive (mapped "
+                          "IPs are added alongside existing IPs; nothing is removed)."),
     }, indent=2, sort_keys=True), encoding="utf-8")
 
     # Write a per-row manifest mirroring the existing tool style.
@@ -463,34 +842,55 @@ def main() -> int:
         "domain_id": args.domain_id,
         "appendix": appendix,
         "include_empty": args.include_empty,
+        "include_pure_ip": args.include_pure_ip,
+        "skip_segment_groups": args.skip_segment_groups,
+        "skip_uncovered": args.skip_uncovered,
+        "no_stripped_originals": args.no_stripped_originals,
+        "csv_remap": csv_path_resolved,
         "counts": counted,
         "rows": rows,
         "paths": {
             "sibling_bundle": str(sibling_root),
-            "stripped_bundle": str(stripped_root),
+            "stripped_bundle": str(stripped_root) if not args.no_stripped_originals else None,
+            "pure_ip_remap_bundle": str(pure_ip_remap_root),
             "sibling_map": str(sibling_map_path),
+            "skipped_segments_report": str(reports_dir / "skipped_segments.json"),
+            "empty_groups_report":     str(reports_dir / "empty_groups.json"),
+            "skipped_uncovered_report": str(reports_dir / "skipped_uncovered.json"),
         },
     }
     (sibling_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True),
                                                 encoding="utf-8")
-    (stripped_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True),
-                                                 encoding="utf-8")
+    if not args.no_stripped_originals:
+        (stripped_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True),
+                                                     encoding="utf-8")
 
     log.info("=" * 60)
     log.info("BUILD SIBLING GROUPS — complete")
-    log.info("  files seen             : %d", counted["files_seen"])
-    log.info("  siblings written       : %d  (total IPs: %d)",
+    log.info("  files seen               : %d", counted["files_seen"])
+    log.info("  siblings written         : %d  (total IPs in siblings: %d)",
              counted["siblings_written"], counted["total_ips_in_siblings"])
-    log.info("  stripped originals     : %d", counted["stripped_written"])
-    log.info("  skipped: no Condition  : %d", counted["skipped_no_condition"])
-    log.info("  skipped: empty IPs     : %d", counted["skipped_empty_ips"])
-    log.info("  errors                 : %d", counted["errors"])
-    log.info("  sibling_map.json       : %s", sibling_map_path)
+    if args.no_stripped_originals:
+        log.info("  stripped originals       : (suppressed by --no-stripped-originals)")
+    else:
+        log.info("  stripped originals       : %d", counted["stripped_written"])
+    log.info("  skipped: no Condition    : %d", counted["skipped_no_condition"])
+    log.info("  skipped: empty IPs       : %d", counted["skipped_empty_ips"])
+    log.info("  skipped: segment groups  : %d  (see reports/skipped_segments.json)", counted["skipped_segment_groups"])
+    log.info("  empty groups (no IPs)    : %d  (see reports/empty_groups.json)", len(empty_groups))
+    log.info("  pure-IP remap bundle     : %d groups → %s/groups/  (push with --csv-remap to add mapped IPs in place)",
+             counted["pure_ip_remap_written"], pure_ip_remap_root)
+    if csv_mapping is not None:
+        log.info("  skipped: uncovered IPs   : %d  (see reports/skipped_uncovered.json)", counted["skipped_uncovered_ips"])
+        log.info("  skipped: no mapped IPs   : %d", counted["skipped_no_mapped_ips"])
+        log.info("  total uncovered IPs      : %d", counted["total_uncovered_ips"])
+    log.info("  errors                   : %d", counted["errors"])
+    log.info("  sibling_map.json         : %s", sibling_map_path)
     log.info("=" * 60)
 
     print(json.dumps({
         "sibling_bundle": str(sibling_root),
-        "stripped_bundle": str(stripped_root),
+        "stripped_bundle": str(stripped_root) if not args.no_stripped_originals else None,
         "sibling_map": str(sibling_map_path),
         "counts": counted,
     }, indent=2))

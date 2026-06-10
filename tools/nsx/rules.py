@@ -868,8 +868,15 @@ def _build_path_pair_map(sibling_map_doc: Dict[str, Any], domain_id: str) -> Dic
 
 def cmd_amend_refs(args: argparse.Namespace) -> int:
     """For every customer rule on --target, append sibling-group paths
-    alongside any matching original-group path in source_groups /
-    destination_groups / scope. Strict-additive: nothing is ever removed.
+    alongside any matching original-group path in the rule's match-criteria
+    fields. Strict-additive: nothing is ever removed.
+
+    Fields walked by default: source_groups, destination_groups.
+    The 'scope' (applied-to / enforcement target) field is opt-in via
+    --include-scope. Default-off because broadening enforcement to an
+    IP-only sibling usually isn't desired — the sibling carries IPs from
+    the tagged group, but the rule was originally scoped to be enforced on
+    whatever the tag dynamically matches.
     """
     target_host = resolve_manager(args.target)
     if not target_host:
@@ -942,9 +949,16 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Walk source_groups / destination_groups / scope.
+        # Walk source_groups / destination_groups (match criteria — always).
+        # Scope (applied-to / enforcement target) is opt-in via --include-scope
+        # because broadening enforcement to IP-only siblings usually isn't
+        # wanted: the sibling has IPs from the tag group, but the rule was
+        # originally scoped to be enforced on whatever the tag matches.
+        fields_to_walk = ["source_groups", "destination_groups"]
+        if getattr(args, "include_scope", False):
+            fields_to_walk.append("scope")
         per_field_diff: Dict[str, Dict[str, Any]] = {}
-        for field in ("source_groups", "destination_groups", "scope"):
+        for field in fields_to_walk:
             current = list(rule.get(field, []) or [])
             sibs_present_already: set = set(current)
             to_add: List[str] = []
@@ -1127,7 +1141,8 @@ def main() -> int:
                         help="For every customer rule on the target, append IP-only "
                              "sibling-group refs (from a sibling_map.json) alongside any "
                              "matching original-group ref in source_groups / "
-                             "destination_groups / scope. Strict-additive — never removes.")
+                             "destination_groups (and optionally scope via "
+                             "--include-scope). Strict-additive — never removes.")
     pa.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pa.add_argument("--sibling-map", required=True,
                     help="Path to sibling_map.json produced by build_sibling_groups.py "
@@ -1145,6 +1160,12 @@ def main() -> int:
                          "to 1 in apply mode (step-through). Set to 0 for fully automated. "
                          "At each prompt: Y/Enter=continue, n=reset to 1, x=exit, "
                          "<number>=change size.")
+    pa.add_argument("--include-scope", action="store_true", default=False,
+                    help="Also append sibling refs to the rule's 'scope' (applied-to) "
+                         "field. OFF by default — scope controls where the rule is "
+                         "enforced and broadening it to IP-only siblings usually isn't "
+                         "wanted. By default only source_groups and destination_groups "
+                         "(match criteria) get the sibling appended.")
     pa.set_defaults(func=cmd_amend_refs)
 
     args = p.parse_args()
