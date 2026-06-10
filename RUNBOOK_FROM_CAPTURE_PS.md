@@ -174,6 +174,22 @@ or rule.** Add `--include-scope` to also amend `scope` (default OFF).
 
 ---
 
+## 6.5 (recommended after step 6) Validate the additive contracts
+
+```powershell
+python tools/nsx/validate_wf_d.py `
+  --target $DST `
+  --baseline nsx_sibling_groups/$SRC_HOST/push_report/baselines/<ts>_target_baseline.json `
+  --sibling-map nsx_sibling_groups/$SRC_HOST/sibling_map.json
+```
+
+Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit 0 = PASS, 1 = FAIL.
+Add `--phase-2-applied` after step 7 has run. Add `--rules-baseline <path>`
+for R2 rule-preservation check. See [RUNBOOK_FROM_CAPTURE.md](RUNBOOK_FROM_CAPTURE.md)
+for full check descriptions.
+
+---
+
 ## 7. (optional, FORCED, separate change window) Phase 2 — move IPs from originals to siblings
 
 > ⚠️  This is the only flow that REMOVES IPs from existing groups.

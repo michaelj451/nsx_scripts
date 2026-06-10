@@ -309,6 +309,41 @@ path" behavior. This is the recommended steady state for production.
 
 ---
 
+## 6.5 (recommended after step 6) Validate the additive contracts
+
+`validate_wf_d.py` is a read-only check that confirms WF-D's strict-additive
+contracts held end-to-end. It compares the live target against the sibling
+push baseline (the "before snapshot" captured by step 5a) and walks the
+sibling_map.json from step 4 to verify rule amendments landed.
+
+```bash
+python tools/nsx/validate_wf_d.py \
+  --target $DST \
+  --baseline nsx_sibling_groups/$SRC_HOST/push_report/baselines/<ts>_target_baseline.json \
+  --sibling-map nsx_sibling_groups/$SRC_HOST/sibling_map.json
+```
+
+Add `--phase-2-applied` after step 7 has run, so the validator downgrades
+the expected IP-removal findings on tag-side originals from CRITICAL to
+INFO. Add `--rules-baseline <path>` to also check that no rule was deleted.
+
+Checks run (CRITICAL fails the validation):
+
+| Code | What it confirms |
+|---|---|
+| **G1** | No customer group present in the baseline was deleted. |
+| **G2** | No IP present in any baseline group was removed (or, with `--phase-2-applied`, only tag-side originals had IPs removed and the corresponding sibling holds the mapped values). |
+| **G3** | Every `Condition` and `PathExpression` in baseline groups is still present (no tag-match or segment-ref silently dropped). |
+| **S1** | Every (original, sibling) pair in `sibling_map.json` exists on the target. |
+| **S2** | Every sibling carries `group_type: [IPAddress]`. |
+| **R1** | Every rule that references an original-with-sibling also references that sibling. (amend-refs ran completely.) |
+| **R2** | (with `--rules-baseline`) Every rule in baseline is still present. |
+
+Exit code: `0` = all checks pass; `1` = at least one CRITICAL finding.
+Report at `$NSX_LOG_DIR/wf_d_validation/<target-host>/validation_report.json`.
+
+---
+
 ## 7. (optional, FORCED, separate change window) Phase 2 — move IPs from originals to siblings
 
 > ⚠️  **This is the only flow in the toolkit that REMOVES IPs from
