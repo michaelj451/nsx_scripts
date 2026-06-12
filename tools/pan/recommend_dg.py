@@ -193,10 +193,11 @@ def _trim_samples(aff: DGAffinity, max_samples: int = 5) -> None:
 # =============================================================================
 
 def _find_first_match(config: cpm.PanoramaConfig,
-                      query:  cpm.Query) -> cpm.Verdict:
+                      query:  cpm.Query,
+                      rule_filter: Optional[List[str]] = None) -> cpm.Verdict:
     """Reuse check_policy_match's evaluate() to see if any rule already
     matches the flow."""
-    return cpm.evaluate(config, query)
+    return cpm.evaluate(config, query, rule_filter=rule_filter)
 
 
 # =============================================================================
@@ -226,6 +227,13 @@ def main() -> int:
                         "$PANO_REPORTS_DIR/recommend_dg/<UTC_TS>/.")
     p.add_argument("--no-disk", action="store_true",
                    help="Suppress on-disk recommendation.json (stdout only).")
+    p.add_argument("--rule-filter", default=None,
+                   help="Path to a rule-filter file (substring keywords). "
+                        "Default: tools/pan/rule_filter.txt if present.")
+    p.add_argument("--skip-rule", action="append", default=[], metavar="KEYWORD",
+                   help="Additional inline filter keyword. Repeatable.")
+    p.add_argument("--no-filter", action="store_true",
+                   help="Disable rule filtering for this run.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -236,6 +244,21 @@ def main() -> int:
     )
 
     config = cpm.PanoramaConfig(Path(args.config))
+
+    # Load filter (delegates to check_policy_match's loader for consistency)
+    try:
+        rule_filter, filter_source = cpm._load_rule_filter(
+            explicit_path=(Path(args.rule_filter) if args.rule_filter else None),
+            inline_keywords=args.skip_rule,
+            disabled=args.no_filter,
+        )
+    except FileNotFoundError as exc:
+        log.error("%s", exc)
+        return 2
+    if rule_filter:
+        log.info("Rule filter active: %d keyword(s)%s",
+                 len(rule_filter),
+                 f" from {filter_source}" if filter_source else " (CLI only)")
 
     # Compute the /N subnets used for affinity scoring
     try:
@@ -258,7 +281,7 @@ def main() -> int:
             protocol=args.protocol, dst_port=args.dst_port,
             device_group=dg_name,
         )
-        v = _find_first_match(config, q)
+        v = _find_first_match(config, q, rule_filter=rule_filter)
         # We deliberately treat default-rule matches as "no match" —
         # we're looking for a CUSTOMER rule that would fire.
         if v.matched_rule and v.matched_rulebase != "default-rules":

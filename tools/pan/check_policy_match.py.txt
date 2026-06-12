@@ -65,59 +65,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 log = logging.getLogger(__name__)
 
 
-def _load_rule_filter(explicit_path: Optional[Path] = None,
-                      inline_keywords: Optional[List[str]] = None,
-                      disabled: bool = False,
-                      ) -> Tuple[List[str], Optional[Path]]:
-    """Load the rule-name filter — substrings to exclude from evaluation.
-
-    Resolution order:
-      1. If --no-filter was passed → empty filter, no file consulted.
-      2. If --rule-filter <path> was passed → read that path (error if missing).
-      3. Else look for tools/pan/rule_filter.txt next to this script.
-      4. Always combine with any --skip-rule keywords from the CLI.
-
-    Returns (combined_keyword_list, source_file_path_used_or_None).
-    Comment lines (#) and blank lines are ignored.
-    """
-    keywords: List[str] = list(inline_keywords or [])
-    source_path: Optional[Path] = None
-
-    if disabled:
-        return keywords, None
-
-    if explicit_path is not None:
-        path = Path(explicit_path).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"--rule-filter file not found: {path}")
-        source_path = path
-    else:
-        default_path = Path(__file__).resolve().parent / "rule_filter.txt"
-        if default_path.exists():
-            source_path = default_path
-
-    if source_path is not None:
-        for line in source_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line not in keywords:
-                keywords.append(line)
-
-    return keywords, source_path
-
-
-def _rule_matches_filter(rule_name: str, keywords: List[str]) -> Optional[str]:
-    """Return the first matching keyword if rule_name contains any of them,
-    else None. Substring match, CASE-INSENSITIVE — 'icmp' matches both
-    'ICMP-allow' and 'icmp_ping_out'."""
-    rule_lower = rule_name.lower()
-    for kw in keywords:
-        if kw and kw.lower() in rule_lower:
-            return kw
-    return None
-
-
 def _resolve_default_output_dir() -> Path:
     """Return the default report root.
 
@@ -732,33 +679,10 @@ def _match_services(query: Query, service_names: List[str], config: PanoramaConf
     return False, caveats
 
 
-def evaluate(config: PanoramaConfig, query: Query,
-             rule_filter: Optional[List[str]] = None) -> Verdict:
-    """Walk the evaluation chain and return a verdict.
-
-    rule_filter: optional list of substrings. Any rule whose name contains
-    any of these is REMOVED FROM THE CHAIN before evaluation — it does not
-    appear in the trace, does not contribute to rules_evaluated, and does
-    not influence the verdict. The count of filtered rules is recorded
-    separately as a caveat so consumers know it happened.
-    """
+def evaluate(config: PanoramaConfig, query: Query) -> Verdict:
     chain = config.evaluation_chain(query.device_group)
-    rule_filter = rule_filter or []
-    if rule_filter:
-        filtered_count = sum(
-            1 for r in chain if _rule_matches_filter(r.name, rule_filter)
-        )
-        chain = [r for r in chain
-                 if not _rule_matches_filter(r.name, rule_filter)]
-    else:
-        filtered_count = 0
     trace: List[TraceEntry] = []
     cumulative_caveats: List[str] = []
-    if filtered_count > 0:
-        cumulative_caveats.append(
-            f"{filtered_count} rule(s) removed from evaluation by rule_filter; "
-            f"the matcher behaved as if those rules did not exist."
-        )
     if not query.src_zone or not query.dst_zone:
         cumulative_caveats.append(
             "query is zone-agnostic (src_zone or dst_zone not supplied) — "
@@ -948,18 +872,6 @@ def main() -> int:
                    help="Do not write a report bundle to disk for this run "
                         "(stdout only). Use when running CAB-question one-offs "
                         "where audit trail isn't wanted.")
-    p.add_argument("--rule-filter", default=None,
-                   help="Path to a rule-filter file. Each non-comment line is "
-                        "a substring; any rule whose name contains a substring "
-                        "is removed from evaluation. Default: tools/pan/rule_filter.txt "
-                        "if present.")
-    p.add_argument("--skip-rule", action="append", default=[],
-                   metavar="KEYWORD",
-                   help="Additional inline filter keyword. Repeatable. Combined "
-                        "with file-based filter. Substring match on rule name.")
-    p.add_argument("--no-filter", action="store_true",
-                   help="Disable rule filtering for this run even if "
-                        "rule_filter.txt exists.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -970,21 +882,6 @@ def main() -> int:
     )
 
     config = PanoramaConfig(Path(args.config))
-
-    # ----- Load rule filter (file + inline keywords) -----
-    try:
-        rule_filter, filter_source = _load_rule_filter(
-            explicit_path=(Path(args.rule_filter) if args.rule_filter else None),
-            inline_keywords=args.skip_rule,
-            disabled=args.no_filter,
-        )
-    except FileNotFoundError as exc:
-        log.error("%s", exc)
-        return 2
-    if rule_filter:
-        log.info("Rule filter active: %d keyword(s)%s",
-                 len(rule_filter),
-                 f" from {filter_source}" if filter_source else " (CLI only)")
 
     # ----- Resolve the DG list (single or all) -----
     # Default to --all-device-groups when neither flag is given. Keeps CAB
@@ -1016,7 +913,7 @@ def main() -> int:
             protocol=args.protocol, dst_port=args.dst_port,
             device_group=dg,
         )
-        verdicts.append((dg, evaluate(config, q, rule_filter=rule_filter)))
+        verdicts.append((dg, evaluate(config, q)))
 
     # ----- Write bundle to disk -----
     if not args.no_disk:
