@@ -822,3 +822,71 @@ class NsxPolicyClient:
             f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules/{self._q(rule_id)}"
         )
         return self._delete(path, timeout=timeout)
+
+    def get_security_policy_statistics(
+        self,
+        security_policy_id: str,
+        domain_id: str = "default",
+        enforcement_point_path: Optional[str] = None,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        """Returns runtime statistics for every rule in a policy.
+
+        Response shape (NSX policy API):
+            {"results": [{"internal_rule_id": "...",
+                          "rule": "/infra/.../rules/<rule-id>",
+                          "rule_path": "/infra/.../rules/<rule-id>",
+                          "hit_count": int,
+                          "byte_count": int,
+                          "packet_count": int,
+                          "popularity_index": int,
+                          "max_session_count": int,
+                          "l7_accept_count": int,
+                          "l7_reject_count": int,
+                          "l7_reject_with_response_count": int,
+                          "active_sessions_count": int,
+                          "last_modified_time": int  # ms since epoch
+                          ...}, ...]}
+
+        enforcement_point_path defaults to the default enforcement point when
+        omitted. Returns {} on 404 (some NSX builds 404 if the policy was just
+        created and has no stats yet).
+        """
+        path = self._policy_path(
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/statistics"
+        )
+        params: Dict[str, str] = {}
+        if enforcement_point_path:
+            params["enforcement_point_path"] = enforcement_point_path
+        try:
+            return self._get(path, params=params, timeout=timeout)
+        except NsxApiError as exc:
+            if exc.status_code == 404:
+                return {}
+            raise
+
+    def get_security_rule_statistics(
+        self,
+        security_policy_id: str,
+        rule_id: str,
+        domain_id: str = "default",
+        enforcement_point_path: Optional[str] = None,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        """Returns runtime statistics for a single rule.
+
+        Same field set as get_security_policy_statistics, but for one rule.
+        Returns {} on 404.
+        """
+        path = self._policy_path(
+            f"/domains/{self._q(domain_id)}/security-policies/{self._q(security_policy_id)}/rules/{self._q(rule_id)}/statistics"
+        )
+        params: Dict[str, str] = {}
+        if enforcement_point_path:
+            params["enforcement_point_path"] = enforcement_point_path
+        try:
+            return self._get(path, params=params, timeout=timeout)
+        except NsxApiError as exc:
+            if exc.status_code == 404:
+                return {}
+            raise
