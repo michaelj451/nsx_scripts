@@ -88,7 +88,9 @@ def main() -> int:
         # Operational-mode command: <show><config><running></running></config></show>
         result = client.op("<show><config><running></running></config></show>")
         # response/result/config
-        cfg_el = result.find("./result/config") or result.find("./result")
+        cfg_el = result.find("./result/config")
+        if cfg_el is None:
+            cfg_el = result.find("./result")
     else:
         # type=config&action=get returns /config under <result>
         result = client.get_config("/config")

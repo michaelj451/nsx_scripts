@@ -289,11 +289,15 @@ def main() -> int:
                         help="Write changes to candidate config. Without this, "
                              "dry-run only.")
     parser.add_argument("--output-base", default=None,
-                        help="Override output root. Default: $NSX_LOG_DIR/pan_add_services/")
+                        help="Override output root. Default: $PANO_REPORTS_DIR/add_services/")
     args = parser.parse_args()
 
-    base = Path(args.output_base or os.environ.get("NSX_LOG_DIR", "nsx_logs"))
-    out_dir = base / "pan_add_services" / _ts()
+    # PAN tools land their reports under $PANO_REPORTS_DIR (hidden dir, separate
+    # from NSX log dir). Falls back to ./.pano_reports if the env var is unset.
+    base = Path(args.output_base
+                or os.environ.get("PANO_REPORTS_DIR")
+                or ".pano_reports")
+    out_dir = base / "add_services" / _ts()
     out_dir.mkdir(parents=True, exist_ok=True)
     _setup_logging(out_dir)
 

@@ -59,11 +59,23 @@ Each runbook has a `_PS.md` PowerShell variant where applicable.
 |---|---|---|
 | **Rules usage report** — every rule classified HOT / USED / STALE / UNUSED / DORMANT, with optional "no hits in N days" filter; works on LM or GM (full federation walk) | Read-only, GETs only, double-locked | [docs/RUNBOOK_RULES_USAGE.md](docs/RUNBOOK_RULES_USAGE.md) |
 
-### Palo Alto (in progress)
+### Palo Alto
 
-| Tool | What it does | Status |
+The PAN toolkit is split into two distinct surfaces with separate runbooks
+to enforce the production/lab boundary:
+
+| Surface | When to use | Runbook |
 |---|---|---|
-| **`tools/pan/check_policy_match.py`** — offline "can A reach B" policy lookup | Parses exported Panorama running-config XML; walks the full DG hierarchy in correct PAN-OS evaluation order; emits verdict + matched-rule + trace | v1 shipped, smoke-tested on real config |
+| **Lab (Panorama API)** — `pano4.lab.local` only. Pull config snapshots, mass-modify rules, stage changes to candidate. | Development, testing, exploration on the home lab Panorama. **Never against production.** | [docs/RUNBOOK_PAN_LAB.md](docs/RUNBOOK_PAN_LAB.md) / [_PS.md](docs/RUNBOOK_PAN_LAB_PS.md) |
+| **Production (manual, no API)** — runs locally on operator machine, reads exported Panorama XML, makes zero network calls. | Customer engagements. CAB analysis. Anything that touches a Panorama you don't own. | [docs/RUNBOOK_PAN_PROD.md](docs/RUNBOOK_PAN_PROD.md) / [_PS.md](docs/RUNBOOK_PAN_PROD_PS.md) |
+
+Tools per surface:
+
+| Tool | Surface | Read/Write |
+|---|---|---|
+| `tools/pan/check_policy_match.py` — offline policy lookup (verdict + matched rule + trace) | **Production** + lab verification | Read-only file |
+| `tools/pan/pull_panorama_config.py` — pull candidate or running config snapshot | **Lab only** | Read-only API |
+| `tools/pan/add_services_to_rules.py` — mass-add services to every customer rule | **Lab only** | API write (gated `--apply`) |
 
 ---
 

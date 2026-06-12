@@ -54,6 +54,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import os
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -62,6 +63,45 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_default_output_dir() -> Path:
+    """Return the default report root.
+
+    Resolution order:
+      1. $PANO_REPORTS_DIR if already in os.environ (operator exported it)
+      2. Read ROOT_DIR + PANO_REPORTS_DIR only from .env if present
+         (never reads credentials — this tool stays prod-safe)
+      3. Fallback: ./.pano_reports relative to cwd
+
+    Only the path keys are read from .env. Credentials, manager hostnames,
+    API tokens, and everything else are deliberately untouched, so this
+    function does NOT compromise the production-tool guarantee that no
+    Panorama credentials are loaded into the process.
+    """
+    if os.environ.get("PANO_REPORTS_DIR"):
+        return Path(os.environ["PANO_REPORTS_DIR"])
+
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if env_path.exists():
+        values: Dict[str, str] = {}
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip()
+            # Only consider the two path keys; nothing else
+            if k not in ("ROOT_DIR", "PANO_REPORTS_DIR"):
+                continue
+            # Expand $VAR / ${VAR} against keys we've already collected
+            for known_k, known_v in values.items():
+                v = v.replace(f"${known_k}", known_v).replace(f"${{{known_k}}}", known_v)
+            values[k] = v
+        if "PANO_REPORTS_DIR" in values:
+            return Path(values["PANO_REPORTS_DIR"])
+
+    return Path(".pano_reports")
 
 # =============================================================================
 # Data model — in-memory representation of the parsed Panorama config
@@ -817,7 +857,14 @@ def main() -> int:
     p.add_argument("--json", action="store_true",
                    help="Suppress human-readable output; print only the JSON verdict.")
     p.add_argument("--output-dir", default=None,
-                   help="If set, write verdict + trace JSON to <output-dir>/<UTC_TS>/verdict.json.")
+                   help="Override the report directory. Default is taken from "
+                        "$PANO_REPORTS_DIR (in shell env or .env), or "
+                        "./.pano_reports if neither is set. Each run lands at "
+                        "<dir>/check_policy_match/<UTC_TS>/verdict.json.")
+    p.add_argument("--no-disk", action="store_true",
+                   help="Do not write a report bundle to disk for this run "
+                        "(stdout only). Use when running CAB-question one-offs "
+                        "where audit trail isn't wanted.")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -842,9 +889,15 @@ def main() -> int:
 
     verdict = evaluate(config, query)
 
-    if args.output_dir:
+    if not args.no_disk:
+        # Default to $PANO_REPORTS_DIR / check_policy_match / <UTC_TS> when
+        # --output-dir isn't given. The resolver only reads path keys from .env;
+        # credentials are never loaded (prod-safety guarantee).
+        base = (Path(args.output_dir).expanduser().resolve()
+                if args.output_dir
+                else _resolve_default_output_dir().expanduser().resolve())
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        out_dir = Path(args.output_dir).expanduser().resolve() / ts
+        out_dir = base / "check_policy_match" / ts
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "verdict.json").write_text(
             json.dumps(verdict_to_json(verdict), indent=2, sort_keys=True),

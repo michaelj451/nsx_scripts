@@ -38,6 +38,11 @@ nsx_pure_ip_remap*/
 # VM Tag Logs
 nsx_vm_files/
 
+# Palo Alto / Panorama tool report root (hidden, separate from NSX log dir).
+# The .gitkeep is preserved so the dir exists on fresh clones.
+.pano_reports/*
+!.pano_reports/.gitkeep
+
 # Palo Alto / Panorama configuration exports — drop them here, they're auto-ignored
 # (the .gitkeep is kept so the directory exists for new clones)
 tools/pan/configs/*
