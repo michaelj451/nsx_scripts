@@ -12,6 +12,7 @@ or [RUNBOOK_B_COMMANDS.md](RUNBOOK_B_COMMANDS.md) for the bash/zsh equivalent.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
 ```
 

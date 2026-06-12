@@ -13,6 +13,7 @@ for explanations, or [RUNBOOK_D_COMMANDS.md](RUNBOOK_D_COMMANDS.md) for bash.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
 ```
 

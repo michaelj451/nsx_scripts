@@ -842,8 +842,14 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     p.add_argument("--config", required=True,
                    help="Path to exported Panorama running-config XML.")
-    p.add_argument("--device-group", required=True,
-                   help="Target device-group name (the DG whose firewall would receive this traffic).")
+    dg_grp = p.add_mutually_exclusive_group(required=True)
+    dg_grp.add_argument("--device-group",
+                        help="Target device-group name (the DG whose firewall would "
+                             "receive this traffic). Use this when you know the DG.")
+    dg_grp.add_argument("--all-device-groups", action="store_true",
+                        help="Evaluate the query against EVERY device-group in the "
+                             "config and report a per-DG verdict. Use this when you "
+                             "don't know which DG owns the flow.")
     p.add_argument("--src-ip", required=True)
     p.add_argument("--dst-ip", required=True)
     p.add_argument("--src-zone", default=None,
@@ -876,19 +882,31 @@ def main() -> int:
 
     config = PanoramaConfig(Path(args.config))
 
-    if args.device_group not in config.device_groups and args.device_group != "shared":
-        log.warning("device-group %r not found in config. Known: %s",
-                    args.device_group, sorted(config.device_groups.keys()))
+    # ----- Resolve the DG list (single or all) -----
+    if args.all_device_groups:
+        target_dgs = list(config.device_groups.keys())
+        if not target_dgs:
+            log.warning("config has no device-groups; running against 'shared' scope only")
+            target_dgs = ["shared"]
+    else:
+        if (args.device_group not in config.device_groups
+                and args.device_group != "shared"):
+            log.warning("device-group %r not found in config. Known: %s",
+                        args.device_group, sorted(config.device_groups.keys()))
+        target_dgs = [args.device_group]
 
-    query = Query(
-        src_ip=args.src_ip, dst_ip=args.dst_ip,
-        src_zone=args.src_zone, dst_zone=args.dst_zone,
-        protocol=args.protocol, dst_port=args.dst_port,
-        device_group=args.device_group,
-    )
+    # ----- Evaluate one or more DGs -----
+    verdicts: List[Tuple[str, Verdict]] = []
+    for dg in target_dgs:
+        q = Query(
+            src_ip=args.src_ip, dst_ip=args.dst_ip,
+            src_zone=args.src_zone, dst_zone=args.dst_zone,
+            protocol=args.protocol, dst_port=args.dst_port,
+            device_group=dg,
+        )
+        verdicts.append((dg, evaluate(config, q)))
 
-    verdict = evaluate(config, query)
-
+    # ----- Write bundle to disk -----
     if not args.no_disk:
         # Default to $PANO_REPORTS_DIR / check_policy_match / <UTC_TS> when
         # --output-dir isn't given. The resolver only reads path keys from .env;
@@ -899,19 +917,78 @@ def main() -> int:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_dir = base / "check_policy_match" / ts
         out_dir.mkdir(parents=True, exist_ok=True)
+        if args.all_device_groups:
+            doc = {
+                "mode": "all_device_groups",
+                "src_ip": args.src_ip, "dst_ip": args.dst_ip,
+                "src_zone": args.src_zone, "dst_zone": args.dst_zone,
+                "protocol": args.protocol, "dst_port": args.dst_port,
+                "device_groups": [
+                    {"device_group": dg, **verdict_to_json(v)}
+                    for dg, v in verdicts
+                ],
+            }
+        else:
+            doc = verdict_to_json(verdicts[0][1])
         (out_dir / "verdict.json").write_text(
-            json.dumps(verdict_to_json(verdict), indent=2, sort_keys=True),
-            encoding="utf-8",
+            json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8",
         )
         log.info("verdict + trace written to %s", out_dir / "verdict.json")
 
+    # ----- Emit stdout -----
     if args.json:
-        print(json.dumps(verdict_to_json(verdict), indent=2, sort_keys=True))
+        if args.all_device_groups:
+            print(json.dumps({
+                "mode": "all_device_groups",
+                "device_groups": [
+                    {"device_group": dg, **verdict_to_json(v)}
+                    for dg, v in verdicts
+                ],
+            }, indent=2, sort_keys=True))
+        else:
+            print(json.dumps(verdict_to_json(verdicts[0][1]), indent=2, sort_keys=True))
     else:
-        print(format_verdict_text(verdict, config, verbose=args.verbose))
+        if args.all_device_groups:
+            # Compact per-DG table
+            print("=" * 72)
+            print("ALL-DG POLICY MATCH")
+            print("=" * 72)
+            print(f"Query:        src={args.src_ip}  dst={args.dst_ip}")
+            print(f"              proto={args.protocol or '(any)'}  port={args.dst_port or '(any)'}")
+            print()
+            custom_allow_count = sum(
+                1 for _, v in verdicts
+                if v.action == "allow" and v.matched_rulebase != "default-rules")
+            for dg, v in verdicts:
+                label = ACTION_LABELS.get(v.action, v.action.upper())
+                rule  = v.matched_rule or "(default — no match)"
+                rb    = v.matched_rulebase or "default-rules"
+                # Visually mark default-rule fall-through (no custom rule matched).
+                # In zone-agnostic mode, intrazone-default appears to "allow" but
+                # on a real firewall this depends on whether src/dst share a zone.
+                tag = "  ← default-rule fall-through" if rb == "default-rules" else ""
+                print(f"  [{dg:10s}] {label:8s}  {rb}/pos {v.matched_position or '-'}  {rule!r}{tag}")
+            # Summary line at the bottom of the table
+            print()
+            print(f"  Summary: {custom_allow_count}/{len(verdicts)} DGs have a CUSTOMER rule "
+                  f"explicitly allowing this flow.")
+            if custom_allow_count < len(verdicts) and not args.src_zone:
+                print(f"  Caveat:  default-rule matches above depend on actual src/dst "
+                      f"zones (not specified in this query).")
+            if args.verbose:
+                # Full trace per DG below the summary
+                for dg, v in verdicts:
+                    print()
+                    print(format_verdict_text(v, config, verbose=True))
+        else:
+            print(format_verdict_text(verdicts[0][1], config, verbose=args.verbose))
 
-    # Exit code: 0 = ALLOWED, 1 = DENIED/DROPPED/RESET
-    return 0 if verdict.action == "allow" else 1
+    # ----- Exit code -----
+    # Single-DG: 0 = ALLOWED, 1 = anything else
+    # All-DG:    0 = at least one DG allows, 1 = no DG allows
+    if any(v.action == "allow" for _, v in verdicts):
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

@@ -258,25 +258,42 @@ done < flows.csv
 
 A wrapped `batch_check_policy.py` is on the future-tools list — flag if you want it sooner.
 
-### Finding the right device-group
+### When you don't know which device-group
 
-If you don't know which DG a flow lands in, you can probe each one:
+Use `--all-device-groups` on `check_policy_match.py` (no longer need a shell loop):
 
 ```bash
-CFG=tools/pan/configs/customer-X-2026-06.xml
-for DG in $(python3 -c "
-import xml.etree.ElementTree as ET, sys
-root = ET.parse('$CFG').getroot()
-dg_root = root.find(\"./devices/entry/device-group\")
-for e in dg_root.findall('./entry'):
-    print(e.get('name'))
-"); do
-  echo "=== $DG ==="
-  python tools/pan/check_policy_match.py --config "$CFG" --device-group "$DG" \
-    --src-ip 10.50.10.5 --dst-ip 8.8.8.8 --protocol tcp --dst-port 443 --json \
-    | jq -r '"  verdict=" + .verdict + "  rule=" + (.matched_rule // "(none)")'
-done
+python tools/pan/check_policy_match.py --config $CFG --all-device-groups \
+  --src-ip 10.50.10.5 --dst-ip 8.8.8.8 \
+  --protocol tcp --dst-port 443
 ```
+
+Output:
+
+```
+========================================================================
+ALL-DG POLICY MATCH
+========================================================================
+Query:        src=10.50.10.5  dst=8.8.8.8
+              proto=tcp  port=443
+
+  [dg-3      ] ALLOWED   shared/pre-rulebase/pos 1  'allow-logging'
+  [dg-5      ] ALLOWED   shared/pre-rulebase/pos 1  'allow-logging'
+  [dg-6      ] DENIED    default-rules/pos 2  'interzone-default'  ← default-rule fall-through
+  [dg-4      ] ALLOWED   BranchOffice-DG/post-rulebase/pos 3  'allow-web'
+
+  Summary: 3/4 DGs have a CUSTOMER rule explicitly allowing this flow.
+  Caveat:  default-rule matches above depend on actual src/dst zones (not specified in this query).
+```
+
+Each row shows:
+- The verdict (ALLOWED / DENIED / DROPPED)
+- The matched rule (rulebase + position + name)
+- A **`← default-rule fall-through`** marker when no customer rule matched and the verdict comes from PAN's synthetic intrazone/interzone defaults. These verdicts are inherently zone-dependent — on the real firewall they only fire when src/dst are actually in the same zone (intrazone) or different zones (interzone). Without `--src-zone` / `--dst-zone` in your query, the tool can't tell which applies.
+
+The summary line at the bottom tells you instantly how many DGs have a real customer-rule match (vs. defaults-only fall-through).
+
+Exit code: `0` if at least one DG returns ALLOWED, `1` otherwise.
 
 ---
 
@@ -359,7 +376,8 @@ Pointing them at this runbook is a clean way to demonstrate the scope.
 | Flag | Default | Purpose |
 |---|---|---|
 | `--config <path>` | required | Path to the Panorama running-config XML file |
-| `--device-group <name>` | required | Target device-group name (whose firewall would receive this traffic) |
+| `--device-group <name>` | one-of | Target device-group name. Use when you know the DG. |
+| `--all-device-groups` | one-of | Evaluate against every DG in the config and report a per-DG verdict. Use when you don't know which DG owns the flow. **Mutually exclusive with `--device-group`.** |
 | `--src-ip <ip>` | required | Source IP |
 | `--dst-ip <ip>` | required | Destination IP |
 | `--src-zone <name>` | (any) | Source zone — omit for zone-agnostic match (caveat emitted) |

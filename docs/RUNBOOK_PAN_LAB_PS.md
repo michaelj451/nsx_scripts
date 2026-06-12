@@ -32,6 +32,7 @@ Line continuation in PowerShell is the backtick `` ` `` at end of line.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
 ```
 

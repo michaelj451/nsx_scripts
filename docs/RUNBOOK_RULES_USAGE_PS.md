@@ -57,6 +57,7 @@ Every run is independent and idempotent.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
 ```
 

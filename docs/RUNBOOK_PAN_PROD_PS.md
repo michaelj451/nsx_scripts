@@ -53,6 +53,7 @@ The file is **typically 10-100 MB** for a real production Panorama. If a custome
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
 ```
 
@@ -230,22 +231,47 @@ Import-Csv flows.csv | ForEach-Object {
 } | Export-Csv flow_audit.csv -NoTypeInformation
 ```
 
-### Finding the right device-group
+### When you don't know which device-group
+
+Use `--all-device-groups` (no loop required):
 
 ```powershell
-$cfg = "tools/pan/configs/customer-X-2026-06.xml"
-
-[xml]$x = Get-Content $cfg
-$dgs = $x.SelectNodes("/config/devices/entry/device-group/entry") | ForEach-Object { $_.name }
-
-foreach ($dg in $dgs) {
-  Write-Host "=== $dg ==="
-  $r = python tools/pan/check_policy_match.py --config $cfg --device-group $dg `
-    --src-ip 10.50.10.5 --dst-ip 8.8.8.8 --protocol tcp --dst-port 443 --json `
-    | ConvertFrom-Json
-  Write-Host "  verdict=$($r.verdict)  rule=$($r.matched_rule)"
-}
+python tools/pan/check_policy_match.py --config $cfg --all-device-groups `
+  --src-ip 10.50.10.5 --dst-ip 8.8.8.8 `
+  --protocol tcp --dst-port 443
 ```
+
+Output:
+
+```
+========================================================================
+ALL-DG POLICY MATCH
+========================================================================
+Query:        src=10.50.10.5  dst=8.8.8.8
+              proto=tcp  port=443
+
+  [dg-3      ] ALLOWED   shared/pre-rulebase/pos 1  'allow-logging'
+  [dg-5      ] ALLOWED   shared/pre-rulebase/pos 1  'allow-logging'
+  [dg-6      ] DENIED    default-rules/pos 2  'interzone-default'  ← default-rule fall-through
+  [dg-4      ] ALLOWED   BranchOffice-DG/post-rulebase/pos 3  'allow-web'
+
+  Summary: 3/4 DGs have a CUSTOMER rule explicitly allowing this flow.
+  Caveat:  default-rule matches above depend on actual src/dst zones (not specified in this query).
+```
+
+The `← default-rule fall-through` marker flags rows where no customer rule matched — the verdict comes from PAN's synthetic intrazone/interzone defaults and is zone-dependent on the real firewall.
+
+JSON form for piping:
+
+```powershell
+$result = python tools/pan/check_policy_match.py --config $cfg --all-device-groups `
+  --src-ip 10.50.10.5 --dst-ip 8.8.8.8 `
+  --protocol tcp --dst-port 443 --json --no-disk | ConvertFrom-Json
+
+$result.device_groups | Format-Table device_group, verdict, matched_rule, matched_rulebase
+```
+
+Exit code: `0` if at least one DG returns ALLOWED, `1` otherwise.
 
 ---
 
@@ -317,7 +343,8 @@ Pointing them at this runbook is a clean way to demonstrate the scope.
 | Flag | Default | Purpose |
 |---|---|---|
 | `--config <path>` | required | Path to the Panorama running-config XML file |
-| `--device-group <name>` | required | Target DG name |
+| `--device-group <name>` | one-of | Target DG name. Use when you know the DG. |
+| `--all-device-groups` | one-of | Evaluate against every DG and emit a per-DG verdict. **Mutually exclusive with `--device-group`.** |
 | `--src-ip <ip>` | required | Source IP |
 | `--dst-ip <ip>` | required | Destination IP |
 | `--src-zone <name>` | (any) | Source zone — omit for zone-agnostic match |
