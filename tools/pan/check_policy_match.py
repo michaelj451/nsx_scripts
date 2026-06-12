@@ -802,17 +802,20 @@ def evaluate(config: PanoramaConfig, query: Query,
         if not svc_ok:
             reasons.append(f"service {(query.protocol, query.dst_port)} not in {rule.services!r}")
 
-        # App-ID offline caveat
+        if reasons:
+            trace.append(TraceEntry(rule.rulebase_path, rule.position, rule.name,
+                                    "skipped", reasons))
+            continue
+
+        # The rule passed every offline-evaluable criterion. App-ID is the only
+        # thing left that could disqualify it — but App-ID can't be resolved
+        # offline. Emit a SINGLE caveat for THIS rule so the operator knows the
+        # match is conditional on the actual app classification matching.
         if "any" not in rule.applications:
             cumulative_caveats.append(
                 f"rule {rule.name!r} requires application(s) {rule.applications!r} — "
                 f"App-ID match cannot be evaluated offline"
             )
-
-        if reasons:
-            trace.append(TraceEntry(rule.rulebase_path, rule.position, rule.name,
-                                    "skipped", reasons))
-            continue
 
         # MATCH
         trace.append(TraceEntry(rule.rulebase_path, rule.position, rule.name, "matched", []))
