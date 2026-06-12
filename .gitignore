@@ -38,7 +38,15 @@ nsx_pure_ip_remap*/
 # VM Tag Logs
 nsx_vm_files/
 
-# # Palo Alto Networks Panorama configuration exports
+# Palo Alto / Panorama configuration exports — drop them here, they're auto-ignored
+# (the .gitkeep is kept so the directory exists for new clones)
+tools/pan/configs/*
+!tools/pan/configs/.gitkeep
+# Real configs used as test inputs — kept alongside synthetic fixtures but ignored.
+# Synthetic fixtures (panorama_running_config.xml, etc.) remain tracked.
+tools/pan/tests/fixtures/script-test-*.xml
+tools/pan/tests/fixtures/real-*.xml
+# (legacy/explicit patterns kept commented for reference)
 # modified-config.xml
 # # running-config*.xml
 # pano_export*

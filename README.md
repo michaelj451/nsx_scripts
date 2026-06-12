@@ -1,109 +1,75 @@
-# NSX DFW Toolset — Local Manager Operations
+# Multi-Vendor Network Automation Toolkit
 
-A collection of Python tools for snapshotting, transforming, and pushing
-NSX Policy distributed-firewall objects (groups, services, security
-policies, rules) between Local Managers. Built for operators with **DFW
-access only** — no networking/segments permission required for the push
-target.
+A workshop of Python tools for snapshotting, transforming, reporting on, and
+selectively pushing distributed-firewall configuration — built around the
+principle that **every push is reviewable, dry-runnable, and revertible**.
 
-Three distinct operations are supported, each with its own runbook:
-
-| Operation | Source | Target | Scope | Runbook |
-|---|---|---|---|---|
-| **Clone** — stand up a new LM with the same DFW config | `nsx-lm1` (live) | `nsx-lm2` (new) | Services + groups + policies + rules | [RUNBOOK_A.md](RUNBOOK_A.md) |
-| **Subnet remap in place** — rewrite group IPs on a single LM using a CSV mapping | `nsx-lm1` | `nsx-lm1` | Groups only (PATCH) | [RUNBOOK_B.md](RUNBOOK_B.md) |
-| **VM hostname tagging** — give every regular VM an NSX tag matching its trailing digits | `nsx-lm1` | `nsx-lm1` | VM tags only (append, never replace) | [RUNBOOK_VM_TAGS.md](RUNBOOK_VM_TAGS.md) |
+Started as an NSX-only DFW toolkit; expanding into a cross-vendor template
+(NSX → Palo Alto → others) where the same operating model — capture, build,
+push, revert, report — is replayed against each vendor's API or config format.
 
 ---
 
-## Design properties
-
-- **Read-only source** — the live source manager is never written to in either workflow.
-- **Tag/dynamic membership is resolved by NSX** — no Python tag parsing. The toolkit asks `/policy/.../groups/<id>/members/virtual-machines` for evaluated VM lists, then looks up each VM's IPs via fabric VIFs.
-- **Every transform is offline and reviewable** — exports, additive trees, transformed trees, build dirs, and remapped trees are all on-disk artifacts you can diff and inspect before any push.
-- **Dry-run is the default safe mode** on every write step. Real apply requires an explicit `--apply` (or `--yes` for the groups-only pusher).
-- **Idempotent push** — both push tools handle "already exists" and 412 revision-conflict by falling back from PUT to PATCH automatically.
-- **Per-run reports + logs** under `nsx_logs/` for every step.
-
----
-
-## What's in this repo
-
-### Tools — `tools/nsx/`
-
-| Script | Purpose |
-|---|---|
-| `export_nsx_objects.py` | GET-only snapshot of an LM's groups/services/policies/rules → `nsx_export/<host>/` |
-| `build_group_ip_additive_from_live_members.py` | Resolve a group's evaluated VM members on a source LM, look up their IPs via fabric VIFs, append as a static `IPAddressExpression` (with `OR`) |
-| `find_rules_affected_by_group_changes.py` | Report which rules reference changed groups + which new subnets drive each match |
-| `find_segments_referenced.py` | Inventory every `/infra/segments/*` path referenced by groups/rules, optionally fetch live segment details (subnets, VLANs, TZ) |
-| `transform_group_segments.py` | Pre-build segment rewriter. `strip` mode drops segment refs and cleans operators; `convert` mode fetches segments and substitutes their subnet CIDRs |
-| `nsx_group_ip_remap_offline.py` | Offline CSV subnet remap on a group tree (`old_subnet,new_subnet` with longest-prefix match) |
-| `build_complete_nsx_payload.py` | Offline assembler — combine source services/policies/rules with a (transformed) groups tree into a ready-to-push build dir |
-| `push_complete_nsx_payload.py` | Push the build dir to a target LM. Dry-run by default. Handles services + groups + policies + rules |
-| `push_additive_group_ips.py` | Groups-only PATCH push. Used by Runbook B. Dry-run by default |
-| `validate_nsx_groups_live.py` | Read-only diff of live NSX groups vs a prepared payload |
-| `push_nsx_groups_revert.py` | **Runbook B rollback** — PATCH groups back to a saved export snapshot (groups-only) |
-| `push_complete_nsx_revert.py` | **Runbook A rollback** — full-stack delete-extraneous (policies → groups → optional services) |
-| `tools/vm_tags/export_vm_tags.py` | **VM tags** — snapshot every VM's current tag set from the NSX fabric API |
-| `tools/vm_tags/build_hostname_tag_plan.py` | **VM tags** — offline classifier; produces eligible / skip_has_tag / skip_invalid_name / skip_edge / skip_other_type buckets |
-| `tools/vm_tags/dryrun_hostname_tags.py` | **VM tags** — single-command export + classify with flagging report |
-| `tools/vm_tags/push_hostname_tags.py` | **VM tags** — append hostname tag to eligible VMs; read-modify-write, never removes |
-| `tools/vm_tags/validate_hostname_tags.py` | **VM tags** — read-only validation against the plan |
-| `tools/vm_tags/revert_hostname_tags.py` | **VM tags rollback** — un-assign exactly the hostname tags this push added, per manifest |
-
-### App library — `app/nsx/`
-
-| Module | Purpose |
-|---|---|
-| `nsx_policy_client.py` | Thin HTTP client for NSX Policy + fabric APIs (segments, groups, services, policies, rules, VMs, VIFs) |
-| `cli_bootstrap.py` | `.env` loader + shared CLI setup |
-| `nsx_constants.py` | Manager hostname resolution + path constants |
-| `nsx_object_functions/nsx_object_exporter.py` | Generic exporter used by `export_nsx_objects.py` |
-| `nsx_object_functions/nsx_object_importer.py` | Generic importer used by the push tools |
-| `nsx_object_functions/nsx_group_importer.py` | Group-specific importer with additive-merge logic |
-| `nsx_object_functions/nsx_group_remap.py` | Subnet-remap primitives used by `nsx_group_ip_remap_offline.py` |
-
-### Data + logs
+## What's where
 
 ```
-data/
-  subnet_map.csv         — example IP-remap CSV
-  nonprod_map.csv        — prod → non-prod subnet remap
-
-nsx_export/              — read-only snapshots from each LM
-nsx_groups_additive_a/   — additive trees built for Runbook A (lm2 target)
-nsx_groups_additive_b/   — additive trees built for Runbook B (lm1 in-place)
-nsx_groups_transformed/  — segment-transformed groups (post step A.4)
-nsx_groups_remapped/     — CSV-remapped groups (post step B.3)
-nsx_build/               — complete push payloads
-nsx_logs/                — per-run logs, snapshots, validation reports
+.
+├── tools/
+│   ├── nsx/                  Mature NSX Policy API toolkit — capture, build, push, revert
+│   ├── pan/                  Palo Alto Panorama tools — offline XML-driven (no API)
+│   │   ├── configs/          (gitignored) drop Panorama running-config XMLs here
+│   │   └── tests/fixtures/   synthetic + script-test XMLs (script-test-* gitignored)
+│   ├── reports/              Cross-vendor report generators (rules-usage, etc.)
+│   ├── vm_tags/              VM hostname → NSX tag automation
+│   ├── test/                 Load-test scaffolding for the NSX tools
+│   ├── bootstrap_server/     Local-host bootstrap helpers
+│   └── archive/              Deprecated tools kept for one-off scenarios
+│
+├── app/
+│   ├── nsx/                  Shared NSX policy client + CLI bootstrap + constants
+│   ├── palo/                 Earlier PAN exploration (XML diff, test cases)
+│   └── utilities/            Cross-tool helpers
+│
+├── docs/                     All runbooks + toolkit summaries (you're at the index here)
+├── certificates/             PEM trust bundles for lab managers
+├── nsx_logs/                 (gitignored) per-run logs + reports
+└── nsx_<bundle>/             (gitignored) capture / transform / push artifacts
 ```
 
 ---
 
-## Which runbook should I follow?
+## Which runbook do I want?
 
-**[RUNBOOK_A.md](RUNBOOK_A.md)** — you want a *new* NSX Local Manager
-(`nsx-lm2`) to look like an existing one (`nsx-lm1`). Pushes services,
-groups (with live VM IPs snapshotted as static), policies, and rules. The
-new manager doesn't have to share segments with the source — optional
-step transforms segment refs into IP-address groups before push.
+### NSX workflows (mature, validated round-trip in lab)
 
-**[RUNBOOK_B.md](RUNBOOK_B.md)** — you want to modify the live manager's
-own groups using a subnet remap CSV. Source and target are the same
-manager (`nsx-lm1`). Groups-only PATCH; services, policies, and rules are
-untouched. Use `--mapped-only` to replace IPs with their CSV-mapped
-values; omit it for additive expansion.
+| Workflow | Source → Target | Scope | Runbook |
+|---|---|---|---|
+| **A — Clone** — stand up a new LM with the same DFW config | `nsx-lm1` (live) → `nsx-lm2` (new) | services + groups + policies + rules | [docs/RUNBOOK_A.md](docs/RUNBOOK_A.md) |
+| **B — Subnet remap in place** — rewrite group IPs on one LM using a CSV map | `nsx-lm1` → `nsx-lm1` | groups only (PATCH) | [docs/RUNBOOK_B.md](docs/RUNBOOK_B.md) |
+| **C — Lab decomposition** — split tag+IP groups into siblings on a non-prod target | `nsx-lm1` → `nsx-lm3` | groups (sibling-decompose) + amend rules | [docs/RUNBOOK_C.md](docs/RUNBOOK_C.md) |
+| **D — Production in-place remap to siblings** — additive prod amendment with Phase-2 forced strip option | `nsx-lm1` → `nsx-lm1` | groups + rules + optional Phase-2 strip | [docs/RUNBOOK_D.md](docs/RUNBOOK_D.md) |
+| **VM hostname tagging** — give every regular VM an NSX tag matching its trailing digits | `nsx-lm1` → `nsx-lm1` | VM tags only (append, never replace) | [docs/RUNBOOK_VM_TAGS.md](docs/RUNBOOK_VM_TAGS.md) |
+| **Capture-first variant of A+D** — single-capture clone + WF-D in one flow (lab validation pattern) | `nsx-lm1` → any non-prod | full | [docs/RUNBOOK_FROM_CAPTURE.md](docs/RUNBOOK_FROM_CAPTURE.md) |
 
-The two workflows do not interact — pick whichever matches what you're
-trying to accomplish.
+Each runbook has a `_PS.md` PowerShell variant where applicable.
+
+### Cross-vendor reports
+
+| Report | What it does | Runbook |
+|---|---|---|
+| **Rules usage report** — every rule classified HOT / USED / STALE / UNUSED / DORMANT, with optional "no hits in N days" filter; works on LM or GM (full federation walk) | Read-only, GETs only, double-locked | [docs/RUNBOOK_RULES_USAGE.md](docs/RUNBOOK_RULES_USAGE.md) |
+
+### Palo Alto (in progress)
+
+| Tool | What it does | Status |
+|---|---|---|
+| **`tools/pan/check_policy_match.py`** — offline "can A reach B" policy lookup | Parses exported Panorama running-config XML; walks the full DG hierarchy in correct PAN-OS evaluation order; emits verdict + matched-rule + trace | v1 shipped, smoke-tested on real config |
 
 ---
 
-## Quick start (Runbook A)
+## Quick-start
 
-### 0) Env — macOS / Linux
+### Setup
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -111,66 +77,80 @@ pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
 ```
 
-### 0) Env — Windows (PowerShell)
+Create a `.env` at the repo root (see existing fields by running any tool — they error clearly on missing config):
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r docker\requirements-pip.txt
-$env:PYTHONPATH = "$PWD\app"
+```
+NSX_USERNAME=...
+NSX_PASSWORD=...
+NSX_LOG_DIR=$PWD/nsx_logs
 ```
 
-> If PowerShell blocks the activation script, run once per session:
-> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned`
-
-### 0) Env — Windows (Command Prompt)
-
-```cmd
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r docker\requirements-pip.txt
-set PYTHONPATH=%CD%\app
-```
-
-> All subsequent commands are written for bash / macOS-Linux. On Windows,
-> use `python` instead of `python3` and replace the `\` line-continuations
-> with backticks (PowerShell) or a single line.
-
-### Workflow commands
+### Most-common commands
 
 ```bash
-# 1) Export source + target
-python tools/nsx/export_nsx_objects.py --manager nsx-lm1 --output-format yaml
-python tools/nsx/export_nsx_objects.py --manager nsx-lm2 --output-format yaml
+# Read-only inventory snapshot of an NSX LM (creates capture bundle + IP coverage report)
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --ip-report-csv data/nonprod_map.csv
 
-# 2) Resolve live members lm1 → lm2 additive tree
-python tools/nsx/build_group_ip_additive_from_live_members.py \
-  --source-manager nsx-lm1 --domain-id default \
-  --source-groups-dir nsx_export/nsx-lm1.lab.local/domains/default/groups \
-  --output-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  --output-format yaml --copy-first --continue-on-group-error
+# Rules-usage snapshot (real-time, read-only) — works against LM or GM (--all-domains on GM)
+python tools/reports/report_rules_usage.py --target nsx-lm1
+python tools/reports/report_rules_usage.py --target nsx-gm1 --federation-global --all-domains \
+  --min-days-since-hit 365
 
-# 3,4) optional pre-push analysis + segment transform — see RUNBOOK_A.md
-
-# 5) Build payload
-python tools/nsx/build_complete_nsx_payload.py \
-  --source-manager-dir nsx_export/nsx-lm1.lab.local \
-  --additive-groups-dir nsx_groups_additive_a/nsx-lm2.lab.local/domains/default/groups \
-  --build-dir nsx_build/nsx-lm2.lab.local --domain-id default --overwrite
-
-# 6) Dry-run, 7) Apply
-python tools/nsx/push_complete_nsx_payload.py --target nsx-lm2 \
-  --build-dir nsx_build/nsx-lm2.lab.local --domain-id default --dry-run
-python tools/nsx/push_complete_nsx_payload.py --target nsx-lm2 \
-  --build-dir nsx_build/nsx-lm2.lab.local --domain-id default --apply
-
-# 8) Validate
-python tools/nsx/validate_nsx_groups_live.py --target nsx-lm2 \
-  --expected-root nsx_groups_additive_a/nsx-lm2.lab.local --domain-id default
+# Offline Panorama policy lookup
+python tools/pan/check_policy_match.py \
+  --config tools/pan/configs/your-panorama.xml \
+  --device-group YourDG \
+  --src-ip 10.20.5.7 --dst-ip 192.168.10.42 \
+  --protocol tcp --dst-port 443
 ```
 
-For the full Runbook A with optional pre-push analysis, segment
-transformation, sandbox testing, and rollback, see
-[RUNBOOK_A.md](RUNBOOK_A.md).
+---
 
-For the in-place CSV remap workflow, see [RUNBOOK_B.md](RUNBOOK_B.md).
+## Design properties (repo-wide)
+
+| Property | Meaning |
+|---|---|
+| **Read-only by default** | Every read tool only does HTTP GETs. The rules-usage report has an additional runtime lockdown on the client instance to refuse PUT/PATCH/POST/DELETE. The Panorama tool never opens a network socket at all. |
+| **Dry-run is the default safe mode** | Every push tool requires an explicit `--apply` to write. Dry-runs emit the same diff artifacts as real applies, minus the API calls. |
+| **Idempotent push** | Push tools handle "already exists" and 412 revision-conflict by falling back from PUT to PATCH automatically. |
+| **Strict-additive amendments** | Group amendments never remove IPs unless `--intentional-ip-removal` is explicitly passed; rule amendments only ever append refs, never remove. |
+| **LIFO baseline revert** | Every push tool captures a per-run baseline; revert pops the most-recent unreverted baseline. Reverts run in reverse phase order to avoid dangling refs. |
+| **Per-run reports + logs** | Every step writes to `nsx_logs/<tool>/<host>/<UTC_TS>/` and a timestamped JSON report. |
+| **Source state is never mutated** | The live source manager is never written to in any workflow. |
+| **Offline review-able** | Capture bundles, transformed bundles, build dirs, and remapped trees are all on-disk artifacts diff-able before any push. |
+
+---
+
+## File and data conventions
+
+| Pattern | Convention |
+|---|---|
+| `NSX_LOG_DIR=$PWD/nsx_logs` | All per-run reports and logs land here, gitignored |
+| `nsx_capture/<host>/`, `nsx_groups_export/<host>/`, etc. | Per-tool bundles, gitignored (regenerable from source) |
+| `tools/pan/configs/<x>.xml` | Drop real Panorama configs here — auto-gitignored |
+| `tools/pan/tests/fixtures/panorama_running_config.xml` | Synthetic test fixture, tracked in git |
+| `tools/pan/tests/fixtures/script-test-*.xml` | Real configs used as test inputs, gitignored by name pattern |
+| Timestamps in filenames | Always UTC, `%Y%m%d_%H%M%S` |
+| Manager aliases | `nsx-lm1` / `nsx-lm2` / `nsx-lm3` / `nsx-gm1` / `nsx-gm2` — resolved in `app/nsx/nsx_constants.py` |
+
+---
+
+## Status
+
+| Area | State |
+|---|---|
+| NSX Workflows A / B / C / D | Validated round-trip in lab |
+| NSX VM tagging | Validated, used in prod |
+| NSX rules-usage report (LM + GM federation walk) | Shipped, double-locked read-only |
+| PAN Panorama policy-lookup tool | v1 shipped, smoke-tested on real config |
+| Cross-vendor abstraction layer | Not started — each vendor's toolkit is independent for now |
+
+---
+
+## Contributing conventions
+
+- **No surprise writes.** Adding any new code path that mutates a vendor's state requires an explicit operator-supplied flag.
+- **Reports go to `tools/reports/`.** Operational tools go to `tools/<vendor>/`.
+- **Don't commit vendor configs.** Drop them in the gitignored directories.
+- **Don't touch existing tools when adding new functionality** — prefer additive new tools over modifications to the well-tested ones.
+- **All scripts pass `--target` aliases**, not hostnames or IPs. Hostnames live in `app/nsx/nsx_constants.py`.
