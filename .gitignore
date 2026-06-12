@@ -47,6 +47,10 @@ nsx_vm_files/
 # (the .gitkeep is kept so the directory exists for new clones)
 tools/pan/configs/*
 !tools/pan/configs/.gitkeep
+
+# Operator-specific rule-name filter for offline analysis tools. The
+# .example.txt is tracked as a template; rule_filter.txt is user-local.
+tools/pan/rule_filter.txt
 # Real configs used as test inputs — kept alongside synthetic fixtures but ignored.
 # Synthetic fixtures (panorama_running_config.xml, etc.) remain tracked.
 tools/pan/tests/fixtures/script-test-*.xml

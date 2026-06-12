@@ -8,6 +8,7 @@ See that file for narrative + lab validation details.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
 
 # Aliases used throughout:

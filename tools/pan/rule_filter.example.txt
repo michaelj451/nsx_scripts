@@ -1,0 +1,43 @@
+# Rule-name filter for tools/pan/check_policy_match.py and recommend_dg.py
+#
+# Each non-comment, non-blank line is a substring. Any rule whose NAME contains
+# any of these substrings is removed from the evaluation chain BEFORE matching
+# runs — the rule is invisible to the matcher and does not appear in the
+# verdict trace, stdout, or verdict.json.
+#
+# How to use:
+#   1. Copy this file to:   tools/pan/rule_filter.txt
+#   2. Edit to taste. One keyword per line. Comments start with #.
+#   3. The tools auto-load rule_filter.txt if present. Use --rule-filter <path>
+#      to point at a different file, or --no-filter to bypass entirely.
+#
+# Use cases:
+#   - Hide overly broad rules that always match first (e.g., a syslog-logging
+#     rule whose any/any/any-port semantics dominate every query)
+#   - Hide noisy test/experimental rules during analysis
+#   - Hide rules from a specific operator or change ticket so you can see what
+#     the rest of the rulebase looks like
+#
+# Caveats:
+#   - Filtering is by SUBSTRING match on the rule's name. Substring 'test'
+#     would filter 'test rule 1-1', 'my-test', 'attestation-rule', etc.
+#     Be specific.
+#   - Matching is CASE-INSENSITIVE. Keyword 'icmp' filters 'ICMP-allow',
+#     'icmp_ping_out', and 'Block-ICMP-Broadcast' alike. You don't need to
+#     enumerate every casing the rules might use.
+#   - The filter does NOT change what's on the actual firewall — it only
+#     changes what THIS TOOL considers during evaluation. Real enforcement
+#     is unaffected.
+#   - Filtered rules don't count toward 'rules_evaluated' but a separate
+#     'rules_filtered' counter is reported.
+
+# ---- Example filters (uncomment in your local rule_filter.txt) ----
+
+# Common case in the lab: the catch-all syslog rule with any/any source/dest
+# allow-logging
+
+# Hide test rules during production analysis
+# test rule
+
+# Hide specific change-ticket rules
+# CHG-12345

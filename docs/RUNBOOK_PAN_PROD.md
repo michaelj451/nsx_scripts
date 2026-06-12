@@ -94,7 +94,20 @@ The flagship tool. Given a Panorama XML config and a `(src, dst, [zones], [servi
 - Any offline-evaluation caveats (App-ID, FQDN address objects, DAGs)
 - Optional full per-rule trace showing why each preceding rule was skipped
 
-### Basic invocation
+### Basic invocation (no DG known — most common CAB pattern)
+
+When you don't know which device-group owns the flow, leave the DG flag off — the tool defaults to `--all-device-groups` and reports a per-DG verdict.
+
+```bash
+python tools/pan/check_policy_match.py \
+  --config tools/pan/configs/<customer>-<ts>.xml \
+  --src-ip 10.20.5.7 --dst-ip 192.168.10.42 \
+  --protocol tcp --dst-port 443
+```
+
+### Targeted invocation (when you know the DG)
+
+Pass `--device-group` to get the single-DG verdict with the full evaluation trace:
 
 ```bash
 python tools/pan/check_policy_match.py \
@@ -223,7 +236,69 @@ $PANO_REPORTS_DIR/recommend_dg/<UTC_TS>/
 
 ---
 
-## 3. Common operational patterns
+## 3. Rule filter — hiding overly broad rules from evaluation
+
+Sometimes a single overly broad rule (e.g., a catch-all syslog `allow-logging` rule with `any/any` source/destination) dominates every query and prevents you from seeing the rules you actually care about. The filter lets you EXCLUDE rules by name keyword — both tools (`check_policy_match.py` and `recommend_dg.py`) treat filtered rules as if they don't exist.
+
+### File-based filter (recommended for repeated work)
+
+1. Copy the template:
+   ```bash
+   cp tools/pan/rule_filter.example.txt tools/pan/rule_filter.txt
+   ```
+2. Edit `tools/pan/rule_filter.txt` to taste. One keyword per line. Lines starting with `#` are comments.
+   ```
+   allow-logging
+   syslog
+   ```
+3. Run any analysis tool — the filter is auto-loaded.
+
+The file is **gitignored** (`tools/pan/rule_filter.txt`) so each operator can maintain their own list. The `.example.txt` template stays tracked.
+
+### Inline filter (one-off queries)
+
+Skip a rule for a single query without editing the file:
+
+```bash
+python tools/pan/check_policy_match.py --config $CFG \
+  --src-ip 10.30.1.50 --dst-ip 10.40.1.50 \
+  --protocol tcp --dst-port 443 \
+  --skip-rule allow-logging --skip-rule "test rule"
+```
+
+Repeatable. Combined with whatever is in the file.
+
+### Bypass entirely
+
+```bash
+python tools/pan/check_policy_match.py --config $CFG --no-filter ...
+```
+
+### How the filter behaves
+
+| Aspect | Behavior |
+|---|---|
+| Match mode | Substring match against the rule's `name` attribute |
+| Case sensitivity | **Case-INSENSITIVE.** Keyword `icmp` matches `ICMP-allow`, `Icmp_ping`, and `block-icmp-broadcast` alike |
+| Filtered rules appearance | **Not in trace, not in stdout, not in verdict.json.** As if the rule didn't exist. |
+| Audit trail | Caveat added to verdict: `"N rule(s) removed from evaluation by rule_filter"` |
+| Real firewall enforcement | **Unchanged.** Filter only affects this TOOL's view of the rulebase. |
+| Default-rule behavior | Defaults are NOT filterable (`intrazone-default`, `interzone-default` are synthetic) |
+
+### Example before/after
+
+Query: `10.30.1.50 → 10.40.1.50 tcp/443` on this lab Panorama:
+
+| Filter | First-match verdict | Why |
+|---|---|---|
+| (none) | `'allow-logging'` (shared/pre pos 1) | The earlier mass-add put pano4-tcp-443 in its services, so it wins on any tcp/443 flow |
+| `allow-logging` | `'intrazone-default'` (default-rules) | With the noisy rule removed, no customer rule matches — falls through to defaults |
+
+Now you can see which CUSTOMER rules are actually involved in your traffic instead of being shadowed by the catch-all.
+
+---
+
+## 4. Common operational patterns
 
 ### Single-flow check (the simplest CAB question)
 
@@ -258,29 +333,46 @@ done < flows.csv
 
 A wrapped `batch_check_policy.py` is on the future-tools list — flag if you want it sooner.
 
-### Finding the right device-group
+### When you don't know which device-group
 
-If you don't know which DG a flow lands in, you can probe each one:
+Use `--all-device-groups` on `check_policy_match.py` (no longer need a shell loop):
 
 ```bash
-CFG=tools/pan/configs/customer-X-2026-06.xml
-for DG in $(python3 -c "
-import xml.etree.ElementTree as ET, sys
-root = ET.parse('$CFG').getroot()
-dg_root = root.find(\"./devices/entry/device-group\")
-for e in dg_root.findall('./entry'):
-    print(e.get('name'))
-"); do
-  echo "=== $DG ==="
-  python tools/pan/check_policy_match.py --config "$CFG" --device-group "$DG" \
-    --src-ip 10.50.10.5 --dst-ip 8.8.8.8 --protocol tcp --dst-port 443 --json \
-    | jq -r '"  verdict=" + .verdict + "  rule=" + (.matched_rule // "(none)")'
-done
+python tools/pan/check_policy_match.py --config $CFG --all-device-groups \
+  --src-ip 10.50.10.5 --dst-ip 8.8.8.8 \
+  --protocol tcp --dst-port 443
 ```
+
+Output:
+
+```
+========================================================================
+ALL-DG POLICY MATCH
+========================================================================
+Query:        src=10.50.10.5  dst=8.8.8.8
+              proto=tcp  port=443
+
+  [dg-3      ] ALLOWED   shared/pre-rulebase/pos 1  'allow-logging'
+  [dg-5      ] ALLOWED   shared/pre-rulebase/pos 1  'allow-logging'
+  [dg-6      ] DENIED    default-rules/pos 2  'interzone-default'  ← default-rule fall-through
+  [dg-4      ] ALLOWED   BranchOffice-DG/post-rulebase/pos 3  'allow-web'
+
+  Summary: 3/4 DGs have a CUSTOMER rule explicitly allowing this flow.
+  Caveat:  default-rule matches above depend on actual src/dst zones (not specified in this query).
+```
+
+Each row shows:
+- The verdict (ALLOWED / DENIED / DROPPED)
+- The matched rule (rulebase + position + name)
+- A **`← default-rule fall-through`** marker when no customer rule matched and the verdict comes from PAN's synthetic intrazone/interzone defaults. These verdicts are inherently zone-dependent — on the real firewall they only fire when src/dst are actually in the same zone (intrazone) or different zones (interzone). Without `--src-zone` / `--dst-zone` in your query, the tool can't tell which applies.
+
+The summary line at the bottom tells you instantly how many DGs have a real customer-rule match (vs. defaults-only fall-through).
+
+Exit code: `0` if at least one DG returns ALLOWED, `1` otherwise.
 
 ---
 
-## 4. Offline limitations (surfaced as `caveats` in the verdict)
+## 5. Offline limitations (surfaced as `caveats` in the verdict)
 
 | Limitation | What the tool does |
 |---|---|
@@ -297,7 +389,7 @@ These are surfaced explicitly in the `Caveats:` section of every verdict so CAB 
 
 ---
 
-## 5. Customer engagement workflow
+## 6. Customer engagement workflow
 
 1. **Request the config**
    - Ask for the running-config XML export. Mention any timestamp / freshness requirement.
@@ -326,7 +418,7 @@ These are surfaced explicitly in the `Caveats:` section of every verdict so CAB 
 
 ---
 
-## 6. Safety properties (production)
+## 7. Safety properties (production)
 
 | Property | Behavior |
 |---|---|
@@ -340,7 +432,7 @@ These are surfaced explicitly in the `Caveats:` section of every verdict so CAB 
 
 ---
 
-## 7. What customers can verify before authorizing analysis
+## 8. What customers can verify before authorizing analysis
 
 If a customer asks "what does this tool do to my Panorama", the truthful answers are:
 
@@ -352,14 +444,15 @@ Pointing them at this runbook is a clean way to demonstrate the scope.
 
 ---
 
-## 8. Full tool flag reference
+## 9. Full tool flag reference
 
 ### `check_policy_match.py`
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--config <path>` | required | Path to the Panorama running-config XML file |
-| `--device-group <name>` | required | Target device-group name (whose firewall would receive this traffic) |
+| `--device-group <name>` | optional | Target device-group name. Use when you know the DG. |
+| `--all-device-groups` | optional | Evaluate against every DG and report a per-DG verdict. **DEFAULT when neither flag is given.** Mutually exclusive with `--device-group`. |
 | `--src-ip <ip>` | required | Source IP |
 | `--dst-ip <ip>` | required | Destination IP |
 | `--src-zone <name>` | (any) | Source zone — omit for zone-agnostic match (caveat emitted) |
@@ -370,6 +463,9 @@ Pointing them at this runbook is a clean way to demonstrate the scope.
 | `--json` | off | Suppress human-readable output; emit structured JSON only |
 | `--output-dir <path>` | `$PANO_REPORTS_DIR` (or `./.pano_reports/`) | Override the report root. Each run lands at `<dir>/check_policy_match/<UTC_TS>/verdict.json` |
 | `--no-disk` | off | Suppress the on-disk verdict.json (stdout only) |
+| `--rule-filter <path>` | `tools/pan/rule_filter.txt` if present | File of rule-name substrings to exclude from evaluation |
+| `--skip-rule <KEYWORD>` | — | Inline filter keyword (repeatable). Combined with file-based filter |
+| `--no-filter` | off | Disable rule filtering even if `rule_filter.txt` exists |
 
 ### Exit codes (`check_policy_match.py`)
 
@@ -394,6 +490,9 @@ Pointing them at this runbook is a clean way to demonstrate the scope.
 | `--json` | off | Suppress human-readable output; emit structured JSON only |
 | `--output-dir <path>` | `$PANO_REPORTS_DIR` (or `./.pano_reports/`) | Override the report root. Each run lands at `<dir>/recommend_dg/<UTC_TS>/recommendation.{json,txt}` |
 | `--no-disk` | off | Suppress the on-disk recommendation files (stdout only) |
+| `--rule-filter <path>` | `tools/pan/rule_filter.txt` if present | File of rule-name substrings to exclude from evaluation |
+| `--skip-rule <KEYWORD>` | — | Inline filter keyword (repeatable) |
+| `--no-filter` | off | Disable rule filtering even if `rule_filter.txt` exists |
 
 ### Exit codes (`recommend_dg.py`)
 
@@ -403,7 +502,7 @@ Pointing them at this runbook is a clean way to demonstrate the scope.
 
 ---
 
-## 9. Caveats — what's NOT in this runbook
+## 10. Caveats — what's NOT in this runbook
 
 The following live in the [lab runbook](RUNBOOK_PAN_LAB.md) and must not bleed into production work:
 
