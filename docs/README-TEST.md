@@ -1,6 +1,6 @@
 # README-TEST — NSX Test Tooling
 
-Tools under [`tools/test/`](tools/test/) for **load testing** an NSX
+Tools under [`tools/test/`](../tools/test/) for **load testing** an NSX
 manager (Local or Global) with synthetic objects, then **wiping** them
 cleanly when done. These are not part of the production runbooks
 ([RUNBOOK_A.md](RUNBOOK_A.md) / [RUNBOOK_B.md](RUNBOOK_B.md) /
@@ -290,7 +290,7 @@ for ad-hoc import/export tree experiments.
 | `testing.md` | Older command-snippets file kept as a quick-reference card. |
 
 Many of these have been superseded by the production runbook tools in
-[`tools/nsx/`](tools/nsx/) but they're kept around for one-off scenarios
+[`tools/nsx/`](../tools/nsx/) but they're kept around for one-off scenarios
 the production tools don't address.
 
 ---

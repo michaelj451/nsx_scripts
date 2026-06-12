@@ -1,0 +1,204 @@
+<?xml version="1.0"?>
+<config version="10.2.0" urldb="paloaltonetworks" detail-version="10.2.0-1">
+  <shared>
+    <address>
+      <entry name="dc-web-net">
+        <ip-netmask>192.168.10.0/24</ip-netmask>
+        <description>data-center web tier</description>
+      </entry>
+      <entry name="dc-db-net">
+        <ip-netmask>192.168.20.0/24</ip-netmask>
+        <description>data-center DB tier</description>
+      </entry>
+      <entry name="branch-a-clients">
+        <ip-netmask>10.20.5.0/24</ip-netmask>
+      </entry>
+      <entry name="branch-b-clients">
+        <ip-netmask>10.21.5.0/24</ip-netmask>
+      </entry>
+      <entry name="quarantine-host">
+        <ip-netmask>10.20.5.99/32</ip-netmask>
+        <description>known-bad host on branch A</description>
+      </entry>
+      <entry name="external-dns-1">
+        <ip-netmask>8.8.8.8/32</ip-netmask>
+      </entry>
+    </address>
+    <address-group>
+      <entry name="dc-app-tiers">
+        <static>
+          <member>dc-web-net</member>
+          <member>dc-db-net</member>
+        </static>
+        <description>all DC application tiers</description>
+      </entry>
+      <entry name="all-branches">
+        <static>
+          <member>branch-a-clients</member>
+          <member>branch-b-clients</member>
+        </static>
+      </entry>
+      <entry name="prod-servers-dynamic">
+        <dynamic>
+          <filter>'prod' and 'web'</filter>
+        </dynamic>
+        <description>DAG — runtime tag match (offline-unresolvable)</description>
+      </entry>
+    </address-group>
+    <service>
+      <entry name="svc-https">
+        <protocol><tcp><port>443</port></tcp></protocol>
+      </entry>
+      <entry name="svc-mysql">
+        <protocol><tcp><port>3306</port></tcp></protocol>
+      </entry>
+      <entry name="svc-ssh">
+        <protocol><tcp><port>22</port></tcp></protocol>
+      </entry>
+      <entry name="svc-web-range">
+        <protocol><tcp><port>8000-8100</port></tcp></protocol>
+      </entry>
+    </service>
+    <service-group>
+      <entry name="svc-web-all">
+        <members>
+          <member>service-http</member>
+          <member>service-https</member>
+          <member>svc-web-range</member>
+        </members>
+      </entry>
+    </service-group>
+    <pre-rulebase>
+      <security>
+        <rules>
+          <entry name="shared-block-quarantine">
+            <from><member>any</member></from>
+            <to><member>any</member></to>
+            <source><member>quarantine-host</member></source>
+            <destination><member>any</member></destination>
+            <application><member>any</member></application>
+            <service><member>any</member></service>
+            <action>deny</action>
+            <log-end>yes</log-end>
+            <description>Top-priority — quarantined host can't reach anything</description>
+          </entry>
+        </rules>
+      </security>
+    </pre-rulebase>
+    <post-rulebase>
+      <security>
+        <rules>
+          <entry name="shared-deny-all-log">
+            <from><member>any</member></from>
+            <to><member>any</member></to>
+            <source><member>any</member></source>
+            <destination><member>any</member></destination>
+            <application><member>any</member></application>
+            <service><member>any</member></service>
+            <action>deny</action>
+            <log-end>yes</log-end>
+            <description>Catch-all explicit deny (logged) before defaults</description>
+          </entry>
+        </rules>
+      </security>
+    </post-rulebase>
+  </shared>
+  <devices>
+    <entry name="localhost.localdomain">
+      <device-group>
+        <entry name="Corporate-DG">
+          <pre-rulebase>
+            <security>
+              <rules>
+                <entry name="corp-block-external-dns">
+                  <from><member>any</member></from>
+                  <to><member>untrust</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>external-dns-1</member></destination>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <action>deny</action>
+                  <description>Corporate-wide: no direct external DNS</description>
+                </entry>
+              </rules>
+            </security>
+          </pre-rulebase>
+          <post-rulebase>
+            <security>
+              <rules>
+                <entry name="corp-allow-branch-to-dc-web">
+                  <from><member>trust</member></from>
+                  <to><member>dmz</member></to>
+                  <source><member>all-branches</member></source>
+                  <destination><member>dc-web-net</member></destination>
+                  <application><member>any</member></application>
+                  <service><member>svc-https</member></service>
+                  <action>allow</action>
+                  <log-end>yes</log-end>
+                </entry>
+              </rules>
+            </security>
+          </post-rulebase>
+        </entry>
+        <entry name="BranchA-DG">
+          <parent-dg>Corporate-DG</parent-dg>
+          <address>
+            <entry name="branch-a-printer">
+              <ip-netmask>10.20.5.250/32</ip-netmask>
+            </entry>
+          </address>
+          <pre-rulebase>
+            <security>
+              <rules>
+                <entry name="branchA-block-printer-to-internet">
+                  <from><member>trust</member></from>
+                  <to><member>untrust</member></to>
+                  <source><member>branch-a-printer</member></source>
+                  <destination><member>any</member></destination>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <action>deny</action>
+                </entry>
+                <entry name="branchA-allow-printer-management">
+                  <from><member>trust</member></from>
+                  <to><member>trust</member></to>
+                  <source><member>branch-a-clients</member></source>
+                  <destination><member>branch-a-printer</member></destination>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <action>allow</action>
+                </entry>
+              </rules>
+            </security>
+          </pre-rulebase>
+          <post-rulebase>
+            <security>
+              <rules>
+                <entry name="branchA-allow-clients-to-db">
+                  <from><member>trust</member></from>
+                  <to><member>dmz</member></to>
+                  <source><member>branch-a-clients</member></source>
+                  <destination><member>dc-db-net</member></destination>
+                  <application><member>any</member></application>
+                  <service><member>svc-mysql</member></service>
+                  <action>allow</action>
+                  <log-end>yes</log-end>
+                </entry>
+                <entry name="branchA-disabled-rule">
+                  <from><member>any</member></from>
+                  <to><member>any</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <action>allow</action>
+                  <disabled>yes</disabled>
+                </entry>
+              </rules>
+            </security>
+          </post-rulebase>
+        </entry>
+      </device-group>
+    </entry>
+  </devices>
+</config>

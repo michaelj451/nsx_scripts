@@ -24,13 +24,13 @@ dependency order, or just one phase.
 
 | Tool | Used in | Purpose |
 |---|---|---|
-| [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) | EXPORT | Orchestrator: raw policy dump + segment inventory + VM-IP snapshot + impact reports |
-| [tools/nsx/services.py](tools/nsx/services.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` services |
-| [tools/nsx/groups.py](tools/nsx/groups.py) | EXPORT, PUSH 1/2/3, REVERT | `export` / `push` / `revert` groups. Push accepts `--segments-mode {keep,strip,convert}` |
-| [tools/nsx/policies.py](tools/nsx/policies.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` security policies |
-| [tools/nsx/rules.py](tools/nsx/rules.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` rules (children of policies) |
-| [tools/nsx/segments.py](tools/nsx/segments.py) | EXPORT (optional PUSH) | `export` segments + segment↔group cross-reference. `push` is optional (only useful when target has matching transport zones). |
-| [tools/nsx/membership.py](tools/nsx/membership.py) | EXPORT | Auditing only: VM ↔ group correlation. Not consumed by any push step. |
+| [tools/nsx/capture_nsx_state.py](../tools/nsx/capture_nsx_state.py) | EXPORT | Orchestrator: raw policy dump + segment inventory + VM-IP snapshot + impact reports |
+| [tools/nsx/services.py](../tools/nsx/services.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` services |
+| [tools/nsx/groups.py](../tools/nsx/groups.py) | EXPORT, PUSH 1/2/3, REVERT | `export` / `push` / `revert` groups. Push accepts `--segments-mode {keep,strip,convert}` |
+| [tools/nsx/policies.py](../tools/nsx/policies.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` security policies |
+| [tools/nsx/rules.py](../tools/nsx/rules.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` rules (children of policies) |
+| [tools/nsx/segments.py](../tools/nsx/segments.py) | EXPORT (optional PUSH) | `export` segments + segment↔group cross-reference. `push` is optional (only useful when target has matching transport zones). |
+| [tools/nsx/membership.py](../tools/nsx/membership.py) | EXPORT | Auditing only: VM ↔ group correlation. Not consumed by any push step. |
 
 > `--source` / `--target` are aliases resolved from `.env` (e.g. `NSX_LM1=nsx-lm1.lab.local`). Examples below use `nsx-lm1` → `nsx-lm2`.
 

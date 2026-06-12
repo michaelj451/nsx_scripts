@@ -41,8 +41,8 @@ Properties:
 
 | Tool | Used in | Purpose |
 |---|---|---|
-| [tools/nsx/capture_nsx_state.py](tools/nsx/capture_nsx_state.py) | CAPTURE | Orchestrator: produces `groups_additive/` (the Workflow B push input) |
-| [tools/nsx/groups.py](tools/nsx/groups.py) | PUSH, REVERT | `push` with `--csv-remap`. `revert` pops the captured baseline. |
+| [tools/nsx/capture_nsx_state.py](../tools/nsx/capture_nsx_state.py) | CAPTURE | Orchestrator: produces `groups_additive/` (the Workflow B push input) |
+| [tools/nsx/groups.py](../tools/nsx/groups.py) | PUSH, REVERT | `push` with `--csv-remap`. `revert` pops the captured baseline. |
 
 That's it. Workflow B is groups-only by design.
 
