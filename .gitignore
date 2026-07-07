@@ -38,6 +38,10 @@ nsx_pure_ip_remap*/
 # VM Tag Logs
 nsx_vm_files/
 
+# Multi-manager security-object pulls (per-host groups/services/policies/rules JSON dumps)
+multi_manager_pull/
+nsx_filtered_bundle/
+
 # Palo Alto / Panorama tool report root (hidden, separate from NSX log dir).
 # The .gitkeep is preserved so the dir exists on fresh clones.
 .pano_reports/*

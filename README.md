@@ -50,6 +50,7 @@ push, revert, report — is replayed against each vendor's API or config format.
 | **D — Production in-place remap to siblings** — additive prod amendment with Phase-2 forced strip option | `nsx-lm1` → `nsx-lm1` | groups + rules + optional Phase-2 strip | [docs/RUNBOOK_D.md](docs/RUNBOOK_D.md) |
 | **VM hostname tagging** — give every regular VM an NSX tag matching its trailing digits | `nsx-lm1` → `nsx-lm1` | VM tags only (append, never replace) | [docs/RUNBOOK_VM_TAGS.md](docs/RUNBOOK_VM_TAGS.md) |
 | **Capture-first variant of A+D** — single-capture clone + WF-D in one flow (lab validation pattern) | `nsx-lm1` → any non-prod | full | [docs/RUNBOOK_FROM_CAPTURE.md](docs/RUNBOOK_FROM_CAPTURE.md) |
+| **Filter-copy** - clone only policies of chosen categories, plus their transitive deps (groups, services, nested groups) | `nsx-lm1` -> any target | filtered subset of services + groups + policies + rules | [docs/RUNBOOK_FILTER_COPY.md](docs/RUNBOOK_FILTER_COPY.md) |
 
 Each runbook has a `_PS.md` PowerShell variant where applicable.
 
