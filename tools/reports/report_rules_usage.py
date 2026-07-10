@@ -192,6 +192,180 @@ def _flatten_policy_stats(stats_doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]
 # Classification
 # =============================================================================
 
+def _write_markdown_report(reports_dir: Path,
+                           summary: Dict[str, Any],
+                           rules_records: List[Dict[str, Any]],
+                           by_class: Dict[str, List[Dict[str, Any]]],
+                           hot_rules: List[Dict[str, Any]],
+                           unused_rules: List[Dict[str, Any]],
+                           dormant_rules: List[Dict[str, Any]],
+                           stale_rules: List[Dict[str, Any]],
+                           diff_records: Optional[List[Dict[str, Any]]],
+                           args: argparse.Namespace,
+                           snapshot_count: int) -> None:
+    """Emit a human-readable Markdown summary of the report.
+
+    Produces report.md alongside the existing JSON/JSONL files. The
+    contents mirror what we would print in a terminal summary but as
+    a portable, shareable document.
+    """
+    counters = summary["counters"]
+    target = summary["target"]
+    ran_at = summary["ran_at"]
+    lines: List[str] = []
+
+    def _add(s: str = "") -> None:
+        lines.append(s)
+
+    _add(f"# Rules Usage Report")
+    _add()
+    _add(f"- **Target**: {target}")
+    _add(f"- **Domain(s) queried**: {', '.join(summary.get('domains_queried') or ['default'])}")
+    _add(f"- **Ran at**: {ran_at}")
+    _add(f"- **Include defaults**: {summary.get('include_defaults')}")
+    _add(f"- **Hot threshold**: `hit_count >= {counters.get('HOT') and args.hot_threshold or args.hot_threshold}`")
+    _add(f"- **Fresh-days**: {args.fresh_days} (UNUSED vs DORMANT split)")
+    _add(f"- **Stale-days**: {args.stale_days} (USED vs STALE split)")
+    _add(f"- **History snapshots scanned**: {snapshot_count}")
+    if summary.get("compare_to"):
+        _add(f"- **Compared to**: `{summary['compare_to']}`")
+    _add()
+
+    # ---- Headline counters ----
+    _add("## Summary")
+    _add()
+    _add("| Metric | Value |")
+    _add("|---|---:|")
+    _add(f"| Customer policies | {counters.get('customer_policies', 0):,} |")
+    _add(f"| Customer rules | {counters.get('customer_rules', 0):,} |")
+    _add(f"| HOT (>= {args.hot_threshold} hits) | {counters.get('HOT', 0)} |")
+    _add(f"| USED (1..{args.hot_threshold - 1} hits, recent) | {counters.get('USED', 0)} |")
+    _add(f"| STALE (had hits, none in {args.stale_days}d) | {counters.get('STALE', 0)} |")
+    _add(f"| UNUSED (0 hits, <= {args.fresh_days}d old) | {counters.get('UNUSED', 0)} |")
+    _add(f"| DORMANT (0 hits, > {args.fresh_days}d old) | {counters.get('DORMANT', 0)} |")
+    _add(f"| **Total hit_count** | **{counters.get('total_hit_count', 0):,}** |")
+    _add(f"| Total byte_count | {counters.get('total_byte_count', 0):,} |")
+    _add(f"| Total packet_count | {counters.get('total_packet_count', 0):,} |")
+    if counters.get("rules_filtered_by_min_days_since_hit") is not None:
+        _add(f"| Rules with no hits in >= {args.min_days_since_hit}d | {counters['rules_filtered_by_min_days_since_hit']} |")
+    _add()
+
+    # ---- Per-rule table sorted by hit_count DESC ----
+    _add(f"## Per-rule breakdown (sorted by hit_count DESC)")
+    _add()
+    _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age |")
+    _add("|---|---|---|---|---|---:|---:|---:|---:|---:|")
+    sorted_rules = sorted(rules_records, key=lambda r: -int(r.get("hit_count") or 0))
+    for r in sorted_rules:
+        age = r.get("rule_age_days")
+        age_s = f"{age}d" if age is not None else "-"
+        # Truncate very long identifiers for readability. Full detail is in the JSON.
+        pol   = str(r.get("policy_id") or "")[:32]
+        rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
+        _add(f"| {r.get('classification','')} "
+             f"| {r.get('domain_id','') or 'default'} "
+             f"| `{pol}` "
+             f"| `{rule}` "
+             f"| {r.get('action','')} "
+             f"| {int(r.get('hit_count') or 0):,} "
+             f"| {int(r.get('byte_count') or 0):,} "
+             f"| {int(r.get('packet_count') or 0):,} "
+             f"| {int(r.get('session_count') or 0):,} "
+             f"| {age_s} |")
+    _add()
+
+    # ---- Top-N hot rules highlight ----
+    if hot_rules:
+        _add(f"## Top {args.top_n} rules by hit_count")
+        _add()
+        _add("| Rank | Policy | Rule | Hits | Bytes |")
+        _add("|---:|---|---|---:|---:|")
+        for i, r in enumerate(hot_rules, start=1):
+            _add(f"| {i} "
+                 f"| `{r.get('policy_id','')}` "
+                 f"| `{r.get('rule_display','')}` "
+                 f"| {int(r.get('hit_count') or 0):,} "
+                 f"| {int(r.get('byte_count') or 0):,} |")
+        _add()
+
+    # ---- DORMANT rules callout ----
+    if dormant_rules:
+        _add(f"## DORMANT rules ({len(dormant_rules)}) - candidates for cleanup review")
+        _add()
+        _add(f"Rules with `hit_count == 0` older than {args.fresh_days} days.")
+        _add()
+        _add("| Domain | Policy | Rule | Action | Age |")
+        _add("|---|---|---|---|---:|")
+        for r in dormant_rules:
+            age = r.get("rule_age_days")
+            age_s = f"{age}d" if age is not None else "-"
+            _add(f"| {r.get('domain_id','') or 'default'} "
+                 f"| `{r.get('policy_id','')}` "
+                 f"| `{r.get('rule_display','')}` "
+                 f"| {r.get('action','')} "
+                 f"| {age_s} |")
+        _add()
+
+    # ---- Optional diff table ----
+    if diff_records is not None:
+        interesting = [d for d in diff_records if d["transition"] != "unchanged"]
+        _add(f"## Diff vs prior snapshot")
+        _add()
+        _add(f"- Compared with: `{summary.get('compare_to')}`")
+        _add(f"- Total rules compared: {len(diff_records)}")
+        _add(f"- Transitions: {len(interesting)} (unchanged rules omitted)")
+        _add()
+        if interesting:
+            _add("| Domain | Policy | Rule | Transition | Prior | Current | Delta |")
+            _add("|---|---|---|---|---:|---:|---:|")
+            for d in interesting:
+                _add(f"| {d.get('domain_id','') or 'default'} "
+                     f"| `{d.get('policy_id','')}` "
+                     f"| `{d.get('rule_id','')}` "
+                     f"| {d.get('transition','')} "
+                     f"| {d.get('hit_count_prior') if d.get('hit_count_prior') is not None else '-'} "
+                     f"| {d.get('hit_count_current') if d.get('hit_count_current') is not None else '-'} "
+                     f"| {d.get('hit_count_delta') if d.get('hit_count_delta') is not None else '-'} |")
+            _add()
+
+    # ---- Per-domain breakdown (only when --all-domains was set) ----
+    if summary.get("all_domains_mode") and summary.get("per_domain"):
+        _add("## Per-domain breakdown")
+        _add()
+        _add("| Domain | Rules | HOT | USED | STALE | UNUSED | DORMANT | Total hits | Total bytes |")
+        _add("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for dname, stats in summary["per_domain"].items():
+            _add(f"| `{dname}` "
+                 f"| {stats.get('rules', 0)} "
+                 f"| {stats.get('HOT', 0)} "
+                 f"| {stats.get('USED', 0)} "
+                 f"| {stats.get('STALE', 0)} "
+                 f"| {stats.get('UNUSED', 0)} "
+                 f"| {stats.get('DORMANT', 0)} "
+                 f"| {int(stats.get('total_hit_count', 0)):,} "
+                 f"| {int(stats.get('total_byte_count', 0)):,} |")
+        _add()
+
+    # ---- Bundle sibling references ----
+    _add("## Files in this bundle")
+    _add()
+    _add("| File | Contents |")
+    _add("|---|---|")
+    _add("| `summary.json` | Headline counters + per-domain breakdown |")
+    _add("| `rules_usage.json` / `.jsonl` | Full per-rule detail |")
+    _add("| `hot_rules.json` / `.jsonl` | Top-N rules by hit_count |")
+    _add("| `unused_rules.json` / `.jsonl` | hit_count == 0 (UNUSED + DORMANT) |")
+    _add("| `dormant_rules.json` / `.jsonl` | Never-hit rules older than fresh-days |")
+    _add("| `stale_rules.json` / `.jsonl` | Had hits, none in stale-days |")
+    if diff_records is not None:
+        _add("| `diff.json` | Per-rule delta vs prior snapshot (this run) |")
+    if counters.get("rules_filtered_by_min_days_since_hit") is not None:
+        _add("| `no_hits_in_n_days.json` / `.jsonl` | Combined STALE + DORMANT view |")
+    _add()
+
+    (reports_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 def _classify(rec: Dict[str, Any], hot_threshold: int, fresh_days: int,
               stale_days: int) -> str:
     """Five-bucket classification:
@@ -663,6 +837,23 @@ def main() -> int:
     _write_filter("stale_rules",   stale_rules,
                   {"stale_days": args.stale_days,
                    "history_snapshot_count": snapshot_count})
+
+    # ------------------------------------------------------------------
+    # Human-readable Markdown summary report
+    # ------------------------------------------------------------------
+    _write_markdown_report(
+        reports_dir=reports_dir,
+        summary=summary,
+        rules_records=rules_records,
+        by_class=by_class,
+        hot_rules=hot_rules,
+        unused_rules=unused_rules,
+        dormant_rules=dormant_rules,
+        stale_rules=stale_rules,
+        diff_records=diff_records,
+        args=args,
+        snapshot_count=snapshot_count,
+    )
 
     if min_days_filter is not None:
         _write_filter("no_hits_in_n_days", min_days_filter, {
