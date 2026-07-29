@@ -81,6 +81,60 @@ def resolve_plan_dir(plan_dir: Path) -> Path:
 TAG_UPDATE_INTERVAL_SECONDS = 0.5
 
 
+class _InteractiveExit(Exception):
+    """Signals operator chose to exit the interactive batch loop cleanly."""
+
+
+def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
+    """Prompt after a batch of applied VM tag updates. Returns the batch size
+    to use for the next batch.
+
+    Allowed responses:
+      y / yes / <Enter>  -> continue at current batch size
+      n / no             -> continue but RESET batch size to 1 (be conservative)
+      <positive number>  -> continue at that new batch size
+      x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
+    """
+    while True:
+        try:
+            answer = input(
+                f"\nApplied {applied_count} VM tag update(s). "
+                f"Continue with current batch_size={current_batch_size}? "
+                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
+            ).strip().lower()
+        except EOFError:
+            log.warning("Non-interactive stdin at batch boundary; auto-approving "
+                        "(batch_size=%d).", current_batch_size)
+            return current_batch_size
+
+        if answer in ("", "y", "yes"):
+            log.info("Operator approved batch (continue at batch_size=%d) "
+                     "after %d applied update(s).",
+                     current_batch_size, applied_count)
+            return current_batch_size
+
+        if answer in ("n", "no"):
+            log.warning("Operator chose RESET-TO-1 after %d applied update(s) "
+                        "(was batch_size=%d).", applied_count, current_batch_size)
+            return 1
+
+        if answer in ("x", "exit", "quit", "q"):
+            log.warning("Operator chose EXIT after %d applied update(s).",
+                        applied_count)
+            raise _InteractiveExit(f"Stopped by operator after {applied_count} update(s).")
+
+        try:
+            new_value = int(answer)
+            if new_value <= 0:
+                print("Please enter a positive integer (e.g. 1, 5, 25).")
+                continue
+            log.info("Operator changed batch_size from %d to %d after %d applied update(s).",
+                     current_batch_size, new_value, applied_count)
+            return new_value
+        except ValueError:
+            print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
+
+
 def setup_logging(tool: str) -> Path:
     log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -156,6 +210,15 @@ def main() -> None:
         action="store_true",
         help="Actually write to NSX. Default is dry-run.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Interactive batching: pause every N applied updates and prompt "
+             "to continue (y/Enter), reset-to-1 (n), exit (x), or change to a "
+             "new size (<number>). Default: 0 (fully automated, no prompts). "
+             "Set to 1 to step through every VM tag update.",
+    )
     args = parser.parse_args()
 
     init_cli()
@@ -204,6 +267,17 @@ def main() -> None:
     }
     dry_run = not args.apply
     last_ts = 0.0
+
+    # Interactive batch state (only active with --apply and --batch-size > 0)
+    resolved_batch_size = int(args.batch_size) if args.batch_size is not None else 0
+    interactive_mode = args.apply and resolved_batch_size > 0
+    batch_size = resolved_batch_size
+    applied_in_batch = 0
+    batch_summary: List[Dict[str, Any]] = []
+    interactive_exit_requested = False
+    if interactive_mode:
+        log.info("INTERACTIVE MODE - batch_size=%d. Will prompt after every "
+                 "%d applied update(s).", batch_size, batch_size)
 
     for plan_entry in eligible:
         ext_id = plan_entry["external_id"]
@@ -311,6 +385,33 @@ def main() -> None:
             manifest_entries.append(manifest_entry)
             last_ts = time.monotonic()
 
+        # ---- Interactive batch boundary ----
+        # Only after real applies (not skips / errors / missing / noop).
+        if interactive_mode and manifest_entry.get("status") == "success":
+            applied_in_batch += 1
+            batch_summary.append(manifest_entry)
+            if applied_in_batch >= batch_size:
+                log.info("=" * 60)
+                log.info("BATCH REVIEW - %d update(s) just applied:", applied_in_batch)
+                for j, br in enumerate(batch_summary, start=1):
+                    log.info("  [%d] %-45s hostname=%s (tags %d -> %d)",
+                             j, str(br.get("display_name"))[:45],
+                             br.get("added_tag"),
+                             br.get("tag_count_before"),
+                             br.get("tag_count_after"))
+                log.info("=" * 60)
+                try:
+                    batch_size = _prompt_batch_continue(applied_in_batch, batch_size)
+                except _InteractiveExit:
+                    interactive_exit_requested = True
+                    break
+                applied_in_batch = 0
+                batch_summary = []
+
+    if interactive_exit_requested:
+        log.warning("Interactive exit requested. Processed %d of %d eligible VM(s).",
+                    len(results["applied"]), len(eligible))
+
     # Write manifest
     manifests_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_manifests" / manager_host
     manifests_dir.mkdir(parents=True, exist_ok=True)
@@ -331,6 +432,10 @@ def main() -> None:
             "errors": len(results["errors"]),
         },
         "max_tags_cap": max_tags_cap,
+        "interactive_mode": interactive_mode,
+        "batch_size_initial": resolved_batch_size,
+        "batch_size_final": batch_size,
+        "interactive_exit_requested": interactive_exit_requested,
         "results": results,
         "manifest_entries": manifest_entries,
     }
