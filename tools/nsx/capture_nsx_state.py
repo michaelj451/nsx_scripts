@@ -96,8 +96,17 @@ def setup_logging(bundle_logs_dir: Path) -> Path:
     return bundle_log_file
 
 
-def run_step(label: str, cmd: List[str], cwd: Path, step_log_dir: Path) -> Dict[str, Any]:
-    """Run a subprocess step. Streams stdout/stderr to a per-step log file. Returns a structured record."""
+def run_step(label: str, cmd: List[str], cwd: Path, step_log_dir: Path,
+             verbose: bool = True) -> Dict[str, Any]:
+    """Run a subprocess step. Streams stdout/stderr to a per-step log file. Returns a structured record.
+
+    When verbose=True (default), the sub-script's output is also streamed
+    live to the terminal so the operator can see per-object detail
+    (each policy/group/service/rule being exported, etc.) as it happens.
+    Every line is prefixed with the step label for easy scanning.
+    When verbose=False, output is captured silently and only the step
+    label + OK/FAILED status appears on the terminal (original behavior).
+    """
     safe_label = label.replace(" ", "_").replace(":", "").replace("/", "_")
     step_log_file = step_log_dir / f"{safe_label}.log"
 
@@ -109,42 +118,72 @@ def run_step(label: str, cmd: List[str], cwd: Path, step_log_dir: Path) -> Dict[
     env.setdefault("PYTHONPATH", str(cwd / "app"))
 
     started_at = datetime.now(timezone.utc).isoformat()
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+
+    if verbose:
+        # Tee-style: read the sub-script's combined stdout+stderr line by
+        # line, echo to the terminal with a prefix, and collect the full
+        # output for the step log file.
+        prefix = f"  [{label}] "
+        collected: List[str] = []
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr into stdout for ordered streaming
+            text=True,
+            bufsize=1,                  # line-buffered
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line_no_nl = line.rstrip("\n")
+            sys.stdout.write(prefix + line_no_nl + "\n")
+            sys.stdout.flush()
+            collected.append(line)
+        proc.wait()
+        stdout_captured = "".join(collected)
+        stderr_captured = ""            # stderr was merged into stdout above
+        returncode = proc.returncode
+    else:
+        proc = subprocess.run(
+            cmd, cwd=str(cwd), env=env, capture_output=True, text=True,
+        )
+        stdout_captured = proc.stdout
+        stderr_captured = proc.stderr
+        returncode = proc.returncode
+
     finished_at = datetime.now(timezone.utc).isoformat()
 
     step_log_file.write_text(
         f"# step: {label}\n# started_at: {started_at}\n# finished_at: {finished_at}\n"
-        f"# returncode: {proc.returncode}\n# cmd: {' '.join(cmd)}\n\n"
-        f"===== STDOUT =====\n{proc.stdout}\n\n===== STDERR =====\n{proc.stderr}\n",
+        f"# returncode: {returncode}\n# cmd: {' '.join(cmd)}\n\n"
+        f"===== STDOUT =====\n{stdout_captured}\n\n===== STDERR =====\n{stderr_captured}\n",
         encoding="utf-8",
     )
 
-    if proc.returncode != 0:
+    if returncode != 0:
         log.error(
-            "STEP FAILED: %s (exit=%d) — see %s for full output",
-            label, proc.returncode, step_log_file,
+            "STEP FAILED: %s (exit=%d) - see %s for full output",
+            label, returncode, step_log_file,
         )
-        for line in proc.stderr.splitlines()[-10:]:
-            log.error("  | %s", line)
+        # When we streamed live output, the operator already saw the errors;
+        # avoid re-echoing the tail redundantly.
+        if not verbose:
+            for line in stderr_captured.splitlines()[-10:]:
+                log.error("  | %s", line)
     else:
         log.info("  OK")
 
     return {
         "label": label,
         "cmd": cmd,
-        "ok": proc.returncode == 0,
-        "returncode": proc.returncode,
+        "ok": returncode == 0,
+        "returncode": returncode,
         "started_at": started_at,
         "finished_at": finished_at,
         "step_log": str(step_log_file),
-        "stdout_tail": "\n".join(proc.stdout.splitlines()[-20:]),
-        "stderr_tail": "\n".join(proc.stderr.splitlines()[-20:]) if proc.returncode != 0 else "",
+        "stdout_tail": "\n".join(stdout_captured.splitlines()[-20:]),
+        "stderr_tail": "\n".join(stderr_captured.splitlines()[-20:]) if returncode != 0 else "",
     }
 
 
@@ -171,7 +210,11 @@ def write_summary(summary_path: Path, manifest: Dict[str, Any]) -> None:
         status = "OK    " if s["ok"] else "FAILED"
         lines.append(f"  [{status}] {s['label']}")
         if not s["ok"]:
-            lines.append(f"            see {s['step_log']}")
+            log_path = s.get("step_log") or "(no log path recorded)"
+            err = s.get("error")
+            lines.append(f"            see {log_path}")
+            if err:
+                lines.append(f"            error: {err}")
     lines.append("")
     if manifest["paths"].get("source_export_dir"):
         lines.append("Artifacts")
@@ -231,6 +274,10 @@ def main() -> int:
     p.add_argument("--no-flat-exports", action="store_false", dest="emit_flat_exports",
                    help="Skip the flat-exports copy (sub-step 7). Capture bundle "
                         "still contains all the data internally.")
+    p.add_argument("--quiet", action="store_true",
+                   help="Suppress live per-object output on the terminal. "
+                        "Step logs still capture the full output for later review. "
+                        "Default is verbose (each object being copied is echoed live).")
     args = p.parse_args()
 
     init_cli()
@@ -288,7 +335,7 @@ def main() -> int:
     ]
     if args.federation_global:
         cmd.append("--federation-global")
-    steps.append(run_step("1_export_nsx_objects", cmd, REPO_ROOT, logs_dir))
+    steps.append(run_step("1_export_nsx_objects", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     source_export_dir = export_root / source_host
     source_groups_dir = source_export_dir / "domains" / args.domain_id / "groups"
@@ -308,7 +355,7 @@ def main() -> int:
         "--copy-first",
         "--continue-on-group-error",
     ]
-    steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir))
+    steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     # 3. Segment inventory WITH live details so transform can run offline. MANDATORY:
     # the segment-convert mode needs the cached segment_details.json from this step.
@@ -320,7 +367,7 @@ def main() -> int:
     ]
     if args.federation_global:
         cmd.append("--federation-global")
-    steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir))
+    steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     # 4. Affected-rules impact report (offline, reads from local export + additive)
     if args.with_impact_report:
@@ -333,7 +380,7 @@ def main() -> int:
         ]
         if args.federation_global:
             cmd.append("--federation-global")
-        steps.append(run_step("4_find_rules_affected_by_group_changes", cmd, REPO_ROOT, logs_dir))
+        steps.append(run_step("4_find_rules_affected_by_group_changes", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     # 5. VM tag capture (LM only, GET-only)
     if args.with_vm_tags and not args.federation_global:
@@ -342,7 +389,7 @@ def main() -> int:
             "--manager", args.source,
             "--base-dir", str(vm_tags_export_root),
         ]
-        steps.append(run_step("5_export_vm_tags", cmd, REPO_ROOT, logs_dir))
+        steps.append(run_step("5_export_vm_tags", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
     elif args.with_vm_tags and args.federation_global:
         log.info("STEP 5 skipped — VM tag fabric API is LM-only (--federation-global is GM)")
 
@@ -358,7 +405,7 @@ def main() -> int:
         ]
         if args.ip_report_csv:
             cmd.extend(["--csv", args.ip_report_csv])
-        steps.append(run_step("6_report_groups_with_ips", cmd, REPO_ROOT, logs_dir))
+        steps.append(run_step("6_report_groups_with_ips", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     # 7. Flat-export emit — copy captured groups/services/policies/rules to the
     #    standalone-export paths so RUNBOOK_A / RUNBOOK_D commands can run

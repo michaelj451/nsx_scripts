@@ -41,6 +41,8 @@ nsx_vm_files/
 # Multi-manager security-object pulls (per-host groups/services/policies/rules JSON dumps)
 multi_manager_pull/
 nsx_filtered_bundle/
+nsx_wipe_bundle/
+nsx_fabric_capture/
 
 # Palo Alto / Panorama tool report root (hidden, separate from NSX log dir).
 # The .gitkeep is preserved so the dir exists on fresh clones.
