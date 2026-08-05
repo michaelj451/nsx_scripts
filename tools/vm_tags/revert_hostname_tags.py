@@ -52,6 +52,60 @@ RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 TAG_UPDATE_INTERVAL_SECONDS = 0.5
 
 
+class _InteractiveExit(Exception):
+    """Signals operator chose to exit the interactive batch loop cleanly."""
+
+
+def _prompt_batch_continue(reverted_count: int, current_batch_size: int) -> int:
+    """Prompt after a batch of applied VM tag reverts. Returns the batch size
+    to use for the next batch.
+
+    Allowed responses:
+      y / yes / <Enter>  -> continue at current batch size
+      n / no             -> continue but RESET batch size to 1 (be conservative)
+      <positive number>  -> continue at that new batch size
+      x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
+    """
+    while True:
+        try:
+            answer = input(
+                f"\nReverted {reverted_count} VM tag(s). "
+                f"Continue with current batch_size={current_batch_size}? "
+                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
+            ).strip().lower()
+        except EOFError:
+            log.warning("Non-interactive stdin at batch boundary; auto-approving "
+                        "(batch_size=%d).", current_batch_size)
+            return current_batch_size
+
+        if answer in ("", "y", "yes"):
+            log.info("Operator approved batch (continue at batch_size=%d) "
+                     "after %d reverted tag(s).",
+                     current_batch_size, reverted_count)
+            return current_batch_size
+
+        if answer in ("n", "no"):
+            log.warning("Operator chose RESET-TO-1 after %d reverted tag(s) "
+                        "(was batch_size=%d).", reverted_count, current_batch_size)
+            return 1
+
+        if answer in ("x", "exit", "quit", "q"):
+            log.warning("Operator chose EXIT after %d reverted tag(s).",
+                        reverted_count)
+            raise _InteractiveExit(f"Stopped by operator after {reverted_count} revert(s).")
+
+        try:
+            new_value = int(answer)
+            if new_value <= 0:
+                print("Please enter a positive integer (e.g. 1, 5, 25).")
+                continue
+            log.info("Operator changed batch_size from %d to %d after %d reverted tag(s).",
+                     current_batch_size, new_value, reverted_count)
+            return new_value
+        except ValueError:
+            print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
+
+
 def setup_logging(tool: str) -> Path:
     log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +141,16 @@ def main() -> None:
     )
     parser.add_argument("--manifest", required=True, help="Path to a manifest JSON from push_hostname_tags.py")
     parser.add_argument("--apply", action="store_true", help="Actually write. Default is dry-run.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Interactive batching: pause every N reverted tags and prompt "
+             "to continue (y/Enter), reset-to-1 (n), exit (x), or change to a "
+             "new size (<number>). Default when --apply is set: 1 "
+             "(step-through, safest). Default when dry-run: 0 (no prompts). "
+             "Pass --batch-size 0 to disable prompts entirely under --apply.",
+    )
     args = parser.parse_args()
 
     init_cli()
@@ -122,6 +186,27 @@ def main() -> None:
     }
     dry_run = not args.apply
     last_ts = 0.0
+
+    # Interactive batch state (mirrors push_hostname_tags.py).
+    # Defaults:
+    #   --apply set AND --batch-size not specified -> resolved = 1 (step-through)
+    #   dry-run  AND --batch-size not specified    -> resolved = 0 (no prompts)
+    #   --batch-size N explicitly passed           -> resolved = N
+    if args.batch_size is None:
+        resolved_batch_size = 1 if args.apply else 0
+        if resolved_batch_size == 1:
+            log.info("Auto-defaulting --batch-size to 1 (step-through is safer for --apply). "
+                     "Pass --batch-size 0 to disable prompts, or --batch-size N to start at N.")
+    else:
+        resolved_batch_size = int(args.batch_size)
+    interactive_mode = args.apply and resolved_batch_size > 0
+    batch_size = resolved_batch_size
+    reverted_in_batch = 0
+    batch_summary: List[Dict[str, Any]] = []
+    interactive_exit_requested = False
+    if interactive_mode:
+        log.info("INTERACTIVE MODE - batch_size=%d. Will prompt after every "
+                 "%d reverted tag(s).", batch_size, batch_size)
 
     for entry in entries:
         ext_id = entry["external_id"]
@@ -206,6 +291,33 @@ def main() -> None:
             results["errors"].append(row)
             last_ts = time.monotonic()
 
+        # ---- Interactive batch boundary ----
+        # Only after real successful reverts (not skips / errors / missing / noop).
+        if interactive_mode and row.get("status") == "success":
+            reverted_in_batch += 1
+            batch_summary.append(row)
+            if reverted_in_batch >= batch_size:
+                log.info("=" * 60)
+                log.info("BATCH REVIEW - %d tag(s) just reverted:", reverted_in_batch)
+                for j, br in enumerate(batch_summary, start=1):
+                    log.info("  [%d] %-45s REMOVED hostname=%s (tags %d -> %d)",
+                             j, str(br.get("display_name"))[:45],
+                             br.get("removed_tag"),
+                             br.get("tag_count_before"),
+                             br.get("tag_count_after"))
+                log.info("=" * 60)
+                try:
+                    batch_size = _prompt_batch_continue(reverted_in_batch, batch_size)
+                except _InteractiveExit:
+                    interactive_exit_requested = True
+                    break
+                reverted_in_batch = 0
+                batch_summary = []
+
+    if interactive_exit_requested:
+        log.warning("Interactive exit requested. Reverted %d of %d entries.",
+                    len(results["reverted"]), len(entries))
+
     # Write revert manifest for audit
     out_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_manifests" / manager_host
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -218,6 +330,10 @@ def main() -> None:
         "dry_run": dry_run,
         "source_manifest": str(manifest_path),
         "counts": {k: len(v) for k, v in results.items()},
+        "interactive_mode": interactive_mode,
+        "batch_size_initial": resolved_batch_size,
+        "batch_size_final": batch_size,
+        "interactive_exit_requested": interactive_exit_requested,
         "results": results,
     }
     out_path.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")

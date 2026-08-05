@@ -216,8 +216,9 @@ def main() -> None:
         default=None,
         help="Interactive batching: pause every N applied updates and prompt "
              "to continue (y/Enter), reset-to-1 (n), exit (x), or change to a "
-             "new size (<number>). Default: 0 (fully automated, no prompts). "
-             "Set to 1 to step through every VM tag update.",
+             "new size (<number>). Default when --apply is set: 1 "
+             "(step-through, safest). Default when dry-run: 0 (no prompts). "
+             "Pass --batch-size 0 to disable prompts entirely under --apply.",
     )
     args = parser.parse_args()
 
@@ -268,8 +269,18 @@ def main() -> None:
     dry_run = not args.apply
     last_ts = 0.0
 
-    # Interactive batch state (only active with --apply and --batch-size > 0)
-    resolved_batch_size = int(args.batch_size) if args.batch_size is not None else 0
+    # Interactive batch state.
+    # Defaults (mirrors groups.py pattern):
+    #   --apply set AND --batch-size not specified -> resolved = 1 (step-through)
+    #   dry-run  AND --batch-size not specified    -> resolved = 0 (no prompts)
+    #   --batch-size N explicitly passed           -> resolved = N
+    if args.batch_size is None:
+        resolved_batch_size = 1 if args.apply else 0
+        if resolved_batch_size == 1:
+            log.info("Auto-defaulting --batch-size to 1 (step-through is safer for --apply). "
+                     "Pass --batch-size 0 to disable prompts, or --batch-size N to start at N.")
+    else:
+        resolved_batch_size = int(args.batch_size)
     interactive_mode = args.apply and resolved_batch_size > 0
     batch_size = resolved_batch_size
     applied_in_batch = 0

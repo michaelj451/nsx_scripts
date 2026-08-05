@@ -101,7 +101,7 @@ python tools/vm_tags/push_hostname_tags.py `
 Actually writes the hostname tag to each eligible VM. Existing tags
 are always preserved (additive-only).
 
-**Fully-automated mode (default pacing, no prompts):**
+**Default behavior (interactive step-through, safest):**
 
 ```powershell
 python tools/vm_tags/push_hostname_tags.py `
@@ -110,14 +110,13 @@ python tools/vm_tags/push_hostname_tags.py `
   --apply
 ```
 
-**Interactive batching (recommended for large fleets):**
+When `--apply` is set and `--batch-size` is not specified, the tool
+auto-defaults to `--batch-size 1` and prompts after every apply. You
+log-line confirmation:
 
-```powershell
-# Step through the first VM, then prompt
-python tools/vm_tags/push_hostname_tags.py `
-  --manager nsx-lm1 `
-  --plan-dir $plan `
-  --apply --batch-size 1
+```
+Auto-defaulting --batch-size to 1 (step-through is safer for --apply).
+Pass --batch-size 0 to disable prompts, or --batch-size N to start at N.
 ```
 
 At each prompt the operator can:
@@ -128,6 +127,24 @@ At each prompt the operator can:
 | `n` / `no` | Continue but reset batch size to 1 (paranoid mode) |
 | `<positive number>` | Change batch size mid-run (e.g., `5` or `25` to ramp up) |
 | `x` / `exit` / `quit` | Stop cleanly, write manifest of what was applied |
+
+**Start at a higher batch size:**
+
+```powershell
+python tools/vm_tags/push_hostname_tags.py `
+  --manager nsx-lm1 `
+  --plan-dir $plan `
+  --apply --batch-size 5
+```
+
+**Fully-automated mode (no prompts, for CI or trusted bulk runs):**
+
+```powershell
+python tools/vm_tags/push_hostname_tags.py `
+  --manager nsx-lm1 `
+  --plan-dir $plan `
+  --apply --batch-size 0
+```
 
 Non-interactive stdin (piped input, cron) auto-approves each boundary
 and logs a warning. Batch size only counts successful applies. Skips
@@ -170,6 +187,8 @@ python tools/vm_tags/revert_hostname_tags.py `
 
 ## Step 7: Revert - apply
 
+**Default behavior (interactive step-through, safest):**
+
 ```powershell
 python tools/vm_tags/revert_hostname_tags.py `
   --manager nsx-lm1 `
@@ -177,9 +196,39 @@ python tools/vm_tags/revert_hostname_tags.py `
   --apply
 ```
 
+Same `--batch-size` semantics as Step 4. When `--apply` is set and
+`--batch-size` is not specified, auto-defaults to 1 (prompt after
+each revert). At each prompt:
+
+| Response | Effect |
+|---|---|
+| `y` / `Y` / `<Enter>` | Continue at current batch size |
+| `n` / `no` | Continue but reset batch size to 1 |
+| `<positive number>` | Change batch size mid-run |
+| `x` / `exit` / `quit` | Stop cleanly, write audit manifest |
+
+**Start at higher batch or ramp:**
+
+```powershell
+python tools/vm_tags/revert_hostname_tags.py `
+  --manager nsx-lm1 `
+  --manifest $manifest `
+  --apply --batch-size 5
+```
+
+**Fully-automated (no prompts):**
+
+```powershell
+python tools/vm_tags/revert_hostname_tags.py `
+  --manager nsx-lm1 `
+  --manifest $manifest `
+  --apply --batch-size 0
+```
+
 Only the hostname tags added by that specific push are removed. Any
 other tags on those VMs (whether pre-existing or applied by other
-runs) stay intact.
+runs) stay intact. Batch counter only advances on successful reverts;
+`[GUARD]`, `[NOOP]`, `[MISSING]` skips don't consume a slot.
 
 ---
 
