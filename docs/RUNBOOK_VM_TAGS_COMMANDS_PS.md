@@ -30,16 +30,16 @@ skip_other_type / skip_has_tag / skip_invalid_name / skip_too_many_tags.
 Writes plan files under `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\`.
 
 ```powershell
-python tools/vm_tags/dryrun_hostname_tags.py `
+python tools/reports/dryrun_hostname_tags.py `
   --manager nsx-lm1 `
-  --output-dir nsx_vm_files\vm_tags_plan\nsx-lm1.lab.local `
+  --output-dir nsx_logs\reports\vm_tags_plan\nsx-lm1.lab.local `
   --overwrite
 ```
 
 Discover the latest plan dir:
 
 ```powershell
-$plan = (Get-ChildItem "nsx_vm_files\vm_tags_plan\nsx-lm1.lab.local" -Directory `
+$plan = (Get-ChildItem "nsx_logs\reports\vm_tags_plan\nsx-lm1.lab.local" -Directory `
          | Sort-Object Name -Descending | Select-Object -First 1).FullName
 Write-Host "Plan: $plan"
 ```
@@ -77,7 +77,7 @@ python tools/vm_tags/export_vm_tags.py `
 ```powershell
 python tools/vm_tags/build_hostname_tag_plan.py `
   --vm-export nsx_vm_files\vm_tags_export\nsx-lm1.lab.local\vms.json `
-  --output-dir nsx_vm_files\vm_tags_plan\nsx-lm1.lab.local `
+  --output-dir nsx_logs\reports\vm_tags_plan\nsx-lm1.lab.local `
   --overwrite
 ```
 
@@ -89,7 +89,7 @@ Loads the plan, re-queries live NSX to catch races (new tags added
 between plan and push), reports what WOULD be applied. No writes.
 
 ```powershell
-python tools/vm_tags/push_hostname_tags.py `
+python tools/reports/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan
 ```
@@ -104,7 +104,7 @@ are always preserved (additive-only).
 **Default behavior (interactive step-through, safest):**
 
 ```powershell
-python tools/vm_tags/push_hostname_tags.py `
+python tools/reports/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan `
   --apply
@@ -131,7 +131,7 @@ At each prompt the operator can:
 **Start at a higher batch size:**
 
 ```powershell
-python tools/vm_tags/push_hostname_tags.py `
+python tools/reports/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan `
   --apply --batch-size 5
@@ -140,7 +140,7 @@ python tools/vm_tags/push_hostname_tags.py `
 **Fully-automated mode (no prompts, for CI or trusted bulk runs):**
 
 ```powershell
-python tools/vm_tags/push_hostname_tags.py `
+python tools/reports/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan `
   --apply --batch-size 0
@@ -176,11 +176,11 @@ tags are always preserved.
 Discover the latest apply manifest:
 
 ```powershell
-$manifest = (Get-ChildItem "nsx_vm_files\vm_tags_manifests\nsx-lm1.lab.local\*_apply.json" `
+$manifest = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*_apply.json" `
              | Sort-Object Name -Descending | Select-Object -First 1).FullName
 Write-Host "Manifest: $manifest"
 
-python tools/vm_tags/revert_hostname_tags.py `
+python tools/reports/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest
 ```
@@ -190,7 +190,7 @@ python tools/vm_tags/revert_hostname_tags.py `
 **Default behavior (interactive step-through, safest):**
 
 ```powershell
-python tools/vm_tags/revert_hostname_tags.py `
+python tools/reports/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest `
   --apply
@@ -210,7 +210,7 @@ each revert). At each prompt:
 **Start at higher batch or ramp:**
 
 ```powershell
-python tools/vm_tags/revert_hostname_tags.py `
+python tools/reports/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest `
   --apply --batch-size 5
@@ -219,7 +219,7 @@ python tools/vm_tags/revert_hostname_tags.py `
 **Fully-automated (no prompts):**
 
 ```powershell
-python tools/vm_tags/revert_hostname_tags.py `
+python tools/reports/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest `
   --apply --batch-size 0
@@ -234,13 +234,20 @@ runs) stay intact. Batch counter only advances on successful reverts;
 
 ## Output locations at a glance
 
-| Tool | Where output lands |
-|---|---|
-| `dryrun_hostname_tags.py` / `build_hostname_tag_plan.py` | `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\` |
-| `export_vm_tags.py` | `nsx_vm_files\vm_tags_export\<host>\vms.json` |
-| `push_hostname_tags.py` | `nsx_vm_files\vm_tags_manifests\<host>\<UTC_TS>_apply.json` (or `_dryrun.json`) |
-| `validate_hostname_tags.py` | `nsx_vm_files\vm_tags_validation\<UTC_TS>_<alias>\validation_report.json` |
-| Per-run log files | `$env:NSX_VM_LOG_DIR\vm_tags_<tool>_<UTC_TS>.log` |
+All report bundles now land under `$env:NSX_LOG_DIR\reports\` (default:
+`nsx_logs\reports\`) with layout `<type>\<host>\<UTC_TS>\`.
+
+| Tool | Location | Where output lands |
+|---|---|---|
+| `dryrun_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` (contains `plan.md` + `plan.json` + per-bucket `.json`) |
+| `push_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.json` + `.md` (or `_dryrun.*`) |
+| `revert_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` (or `_dryrun.json`) |
+| `report_rules_usage.py` | `tools\reports\` | `nsx_logs\reports\rules_usage\<host>\<UTC_TS>\` |
+| `report_groups_usage.py` | `tools\reports\` | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
+| `build_hostname_tag_plan.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\` (offline planner) |
+| `export_vm_tags.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_export\<host>\vms.json` |
+| `validate_hostname_tags.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_validation\<UTC_TS>_<alias>\validation_report.json` |
+| Per-run log files (for tools in `tools\reports\`) | | `$env:NSX_LOG_DIR\vm_tags_<tool>_<UTC_TS>.log` |
 
 ---
 

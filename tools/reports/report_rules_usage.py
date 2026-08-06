@@ -516,8 +516,8 @@ def main() -> int:
         raise SystemExit(f"Target manager not defined: {args.target}")
 
     output_base = (Path(args.output_base).expanduser().resolve()
-                   if args.output_base else Path(nsx_log_dir))
-    reports_dir = output_base / "rules_usage_report" / target_host / RUN_TS
+                   if args.output_base else Path(nsx_log_dir) / "reports")
+    reports_dir = output_base / "rules_usage" / target_host / RUN_TS
     log_file = _setup_logging(reports_dir / "logs")
 
     history_dir = (Path(args.history_dir).expanduser().resolve()
