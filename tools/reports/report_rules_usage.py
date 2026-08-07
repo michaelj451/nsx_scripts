@@ -341,17 +341,24 @@ def _write_markdown_report(reports_dir: Path,
     _add(f"| Total packet_count | {counters.get('total_packet_count', 0):,} |")
     if counters.get("rules_filtered_by_min_days_since_hit") is not None:
         _add(f"| Rules with no hits in >= {args.min_days_since_hit}d | {counters['rules_filtered_by_min_days_since_hit']} |")
+    if counters.get("rules_with_hits_in_last_days") is not None:
+        _add(f"| Rules with hits in the last {args.hits_in_last_days}d | {counters['rules_with_hits_in_last_days']} |")
     _add()
 
     # ---- Per-rule table sorted by hit_count DESC ----
     _add(f"## Per-rule breakdown (sorted by hit_count DESC)")
     _add()
-    _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age |")
-    _add("|---|---|---|---|---|---:|---:|---:|---:|---:|")
+    _add("`Days since hit` is derived from the history dir. `-` means no history "
+         "data yet for that rule (either no prior snapshots, or the counter has "
+         "never gone up in the observation window).\n")
+    _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age | Days since hit |")
+    _add("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|")
     sorted_rules = sorted(rules_records, key=lambda r: -int(r.get("hit_count") or 0))
     for r in sorted_rules:
         age = r.get("rule_age_days")
         age_s = f"{age}d" if age is not None else "-"
+        dsh = r.get("days_since_hit_changed")
+        dsh_s = f"{dsh}d" if dsh is not None else "-"
         # Truncate very long identifiers for readability. Full detail is in the JSON.
         pol   = str(r.get("policy_id") or "")[:32]
         rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
@@ -364,7 +371,8 @@ def _write_markdown_report(reports_dir: Path,
              f"| {int(r.get('byte_count') or 0):,} "
              f"| {int(r.get('packet_count') or 0):,} "
              f"| {int(r.get('session_count') or 0):,} "
-             f"| {age_s} |")
+             f"| {age_s} "
+             f"| {dsh_s} |")
     _add()
 
     # ---- Top-N hot rules highlight ----
@@ -380,6 +388,39 @@ def _write_markdown_report(reports_dir: Path,
                  f"| {int(r.get('hit_count') or 0):,} "
                  f"| {int(r.get('byte_count') or 0):,} |")
         _add()
+
+    # ---- Recent activity (--hits-in-last-days) ----
+    if counters.get("rules_with_hits_in_last_days") is not None:
+        recent_n = args.hits_in_last_days
+        _add(f"## Rules with hits in the last {recent_n} day(s)")
+        _add()
+        _add(f"Rules whose `hit_count` went up within the last {recent_n} days, "
+             f"per snapshot history. Requires prior snapshots covering the window. "
+             f"See `hits_in_last_n_days.jsonl` for the full list.\n")
+        recent = [r for r in rules_records
+                  if r.get("days_since_hit_changed") is not None
+                  and r["days_since_hit_changed"] <= recent_n]
+        if not recent:
+            _add(f"_No rules with hits in the last {recent_n} day(s)._")
+            _add("")
+            if snapshot_count <= 1:
+                _add(f"_Note: history_snapshot_count={snapshot_count}. "
+                     f"With no prior snapshots, this window can't be measured. "
+                     f"Re-run the report periodically to build history._")
+                _add("")
+        else:
+            _add("| Domain | Policy | Rule | Action | Hits | Bytes | Days since hit |")
+            _add("|---|---|---|---|---:|---:|---:|")
+            for r in sorted(recent, key=lambda r: (r.get("days_since_hit_changed") or 0,
+                                                     -int(r.get("hit_count") or 0))):
+                _add(f"| {r.get('domain_id','') or 'default'} "
+                     f"| `{r.get('policy_id','')}` "
+                     f"| `{r.get('rule_display','')}` "
+                     f"| {r.get('action','')} "
+                     f"| {int(r.get('hit_count') or 0):,} "
+                     f"| {int(r.get('byte_count') or 0):,} "
+                     f"| {r.get('days_since_hit_changed')}d |")
+            _add()
 
     # ---- DORMANT rules callout ----
     if dormant_rules:
@@ -454,6 +495,8 @@ def _write_markdown_report(reports_dir: Path,
         _add("| `diff.json` | Per-rule delta vs prior snapshot (this run) |")
     if counters.get("rules_filtered_by_min_days_since_hit") is not None:
         _add("| `no_hits_in_n_days.json` / `.jsonl` | Combined STALE + DORMANT view |")
+    if counters.get("rules_with_hits_in_last_days") is not None:
+        _add("| `hits_in_last_n_days.json` / `.jsonl` | Rules with hits in the last N days (via history) |")
     _add()
 
     (reports_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
@@ -593,6 +636,11 @@ def main() -> int:
                    help="(filter) Emit a separate stale_rules.json containing only "
                         "rules whose hit_count hasn't changed in at least N days. "
                         "Set N=365 to find rules unused in the past year.")
+    p.add_argument("--hits-in-last-days", type=int, default=None,
+                   help="(filter) Emit a separate hits_in_last_n_days.jsonl containing "
+                        "only rules whose hit_count went up within the last N days. "
+                        "Requires snapshot history covering the window; without prior "
+                        "snapshots this will be empty. Set N=7 for 'active this week'.")
     p.add_argument("--top-n", type=int, default=20,
                    help="Number of rules to include in hot_rules.json. Default: 20.")
     p.add_argument("--compare-to", default=None,
@@ -857,8 +905,18 @@ def main() -> int:
             r for r in rules_records
             if (r.get("days_since_hit_changed") is not None
                 and r["days_since_hit_changed"] >= args.min_days_since_hit)
-            # Include never-hit DORMANT rules too — those are always "no hit in N days"
+            # Include never-hit DORMANT rules too - those are always "no hit in N days"
             or (r["hit_count"] == 0 and (r.get("rule_age_days") or 0) >= args.min_days_since_hit)
+        ]
+
+    # --hits-in-last-days filter: rules whose hit_count went UP within the last N
+    # days per snapshot history. Requires prior snapshots covering the window.
+    recent_hits_filter: Optional[List[Dict[str, Any]]] = None
+    if args.hits_in_last_days is not None:
+        recent_hits_filter = [
+            r for r in rules_records
+            if r.get("days_since_hit_changed") is not None
+            and r["days_since_hit_changed"] <= args.hits_in_last_days
         ]
 
     # =============================================================================
@@ -965,6 +1023,9 @@ def main() -> int:
             "rules_filtered_by_min_days_since_hit": (
                 len(min_days_filter) if min_days_filter is not None else None
             ),
+            "rules_with_hits_in_last_days": (
+                len(recent_hits_filter) if recent_hits_filter is not None else None
+            ),
         },
         "compare_to":  args.compare_to,
         "log_file":    str(log_file),
@@ -1027,6 +1088,16 @@ def main() -> int:
                      "DORMANT rules (hit_count=0 throughout, rule older than N days). "
                      "If history_snapshot_count is low, 'days_since_hit_changed' is "
                      "based on a short observation window and may underestimate."),
+        })
+    if recent_hits_filter is not None:
+        _write_filter("hits_in_last_n_days", recent_hits_filter, {
+            "hits_in_last_days":      args.hits_in_last_days,
+            "history_snapshot_count": snapshot_count,
+            "note": ("Rules whose hit_count went UP within the last N days per "
+                     "snapshot history. If history_snapshot_count is low or the "
+                     "oldest snapshot is newer than N days, the window is "
+                     "effectively smaller than N and results reflect only what "
+                     "was observed."),
         })
     if diff_records is not None:
         (reports_dir / "diff.json").write_text(
