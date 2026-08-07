@@ -321,7 +321,8 @@ def _write_markdown_report(reports_dir: Path,
         _add("| Domain | Policy | Attempt | Error (truncated) |")
         _add("|---|---|---|---|")
         for e in errs[:30]:
-            _add(f"| `{e.get('domain')}` | `{e.get('policy')}` | {e.get('attempt')} | "
+            pol_name = e.get('display') or e.get('policy') or ''
+            _add(f"| `{e.get('domain')}` | `{pol_name}` | {e.get('attempt')} | "
                  f"{(e.get('error') or '')[:120]} |")
         _add()
 
@@ -349,32 +350,53 @@ def _write_markdown_report(reports_dir: Path,
     # ---- Per-rule table sorted by hit_count DESC ----
     _add(f"## Per-rule breakdown (sorted by hit_count DESC)")
     _add()
-    _add("`Days since hit` is derived from the history dir. `-` means no history "
-         "data yet for that rule (either no prior snapshots, or the counter has "
-         "never gone up in the observation window).\n")
-    _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age | Days since hit |")
-    _add("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|")
-    sorted_rules = sorted(rules_records, key=lambda r: -int(r.get("hit_count") or 0))
-    for r in sorted_rules:
-        age = r.get("rule_age_days")
-        age_s = f"{age}d" if age is not None else "-"
-        dsh = r.get("days_since_hit_changed")
-        dsh_s = f"{dsh}d" if dsh is not None else "-"
-        # Truncate very long identifiers for readability. Full detail is in the JSON.
-        pol   = str(r.get("policy_display") or r.get("policy_id") or "")[:32]
-        rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
-        _add(f"| {r.get('classification','')} "
-             f"| {r.get('domain_id','') or 'default'} "
-             f"| `{pol}` "
-             f"| `{rule}` "
-             f"| {r.get('action','')} "
-             f"| {int(r.get('hit_count') or 0):,} "
-             f"| {int(r.get('byte_count') or 0):,} "
-             f"| {int(r.get('packet_count') or 0):,} "
-             f"| {int(r.get('session_count') or 0):,} "
-             f"| {age_s} "
-             f"| {dsh_s} |")
-    _add()
+    _add("Rules grouped by NSX category (evaluation order: Ethernet -> Emergency "
+         "-> Infrastructure -> Environment -> Application). Sorted by hit_count "
+         "DESC within each section. `Days since hit` is derived from the history "
+         "dir; `-` means no history data yet for that rule.\n")
+
+    # NSX categories in standard evaluation order. Anything not in this list
+    # gets bucketed under "Uncategorized" and rendered last.
+    CATEGORY_ORDER = ["Ethernet", "Emergency", "Infrastructure",
+                      "Environment", "Application"]
+    by_cat: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rules_records:
+        cat = r.get("policy_category") or "Uncategorized"
+        by_cat.setdefault(cat, []).append(r)
+
+    ordered_cats = [c for c in CATEGORY_ORDER if c in by_cat]
+    for c in sorted(by_cat.keys()):
+        if c not in ordered_cats:
+            ordered_cats.append(c)
+
+    for cat in ordered_cats:
+        cat_rules = by_cat[cat]
+        total_hits = sum(int(x.get("hit_count") or 0) for x in cat_rules)
+        active = sum(1 for x in cat_rules if int(x.get("hit_count") or 0) > 0)
+        _add(f"### Category: {cat}  ({len(cat_rules)} rule(s), "
+             f"{active} with hits, {total_hits:,} total hits)")
+        _add()
+        _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age | Days since hit |")
+        _add("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|")
+        for r in sorted(cat_rules, key=lambda r: -int(r.get("hit_count") or 0)):
+            age = r.get("rule_age_days")
+            age_s = f"{age}d" if age is not None else "-"
+            dsh = r.get("days_since_hit_changed")
+            dsh_s = f"{dsh}d" if dsh is not None else "-"
+            pol   = str(r.get("policy_display") or r.get("policy_id") or "")[:32]
+            rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
+            _add(f"| {r.get('classification','')} "
+                 f"| {r.get('domain_id','') or 'default'} "
+                 f"| `{pol}` "
+                 f"| `{rule}` "
+                 f"| {r.get('action','')} "
+                 f"| {int(r.get('hit_count') or 0):,} "
+                 f"| {int(r.get('byte_count') or 0):,} "
+                 f"| {int(r.get('packet_count') or 0):,} "
+                 f"| {int(r.get('session_count') or 0):,} "
+                 f"| {age_s} "
+                 f"| {dsh_s} |")
+        _add()
 
     # ---- Top-N hot rules highlight ----
     if hot_rules:
@@ -840,6 +862,7 @@ def main() -> int:
                 "domain_id":          did,
                 "policy_id":          pol_id,
                 "policy_display":     pol_display,
+                "policy_category":    pol.get("category"),
                 "rule_id":            rid,
                 "rule_display":       rule.get("display_name") or rid,
                 "internal_rule_id":   irid,
