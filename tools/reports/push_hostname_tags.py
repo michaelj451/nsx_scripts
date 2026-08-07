@@ -46,6 +46,7 @@ from typing import Any, Dict, List
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.md_utils import align_markdown_tables
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -82,12 +83,14 @@ TAG_UPDATE_INTERVAL_SECONDS = 0.5
 
 
 def _fmt_tags(tags):
+    """Compact 'scope\\|value, scope\\|value' string. Pipes escaped for
+    markdown table cell safety."""
     if not tags:
         return "(none)"
     parts = []
     for t in tags:
         if isinstance(t, dict):
-            parts.append(f"{t.get('scope','') or ''}|{t.get('tag','')}")
+            parts.append(f"{t.get('scope','') or ''}\\|{t.get('tag','')}")
     return ", ".join(parts) if parts else "(none)"
 
 
@@ -164,7 +167,7 @@ def write_push_markdown(out_path: Path, manifest_doc: dict) -> Path:
             )
         lines.append("")
 
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    out_path.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
     return out_path
 
 

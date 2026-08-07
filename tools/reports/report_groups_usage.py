@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
+from nsx.md_utils import align_markdown_tables               # noqa: E402
 
 
 log = logging.getLogger(__name__)
@@ -278,8 +279,12 @@ def write_markdown(out: Path, target: str, domains: List[str],
     lines.append("|---|---|---:|---:|---|")
     for r in sorted(tag_records, key=lambda r: -(r.get("vm_count") or 0)):
         tag_conds = r.get("classification", {}).get("tag_conditions") or []
+        # NSX stores the Tag condition value as "scope|tag" in a single
+        # string, so escape ALL pipes for markdown table safety, not just
+        # the tag= separator.
         tag_parts = [
-            f"{t.get('member_type','?')} tag={t.get('scope','') or ''}|{t.get('value','')}"
+            (f"{t.get('member_type','?')} tag={t.get('scope','') or ''}|{t.get('value','')}"
+             ).replace("|", "\\|")
             for t in tag_conds
         ]
         lines.append(
@@ -320,7 +325,7 @@ def write_markdown(out: Path, target: str, domains: List[str],
             )
         lines.append("")
 
-    out.write_text("\n".join(lines), encoding="utf-8")
+    out.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
 
 
 def write_json_files(out: Path, records: List[Dict[str, Any]]) -> None:

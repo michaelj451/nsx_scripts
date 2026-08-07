@@ -36,6 +36,7 @@ from pathlib import Path
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.md_utils import align_markdown_tables
 
 # Re-use the classifier from build_hostname_tag_plan.py to avoid duplication.
 # That file still lives under tools/vm_tags/; we're now under tools/reports/.
@@ -48,13 +49,14 @@ RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def _fmt_tags(tags):
-    """Compact 'scope|value, scope|value' string for a VM tag list."""
+    """Compact 'scope|value, scope|value' string for a VM tag list. Pipes
+    are escaped for markdown table cell safety."""
     if not tags:
         return "(none)"
     parts = []
     for t in tags:
         if isinstance(t, dict):
-            parts.append(f"{t.get('scope','') or ''}|{t.get('tag','')}")
+            parts.append(f"{t.get('scope','') or ''}\\|{t.get('tag','')}")
     return ", ".join(parts) if parts else "(none)"
 
 
@@ -115,7 +117,7 @@ def write_plan_markdown(out_dir: Path, summary: dict, buckets: dict) -> Path:
         lines.append("")
 
     md_path = out_dir / "plan.md"
-    md_path.write_text("\n".join(lines), encoding="utf-8")
+    md_path.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
     return md_path
 
 

@@ -54,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
+from nsx.md_utils import align_markdown_tables               # noqa: E402
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -360,7 +361,7 @@ def _write_markdown_report(reports_dir: Path,
         dsh = r.get("days_since_hit_changed")
         dsh_s = f"{dsh}d" if dsh is not None else "-"
         # Truncate very long identifiers for readability. Full detail is in the JSON.
-        pol   = str(r.get("policy_id") or "")[:32]
+        pol   = str(r.get("policy_display") or r.get("policy_id") or "")[:32]
         rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
         _add(f"| {r.get('classification','')} "
              f"| {r.get('domain_id','') or 'default'} "
@@ -383,7 +384,7 @@ def _write_markdown_report(reports_dir: Path,
         _add("|---:|---|---|---:|---:|")
         for i, r in enumerate(hot_rules, start=1):
             _add(f"| {i} "
-                 f"| `{r.get('policy_id','')}` "
+                 f"| `{r.get('policy_display') or r.get('policy_id','')}` "
                  f"| `{r.get('rule_display','')}` "
                  f"| {int(r.get('hit_count') or 0):,} "
                  f"| {int(r.get('byte_count') or 0):,} |")
@@ -414,7 +415,7 @@ def _write_markdown_report(reports_dir: Path,
             for r in sorted(recent, key=lambda r: (r.get("days_since_hit_changed") or 0,
                                                      -int(r.get("hit_count") or 0))):
                 _add(f"| {r.get('domain_id','') or 'default'} "
-                     f"| `{r.get('policy_id','')}` "
+                     f"| `{r.get('policy_display') or r.get('policy_id','')}` "
                      f"| `{r.get('rule_display','')}` "
                      f"| {r.get('action','')} "
                      f"| {int(r.get('hit_count') or 0):,} "
@@ -434,7 +435,7 @@ def _write_markdown_report(reports_dir: Path,
             age = r.get("rule_age_days")
             age_s = f"{age}d" if age is not None else "-"
             _add(f"| {r.get('domain_id','') or 'default'} "
-                 f"| `{r.get('policy_id','')}` "
+                 f"| `{r.get('policy_display') or r.get('policy_id','')}` "
                  f"| `{r.get('rule_display','')}` "
                  f"| {r.get('action','')} "
                  f"| {age_s} |")
@@ -454,7 +455,7 @@ def _write_markdown_report(reports_dir: Path,
             _add("|---|---|---|---|---:|---:|---:|")
             for d in interesting:
                 _add(f"| {d.get('domain_id','') or 'default'} "
-                     f"| `{d.get('policy_id','')}` "
+                     f"| `{d.get('policy_display') or d.get('policy_id','')}` "
                      f"| `{d.get('rule_id','')}` "
                      f"| {d.get('transition','')} "
                      f"| {d.get('hit_count_prior') if d.get('hit_count_prior') is not None else '-'} "
@@ -499,7 +500,8 @@ def _write_markdown_report(reports_dir: Path,
         _add("| `hits_in_last_n_days.json` / `.jsonl` | Rules with hits in the last N days (via history) |")
     _add()
 
-    (reports_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    (reports_dir / "report.md").write_text(
+        align_markdown_tables("\n".join(lines)), encoding="utf-8")
 
 
 def _classify(rec: Dict[str, Any], hot_threshold: int, fresh_days: int,
