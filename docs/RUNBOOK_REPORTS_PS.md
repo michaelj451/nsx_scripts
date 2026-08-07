@@ -1,0 +1,468 @@
+# Runbook - Reports (Windows PowerShell)
+
+Reference for the five report tools under `tools/reports/`. All emit
+markdown alongside JSON so results are readable both as raw text and in a
+markdown viewer.
+
+Line continuation in PowerShell is the backtick `` ` `` at end of line.
+
+---
+
+## What's in `tools/reports/`
+
+| Tool | Read/Write | Purpose |
+|---|---|---|
+| `report_rules_usage.py` | Read-only | Per-rule hit_count / bytes / packets classification (HOT/USED/UNUSED/DORMANT) + time-window filtering via snapshot history |
+| `report_groups_usage.py` | Read-only | Per-group VM member count, tag conditions, segment refs, IP CIDR entries (per-site aggregated for federation) |
+| `report_tag_map.py` | Read-only | Three-way correlation of Tags <-> Groups <-> VMs. Includes orphan-tag and orphan-condition cleanup lists. |
+| `dryrun_hostname_tags.py` | Read-only | Classify every VM into eligible / skip buckets for hostname-tag workflow. Produces the plan a push would apply. |
+| `push_hostname_tags.py` | Writes (with `--apply`) | Apply the hostname-tag plan to VMs. Interactive step-through by default. |
+| `revert_hostname_tags.py` | Writes (with `--apply`) | Undo a specific push manifest. Only removes hostname tags this manifest added. |
+
+All output lands under `$env:NSX_LOG_DIR\reports\` (default `nsx_logs\reports\`).
+
+---
+
+## Step 0: Env setup (once per PowerShell session)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r docker\requirements-pip.txt
+$env:PYTHONPATH = "$PWD\app"
+```
+
+Assumes `.env` is populated with NSX credentials and manager aliases.
+
+---
+
+## 1. Rules usage report
+
+### Basic
+
+```powershell
+python tools/reports/report_rules_usage.py --target nsx-lm1
+```
+
+### Federation view (GM)
+
+```powershell
+python tools/reports/report_rules_usage.py --target nsx-gm1 `
+  --federation-global --all-domains
+```
+
+`--all-domains` iterates every federation domain (default, plus per-site).
+`--federation-global` queries the federated ruleset; required when the
+target is a GM or when you want the federated view from an LM.
+
+### Time-window filter (positive)
+
+Show rules whose `hit_count` went up within the last N days. Requires
+prior snapshots covering the window.
+
+```powershell
+python tools/reports/report_rules_usage.py --target nsx-gm1 `
+  --federation-global --all-domains `
+  --hits-in-last-days 7
+```
+
+Adds a `Rules with hits in the last 7d` counter to the summary and
+emits `hits_in_last_n_days.jsonl` with the matching rows.
+
+### Time-window filter (negative)
+
+Show rules with NO hits in the last N days (cleanup candidates).
+
+```powershell
+python tools/reports/report_rules_usage.py --target nsx-gm1 `
+  --federation-global --all-domains `
+  --min-days-since-hit 365
+```
+
+Emits `no_hits_in_n_days.jsonl`.
+
+### Diff mode (compare two runs)
+
+```powershell
+$prior = "nsx_logs\reports\rules_usage\nsx-gm1.lab.local\20260807_035735"
+python tools/reports/report_rules_usage.py --target nsx-gm1 `
+  --federation-global --all-domains `
+  --compare-to $prior
+```
+
+Emits `diff.json` showing per-rule hit_count deltas, transitions
+(unchanged / lit-up / went-dormant / added / removed).
+
+### View the results
+
+```powershell
+$latest = (Get-ChildItem "nsx_logs\reports\rules_usage\nsx-gm1.lab.local" -Directory `
+           | Sort-Object Name -Descending | Select-Object -First 1).FullName
+Get-Content "$latest\report.md"
+
+# Structured counters
+Get-Content "$latest\summary.json" | ConvertFrom-Json | Format-List
+
+# Top hot rules
+Get-Content "$latest\hot_rules.jsonl" | ForEach-Object { ConvertFrom-Json $_ } | `
+  Format-Table policy_display, rule_display, hit_count, byte_count -AutoSize
+```
+
+### Report sections at a glance
+
+| Section | When shown | Notes |
+|---|---|---|
+| Summary | Always | Counters + stats source provenance |
+| Policy-API stats query errors | When any policy's `/statistics` failed | Fed-GM will always have all 3 here (NSX bug); tool falls back to old firewall API |
+| Per-rule breakdown | Always | **Grouped by NSX category** (Ethernet -> Emergency -> Infrastructure -> Environment -> Application), sorted by hit_count DESC within each |
+| Top 20 rules | When any rules present | Flat across categories |
+| Rules with hits in the last Nd | With `--hits-in-last-days` | |
+| DORMANT rules callout | When any DORMANT (0 hits, older than fresh-days) exist | |
+| Diff vs prior snapshot | With `--compare-to` | |
+| Per-domain breakdown | With `--all-domains` when >1 domain | |
+
+### Federation stats-fallback (important)
+
+NSX 3.2.x has a bug where `/policy/api/v1/global-infra/.../statistics`
+returns HTTP 500 on federated policies (LM side) or HTTP 400 "Enforcement
+point is mandatory" on GM side. When this happens, the tool automatically
+falls back to `/api/v1/firewall/sections/<id>/rules/stats` on each site's
+LM and aggregates. Look for `Stats source (per policy): old_firewall_api=N`
+in the report header; failed Policy-API queries are listed in the
+"Policy-API stats query errors" section for transparency.
+
+### Building snapshot history
+
+`--hits-in-last-days`, `--min-days-since-hit`, and the `Days since hit`
+column all read from the per-host snapshot directory. Every run creates
+a new UTC-timestamped subdir which becomes tomorrow's history. To get
+meaningful `--hits-in-last-days 7`, you need snapshots at least 7 days
+old.
+
+Automate a daily snapshot via Task Scheduler:
+
+```powershell
+# Runs the report and writes to the standard location
+python tools/reports/report_rules_usage.py --target nsx-gm1 `
+  --federation-global --all-domains
+```
+
+---
+
+## 2. Groups usage report
+
+### Basic (LM local scope)
+
+```powershell
+python tools/reports/report_groups_usage.py --target nsx-lm1
+```
+
+### Federation view (GM, per-site aggregated)
+
+```powershell
+python tools/reports/report_groups_usage.py --target nsx-gm1 `
+  --federation-global --all-domains
+```
+
+The tool auto-discovers federation sites and queries each LM directly
+for VM member counts (GM's own `/members/virtual-machines` endpoint
+returns HTTP 400 without an enforcement point). Per-site columns are
+added to the table so you can see membership breakdown per LM.
+
+### View the results
+
+```powershell
+$latest = (Get-ChildItem "nsx_logs\reports\groups_usage\nsx-gm1.lab.local" -Directory `
+           | Sort-Object Name -Descending | Select-Object -First 1).FullName
+Get-Content "$latest\report.md"
+
+Get-Content "$latest\summary.json" | ConvertFrom-Json | Format-List
+
+# Only tag-based groups
+Get-Content "$latest\tag_based_groups.jsonl" | ForEach-Object { ConvertFrom-Json $_ } | `
+  Format-Table id, display_name, vm_count -AutoSize
+```
+
+### Report sections
+
+| Section | Notes |
+|---|---|
+| Summary | Groups, VM members, tag conditions, segment refs, IPs totals |
+| Groups by classification | TAG / IP / SEGMENT / VM_PATH / NESTED / MIXED / EMPTY |
+| Per-domain breakdown | With `--all-domains` |
+| All groups | One row per group with counts of tag conds, segments, IPs |
+| Tag-based groups only | Focused on membership-by-tag groups + their conditions |
+| Groups with segment references | Only shown if any group references a segment |
+| Groups with IP address / CIDR entries | Only shown if any group has IPAddressExpression |
+
+### Output files
+
+| File | Contents |
+|---|---|
+| `report.md` | Human-readable markdown |
+| `summary.json` | Headline counters + per-domain + per-class |
+| `groups_usage.json` / `.jsonl` | Full per-group detail |
+| `tag_based_groups.jsonl` | Filter: groups with any Tag condition |
+| `empty_groups.jsonl` | Filter: groups with 0 VM members |
+
+---
+
+## 3. Tag map report
+
+### Basic (LM local)
+
+```powershell
+python tools/reports/report_tag_map.py --target nsx-lm1
+```
+
+### Federation view (GM, per-site aggregated)
+
+```powershell
+python tools/reports/report_tag_map.py --target nsx-gm1 `
+  --federation-global --all-domains
+```
+
+On GM, auto-discovers federation sites and pulls VM inventory from
+each LM directly (fabric API is LM-scoped). Group data comes from GM.
+
+### Include system VMs (edges, vCLS)
+
+Default: only `type=REGULAR` customer VMs. Add `--include-system-vms`
+to see everything.
+
+```powershell
+python tools/reports/report_tag_map.py --target nsx-gm1 `
+  --federation-global --all-domains --include-system-vms
+```
+
+### View the results
+
+```powershell
+$latest = (Get-ChildItem "nsx_logs\reports\tag_map\nsx-gm1.lab.local" -Directory `
+           | Sort-Object Name -Descending | Select-Object -First 1).FullName
+Get-Content "$latest\report.md"
+
+# Orphan tags (on VMs but no group uses them)
+Get-Content "$latest\orphan_tags.jsonl" | ForEach-Object { ConvertFrom-Json $_ }
+
+# Orphan group conditions (no VM currently satisfies)
+Get-Content "$latest\orphan_conditions.jsonl" | ForEach-Object { ConvertFrom-Json $_ }
+```
+
+### Report sections
+
+| Section | Notes |
+|---|---|
+| Summary | Unique tags, groups scanned, VMs scanned, orphan counts |
+| Per-tag view | For each tag: which VMs carry it + which groups reference it |
+| Per-VM view | For each VM: its tags + the groups it currently matches |
+| Per-group view | For each group with Tag conditions: conditions + matching VMs (via correlation for simple groups, via live eval for complex) |
+| Orphan tags | Applied to a VM but no group condition references (cleanup candidates or intentional metadata) |
+| Orphan conditions | Group Tag conditions that no VM currently satisfies (dead conditions or tags not yet applied) |
+
+### Simple vs complex groups
+
+- **Simple** (only Tag conditions, joined by OR or none): matching VMs computed offline from the VM tag inventory. Fast, deterministic, doesn't need extra NSX calls.
+- **Complex** (NestedExpression, AND joins, mixed with IP/segment/path): matching VMs come from live NSX `/members/virtual-machines` evaluation.
+
+The `expression_kind` column in the per-group table shows which path was used per group.
+
+---
+
+## 4. Hostname tag dryrun
+
+### Basic
+
+```powershell
+python tools/reports/dryrun_hostname_tags.py --manager nsx-lm1 --overwrite
+```
+
+Read-only. Classifies every VM on the manager into:
+
+| Bucket | Meaning |
+|---|---|
+| `eligible` | Will be tagged on push |
+| `skip_has_tag` | Already has a hostname-scope tag |
+| `skip_invalid_name` | Name does not end in 3-6 digits |
+| `skip_edge` | NSX Edge VM (always skipped) |
+| `skip_other_type` | VC_SYSTEM / MANAGER / other non-REGULAR (per `VM_TAGS_SUPPORTED_TYPES`) |
+| `skip_too_many_tags` | VM at NSX 30-tag cap |
+
+### View the results
+
+```powershell
+$latest = (Get-ChildItem "nsx_logs\reports\vm_tags_plan\nsx-lm1.lab.local" -Directory `
+           | Sort-Object Name -Descending | Select-Object -First 1).FullName
+Get-Content "$latest\plan.md"
+
+# Just the eligible VMs and their proposed tags
+Get-Content "$latest\eligible.json" | ConvertFrom-Json `
+  | Select-Object -ExpandProperty vms `
+  | Format-Table display_name, proposed_hostname_tag, existing_tag_count
+```
+
+### Output files
+
+| File | Contents |
+|---|---|
+| `plan.md` | Human-readable markdown - eligible + per-skip-bucket tables |
+| `plan.json` | Full classification + summary |
+| `eligible.json` | VMs that would be tagged |
+| `skip_*.json` | One file per skip bucket |
+| `vm_tag_inventory.jsonl` | Every VM regardless of classification |
+
+---
+
+## 5. Hostname tag push
+
+### Default (interactive step-through)
+
+```powershell
+$plan = (Get-ChildItem "nsx_logs\reports\vm_tags_plan\nsx-lm1.lab.local" -Directory `
+         | Sort-Object Name -Descending | Select-Object -First 1).FullName
+
+python tools/reports/push_hostname_tags.py `
+  --manager nsx-lm1 --plan-dir $plan --apply
+```
+
+When `--apply` is set and `--batch-size` is not specified, the tool
+auto-defaults to `--batch-size 1` and prompts after every apply. At
+each prompt:
+
+| Response | Effect |
+|---|---|
+| `y` / `<Enter>` | Continue at current batch size |
+| `n` | Reset batch size to 1 (paranoid mode) |
+| `<number>` | Change batch size mid-run (e.g., `5`, `25`) |
+| `x` | Stop cleanly, write manifest of what was applied |
+
+### Faster (start at N)
+
+```powershell
+python tools/reports/push_hostname_tags.py `
+  --manager nsx-lm1 --plan-dir $plan --apply --batch-size 5
+```
+
+### Fully-automated (no prompts)
+
+```powershell
+python tools/reports/push_hostname_tags.py `
+  --manager nsx-lm1 --plan-dir $plan --apply --batch-size 0
+```
+
+### Dry-run (no writes)
+
+```powershell
+python tools/reports/push_hostname_tags.py `
+  --manager nsx-lm1 --plan-dir $plan
+```
+
+### View the results
+
+```powershell
+$md = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*.md" `
+       | Sort-Object Name -Descending | Select-Object -First 1).FullName
+Get-Content $md
+```
+
+### Safety gates
+
+- **Additive only.** Never removes existing tags.
+- **`skip_has_tag`** at plan time keeps re-runs safe.
+- **Race re-check** at push time (`[RACE]`) skips VMs that acquired a
+  hostname tag between plan and push.
+- **Idempotent no-op** (`[NOOP]`) skips VMs that already have the exact
+  `(hostname, value)` we would add.
+- **Tag-cap defense** refuses to push to a VM at `VM_TAGS_MAX_TAGS_PER_VM`.
+- **Batch counter** only advances on successful applies; skips do not
+  consume a slot.
+- **Type filter** via `.env`'s `VM_TAGS_SUPPORTED_TYPES` (default
+  `REGULAR`). All system VM types are excluded by default.
+
+---
+
+## 6. Hostname tag revert
+
+Undo the additions from a specific push manifest. Only removes hostname
+tags this manifest added; every other tag on those VMs is preserved.
+
+### Default (interactive step-through)
+
+```powershell
+$manifest = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*_apply.json" `
+             | Sort-Object Name -Descending | Select-Object -First 1).FullName
+
+python tools/reports/revert_hostname_tags.py `
+  --manager nsx-lm1 --manifest $manifest --apply
+```
+
+Same `--batch-size` semantics as push (auto-defaults to 1 under `--apply`).
+
+### Dry-run
+
+```powershell
+python tools/reports/revert_hostname_tags.py `
+  --manager nsx-lm1 --manifest $manifest
+```
+
+Produces `<TS>_revert_dryrun.json` with per-VM before/after tag lists.
+
+### Safety gates
+
+- **Additive-only reverse.** Only removes the exact `(scope=hostname,
+  tag=<value>)` pair recorded in the push manifest for each VM.
+- **`[GUARD]`** skip: if a VM's current hostname tag value differs from
+  what the manifest says was added (someone else changed it), the tool
+  refuses to touch that VM.
+- **`[NOOP]`** skip: VM no longer has the hostname tag.
+- **`[MISSING]`** skip: VM no longer exists on target.
+
+---
+
+## Output locations at a glance
+
+All report bundles land under `$env:NSX_LOG_DIR\reports\` (default:
+`nsx_logs\reports\`) with layout `<report-type>\<host>\<UTC_TS>\`.
+
+| Report type | Path pattern |
+|---|---|
+| Rules usage | `nsx_logs\reports\rules_usage\<host>\<UTC_TS>\` |
+| Groups usage | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
+| Tag map | `nsx_logs\reports\tag_map\<host>\<UTC_TS>\` |
+| VM tag plan (dryrun) | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` |
+| VM tag push | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.{json,md}` |
+| VM tag revert | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` |
+| Per-run process logs | `$env:NSX_LOG_DIR\<tool_name>_<UTC_TS>.log` |
+
+---
+
+## Git tracking of report markdowns
+
+Per `.gitignore` rules, `.md` files under `nsx_logs\reports\` are
+tracked but their sibling `.json` / `.jsonl` / `logs\` are ignored.
+Committed markdown reports serve as historical human-readable audit;
+raw JSON stays local (fresh on every run).
+
+---
+
+## Read-only guarantee for the three report-only tools
+
+`report_rules_usage.py`, `report_groups_usage.py`, and
+`report_tag_map.py` are strictly read-only against NSX. Additionally
+`report_rules_usage.py` monkey-patches its `NsxPolicyClient` instance
+at startup so that `_post`, `_put`, `_patch`, `_delete` raise
+`ReadOnlyViolationError` before any HTTP request is dispatched. The
+log line `Read-only lockdown engaged` appears on every run.
+
+Safe to run against production at any time, including during change
+windows.
+
+---
+
+## See also
+
+- [REPORTS_DATA_SOURCES.md](REPORTS_DATA_SOURCES.md) - where each tool reads/writes (NSX endpoints + disk paths)
+- [RUNBOOK_VM_TAGS_COMMANDS_PS.md](RUNBOOK_VM_TAGS_COMMANDS_PS.md) - VM-tags workflow narrative (dryrun -> push -> validate -> revert)
+- [RUNBOOK_VM_TAGS.md](RUNBOOK_VM_TAGS.md) - bash / narrative form
+- [RUNBOOK_RULES_USAGE_PS.md](RUNBOOK_RULES_USAGE_PS.md) - deeper dive on the rules report
+- [QUICKREF_PS.md](QUICKREF_PS.md) - one-liner commands for the whole toolkit

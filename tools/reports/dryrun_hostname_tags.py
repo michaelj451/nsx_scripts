@@ -34,11 +34,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_vm_log_dir, resolve_manager
+from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.md_utils import align_markdown_tables
 
 # Re-use the classifier from build_hostname_tag_plan.py to avoid duplication.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# That file still lives under tools/vm_tags/; we're now under tools/reports/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vm_tags"))
 from build_hostname_tag_plan import classify_vm, write_tag_inventory_jsonl  # type: ignore
 
 log = logging.getLogger(__name__)
@@ -46,8 +48,81 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def _fmt_tags(tags):
+    """Compact 'scope|value, scope|value' string for a VM tag list. Pipes
+    are escaped for markdown table cell safety."""
+    if not tags:
+        return "(none)"
+    parts = []
+    for t in tags:
+        if isinstance(t, dict):
+            parts.append(f"{t.get('scope','') or ''}\\|{t.get('tag','')}")
+    return ", ".join(parts) if parts else "(none)"
+
+
+def write_plan_markdown(out_dir: Path, summary: dict, buckets: dict) -> Path:
+    """Write plan.md - one line per eligible VM + skip summary."""
+    lines = []
+    lines.append(f"# VM Hostname Tag Plan - {summary['manager']} ({summary['manager_host']})\n")
+    lines.append(f"- **Ran at**: {summary['ran_at']}")
+    lines.append(f"- **Total VMs**: {summary['vm_count_total']}")
+    lines.append(f"- **Eligible for tagging**: **{summary['counts']['eligible']}**")
+    lines.append(f"- **Flagged for review**: {summary['flagged_for_review']}")
+    lines.append(f"- **Read-only**: yes (no NSX writes)\n")
+
+    lines.append("## Classification counts\n")
+    lines.append("| Bucket | Count | Meaning |")
+    lines.append("|---|---:|---|")
+    meanings = {
+        "eligible":            "Will be tagged when push runs with --apply",
+        "skip_has_tag":        "Already has a hostname tag - no action",
+        "skip_invalid_name":   "Name does not end in 3-6 digits - flag for review",
+        "skip_too_many_tags":  "VM at NSX 30-tag cap - flag for cleanup",
+        "skip_edge":           "NSX Edge VM - always skipped",
+        "skip_other_type":     "System VM (vCLS, NSX Manager, etc.) - always skipped",
+    }
+    for k, count in summary["counts"].items():
+        lines.append(f"| `{k}` | {count} | {meanings.get(k,'')} |")
+    lines.append("")
+
+    lines.append("## Eligible VMs (planned to be tagged)\n")
+    eligible = buckets.get("eligible") or []
+    if not eligible:
+        lines.append("_None. Nothing will be tagged._\n")
+    else:
+        lines.append("| # | VM | External ID | Current tags | Proposed hostname tag |")
+        lines.append("|---:|---|---|---|---|")
+        for i, v in enumerate(eligible, start=1):
+            lines.append(
+                f"| {i} | {v.get('display_name','')} | "
+                f"`{v.get('external_id','')[:12]}...` | "
+                f"{_fmt_tags(v.get('existing_tags'))} | "
+                f"**`hostname\\|{v.get('proposed_hostname_tag','')}`** |"
+            )
+        lines.append("")
+
+    # Bucket sections - one line per VM in each non-empty skip bucket
+    for key in ("skip_has_tag", "skip_invalid_name", "skip_too_many_tags", "skip_edge", "skip_other_type"):
+        rows = buckets.get(key) or []
+        if not rows:
+            continue
+        lines.append(f"## {key} ({len(rows)})\n")
+        lines.append("| # | VM | Type | Existing tags | Reason |")
+        lines.append("|---:|---|---|---|---|")
+        for i, v in enumerate(rows, start=1):
+            lines.append(
+                f"| {i} | {v.get('display_name','')} | {v.get('type','')} | "
+                f"{_fmt_tags(v.get('existing_tags'))} | {v.get('reason','')} |"
+            )
+        lines.append("")
+
+    md_path = out_dir / "plan.md"
+    md_path.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
+    return md_path
+
+
 def setup_logging(tool: str) -> Path:
-    log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
+    log_dir = Path(nsx_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = (log_dir / f"vm_tags_{tool}_{RUN_TS}.log").resolve()
     log_file.touch(exist_ok=True)
@@ -98,7 +173,7 @@ def main() -> None:
     if args.output_dir:
         host_dir = Path(args.output_dir).expanduser().resolve()
     else:
-        host_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_plan" / manager_host
+        host_dir = Path(nsx_log_dir).expanduser().resolve() / "reports" / "vm_tags_plan" / manager_host
 
     # Per-run timestamped subdir so successive runs accumulate instead of
     # overwriting each other.
@@ -159,6 +234,9 @@ def main() -> None:
         json.dumps({"summary": summary, "classified": classified}, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    md_path = write_plan_markdown(out_dir, summary, buckets)
+    log.info("Markdown report: %s", md_path)
+    summary["plan_md"] = str(md_path)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
     if flagged > 0:

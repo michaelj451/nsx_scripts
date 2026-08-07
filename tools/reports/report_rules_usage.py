@@ -54,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
+from nsx.md_utils import align_markdown_tables               # noqa: E402
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -189,6 +190,75 @@ def _flatten_policy_stats(stats_doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]
 
 
 # =============================================================================
+# Fallback stats query via the old /api/v1/firewall/sections/<id>/rules/stats
+#
+# The Policy-API /statistics endpoint has an NSX 3.2.x bug when queried against
+# federated policies (/global-infra scope). It returns HTTP 500
+# "General error has occurred. java.lang.NullPointerException" on LMs.
+# GM returns 400 "Enforcement point is mandatory" even when the param is set.
+#
+# The pre-Policy API (/api/v1/firewall/sections/<id>/rules/stats) still works
+# on the LM side because federated rules are shadowed there for enforcement.
+# We use it as a fallback when the Policy stats query fails.
+# =============================================================================
+
+_SECTION_INDEX_CACHE: Dict[Any, Dict[str, str]] = {}
+
+
+def _build_section_index(client) -> Dict[str, str]:
+    """Return {display_name -> section_id} for every firewall section on the
+    manager. Cached per client instance."""
+    key = id(client)
+    if key in _SECTION_INDEX_CACHE:
+        return _SECTION_INDEX_CACHE[key]
+    idx: Dict[str, str] = {}
+    try:
+        r = client._get("/api/v1/firewall/sections")
+        for s in (r.get("results") or []):
+            disp = s.get("display_name")
+            sid = s.get("id")
+            if disp and sid:
+                idx[disp] = sid
+    except Exception as exc:
+        log.warning("  could not build firewall section index: %s", str(exc)[:120])
+    _SECTION_INDEX_CACHE[key] = idx
+    return idx
+
+
+def _fetch_stats_via_old_firewall_api(client, policy_display: str) -> Dict[str, Dict[str, Any]]:
+    """Fallback stats query. Returns dict shaped like _flatten_policy_stats
+    output ({irid: {counters...}}). Empty dict on any failure."""
+    idx = _build_section_index(client)
+    sid = idx.get(policy_display)
+    if not sid:
+        return {}
+    try:
+        stats = client._get(f"/api/v1/firewall/sections/{sid}/rules/stats")
+    except Exception as exc:
+        log.warning("  old-firewall-API fallback failed for section %s (%s): %s",
+                    sid[:8], policy_display, str(exc)[:120])
+        return {}
+    by_irid: Dict[str, Dict[str, Any]] = {}
+    sum_fields = ("hit_count", "byte_count", "packet_count", "session_count",
+                  "l7_accept_count", "l7_reject_count",
+                  "l7_reject_with_response_count", "total_session_count",
+                  "active_sessions_count")
+    max_fields = ("popularity_index", "max_popularity_index", "max_session_count")
+    for row in (stats.get("results") or []):
+        irid = str(row.get("rule_id") or row.get("internal_rule_id") or "")
+        if not irid:
+            continue
+        slot = by_irid.setdefault(irid, {"internal_rule_id": irid})
+        for f in sum_fields:
+            if row.get(f) is not None:
+                slot[f] = slot.get(f, 0) + int(row[f])
+        for f in max_fields:
+            if row.get(f) is not None:
+                slot[f] = max(slot.get(f, 0), int(row[f]))
+    return by_irid
+
+
+# =============================================================================
 # Classification
 # =============================================================================
 
@@ -229,7 +299,32 @@ def _write_markdown_report(reports_dir: Path,
     _add(f"- **History snapshots scanned**: {snapshot_count}")
     if summary.get("compare_to"):
         _add(f"- **Compared to**: `{summary['compare_to']}`")
+
+    src = summary.get("stats_source_summary") or {}
+    errs = summary.get("stats_query_errors") or []
+    if src or errs:
+        parts = []
+        if src.get("policy_api"):        parts.append(f"policy_api={src['policy_api']}")
+        if src.get("old_firewall_api"):  parts.append(f"old_firewall_api={src['old_firewall_api']}")
+        if src.get("empty"):             parts.append(f"empty={src['empty']}")
+        _add(f"- **Stats source (per policy)**: {', '.join(parts)}")
+        if errs:
+            _add(f"- **Policy-API stats errors** (falling back where possible): {len(errs)}")
     _add()
+
+    if errs:
+        _add("### Policy-API stats query errors\n")
+        _add("The Policy-API `/statistics` endpoint failed for these policies. "
+             "Where possible the tool fell back to the pre-Policy firewall API "
+             "(`/api/v1/firewall/sections/<id>/rules/stats`). See "
+             "`stats_source (per policy)` above for how many were rescued.\n")
+        _add("| Domain | Policy | Attempt | Error (truncated) |")
+        _add("|---|---|---|---|")
+        for e in errs[:30]:
+            pol_name = e.get('display') or e.get('policy') or ''
+            _add(f"| `{e.get('domain')}` | `{pol_name}` | {e.get('attempt')} | "
+                 f"{(e.get('error') or '')[:120]} |")
+        _add()
 
     # ---- Headline counters ----
     _add("## Summary")
@@ -248,31 +343,60 @@ def _write_markdown_report(reports_dir: Path,
     _add(f"| Total packet_count | {counters.get('total_packet_count', 0):,} |")
     if counters.get("rules_filtered_by_min_days_since_hit") is not None:
         _add(f"| Rules with no hits in >= {args.min_days_since_hit}d | {counters['rules_filtered_by_min_days_since_hit']} |")
+    if counters.get("rules_with_hits_in_last_days") is not None:
+        _add(f"| Rules with hits in the last {args.hits_in_last_days}d | {counters['rules_with_hits_in_last_days']} |")
     _add()
 
     # ---- Per-rule table sorted by hit_count DESC ----
     _add(f"## Per-rule breakdown (sorted by hit_count DESC)")
     _add()
-    _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age |")
-    _add("|---|---|---|---|---|---:|---:|---:|---:|---:|")
-    sorted_rules = sorted(rules_records, key=lambda r: -int(r.get("hit_count") or 0))
-    for r in sorted_rules:
-        age = r.get("rule_age_days")
-        age_s = f"{age}d" if age is not None else "-"
-        # Truncate very long identifiers for readability. Full detail is in the JSON.
-        pol   = str(r.get("policy_id") or "")[:32]
-        rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
-        _add(f"| {r.get('classification','')} "
-             f"| {r.get('domain_id','') or 'default'} "
-             f"| `{pol}` "
-             f"| `{rule}` "
-             f"| {r.get('action','')} "
-             f"| {int(r.get('hit_count') or 0):,} "
-             f"| {int(r.get('byte_count') or 0):,} "
-             f"| {int(r.get('packet_count') or 0):,} "
-             f"| {int(r.get('session_count') or 0):,} "
-             f"| {age_s} |")
-    _add()
+    _add("Rules grouped by NSX category (evaluation order: Ethernet -> Emergency "
+         "-> Infrastructure -> Environment -> Application). Sorted by hit_count "
+         "DESC within each section. `Days since hit` is derived from the history "
+         "dir; `-` means no history data yet for that rule.\n")
+
+    # NSX categories in standard evaluation order. Anything not in this list
+    # gets bucketed under "Uncategorized" and rendered last.
+    CATEGORY_ORDER = ["Ethernet", "Emergency", "Infrastructure",
+                      "Environment", "Application"]
+    by_cat: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rules_records:
+        cat = r.get("policy_category") or "Uncategorized"
+        by_cat.setdefault(cat, []).append(r)
+
+    ordered_cats = [c for c in CATEGORY_ORDER if c in by_cat]
+    for c in sorted(by_cat.keys()):
+        if c not in ordered_cats:
+            ordered_cats.append(c)
+
+    for cat in ordered_cats:
+        cat_rules = by_cat[cat]
+        total_hits = sum(int(x.get("hit_count") or 0) for x in cat_rules)
+        active = sum(1 for x in cat_rules if int(x.get("hit_count") or 0) > 0)
+        _add(f"### Category: {cat}  ({len(cat_rules)} rule(s), "
+             f"{active} with hits, {total_hits:,} total hits)")
+        _add()
+        _add("| Class | Domain | Policy | Rule | Action | Hits | Bytes | Packets | Sessions | Age | Days since hit |")
+        _add("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|")
+        for r in sorted(cat_rules, key=lambda r: -int(r.get("hit_count") or 0)):
+            age = r.get("rule_age_days")
+            age_s = f"{age}d" if age is not None else "-"
+            dsh = r.get("days_since_hit_changed")
+            dsh_s = f"{dsh}d" if dsh is not None else "-"
+            pol   = str(r.get("policy_display") or r.get("policy_id") or "")[:32]
+            rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
+            _add(f"| {r.get('classification','')} "
+                 f"| {r.get('domain_id','') or 'default'} "
+                 f"| `{pol}` "
+                 f"| `{rule}` "
+                 f"| {r.get('action','')} "
+                 f"| {int(r.get('hit_count') or 0):,} "
+                 f"| {int(r.get('byte_count') or 0):,} "
+                 f"| {int(r.get('packet_count') or 0):,} "
+                 f"| {int(r.get('session_count') or 0):,} "
+                 f"| {age_s} "
+                 f"| {dsh_s} |")
+        _add()
 
     # ---- Top-N hot rules highlight ----
     if hot_rules:
@@ -282,11 +406,44 @@ def _write_markdown_report(reports_dir: Path,
         _add("|---:|---|---|---:|---:|")
         for i, r in enumerate(hot_rules, start=1):
             _add(f"| {i} "
-                 f"| `{r.get('policy_id','')}` "
+                 f"| `{r.get('policy_display') or r.get('policy_id','')}` "
                  f"| `{r.get('rule_display','')}` "
                  f"| {int(r.get('hit_count') or 0):,} "
                  f"| {int(r.get('byte_count') or 0):,} |")
         _add()
+
+    # ---- Recent activity (--hits-in-last-days) ----
+    if counters.get("rules_with_hits_in_last_days") is not None:
+        recent_n = args.hits_in_last_days
+        _add(f"## Rules with hits in the last {recent_n} day(s)")
+        _add()
+        _add(f"Rules whose `hit_count` went up within the last {recent_n} days, "
+             f"per snapshot history. Requires prior snapshots covering the window. "
+             f"See `hits_in_last_n_days.jsonl` for the full list.\n")
+        recent = [r for r in rules_records
+                  if r.get("days_since_hit_changed") is not None
+                  and r["days_since_hit_changed"] <= recent_n]
+        if not recent:
+            _add(f"_No rules with hits in the last {recent_n} day(s)._")
+            _add("")
+            if snapshot_count <= 1:
+                _add(f"_Note: history_snapshot_count={snapshot_count}. "
+                     f"With no prior snapshots, this window can't be measured. "
+                     f"Re-run the report periodically to build history._")
+                _add("")
+        else:
+            _add("| Domain | Policy | Rule | Action | Hits | Bytes | Days since hit |")
+            _add("|---|---|---|---|---:|---:|---:|")
+            for r in sorted(recent, key=lambda r: (r.get("days_since_hit_changed") or 0,
+                                                     -int(r.get("hit_count") or 0))):
+                _add(f"| {r.get('domain_id','') or 'default'} "
+                     f"| `{r.get('policy_display') or r.get('policy_id','')}` "
+                     f"| `{r.get('rule_display','')}` "
+                     f"| {r.get('action','')} "
+                     f"| {int(r.get('hit_count') or 0):,} "
+                     f"| {int(r.get('byte_count') or 0):,} "
+                     f"| {r.get('days_since_hit_changed')}d |")
+            _add()
 
     # ---- DORMANT rules callout ----
     if dormant_rules:
@@ -300,7 +457,7 @@ def _write_markdown_report(reports_dir: Path,
             age = r.get("rule_age_days")
             age_s = f"{age}d" if age is not None else "-"
             _add(f"| {r.get('domain_id','') or 'default'} "
-                 f"| `{r.get('policy_id','')}` "
+                 f"| `{r.get('policy_display') or r.get('policy_id','')}` "
                  f"| `{r.get('rule_display','')}` "
                  f"| {r.get('action','')} "
                  f"| {age_s} |")
@@ -320,7 +477,7 @@ def _write_markdown_report(reports_dir: Path,
             _add("|---|---|---|---|---:|---:|---:|")
             for d in interesting:
                 _add(f"| {d.get('domain_id','') or 'default'} "
-                     f"| `{d.get('policy_id','')}` "
+                     f"| `{d.get('policy_display') or d.get('policy_id','')}` "
                      f"| `{d.get('rule_id','')}` "
                      f"| {d.get('transition','')} "
                      f"| {d.get('hit_count_prior') if d.get('hit_count_prior') is not None else '-'} "
@@ -361,9 +518,12 @@ def _write_markdown_report(reports_dir: Path,
         _add("| `diff.json` | Per-rule delta vs prior snapshot (this run) |")
     if counters.get("rules_filtered_by_min_days_since_hit") is not None:
         _add("| `no_hits_in_n_days.json` / `.jsonl` | Combined STALE + DORMANT view |")
+    if counters.get("rules_with_hits_in_last_days") is not None:
+        _add("| `hits_in_last_n_days.json` / `.jsonl` | Rules with hits in the last N days (via history) |")
     _add()
 
-    (reports_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    (reports_dir / "report.md").write_text(
+        align_markdown_tables("\n".join(lines)), encoding="utf-8")
 
 
 def _classify(rec: Dict[str, Any], hot_threshold: int, fresh_days: int,
@@ -500,6 +660,11 @@ def main() -> int:
                    help="(filter) Emit a separate stale_rules.json containing only "
                         "rules whose hit_count hasn't changed in at least N days. "
                         "Set N=365 to find rules unused in the past year.")
+    p.add_argument("--hits-in-last-days", type=int, default=None,
+                   help="(filter) Emit a separate hits_in_last_n_days.jsonl containing "
+                        "only rules whose hit_count went up within the last N days. "
+                        "Requires snapshot history covering the window; without prior "
+                        "snapshots this will be empty. Set N=7 for 'active this week'.")
     p.add_argument("--top-n", type=int, default=20,
                    help="Number of rules to include in hot_rules.json. Default: 20.")
     p.add_argument("--compare-to", default=None,
@@ -516,8 +681,8 @@ def main() -> int:
         raise SystemExit(f"Target manager not defined: {args.target}")
 
     output_base = (Path(args.output_base).expanduser().resolve()
-                   if args.output_base else Path(nsx_log_dir))
-    reports_dir = output_base / "rules_usage_report" / target_host / RUN_TS
+                   if args.output_base else Path(nsx_log_dir) / "reports")
+    reports_dir = output_base / "rules_usage" / target_host / RUN_TS
     log_file = _setup_logging(reports_dir / "logs")
 
     history_dir = (Path(args.history_dir).expanduser().resolve()
@@ -590,6 +755,31 @@ def main() -> int:
     log.info("History scan: %d prior snapshot(s) found; %d rules with hit-anchor data",
              snapshot_count, sum(1 for v in history.values() if v.get("last_change_iso")))
 
+    # Detect GM federation-global target. In that case we should query stats
+    # against each federation site's LM directly (GM's own stats endpoint has
+    # a mandatory-enforcement-point requirement plus an NPE bug on 3.2.x).
+    site_clients: Dict[str, Any] = {}
+    is_gm_fed = args.federation_global and "/global-manager/" in client.POLICY_ROOT
+    if is_gm_fed:
+        try:
+            sr = client._get(client.POLICY_ROOT + "/sites")
+            for s in (sr.get("results") or []):
+                sid = s.get("id")
+                if not sid:
+                    continue
+                try:
+                    site_clients[sid] = NsxPolicyClient(nsxmanager=sid,
+                                                        federation_global=False)
+                    log.info("  federation site client ready for stats: %s", sid)
+                except Exception as e:
+                    log.warning("  cannot connect to site %s for stats query: %s",
+                                sid, str(e)[:80])
+        except Exception as e:
+            log.warning("  site discovery failed: %s", str(e)[:80])
+
+    stats_query_errors: List[Dict[str, str]] = []
+    stats_source_summary: Dict[str, int] = {"policy_api": 0, "old_firewall_api": 0, "empty": 0}
+
     for did, pol in policies_with_domain:
         pol_id = pol.get("id")
         pol_display = pol.get("display_name") or pol_id
@@ -603,14 +793,58 @@ def main() -> int:
         except Exception as exc:
             log.warning("  could not list rules for %s/%s: %s", did, pol_id, exc)
             continue
+
+        stats_by_irid: Dict[str, Dict[str, Any]] = {}
+        stats_source = "empty"
+
+        # Attempt 1: Policy-API /statistics on the primary client
         try:
             stats_doc = client.get_security_policy_statistics(
                 security_policy_id=pol_id, domain_id=did,
             )
+            stats_by_irid = _flatten_policy_stats(stats_doc)
+            if stats_by_irid:
+                stats_source = "policy_api"
         except Exception as exc:
-            log.warning("  could not fetch stats for %s/%s: %s", did, pol_id, exc)
-            stats_doc = {}
-        stats_by_irid = _flatten_policy_stats(stats_doc)
+            log.warning("  Policy-API /statistics failed for %s/%s: %s",
+                        did, pol_id, str(exc)[:100])
+            stats_query_errors.append({
+                "domain": did, "policy": pol_id, "display": pol_display,
+                "attempt": "policy_api",
+                "error": str(exc)[:200],
+            })
+
+        # Attempt 2 (fallback): old firewall API on each site LM (when GM), or on
+        # the same LM if we're querying an LM directly.
+        if not stats_by_irid:
+            if site_clients:
+                for site_id, site_c in site_clients.items():
+                    site_stats = _fetch_stats_via_old_firewall_api(site_c, pol_display)
+                    for irid, row in site_stats.items():
+                        slot = stats_by_irid.setdefault(irid, {"internal_rule_id": irid})
+                        for f in ("hit_count", "byte_count", "packet_count",
+                                  "session_count", "l7_accept_count",
+                                  "l7_reject_count", "l7_reject_with_response_count",
+                                  "total_session_count", "active_sessions_count"):
+                            if row.get(f) is not None:
+                                slot[f] = slot.get(f, 0) + int(row[f])
+                        for f in ("popularity_index", "max_popularity_index", "max_session_count"):
+                            if row.get(f) is not None:
+                                slot[f] = max(slot.get(f, 0), int(row[f]))
+                if stats_by_irid:
+                    stats_source = "old_firewall_api"
+                    log.info("  stats via old-firewall-API fallback (aggregated across %d site(s))",
+                             len(site_clients))
+            else:
+                stats_by_irid = _fetch_stats_via_old_firewall_api(client, pol_display)
+                if stats_by_irid:
+                    stats_source = "old_firewall_api"
+                    log.info("  stats via old-firewall-API fallback")
+
+        stats_source_summary[stats_source] = stats_source_summary.get(stats_source, 0) + 1
+        if stats_source == "empty":
+            log.warning("  no stats available for %s/%s (Policy API failed, no fallback match)",
+                        did, pol_id)
 
         for rule in rules:
             if rule.get("_system_owned"):
@@ -628,6 +862,7 @@ def main() -> int:
                 "domain_id":          did,
                 "policy_id":          pol_id,
                 "policy_display":     pol_display,
+                "policy_category":    pol.get("category"),
                 "rule_id":            rid,
                 "rule_display":       rule.get("display_name") or rid,
                 "internal_rule_id":   irid,
@@ -695,8 +930,18 @@ def main() -> int:
             r for r in rules_records
             if (r.get("days_since_hit_changed") is not None
                 and r["days_since_hit_changed"] >= args.min_days_since_hit)
-            # Include never-hit DORMANT rules too — those are always "no hit in N days"
+            # Include never-hit DORMANT rules too - those are always "no hit in N days"
             or (r["hit_count"] == 0 and (r.get("rule_age_days") or 0) >= args.min_days_since_hit)
+        ]
+
+    # --hits-in-last-days filter: rules whose hit_count went UP within the last N
+    # days per snapshot history. Requires prior snapshots covering the window.
+    recent_hits_filter: Optional[List[Dict[str, Any]]] = None
+    if args.hits_in_last_days is not None:
+        recent_hits_filter = [
+            r for r in rules_records
+            if r.get("days_since_hit_changed") is not None
+            and r["days_since_hit_changed"] <= args.hits_in_last_days
         ]
 
     # =============================================================================
@@ -803,9 +1048,14 @@ def main() -> int:
             "rules_filtered_by_min_days_since_hit": (
                 len(min_days_filter) if min_days_filter is not None else None
             ),
+            "rules_with_hits_in_last_days": (
+                len(recent_hits_filter) if recent_hits_filter is not None else None
+            ),
         },
         "compare_to":  args.compare_to,
         "log_file":    str(log_file),
+        "stats_source_summary":  stats_source_summary,
+        "stats_query_errors":    stats_query_errors,
     }
 
     (reports_dir / "summary.json").write_text(
@@ -863,6 +1113,16 @@ def main() -> int:
                      "DORMANT rules (hit_count=0 throughout, rule older than N days). "
                      "If history_snapshot_count is low, 'days_since_hit_changed' is "
                      "based on a short observation window and may underestimate."),
+        })
+    if recent_hits_filter is not None:
+        _write_filter("hits_in_last_n_days", recent_hits_filter, {
+            "hits_in_last_days":      args.hits_in_last_days,
+            "history_snapshot_count": snapshot_count,
+            "note": ("Rules whose hit_count went UP within the last N days per "
+                     "snapshot history. If history_snapshot_count is low or the "
+                     "oldest snapshot is newer than N days, the window is "
+                     "effectively smaller than N and results reflect only what "
+                     "was observed."),
         })
     if diff_records is not None:
         (reports_dir / "diff.json").write_text(

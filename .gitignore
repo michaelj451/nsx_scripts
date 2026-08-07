@@ -11,7 +11,13 @@ nsx_export_promote/
 nsx_domain_meta/
 nsx_remapped_groups/
 nsx_updated_rules/
-nsx_logs/
+nsx_logs/*
+# Uncomment to track markdown reports under nsx_logs/reports/ in source control:
+# !nsx_logs/reports/
+# # Under reports/: track only markdown, skip generated JSON/JSONL/logs
+# nsx_logs/reports/**/*.json
+# nsx_logs/reports/**/*.jsonl
+# nsx_logs/reports/**/logs/
 nsx_groups_additive/
 nsx_promoted_groups/
 nsx_build/

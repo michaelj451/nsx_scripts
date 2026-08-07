@@ -44,8 +44,9 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_vm_log_dir, resolve_manager
+from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.md_utils import align_markdown_tables
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +80,95 @@ def resolve_plan_dir(plan_dir: Path) -> Path:
 
 # Pacing between writes
 TAG_UPDATE_INTERVAL_SECONDS = 0.5
+
+
+def _fmt_tags(tags):
+    """Compact 'scope\\|value, scope\\|value' string. Pipes escaped for
+    markdown table cell safety."""
+    if not tags:
+        return "(none)"
+    parts = []
+    for t in tags:
+        if isinstance(t, dict):
+            parts.append(f"{t.get('scope','') or ''}\\|{t.get('tag','')}")
+    return ", ".join(parts) if parts else "(none)"
+
+
+def write_push_markdown(out_path: Path, manifest_doc: dict) -> Path:
+    """Write a one-line-per-VM markdown alongside the JSON manifest."""
+    d = manifest_doc
+    mode = "APPLY" if not d.get("dry_run") else "DRY-RUN"
+    lines = []
+    lines.append(f"# VM Hostname Tag Push - {d.get('manager','?')} ({d.get('manager_host','?')})\n")
+    lines.append(f"- **Mode**: {mode}")
+    lines.append(f"- **Ran at**: {d.get('ran_at','')}")
+    lines.append(f"- **Plan dir**: `{d.get('plan_dir','')}`")
+    c = d.get("counts") or {}
+    lines.append(f"- **Applied**: **{c.get('applied', 0)}**")
+    lines.append(f"- **Skipped (already has hostname since plan)**: {c.get('skipped_already_has_hostname_post_plan', 0)}")
+    lines.append(f"- **Skipped (already has exact tag)**: {c.get('skipped_already_has_exact_tag', 0)}")
+    lines.append(f"- **Skipped (at tag cap)**: {c.get('skipped_too_many_tags_post_plan', 0)}")
+    lines.append(f"- **Missing on target**: {c.get('missing_on_target', 0)}")
+    lines.append(f"- **Errors**: {c.get('errors', 0)}")
+    if d.get("interactive_mode") is not None:
+        lines.append(f"- **Interactive mode**: {d.get('interactive_mode')}  "
+                     f"(batch_size started at {d.get('batch_size_initial')}, ended at {d.get('batch_size_final')})")
+        if d.get("interactive_exit_requested"):
+            lines.append(f"- **Operator exited early**: yes")
+    lines.append("")
+
+    entries = d.get("manifest_entries") or []
+    if not entries:
+        lines.append("_No VMs processed._\n")
+    else:
+        header_label = "VMs tagged" if mode == "APPLY" else "VMs planned to be tagged"
+        lines.append(f"## {header_label} ({len(entries)})\n")
+        lines.append("| # | VM | Ext ID | Added tag | Tags before | Tags after | Status |")
+        lines.append("|---:|---|---|---|---:|---:|---|")
+        for i, e in enumerate(entries, start=1):
+            lines.append(
+                f"| {i} | {e.get('display_name','')} | "
+                f"`{(e.get('external_id') or '')[:12]}...` | "
+                f"**`hostname\\|{e.get('added_tag','')}`** | "
+                f"{e.get('tag_count_before','')} | {e.get('tag_count_after','')} | "
+                f"{e.get('status','')} |"
+            )
+        lines.append("")
+
+    # Also surface skipped/missing/errors from results if there's context worth showing
+    results = d.get("results") or {}
+    for key, label in (
+        ("skipped_already_has_hostname_post_plan", "Skipped - already has hostname since plan"),
+        ("skipped_already_has_exact_tag",          "Skipped - already has this exact tag"),
+        ("skipped_too_many_tags_post_plan",        "Skipped - at tag cap"),
+        ("missing_on_target",                       "Missing on target"),
+        ("errors",                                  "Errors"),
+    ):
+        rows = results.get(key) or []
+        if not rows:
+            continue
+        lines.append(f"## {label} ({len(rows)})\n")
+        lines.append("| # | VM | Ext ID | Detail |")
+        lines.append("|---:|---|---|---|")
+        for i, r in enumerate(rows, start=1):
+            if key == "errors":
+                detail = r.get("error", "")
+            elif key == "skipped_too_many_tags_post_plan":
+                detail = f"live_tag_count={r.get('live_tag_count','?')}"
+            elif key == "skipped_already_has_hostname_post_plan":
+                detail = f"current_hostname_tag={r.get('current_hostname_tag','?')}"
+            elif key == "skipped_already_has_exact_tag":
+                detail = f"hostname_tag={r.get('hostname_tag','?')}"
+            else:
+                detail = ""
+            lines.append(
+                f"| {i} | {r.get('display_name','')} | "
+                f"`{(r.get('external_id') or '')[:12]}...` | {detail} |"
+            )
+        lines.append("")
+
+    out_path.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
+    return out_path
 
 
 class _InteractiveExit(Exception):
@@ -136,7 +226,7 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
 
 
 def setup_logging(tool: str) -> Path:
-    log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
+    log_dir = Path(nsx_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = (log_dir / f"vm_tags_{tool}_{RUN_TS}.log").resolve()
     log_file.touch(exist_ok=True)
@@ -424,7 +514,7 @@ def main() -> None:
                     len(results["applied"]), len(eligible))
 
     # Write manifest
-    manifests_dir = Path(nsx_vm_log_dir).expanduser().resolve() / "vm_tags_manifests" / manager_host
+    manifests_dir = Path(nsx_log_dir).expanduser().resolve() / "reports" / "vm_tags_push" / manager_host
     manifests_dir.mkdir(parents=True, exist_ok=True)
     manifest_kind = "dryrun" if dry_run else "apply"
     manifest_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.json"
@@ -452,7 +542,14 @@ def main() -> None:
     }
     manifest_path.write_text(json.dumps(manifest_doc, indent=2, sort_keys=True), encoding="utf-8")
     log.info("Manifest written: %s", manifest_path)
-    print(json.dumps(manifest_doc["counts"] | {"manifest": str(manifest_path), "dry_run": dry_run}, indent=2, sort_keys=True))
+    md_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.md"
+    write_push_markdown(md_path, manifest_doc)
+    log.info("Markdown report: %s", md_path)
+    print(json.dumps(manifest_doc["counts"] | {
+        "manifest": str(manifest_path),
+        "markdown": str(md_path),
+        "dry_run": dry_run,
+    }, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

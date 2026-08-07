@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
+from nsx.md_utils import align_markdown_tables               # noqa: E402
 
 
 log = logging.getLogger(__name__)
@@ -195,11 +196,24 @@ def write_markdown(out: Path, target: str, domains: List[str],
     lines.append(f"- **Ran at**: {summary['ran_at']}")
     lines.append(f"- **Read-only**: yes (GET only)\n")
 
+    # Composition totals across all groups
+    total_tag_conds = 0
+    total_segments  = 0
+    total_ips       = 0
+    for r in records:
+        cinfo = r.get("classification") or {}
+        total_tag_conds += len(cinfo.get("tag_conditions") or [])
+        total_segments  += len(cinfo.get("segment_paths") or [])
+        total_ips       += len(cinfo.get("ip_ranges") or [])
+
     lines.append("## Summary\n")
     lines.append("| Metric | Value |\n|---|---:|")
     lines.append(f"| Customer groups | {summary['counters']['customer_groups']} |")
-    lines.append(f"| Total VM members (across all groups) | {summary['counters']['total_vm_members']} |")
+    lines.append(f"| Total VM members (evaluated, across all groups) | {summary['counters']['total_vm_members']} |")
     lines.append(f"| Groups with 0 VM members | {summary['counters']['groups_with_no_vms']} |")
+    lines.append(f"| Total tag conditions defined | {total_tag_conds} |")
+    lines.append(f"| Total segment references defined | {total_segments} |")
+    lines.append(f"| Total IP addresses / CIDRs defined | {total_ips} |")
     lines.append("")
 
     lines.append("## Groups by classification\n")
@@ -224,27 +238,34 @@ def write_markdown(out: Path, target: str, domains: List[str],
                 site_ids.append(sid)
 
     lines.append("## All groups (sorted by VM members DESC)\n")
+    lines.append("Each row shows the composition of the group and how many "
+                 "VMs currently evaluate as members.\n")
+    lines.append("- **VMs**: live evaluated VM members (from tag conditions, path expressions, etc.)")
+    lines.append("- **Tag conds**: number of `scope=Tag` conditions in the group's expression")
+    lines.append("- **Segments**: number of segment paths the group references")
+    lines.append("- **IPs**: number of IP addresses / CIDRs the group has listed via `IPAddressExpression`\n")
     if site_ids:
-        hdr = "| Class | Domain | Group ID | Display | VMs total | " + " | ".join(f"VMs @ {s}" for s in site_ids) + " | Tag conditions |"
-        sep = "|---|---|---|---|---:|" + "".join("---:|" for _ in site_ids) + "---|"
+        hdr = ("| Class | Domain | Group ID | Display | VMs total | " +
+               " | ".join(f"VMs @ {s}" for s in site_ids) +
+               " | Tag conds | Segments | IPs |")
+        sep = "|---|---|---|---|---:|" + "".join("---:|" for _ in site_ids) + "---:|---:|---:|"
     else:
-        hdr = "| Class | Domain | Group ID | Display | VM members | Tag conditions |"
-        sep = "|---|---|---|---|---:|---|"
+        hdr = "| Class | Domain | Group ID | Display | VMs | Tag conds | Segments | IPs |"
+        sep = "|---|---|---|---|---:|---:|---:|---:|"
     lines.append(hdr)
     lines.append(sep)
     for r in sorted(records, key=lambda r: (-(r.get("vm_count") or 0),
                                              r.get("domain_id", ""),
                                              r.get("id", ""))):
-        tag_parts = []
-        for t in (r.get("classification", {}).get("tag_conditions") or []):
-            tag_parts.append(
-                f"{t.get('member_type','?')} tag={t.get('scope','') or ''}|{t.get('value','')}"
-            )
+        cinfo = r.get("classification") or {}
+        n_tag = len(cinfo.get("tag_conditions") or [])
+        n_seg = len(cinfo.get("segment_paths") or [])
+        n_ip  = len(cinfo.get("ip_ranges") or [])
         row = f"| {r['class']} | {r['domain_id']} | `{r['id']}` | {r.get('display_name','')} | {r.get('vm_count', 'n/a')} |"
         for sid in site_ids:
             v = (r.get("per_site_counts") or {}).get(sid)
             row += f" {v if v is not None else 'n/a'} |"
-        row += f" {'; '.join(tag_parts) or ''} |"
+        row += f" {n_tag} | {n_seg} | {n_ip} |"
         lines.append(row)
     lines.append("")
 
@@ -252,21 +273,59 @@ def write_markdown(out: Path, target: str, domains: List[str],
                    or ((r["class"] == "MIXED" or r["class"] == "NESTED")
                        and r.get("classification", {}).get("tag_conditions"))]
     lines.append(f"## Tag-based groups only ({len(tag_records)})\n")
-    lines.append("| Group ID | Display | VM members | Tag conditions |\n"
-                 "|---|---|---:|---|")
+    lines.append("Groups whose membership is populated (at least partially) "
+                 "by VM tag conditions. VM count is the live evaluated total.\n")
+    lines.append("| Group ID | Display | VMs | # Tag conds | Tag conditions |")
+    lines.append("|---|---|---:|---:|---|")
     for r in sorted(tag_records, key=lambda r: -(r.get("vm_count") or 0)):
-        tag_parts = []
-        for t in (r.get("classification", {}).get("tag_conditions") or []):
-            tag_parts.append(
-                f"{t.get('member_type','?')} tag={t.get('scope','') or ''}|{t.get('value','')}"
-            )
+        tag_conds = r.get("classification", {}).get("tag_conditions") or []
+        # NSX stores the Tag condition value as "scope|tag" in a single
+        # string, so escape ALL pipes for markdown table safety, not just
+        # the tag= separator.
+        tag_parts = [
+            (f"{t.get('member_type','?')} tag={t.get('scope','') or ''}|{t.get('value','')}"
+             ).replace("|", "\\|")
+            for t in tag_conds
+        ]
         lines.append(
             f"| `{r['id']}` | {r.get('display_name','')} | "
-            f"{r.get('vm_count', 'n/a')} | {'; '.join(tag_parts) or ''} |"
+            f"{r.get('vm_count', 'n/a')} | {len(tag_conds)} | "
+            f"{'; '.join(tag_parts) or ''} |"
         )
     lines.append("")
 
-    out.write_text("\n".join(lines), encoding="utf-8")
+    # Segment-based groups section
+    seg_records = [r for r in records if (r.get("classification") or {}).get("segment_paths")]
+    if seg_records:
+        lines.append(f"## Groups with segment references ({len(seg_records)})\n")
+        lines.append("| Group ID | Display | VMs | # Segments | Segment paths |")
+        lines.append("|---|---|---:|---:|---|")
+        for r in sorted(seg_records, key=lambda r: -(r.get("vm_count") or 0)):
+            paths = (r.get("classification") or {}).get("segment_paths") or []
+            short_paths = [p.rsplit("/", 1)[-1] for p in paths]
+            lines.append(
+                f"| `{r['id']}` | {r.get('display_name','')} | "
+                f"{r.get('vm_count', 'n/a')} | {len(paths)} | "
+                f"{', '.join(short_paths)} |"
+            )
+        lines.append("")
+
+    # IP-based groups section
+    ip_records = [r for r in records if (r.get("classification") or {}).get("ip_ranges")]
+    if ip_records:
+        lines.append(f"## Groups with IP address / CIDR entries ({len(ip_records)})\n")
+        lines.append("| Group ID | Display | # IPs | Sample IPs |")
+        lines.append("|---|---|---:|---|")
+        for r in sorted(ip_records, key=lambda r: -len((r.get("classification") or {}).get("ip_ranges") or [])):
+            ips = (r.get("classification") or {}).get("ip_ranges") or []
+            preview = ", ".join(ips[:5]) + (f" ... (+{len(ips)-5} more)" if len(ips) > 5 else "")
+            lines.append(
+                f"| `{r['id']}` | {r.get('display_name','')} | "
+                f"{len(ips)} | {preview} |"
+            )
+        lines.append("")
+
+    out.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
 
 
 def write_json_files(out: Path, records: List[Dict[str, Any]]) -> None:
@@ -302,7 +361,7 @@ def main() -> int:
     if not target_host:
         raise SystemExit(f"Cannot resolve alias {args.target}")
 
-    base = Path(args.output_base or Path(nsx_log_dir) / "groups_usage_report").expanduser().resolve()
+    base = Path(args.output_base or Path(nsx_log_dir) / "reports" / "groups_usage").expanduser().resolve()
     out_dir = base / target_host / RUN_TS
     logs_dir = out_dir / "logs"
     setup_logging(logs_dir)
