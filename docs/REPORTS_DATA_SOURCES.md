@@ -40,7 +40,25 @@ patched at startup to reject any `_post/_put/_patch/_delete` call
 
 No disk reads, no snapshot history. Every run is fresh live-query.
 
-### 3. `dryrun_hostname_tags.py` - Fabric VM inventory + local classification
+### 3. `report_tag_map.py` - Fabric VM inventory + Policy API groups (three-way correlation)
+
+| Data | Source |
+|---|---|
+| VM inventory + current tags (single LM) | **NSX API** `GET /api/v1/fabric/virtual-machines` on that LM |
+| VM inventory + current tags (GM federation) | **NSX API on each site's LM directly** (fabric API is LM-scoped). Auto-aggregated. |
+| Customer groups per domain | **NSX API** `GET /policy/api/v1/infra/domains/<d>/groups` |
+| Tag conditions per group | Same GET as above (embedded in group expression tree) |
+| Live member lookup for complex groups | **NSX API** `GET .../groups/<g>/members/virtual-machines` on the appropriate LM |
+
+Simple groups (single Condition or OR-only Conditions) have their
+matching VMs computed offline from the tag inventory. Complex groups
+(NestedExpression, AND joins, mixed with IP/segment) fall back to the
+live `/members/virtual-machines` endpoint.
+
+Read-only. Same VM data source as `dryrun_hostname_tags.py`, plus Policy
+API groups.
+
+### 4. `dryrun_hostname_tags.py` - Fabric VM inventory + local classification
 
 | Data | Source |
 |---|---|
@@ -51,7 +69,7 @@ No disk reads, no snapshot history. Every run is fresh live-query.
 Read-only. Nothing loaded from disk (each run reclassifies from live
 VM state).
 
-### 4. `push_hostname_tags.py` - plan on disk + live tag state at write time
+### 5. `push_hostname_tags.py` - plan on disk + live tag state at write time
 
 | Data | Source |
 |---|---|
@@ -62,7 +80,7 @@ VM state).
 Reads plan file first, then does a live check against NSX before
 writing each tag. That's how `[RACE]` and `[NOOP]` skips are detected.
 
-### 5. `revert_hostname_tags.py` - push manifest on disk + live tag state
+### 6. `revert_hostname_tags.py` - push manifest on disk + live tag state
 
 | Data | Source |
 |---|---|
@@ -190,11 +208,12 @@ Implications:
 |---|:---:|:---:|:---:|:---:|
 | report_rules_usage | Yes (GET) | Yes (snapshots) | **No** (locked) | Yes (bundle) |
 | report_groups_usage | Yes (GET) | No | **No** | Yes (bundle) |
+| report_tag_map | Yes (GET) | No | **No** | Yes (bundle) |
 | dryrun_hostname_tags | Yes (GET) | No | **No** | Yes (bundle) |
 | push_hostname_tags | Yes (GET + PUT with `--apply`) | Yes (plan) | Yes with `--apply` | Yes (manifest) |
 | revert_hostname_tags | Yes (GET + PUT with `--apply`) | Yes (manifest) | Yes with `--apply` | Yes (audit manifest) |
 
-The three read-only tools are safe to run against production during
+The four read-only tools are safe to run against production during
 change windows. The two write tools default to dry-run unless
 `--apply` is set, and even under `--apply` the default `--batch-size 1`
 prompts before each write.

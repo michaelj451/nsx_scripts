@@ -14,6 +14,7 @@ Line continuation in PowerShell is the backtick `` ` `` at end of line.
 |---|---|---|
 | `report_rules_usage.py` | Read-only | Per-rule hit_count / bytes / packets classification (HOT/USED/UNUSED/DORMANT) + time-window filtering via snapshot history |
 | `report_groups_usage.py` | Read-only | Per-group VM member count, tag conditions, segment refs, IP CIDR entries (per-site aggregated for federation) |
+| `report_tag_map.py` | Read-only | Three-way correlation of Tags <-> Groups <-> VMs. Includes orphan-tag and orphan-condition cleanup lists. |
 | `dryrun_hostname_tags.py` | Read-only | Classify every VM into eligible / skip buckets for hostname-tag workflow. Produces the plan a push would apply. |
 | `push_hostname_tags.py` | Writes (with `--apply`) | Apply the hostname-tag plan to VMs. Interactive step-through by default. |
 | `revert_hostname_tags.py` | Writes (with `--apply`) | Undo a specific push manifest. Only removes hostname tags this manifest added. |
@@ -206,7 +207,69 @@ Get-Content "$latest\tag_based_groups.jsonl" | ForEach-Object { ConvertFrom-Json
 
 ---
 
-## 3. Hostname tag dryrun
+## 3. Tag map report
+
+### Basic (LM local)
+
+```powershell
+python tools/reports/report_tag_map.py --target nsx-lm1
+```
+
+### Federation view (GM, per-site aggregated)
+
+```powershell
+python tools/reports/report_tag_map.py --target nsx-gm1 `
+  --federation-global --all-domains
+```
+
+On GM, auto-discovers federation sites and pulls VM inventory from
+each LM directly (fabric API is LM-scoped). Group data comes from GM.
+
+### Include system VMs (edges, vCLS)
+
+Default: only `type=REGULAR` customer VMs. Add `--include-system-vms`
+to see everything.
+
+```powershell
+python tools/reports/report_tag_map.py --target nsx-gm1 `
+  --federation-global --all-domains --include-system-vms
+```
+
+### View the results
+
+```powershell
+$latest = (Get-ChildItem "nsx_logs\reports\tag_map\nsx-gm1.lab.local" -Directory `
+           | Sort-Object Name -Descending | Select-Object -First 1).FullName
+Get-Content "$latest\report.md"
+
+# Orphan tags (on VMs but no group uses them)
+Get-Content "$latest\orphan_tags.jsonl" | ForEach-Object { ConvertFrom-Json $_ }
+
+# Orphan group conditions (no VM currently satisfies)
+Get-Content "$latest\orphan_conditions.jsonl" | ForEach-Object { ConvertFrom-Json $_ }
+```
+
+### Report sections
+
+| Section | Notes |
+|---|---|
+| Summary | Unique tags, groups scanned, VMs scanned, orphan counts |
+| Per-tag view | For each tag: which VMs carry it + which groups reference it |
+| Per-VM view | For each VM: its tags + the groups it currently matches |
+| Per-group view | For each group with Tag conditions: conditions + matching VMs (via correlation for simple groups, via live eval for complex) |
+| Orphan tags | Applied to a VM but no group condition references (cleanup candidates or intentional metadata) |
+| Orphan conditions | Group Tag conditions that no VM currently satisfies (dead conditions or tags not yet applied) |
+
+### Simple vs complex groups
+
+- **Simple** (only Tag conditions, joined by OR or none): matching VMs computed offline from the VM tag inventory. Fast, deterministic, doesn't need extra NSX calls.
+- **Complex** (NestedExpression, AND joins, mixed with IP/segment/path): matching VMs come from live NSX `/members/virtual-machines` evaluation.
+
+The `expression_kind` column in the per-group table shows which path was used per group.
+
+---
+
+## 4. Hostname tag dryrun
 
 ### Basic
 
@@ -250,7 +313,7 @@ Get-Content "$latest\eligible.json" | ConvertFrom-Json `
 
 ---
 
-## 4. Hostname tag push
+## 5. Hostname tag push
 
 ### Default (interactive step-through)
 
@@ -318,7 +381,7 @@ Get-Content $md
 
 ---
 
-## 5. Hostname tag revert
+## 6. Hostname tag revert
 
 Undo the additions from a specific push manifest. Only removes hostname
 tags this manifest added; every other tag on those VMs is preserved.
@@ -365,6 +428,7 @@ All report bundles land under `$env:NSX_LOG_DIR\reports\` (default:
 |---|---|
 | Rules usage | `nsx_logs\reports\rules_usage\<host>\<UTC_TS>\` |
 | Groups usage | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
+| Tag map | `nsx_logs\reports\tag_map\<host>\<UTC_TS>\` |
 | VM tag plan (dryrun) | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` |
 | VM tag push | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.{json,md}` |
 | VM tag revert | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` |
@@ -381,14 +445,14 @@ raw JSON stays local (fresh on every run).
 
 ---
 
-## Read-only guarantee for the two report-only tools
+## Read-only guarantee for the three report-only tools
 
-`report_rules_usage.py` and `report_groups_usage.py` are strictly
-read-only against NSX. Additionally `report_rules_usage.py` monkey-
-patches its `NsxPolicyClient` instance at startup so that `_post`,
-`_put`, `_patch`, `_delete` raise `ReadOnlyViolationError` before any
-HTTP request is dispatched. The log line `Read-only lockdown engaged`
-appears on every run.
+`report_rules_usage.py`, `report_groups_usage.py`, and
+`report_tag_map.py` are strictly read-only against NSX. Additionally
+`report_rules_usage.py` monkey-patches its `NsxPolicyClient` instance
+at startup so that `_post`, `_put`, `_patch`, `_delete` raise
+`ReadOnlyViolationError` before any HTTP request is dispatched. The
+log line `Read-only lockdown engaged` appears on every run.
 
 Safe to run against production at any time, including during change
 windows.
