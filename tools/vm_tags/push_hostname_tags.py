@@ -185,17 +185,23 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
       <positive number>  -> continue at that new batch size
       x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
     """
+    prompt_text = (f"Applied {applied_count} VM tag update(s). "
+                   f"Continue with current batch_size={current_batch_size}? "
+                   f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]:")
     while True:
+        # Log the prompt itself so the log file has context for the response.
+        log.info("PROMPT: %s", prompt_text)
         try:
-            answer = input(
-                f"\nApplied {applied_count} VM tag update(s). "
-                f"Continue with current batch_size={current_batch_size}? "
-                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
-            ).strip().lower()
+            raw = input("\n" + prompt_text + " ")
         except EOFError:
-            log.warning("Non-interactive stdin at batch boundary; auto-approving "
-                        "(batch_size=%d).", current_batch_size)
+            log.warning("OPERATOR RESPONSE: <EOF> (non-interactive stdin). "
+                        "Auto-approving (batch_size=%d).", current_batch_size)
             return current_batch_size
+
+        # Log the RAW response before any parsing so typos, whitespace, and
+        # empty-Enter are all captured verbatim in the audit log.
+        log.info("OPERATOR RESPONSE: %r", raw)
+        answer = raw.strip().lower()
 
         if answer in ("", "y", "yes"):
             log.info("Operator approved batch (continue at batch_size=%d) "
@@ -216,12 +222,14 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
         try:
             new_value = int(answer)
             if new_value <= 0:
+                log.info("OPERATOR RESPONSE was non-positive (%r); re-prompting.", raw)
                 print("Please enter a positive integer (e.g. 1, 5, 25).")
                 continue
             log.info("Operator changed batch_size from %d to %d after %d applied update(s).",
                      current_batch_size, new_value, applied_count)
             return new_value
         except ValueError:
+            log.info("OPERATOR RESPONSE was invalid (%r); re-prompting.", raw)
             print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
 
 

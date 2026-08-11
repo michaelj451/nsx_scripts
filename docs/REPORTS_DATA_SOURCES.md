@@ -1,6 +1,7 @@
 # Reports - Data Sources
 
-Reference for where each tool under `tools/reports/` sources its data.
+Reference for where each tool under `tools/reports/` (read-only reports)
+and `tools/vm_tags/` (write-capable action tools) sources its data.
 Covers NSX endpoints hit, local files read, and files written. Use this
 when planning federation deployments, debugging missing data, or
 understanding read/write blast radius.
@@ -69,7 +70,7 @@ API groups.
 Read-only. Nothing loaded from disk (each run reclassifies from live
 VM state).
 
-### 5. `push_hostname_tags.py` - plan on disk + live tag state at write time
+### 5. `push_hostname_tags.py` (in `tools/vm_tags/`) - plan on disk + live tag state at write time
 
 | Data | Source |
 |---|---|
@@ -80,7 +81,7 @@ VM state).
 Reads plan file first, then does a live check against NSX before
 writing each tag. That's how `[RACE]` and `[NOOP]` skips are detected.
 
-### 6. `revert_hostname_tags.py` - push manifest on disk + live tag state
+### 6. `revert_hostname_tags.py` (in `tools/vm_tags/`) - push manifest on disk + live tag state
 
 | Data | Source |
 |---|---|

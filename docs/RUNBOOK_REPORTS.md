@@ -10,14 +10,14 @@ Windows PowerShell variant: [RUNBOOK_REPORTS_PS.md](RUNBOOK_REPORTS_PS.md).
 
 ## What's in `tools/reports/`
 
-| Tool | Read/Write | Purpose |
-|---|---|---|
-| `report_rules_usage.py` | Read-only | Per-rule hit_count / bytes / packets classification (HOT/USED/UNUSED/DORMANT) + time-window filtering via snapshot history |
-| `report_groups_usage.py` | Read-only | Per-group VM member count, tag conditions, segment refs, IP CIDR entries (per-site aggregated for federation) |
-| `report_tag_map.py` | Read-only | Three-way correlation of Tags <-> Groups <-> VMs. Includes orphan-tag and orphan-condition cleanup lists. |
-| `dryrun_hostname_tags.py` | Read-only | Classify every VM into eligible / skip buckets for hostname-tag workflow. Produces the plan a push would apply. |
-| `push_hostname_tags.py` | Writes (with `--apply`) | Apply the hostname-tag plan to VMs. Interactive step-through by default. |
-| `revert_hostname_tags.py` | Writes (with `--apply`) | Undo a specific push manifest. Only removes hostname tags this manifest added. |
+| Tool | Location | Read/Write | Purpose |
+|---|---|---|---|
+| `report_rules_usage.py` | `tools/reports/` | Read-only | Per-rule hit_count / bytes / packets classification (HOT/USED/UNUSED/DORMANT) + time-window filtering via snapshot history |
+| `report_groups_usage.py` | `tools/reports/` | Read-only | Per-group VM member count, tag conditions, segment refs, IP CIDR entries (per-site aggregated for federation) |
+| `report_tag_map.py` | `tools/reports/` | Read-only | Three-way correlation of Tags <-> Groups <-> VMs. Includes orphan-tag and orphan-condition cleanup lists. |
+| `dryrun_hostname_tags.py` | `tools/reports/` | Read-only | Classify every VM into eligible / skip buckets for hostname-tag workflow. Produces the plan a push would apply. |
+| `push_hostname_tags.py` | `tools/vm_tags/` | Writes (with `--apply`) | Apply the hostname-tag plan to VMs. Interactive step-through by default. |
+| `revert_hostname_tags.py` | `tools/vm_tags/` | Writes (with `--apply`) | Undo a specific push manifest. Only removes hostname tags this manifest added. |
 
 All output lands under `$NSX_LOG_DIR/reports/` (default `nsx_logs/reports/`).
 
@@ -320,7 +320,7 @@ jq '.vms[] | {display_name, proposed_hostname_tag, existing_tag_count}' "$latest
 plan=$(ls -1dt nsx_logs/reports/vm_tags_plan/nsx-lm1.lab.local/*/ | head -1)
 plan=${plan%/}
 
-python tools/reports/push_hostname_tags.py \
+python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 --plan-dir "$plan" --apply
 ```
 
@@ -338,21 +338,21 @@ each prompt:
 ### Faster (start at N)
 
 ```bash
-python tools/reports/push_hostname_tags.py \
+python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 --plan-dir "$plan" --apply --batch-size 5
 ```
 
 ### Fully-automated (no prompts)
 
 ```bash
-python tools/reports/push_hostname_tags.py \
+python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 --plan-dir "$plan" --apply --batch-size 0
 ```
 
 ### Dry-run (no writes)
 
 ```bash
-python tools/reports/push_hostname_tags.py \
+python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 --plan-dir "$plan"
 ```
 
@@ -389,7 +389,7 @@ tags this manifest added; every other tag on those VMs is preserved.
 ```bash
 manifest=$(ls -1t nsx_logs/reports/vm_tags_push/nsx-lm1.lab.local/*_apply.json | head -1)
 
-python tools/reports/revert_hostname_tags.py \
+python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 --manifest "$manifest" --apply
 ```
 
@@ -398,7 +398,7 @@ Same `--batch-size` semantics as push (auto-defaults to 1 under `--apply`).
 ### Dry-run
 
 ```bash
-python tools/reports/revert_hostname_tags.py \
+python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 --manifest "$manifest"
 ```
 

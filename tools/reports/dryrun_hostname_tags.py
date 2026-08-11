@@ -201,6 +201,31 @@ def main() -> None:
     for c in classified:
         buckets[c["classification"]].append(c)
 
+    # Per-VM log lines so operators see exactly what a subsequent push --apply
+    # would do, without having to open plan.md. Same [DRY-RUN] prefix that
+    # push uses for its own dry-run mode, so the two logs read consistently.
+    for c in classified:
+        cls = c["classification"]
+        name = c.get("display_name", "?")
+        ext  = (c.get("external_id") or "")[:12]
+        tag_cnt = c.get("existing_tag_count", 0)
+        if cls == "eligible":
+            log.info("[DRY-RUN] VM=%s ext_id=%s: WOULD ADD hostname=%s (tags %d -> %d)",
+                     name, ext, c.get("proposed_hostname_tag"),
+                     tag_cnt, tag_cnt + 1)
+        elif cls == "skip_has_tag":
+            log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (already has hostname=%s)",
+                     name, ext, c.get("existing_hostname_tag"))
+        elif cls == "skip_too_many_tags":
+            log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (at tag cap %d)",
+                     name, ext, tag_cnt)
+        elif cls == "skip_invalid_name":
+            log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (name does not match hostname regex)",
+                     name, ext)
+        # skip_edge and skip_other_type are noisy for typical labs; log at DEBUG only.
+        elif cls in ("skip_edge", "skip_other_type"):
+            log.debug("[DRY-RUN] VM=%s ext_id=%s: SKIP (%s)", name, ext, cls)
+
     for key, rows in buckets.items():
         (out_dir / f"{key}.json").write_text(
             json.dumps({"count": len(rows), "vms": rows}, indent=2, sort_keys=True),

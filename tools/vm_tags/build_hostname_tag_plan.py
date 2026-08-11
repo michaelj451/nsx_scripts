@@ -44,8 +44,120 @@ log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+# Default: trailing digits, length controlled by VM_TAGS_HOSTNAME_MIN_LEN /
+# VM_TAGS_HOSTNAME_MAX_LEN (defaults 3/6). The negative lookbehind ensures
+# we reject names with more trailing digits than MAX (rejected entirely,
+# not truncated). Backwards-compatible with the original hard-coded rule.
+# Operators can override via env var VM_TAGS_HOSTNAME_REGEX.
+#
+# The literal string `{MIN,MAX}` in the regex is substituted with the
+# actual length range at load time. This lets operators tune length
+# via env without knowing regex quantifier syntax.
+DEFAULT_HOSTNAME_REGEX = r"(?<!\d)(\d{MIN,MAX})$"
+DEFAULT_HOSTNAME_MIN_LEN = 3
+DEFAULT_HOSTNAME_MAX_LEN = 6
+
+# Legacy names kept as aliases so external tests/callers keep working. These
+# are only used if VM_TAGS_HOSTNAME_REGEX is unset.
 TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
 ELIGIBLE_DIGIT_LENGTHS = (3, 4, 5, 6)
+
+# Compiled once per process. Reset via _reset_hostname_regex_cache() in tests.
+_HOSTNAME_REGEX_CACHE: Optional[re.Pattern] = None
+
+
+def _reset_hostname_regex_cache() -> None:
+    global _HOSTNAME_REGEX_CACHE
+    _HOSTNAME_REGEX_CACHE = None
+
+
+def _load_hostname_len_bounds() -> Tuple[int, int]:
+    """Read VM_TAGS_HOSTNAME_MIN_LEN and MAX_LEN from env. Defaults 3/6.
+    Silently clamps invalid values back to defaults."""
+    def _as_int(env_name: str, default: int) -> int:
+        raw = os.getenv(env_name, "").strip()
+        if not raw:
+            return default
+        try:
+            v = int(raw)
+            return v if v > 0 else default
+        except ValueError:
+            log.warning("%s=%r is not a positive integer; using default %d.",
+                        env_name, raw, default)
+            return default
+    lo = _as_int("VM_TAGS_HOSTNAME_MIN_LEN", DEFAULT_HOSTNAME_MIN_LEN)
+    hi = _as_int("VM_TAGS_HOSTNAME_MAX_LEN", DEFAULT_HOSTNAME_MAX_LEN)
+    if lo > hi:
+        log.warning("VM_TAGS_HOSTNAME_MIN_LEN (%d) > MAX_LEN (%d); swapping.",
+                    lo, hi)
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def hostname_regex() -> re.Pattern:
+    """Return the compiled regex used to extract the hostname tag value
+    from a VM display_name.
+
+    Source of truth:
+      1. VM_TAGS_HOSTNAME_REGEX env var (if set)
+      2. DEFAULT_HOSTNAME_REGEX  ->  (?<!\\d)(\\d{MIN,MAX})$
+
+    Placeholder substitution:
+      The literal string `{MIN,MAX}` in the regex is replaced with the
+      actual length range from VM_TAGS_HOSTNAME_MIN_LEN /
+      VM_TAGS_HOSTNAME_MAX_LEN (defaults 3/6). This lets operators tune
+      length via env without knowing regex quantifier syntax.
+
+    Contract:
+      - Must compile as a valid Python regex.
+      - Must contain at least one capture group; group(1) becomes the tag.
+      - Should be anchored at the end (`$`) unless you deliberately want
+        matches from anywhere in the name.
+
+    Cached after first call. If VM_TAGS_HOSTNAME_REGEX is invalid or has
+    no capture group, we log a warning and fall back to the default so
+    the tool never crashes at startup.
+    """
+    global _HOSTNAME_REGEX_CACHE
+    if _HOSTNAME_REGEX_CACHE is not None:
+        return _HOSTNAME_REGEX_CACHE
+
+    lo, hi = _load_hostname_len_bounds()
+    raw = os.getenv("VM_TAGS_HOSTNAME_REGEX", "").strip()
+    pattern = raw or DEFAULT_HOSTNAME_REGEX
+    # Substitute {MIN,MAX} placeholder if present. Operators writing custom
+    # regexes can opt in by including this literal string.
+    pattern = pattern.replace("{MIN,MAX}", f"{{{lo},{hi}}}")
+
+    try:
+        compiled = re.compile(pattern)
+    except re.error as exc:
+        default_expanded = DEFAULT_HOSTNAME_REGEX.replace(
+            "{MIN,MAX}", f"{{{lo},{hi}}}")
+        log.warning(
+            "VM_TAGS_HOSTNAME_REGEX=%r (expanded=%r) is not a valid regex (%s). "
+            "Falling back to default %r.",
+            raw, pattern, exc, default_expanded,
+        )
+        compiled = re.compile(default_expanded)
+        pattern = default_expanded
+
+    if compiled.groups < 1:
+        default_expanded = DEFAULT_HOSTNAME_REGEX.replace(
+            "{MIN,MAX}", f"{{{lo},{hi}}}")
+        log.warning(
+            "VM_TAGS_HOSTNAME_REGEX=%r (expanded=%r) has no capture group. "
+            "The tool needs one - group(1) becomes the tag value. "
+            "Falling back to default %r.",
+            raw, pattern, default_expanded,
+        )
+        compiled = re.compile(default_expanded)
+        pattern = default_expanded
+
+    log.info("VM name-to-tag regex in use: %r  (min_len=%d, max_len=%d)",
+             pattern, lo, hi)
+    _HOSTNAME_REGEX_CACHE = compiled
+    return compiled
 
 
 def supported_vm_types() -> Set[str]:
@@ -99,16 +211,15 @@ def setup_logging(tool: str) -> Path:
 
 
 def extract_hostname_value(vm_name: str) -> Optional[str]:
-    """Return the trailing digit run if it has 3-6 digits, else None."""
+    """Return capture group 1 of the configured hostname regex applied to
+    vm_name, or None if no match. Regex source is controlled by env var
+    VM_TAGS_HOSTNAME_REGEX (see hostname_regex() for the loader contract)."""
     if not vm_name:
         return None
-    m = TRAILING_DIGITS_RE.search(vm_name)
+    m = hostname_regex().search(vm_name)
     if not m:
         return None
-    digits = m.group(1)
-    if len(digits) in ELIGIBLE_DIGIT_LENGTHS:
-        return digits
-    return None
+    return m.group(1)
 
 
 def find_hostname_tag(tags: List[Dict[str, str]]) -> Optional[str]:

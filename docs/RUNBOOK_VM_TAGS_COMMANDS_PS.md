@@ -89,7 +89,7 @@ Loads the plan, re-queries live NSX to catch races (new tags added
 between plan and push), reports what WOULD be applied. No writes.
 
 ```powershell
-python tools/reports/push_hostname_tags.py `
+python tools/vm_tags/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan
 ```
@@ -104,7 +104,7 @@ are always preserved (additive-only).
 **Default behavior (interactive step-through, safest):**
 
 ```powershell
-python tools/reports/push_hostname_tags.py `
+python tools/vm_tags/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan `
   --apply
@@ -131,7 +131,7 @@ At each prompt the operator can:
 **Start at a higher batch size:**
 
 ```powershell
-python tools/reports/push_hostname_tags.py `
+python tools/vm_tags/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan `
   --apply --batch-size 5
@@ -140,7 +140,7 @@ python tools/reports/push_hostname_tags.py `
 **Fully-automated mode (no prompts, for CI or trusted bulk runs):**
 
 ```powershell
-python tools/reports/push_hostname_tags.py `
+python tools/vm_tags/push_hostname_tags.py `
   --manager nsx-lm1 `
   --plan-dir $plan `
   --apply --batch-size 0
@@ -180,7 +180,7 @@ $manifest = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*_ap
              | Sort-Object Name -Descending | Select-Object -First 1).FullName
 Write-Host "Manifest: $manifest"
 
-python tools/reports/revert_hostname_tags.py `
+python tools/vm_tags/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest
 ```
@@ -190,7 +190,7 @@ python tools/reports/revert_hostname_tags.py `
 **Default behavior (interactive step-through, safest):**
 
 ```powershell
-python tools/reports/revert_hostname_tags.py `
+python tools/vm_tags/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest `
   --apply
@@ -210,7 +210,7 @@ each revert). At each prompt:
 **Start at higher batch or ramp:**
 
 ```powershell
-python tools/reports/revert_hostname_tags.py `
+python tools/vm_tags/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest `
   --apply --batch-size 5
@@ -219,7 +219,7 @@ python tools/reports/revert_hostname_tags.py `
 **Fully-automated (no prompts):**
 
 ```powershell
-python tools/reports/revert_hostname_tags.py `
+python tools/vm_tags/revert_hostname_tags.py `
   --manager nsx-lm1 `
   --manifest $manifest `
   --apply --batch-size 0
@@ -240,8 +240,8 @@ All report bundles now land under `$env:NSX_LOG_DIR\reports\` (default:
 | Tool | Location | Where output lands |
 |---|---|---|
 | `dryrun_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` (contains `plan.md` + `plan.json` + per-bucket `.json`) |
-| `push_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.json` + `.md` (or `_dryrun.*`) |
-| `revert_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` (or `_dryrun.json`) |
+| `push_hostname_tags.py` | `tools\vm_tags\` | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.json` + `.md` (or `_dryrun.*`) |
+| `revert_hostname_tags.py` | `tools\vm_tags\` | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` (or `_dryrun.json`) |
 | `report_rules_usage.py` | `tools\reports\` | `nsx_logs\reports\rules_usage\<host>\<UTC_TS>\` |
 | `report_groups_usage.py` | `tools\reports\` | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
 | `build_hostname_tag_plan.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\` (offline planner) |
