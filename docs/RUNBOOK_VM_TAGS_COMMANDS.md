@@ -29,7 +29,7 @@ set PYTHONPATH=%CD%\app
 ## Step 1: Pre-change dry-run (single command)
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/dryrun_hostname_tags.py \
+PYTHONPATH="$PWD/app" python tools/reports/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
   --output-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite

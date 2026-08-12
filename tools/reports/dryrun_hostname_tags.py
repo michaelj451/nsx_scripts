@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tools/vm_tags/dryrun_hostname_tags.py
+tools/reports/dryrun_hostname_tags.py
 
 Single-command dry-run that produces a complete pre-change report. Composes
 export_vm_tags.py + build_hostname_tag_plan.py into one operation and flags
@@ -11,13 +11,13 @@ API and writes plan + classification reports locally.
 
 Flagged conditions (each gets its own JSON report under --output-dir):
   - skip_has_tag       : VMs already carrying a hostname tag
-  - skip_invalid_name  : VMs whose names lack 3-6 trailing digits
+  - skip_invalid_name  : VMs whose names lack a 3-8 char trailing token
   - skip_edge          : NSX Edge VMs (always skipped)
   - skip_other_type    : non-REGULAR VMs (NSX appliances, etc.)
   - eligible           : VMs that WILL get tagged on apply
 
 Usage:
-  python tools/vm_tags/dryrun_hostname_tags.py \\
+  python tools/reports/dryrun_hostname_tags.py \\
     --manager nsx-lm1 \\
     --output-dir vm_tags_plan/nsx-lm1.lab.local \\
     --overwrite

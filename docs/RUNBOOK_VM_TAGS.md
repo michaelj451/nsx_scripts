@@ -58,7 +58,7 @@ Read live VM state from the NSX LM, classify every VM, produce a complete
 pre-change report. Makes no NSX writes.
 
 ```bash
-python tools/vm_tags/dryrun_hostname_tags.py \
+python tools/reports/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
   --output-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite

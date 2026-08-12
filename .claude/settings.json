@@ -5,7 +5,9 @@
     ],
     "deny": [
       "Bash(stb harbor runsettings.:*)",
-      "Bash(stb submissions:*)"
+      "Bash(stb submissions:*)",
+      "Bash(git commit)",
+      "Bash(git commit:*)"
     ]
   }
 }
