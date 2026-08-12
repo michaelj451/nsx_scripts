@@ -15,7 +15,7 @@ finds VMs classified as `eligible`, and for each one:
 Critical behavior:
   - NEVER removes any pre-existing tag on a VM.
   - NEVER touches VMs classified as skip_* in the plan.
-  - Writes a per-run manifest to vm_tags_manifests/<host>/<ts>_apply.json
+  - Writes a per-run manifest to nsx_vm_tags_manifests/<host>/<ts>_apply.json
     that records EXACTLY which (external_id, hostname_tag_value) pairs were
     added. revert_hostname_tags.py uses this manifest to un-do precisely
     what was done.
@@ -522,7 +522,7 @@ def main() -> None:
                     len(results["applied"]), len(eligible))
 
     # Write manifest
-    manifests_dir = Path(nsx_log_dir).expanduser().resolve() / "reports" / "vm_tags_push" / manager_host
+    manifests_dir = REPO_ROOT / "nsx_vm_tags_manifests" / manager_host
     manifests_dir.mkdir(parents=True, exist_ok=True)
     manifest_kind = "dryrun" if dry_run else "apply"
     manifest_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.json"

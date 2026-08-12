@@ -148,7 +148,7 @@ PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
 Dry-run is the default — no `--apply` flag means no NSX writes.
 
 A dry-run manifest is written to:
-`nsx_vm_files/vm_tags_manifests/<host>/<TS>_dryrun.json`
+`nsx_vm_tags_manifests/<host>/<TS>_dryrun.json`
 
 ---
 
@@ -168,7 +168,7 @@ For each eligible VM:
 3. Append `{"scope": "hostname", "tag": "<digits>"}` to the existing tag list
 4. POST the FULL combined list back via the fabric `update_tags` action
 
-The apply manifest is written to `nsx_vm_files/vm_tags_manifests/<host>/<TS>_apply.json`
+The apply manifest is written to `nsx_vm_tags_manifests/<host>/<TS>_apply.json`
 with the exact (external_id, hostname_value) pairs that were added.
 **Keep this file** — it's the input to revert.
 
@@ -202,11 +202,11 @@ preserved.
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest nsx_vm_files/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
+  --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
 ```
 
 A revert dry-run audit is written to
-`nsx_vm_files/vm_tags_manifests/<host>/<TS>_revert_dryrun.json`.
+`nsx_vm_tags_manifests/<host>/<TS>_revert_dryrun.json`.
 
 ---
 
@@ -215,7 +215,7 @@ A revert dry-run audit is written to
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest nsx_vm_files/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
+  --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
   --apply
 ```
 
@@ -228,7 +228,7 @@ For each manifest entry with `status=success`:
 4. POST that list back via `update_tags`
 
 A revert apply audit is written to
-`nsx_vm_files/vm_tags_manifests/<host>/<TS>_revert_apply.json`.
+`nsx_vm_tags_manifests/<host>/<TS>_revert_apply.json`.
 
 ---
 
@@ -252,13 +252,13 @@ vm_tags_plan/<host>/<TIMESTAMP>/
         │  3) push --dry-run
         │  4) push --apply
         ▼
-nsx_vm_files/vm_tags_manifests/<host>/<TS>_apply.json   ← revert input
+nsx_vm_tags_manifests/<host>/<TS>_apply.json   ← revert input
         │
         │  5) validate
         │  6) revert --dry-run
         │  7) revert --apply
         ▼
-nsx_vm_files/vm_tags_manifests/<host>/<TS>_revert_apply.json
+nsx_vm_tags_manifests/<host>/<TS>_revert_apply.json
 ```
 
 ---
