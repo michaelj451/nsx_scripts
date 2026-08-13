@@ -23,12 +23,12 @@ Dry-run is the default. Real writes require --apply.
 Usage (dry-run preview):
   python tools/vm_tags/revert_hostname_tags.py \\
     --manager nsx-lm1 \\
-    --manifest vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
+    --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
 
 Usage (apply):
   python tools/vm_tags/revert_hostname_tags.py \\
     --manager nsx-lm1 \\
-    --manifest vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \\
+    --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \\
     --apply
 """
 from __future__ import annotations
@@ -325,7 +325,7 @@ def main() -> None:
                     len(results["reverted"]), len(entries))
 
     # Write revert manifest for audit
-    out_dir = Path(nsx_log_dir).expanduser().resolve() / "reports" / "vm_tags_revert" / manager_host
+    out_dir = REPO_ROOT / "nsx_vm_tags_manifests" / manager_host
     out_dir.mkdir(parents=True, exist_ok=True)
     kind = "dryrun" if dry_run else "apply"
     out_path = out_dir / f"{RUN_TS}_revert_{kind}.json"

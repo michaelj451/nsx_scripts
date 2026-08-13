@@ -4,18 +4,22 @@ tools/vm_tags/build_hostname_tag_plan.py
 
 Offline transform. Read a VM-tag export and classify every VM into one of:
 
-  eligible            — type=REGULAR, name ends in 3-6 trailing digits, no
-                        existing hostname tag. Will be tagged.
-  skip_has_tag        — already has a hostname-scope tag. Will be skipped.
+  eligible            : type=REGULAR, name ends in a 3-8 char alphanumeric
+                        token after a hyphen, no existing hostname tag.
+                        Will be tagged.
+  skip_has_tag        : already has a hostname-scope tag. Will be skipped.
                         Logged as separate report (operator review).
-  skip_invalid_name   — name does not end in a 3-6 digit run. Will be
-                        skipped + flagged.
-  skip_edge           — NSX Edge VM (type=EDGE). Always skipped.
-  skip_other_type    — type is something other than REGULAR / EDGE
+  skip_length_out_of_range : trailing token present but its length is below
+                        min or above max. Skipped + flagged.
+  skip_invalid_name   : name has no trailing hyphen-delimited alphanumeric
+                        token at all. Skipped + flagged.
+  skip_edge           : NSX Edge VM (type=EDGE). Always skipped.
+  skip_other_type     : type is something other than REGULAR / EDGE
                         (e.g. NSX Manager appliances). Always skipped.
 
-Leading zeros in the trailing digit sequence are preserved exactly as they
-appear in the name (e.g. `host-0042` -> hostname tag `0042`).
+The trailing token is captured verbatim, letters and leading zeros included
+(e.g. `host-ax2001` -> `ax2001`, `host-0042` -> `0042`). The tagging rule
+itself is defined in code below (DEFAULT_HOSTNAME_REGEX), not via env.
 
 This step writes ONLY local files. No NSX writes.
 
@@ -44,120 +48,77 @@ log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-# Default: trailing digits, length controlled by VM_TAGS_HOSTNAME_MIN_LEN /
-# VM_TAGS_HOSTNAME_MAX_LEN (defaults 3/6). The negative lookbehind ensures
-# we reject names with more trailing digits than MAX (rejected entirely,
-# not truncated). Backwards-compatible with the original hard-coded rule.
-# Operators can override via env var VM_TAGS_HOSTNAME_REGEX.
+# Hostname tag extraction rule. Defined here in code on purpose (NOT via
+# env) so the tagging behavior is versioned with the tool and shows up in
+# code review.
 #
-# The literal string `{MIN,MAX}` in the regex is substituted with the
-# actual length range at load time. This lets operators tune length
-# via env without knowing regex quantifier syntax.
-DEFAULT_HOSTNAME_REGEX = r"(?<!\d)(\d{MIN,MAX})$"
+# Rule: the last hyphen-delimited token of the VM display_name, 3-8
+# alphanumeric chars (e.g. "...-ax2001" -> "ax2001",
+# "...-10700101" -> "10700101"). Requiring the leading hyphen rejects a
+# token longer than MAX outright (it can't align to the hyphen) instead of
+# silently truncating it.
+#
+# The literal string `{MIN,MAX}` in the regex is substituted with the length
+# bounds below at compile time, so length can be retuned by editing MIN/MAX
+# without touching quantifier syntax. group(1) of the match becomes the tag.
+DEFAULT_HOSTNAME_REGEX = r"-([A-Za-z0-9]{MIN,MAX})$"
 DEFAULT_HOSTNAME_MIN_LEN = 3
-DEFAULT_HOSTNAME_MAX_LEN = 6
-
-# Legacy names kept as aliases so external tests/callers keep working. These
-# are only used if VM_TAGS_HOSTNAME_REGEX is unset.
-TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
-ELIGIBLE_DIGIT_LENGTHS = (3, 4, 5, 6)
+DEFAULT_HOSTNAME_MAX_LEN = 8
 
 # Compiled once per process. Reset via _reset_hostname_regex_cache() in tests.
 _HOSTNAME_REGEX_CACHE: Optional[re.Pattern] = None
+_HOSTNAME_TOKEN_REGEX_CACHE: Optional[re.Pattern] = None
 
 
 def _reset_hostname_regex_cache() -> None:
-    global _HOSTNAME_REGEX_CACHE
+    global _HOSTNAME_REGEX_CACHE, _HOSTNAME_TOKEN_REGEX_CACHE
     _HOSTNAME_REGEX_CACHE = None
+    _HOSTNAME_TOKEN_REGEX_CACHE = None
 
 
-def _load_hostname_len_bounds() -> Tuple[int, int]:
-    """Read VM_TAGS_HOSTNAME_MIN_LEN and MAX_LEN from env. Defaults 3/6.
-    Silently clamps invalid values back to defaults."""
-    def _as_int(env_name: str, default: int) -> int:
-        raw = os.getenv(env_name, "").strip()
-        if not raw:
-            return default
-        try:
-            v = int(raw)
-            return v if v > 0 else default
-        except ValueError:
-            log.warning("%s=%r is not a positive integer; using default %d.",
-                        env_name, raw, default)
-            return default
-    lo = _as_int("VM_TAGS_HOSTNAME_MIN_LEN", DEFAULT_HOSTNAME_MIN_LEN)
-    hi = _as_int("VM_TAGS_HOSTNAME_MAX_LEN", DEFAULT_HOSTNAME_MAX_LEN)
-    if lo > hi:
-        log.warning("VM_TAGS_HOSTNAME_MIN_LEN (%d) > MAX_LEN (%d); swapping.",
-                    lo, hi)
-        lo, hi = hi, lo
-    return lo, hi
+def hostname_len_bounds() -> tuple[int, int]:
+    """The (min, max) trailing-token length bounds, normalized so min <= max."""
+    lo, hi = DEFAULT_HOSTNAME_MIN_LEN, DEFAULT_HOSTNAME_MAX_LEN
+    return (hi, lo) if lo > hi else (lo, hi)
 
 
 def hostname_regex() -> re.Pattern:
-    """Return the compiled regex used to extract the hostname tag value
-    from a VM display_name.
+    """Return the compiled regex used to extract the hostname tag value from
+    a VM display_name.
 
-    Source of truth:
-      1. VM_TAGS_HOSTNAME_REGEX env var (if set)
-      2. DEFAULT_HOSTNAME_REGEX  ->  (?<!\\d)(\\d{MIN,MAX})$
-
-    Placeholder substitution:
-      The literal string `{MIN,MAX}` in the regex is replaced with the
-      actual length range from VM_TAGS_HOSTNAME_MIN_LEN /
-      VM_TAGS_HOSTNAME_MAX_LEN (defaults 3/6). This lets operators tune
-      length via env without knowing regex quantifier syntax.
-
-    Contract:
-      - Must compile as a valid Python regex.
-      - Must contain at least one capture group; group(1) becomes the tag.
-      - Should be anchored at the end (`$`) unless you deliberately want
-        matches from anywhere in the name.
-
-    Cached after first call. If VM_TAGS_HOSTNAME_REGEX is invalid or has
-    no capture group, we log a warning and fall back to the default so
-    the tool never crashes at startup.
+    The pattern is defined in code (DEFAULT_HOSTNAME_REGEX, with the
+    DEFAULT_HOSTNAME_MIN_LEN / DEFAULT_HOSTNAME_MAX_LEN length bounds
+    substituted into the `{MIN,MAX}` placeholder) and is intentionally NOT
+    env-configurable, so the tagging rule is versioned with the tool.
+    group(1) of a match becomes the tag value. Result is cached.
     """
     global _HOSTNAME_REGEX_CACHE
     if _HOSTNAME_REGEX_CACHE is not None:
         return _HOSTNAME_REGEX_CACHE
 
-    lo, hi = _load_hostname_len_bounds()
-    raw = os.getenv("VM_TAGS_HOSTNAME_REGEX", "").strip()
-    pattern = raw or DEFAULT_HOSTNAME_REGEX
-    # Substitute {MIN,MAX} placeholder if present. Operators writing custom
-    # regexes can opt in by including this literal string.
-    pattern = pattern.replace("{MIN,MAX}", f"{{{lo},{hi}}}")
+    lo, hi = DEFAULT_HOSTNAME_MIN_LEN, DEFAULT_HOSTNAME_MAX_LEN
+    if lo > hi:
+        lo, hi = hi, lo
+    pattern = DEFAULT_HOSTNAME_REGEX.replace("{MIN,MAX}", f"{{{lo},{hi}}}")
 
-    try:
-        compiled = re.compile(pattern)
-    except re.error as exc:
-        default_expanded = DEFAULT_HOSTNAME_REGEX.replace(
-            "{MIN,MAX}", f"{{{lo},{hi}}}")
-        log.warning(
-            "VM_TAGS_HOSTNAME_REGEX=%r (expanded=%r) is not a valid regex (%s). "
-            "Falling back to default %r.",
-            raw, pattern, exc, default_expanded,
-        )
-        compiled = re.compile(default_expanded)
-        pattern = default_expanded
-
-    if compiled.groups < 1:
-        default_expanded = DEFAULT_HOSTNAME_REGEX.replace(
-            "{MIN,MAX}", f"{{{lo},{hi}}}")
-        log.warning(
-            "VM_TAGS_HOSTNAME_REGEX=%r (expanded=%r) has no capture group. "
-            "The tool needs one - group(1) becomes the tag value. "
-            "Falling back to default %r.",
-            raw, pattern, default_expanded,
-        )
-        compiled = re.compile(default_expanded)
-        pattern = default_expanded
-
+    compiled = re.compile(pattern)
     log.info("VM name-to-tag regex in use: %r  (min_len=%d, max_len=%d)",
              pattern, lo, hi)
     _HOSTNAME_REGEX_CACHE = compiled
     return compiled
+
+
+def hostname_token_regex() -> re.Pattern:
+    """Length-agnostic sibling of hostname_regex(): DEFAULT_HOSTNAME_REGEX with
+    the `{MIN,MAX}` quantifier relaxed to `+`. Used only to tell a name with no
+    usable trailing token apart from one whose token merely falls outside the
+    [MIN,MAX] length window (below min / above max)."""
+    global _HOSTNAME_TOKEN_REGEX_CACHE
+    if _HOSTNAME_TOKEN_REGEX_CACHE is not None:
+        return _HOSTNAME_TOKEN_REGEX_CACHE
+    _HOSTNAME_TOKEN_REGEX_CACHE = re.compile(
+        DEFAULT_HOSTNAME_REGEX.replace("{MIN,MAX}", "+"))
+    return _HOSTNAME_TOKEN_REGEX_CACHE
 
 
 def supported_vm_types() -> Set[str]:
@@ -211,9 +172,8 @@ def setup_logging(tool: str) -> Path:
 
 
 def extract_hostname_value(vm_name: str) -> Optional[str]:
-    """Return capture group 1 of the configured hostname regex applied to
-    vm_name, or None if no match. Regex source is controlled by env var
-    VM_TAGS_HOSTNAME_REGEX (see hostname_regex() for the loader contract)."""
+    """Return capture group 1 of the hostname regex applied to vm_name, or
+    None if no match. The regex is defined in code (see hostname_regex())."""
     if not vm_name:
         return None
     m = hostname_regex().search(vm_name)
@@ -316,14 +276,31 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
         return base
 
     if proposed is None:
+        lo, hi = hostname_len_bounds()
+        token_match = hostname_token_regex().search(name)
+        if token_match:
+            # A trailing token exists; it just falls outside the length window
+            # (otherwise the main regex would have matched it).
+            token = token_match.group(1)
+            n = len(token)
+            below = n < lo
+            base["classification"] = "skip_length_out_of_range"
+            base["length_issue"] = "below_min" if below else "above_max"
+            base["candidate_token"] = token
+            base["reason"] = (
+                f"Trailing token {token!r} length {n} is "
+                f"{'below the minimum' if below else 'above the maximum'} "
+                f"({lo}-{hi} allowed)"
+            )
+            return base
         base["classification"] = "skip_invalid_name"
-        base["reason"] = "Name does not end with 3-6 trailing digits"
+        base["reason"] = "Name has no trailing hyphen-delimited alphanumeric token"
         return base
 
     base["classification"] = "eligible"
     base["reason"] = (
         f"Will add hostname tag {proposed!r} "
-        f"(from trailing digits in name; current tag count={tag_count})"
+        f"(from trailing token in name; current tag count={tag_count})"
     )
     return base
 
@@ -378,6 +355,7 @@ def main() -> None:
         "eligible": [],
         "skip_has_tag": [],
         "skip_too_many_tags": [],
+        "skip_length_out_of_range": [],
         "skip_invalid_name": [],
         "skip_edge": [],
         "skip_other_type": [],

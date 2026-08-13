@@ -360,7 +360,7 @@ python tools/vm_tags/push_hostname_tags.py `
 ### View the results
 
 ```powershell
-$md = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*.md" `
+$md = (Get-ChildItem "nsx_vm_tags_manifests\nsx-lm1.lab.local\*.md" `
        | Sort-Object Name -Descending | Select-Object -First 1).FullName
 Get-Content $md
 ```
@@ -389,7 +389,7 @@ tags this manifest added; every other tag on those VMs is preserved.
 ### Default (interactive step-through)
 
 ```powershell
-$manifest = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*_apply.json" `
+$manifest = (Get-ChildItem "nsx_vm_tags_manifests\nsx-lm1.lab.local\*_apply.json" `
              | Sort-Object Name -Descending | Select-Object -First 1).FullName
 
 python tools/vm_tags/revert_hostname_tags.py `
@@ -422,7 +422,9 @@ Produces `<TS>_revert_dryrun.json` with per-VM before/after tag lists.
 ## Output locations at a glance
 
 All report bundles land under `$env:NSX_LOG_DIR\reports\` (default:
-`nsx_logs\reports\`) with layout `<report-type>\<host>\<UTC_TS>\`.
+`nsx_logs\reports\`) with layout `<report-type>\<host>\<UTC_TS>\`. The
+exception is the vm-tag push/revert **manifests**, which land in the
+top-level `nsx_vm_tags_manifests\<host>\` data dir (gitignored).
 
 | Report type | Path pattern |
 |---|---|
@@ -430,8 +432,8 @@ All report bundles land under `$env:NSX_LOG_DIR\reports\` (default:
 | Groups usage | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
 | Tag map | `nsx_logs\reports\tag_map\<host>\<UTC_TS>\` |
 | VM tag plan (dryrun) | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` |
-| VM tag push | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.{json,md}` |
-| VM tag revert | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` |
+| VM tag push | `nsx_vm_tags_manifests\<host>\<UTC_TS>_apply.{json,md}` |
+| VM tag revert | `nsx_vm_tags_manifests\<host>\<UTC_TS>_revert_apply.json` |
 | Per-run process logs | `$env:NSX_LOG_DIR\<tool_name>_<UTC_TS>.log` |
 
 ---

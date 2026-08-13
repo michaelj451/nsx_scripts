@@ -116,8 +116,8 @@ Mismatch triggers `[GUARD]` skip.
                             │
                             ▼ writes reports here
        nsx_logs/reports/<type>/<host>/<UTC_TS>/
-       nsx_logs/reports/vm_tags_push/<host>/<UTC_TS>_apply.{json,md}
-       nsx_logs/reports/vm_tags_revert/<host>/<UTC_TS>_revert_apply.json
+       nsx_vm_tags_manifests/<host>/<UTC_TS>_apply.{json,md}
+       nsx_vm_tags_manifests/<host>/<UTC_TS>_revert_apply.json
 ```
 
 ---

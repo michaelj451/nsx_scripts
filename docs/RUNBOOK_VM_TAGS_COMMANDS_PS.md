@@ -176,7 +176,7 @@ tags are always preserved.
 Discover the latest apply manifest:
 
 ```powershell
-$manifest = (Get-ChildItem "nsx_logs\reports\vm_tags_push\nsx-lm1.lab.local\*_apply.json" `
+$manifest = (Get-ChildItem "nsx_vm_tags_manifests\nsx-lm1.lab.local\*_apply.json" `
              | Sort-Object Name -Descending | Select-Object -First 1).FullName
 Write-Host "Manifest: $manifest"
 
@@ -235,13 +235,15 @@ runs) stay intact. Batch counter only advances on successful reverts;
 ## Output locations at a glance
 
 All report bundles now land under `$env:NSX_LOG_DIR\reports\` (default:
-`nsx_logs\reports\`) with layout `<type>\<host>\<UTC_TS>\`.
+`nsx_logs\reports\`) with layout `<type>\<host>\<UTC_TS>\`. The one
+exception is the push/revert **manifests**, which land in the top-level
+`nsx_vm_tags_manifests\<host>\` data dir (gitignored).
 
 | Tool | Location | Where output lands |
 |---|---|---|
 | `dryrun_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` (contains `plan.md` + `plan.json` + per-bucket `.json`) |
-| `push_hostname_tags.py` | `tools\vm_tags\` | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.json` + `.md` (or `_dryrun.*`) |
-| `revert_hostname_tags.py` | `tools\vm_tags\` | `nsx_logs\reports\vm_tags_revert\<host>\<UTC_TS>_revert_apply.json` (or `_dryrun.json`) |
+| `push_hostname_tags.py` | `tools\vm_tags\` | `nsx_vm_tags_manifests\<host>\<UTC_TS>_apply.json` + `.md` (or `_dryrun.*`) |
+| `revert_hostname_tags.py` | `tools\vm_tags\` | `nsx_vm_tags_manifests\<host>\<UTC_TS>_revert_apply.json` (or `_dryrun.json`) |
 | `report_rules_usage.py` | `tools\reports\` | `nsx_logs\reports\rules_usage\<host>\<UTC_TS>\` |
 | `report_groups_usage.py` | `tools\reports\` | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
 | `build_hostname_tag_plan.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\` (offline planner) |

@@ -29,7 +29,7 @@ set PYTHONPATH=%CD%\app
 ## Step 1: Pre-change dry-run (single command)
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/dryrun_hostname_tags.py \
+PYTHONPATH="$PWD/app" python tools/reports/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
   --output-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --overwrite
@@ -82,7 +82,7 @@ PYTHONPATH="$PWD/app" python tools/vm_tags/validate_hostname_tags.py \
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest nsx_vm_files/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
+  --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
 ```
 
 ## Step 7: Revert — apply
@@ -90,6 +90,6 @@ PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
 ```bash
 PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
-  --manifest nsx_vm_files/vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
+  --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
   --apply
 ```
