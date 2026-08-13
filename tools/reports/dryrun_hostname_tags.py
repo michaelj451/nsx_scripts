@@ -10,11 +10,12 @@ This script makes NO NSX writes. It reads the live VM state via the fabric
 API and writes plan + classification reports locally.
 
 Flagged conditions (each gets its own JSON report under --output-dir):
-  - skip_has_tag       : VMs already carrying a hostname tag
-  - skip_invalid_name  : VMs whose names lack a 3-8 char trailing token
-  - skip_edge          : NSX Edge VMs (always skipped)
-  - skip_other_type    : non-REGULAR VMs (NSX appliances, etc.)
-  - eligible           : VMs that WILL get tagged on apply
+  - skip_has_tag             : VMs already carrying a hostname tag
+  - skip_length_out_of_range : trailing token below min / above max length
+  - skip_invalid_name        : VMs with no usable trailing token in the name
+  - skip_edge                : NSX Edge VMs (always skipped)
+  - skip_other_type          : non-REGULAR VMs (NSX appliances, etc.)
+  - eligible                 : VMs that WILL get tagged on apply
 
 Usage:
   python tools/reports/dryrun_hostname_tags.py \\
@@ -76,7 +77,8 @@ def write_plan_markdown(out_dir: Path, summary: dict, buckets: dict) -> Path:
     meanings = {
         "eligible":            "Will be tagged when push runs with --apply",
         "skip_has_tag":        "Already has a hostname tag - no action",
-        "skip_invalid_name":   "Name does not end in 3-6 digits - flag for review",
+        "skip_length_out_of_range": "Trailing token below min / above max length - flag for review",
+        "skip_invalid_name":   "Name has no usable trailing token - flag for review",
         "skip_too_many_tags":  "VM at NSX 30-tag cap - flag for cleanup",
         "skip_edge":           "NSX Edge VM - always skipped",
         "skip_other_type":     "System VM (vCLS, NSX Manager, etc.) - always skipped",
@@ -102,7 +104,7 @@ def write_plan_markdown(out_dir: Path, summary: dict, buckets: dict) -> Path:
         lines.append("")
 
     # Bucket sections - one line per VM in each non-empty skip bucket
-    for key in ("skip_has_tag", "skip_invalid_name", "skip_too_many_tags", "skip_edge", "skip_other_type"):
+    for key in ("skip_has_tag", "skip_length_out_of_range", "skip_invalid_name", "skip_too_many_tags", "skip_edge", "skip_other_type"):
         rows = buckets.get(key) or []
         if not rows:
             continue
@@ -194,6 +196,7 @@ def main() -> None:
         "eligible": [],
         "skip_has_tag": [],
         "skip_too_many_tags": [],
+        "skip_length_out_of_range": [],
         "skip_invalid_name": [],
         "skip_edge": [],
         "skip_other_type": [],
@@ -222,6 +225,9 @@ def main() -> None:
         elif cls == "skip_invalid_name":
             log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (name does not match hostname regex)",
                      name, ext)
+        elif cls == "skip_length_out_of_range":
+            log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (%s)",
+                     name, ext, c.get("reason", "hostname length out of range"))
         # skip_edge and skip_other_type are noisy for typical labs; log at DEBUG only.
         elif cls in ("skip_edge", "skip_other_type"):
             log.debug("[DRY-RUN] VM=%s ext_id=%s: SKIP (%s)", name, ext, cls)
@@ -241,6 +247,7 @@ def main() -> None:
     flagged = (
         len(buckets["skip_has_tag"])
         + len(buckets["skip_invalid_name"])
+        + len(buckets["skip_length_out_of_range"])
         + len(buckets["skip_too_many_tags"])
     )
 

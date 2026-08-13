@@ -9,8 +9,10 @@ Offline transform. Read a VM-tag export and classify every VM into one of:
                         Will be tagged.
   skip_has_tag        : already has a hostname-scope tag. Will be skipped.
                         Logged as separate report (operator review).
-  skip_invalid_name   : name has no matching 3-8 char trailing token. Will
-                        be skipped + flagged.
+  skip_length_out_of_range : trailing token present but its length is below
+                        min or above max. Skipped + flagged.
+  skip_invalid_name   : name has no trailing hyphen-delimited alphanumeric
+                        token at all. Skipped + flagged.
   skip_edge           : NSX Edge VM (type=EDGE). Always skipped.
   skip_other_type     : type is something other than REGULAR / EDGE
                         (e.g. NSX Manager appliances). Always skipped.
@@ -65,11 +67,19 @@ DEFAULT_HOSTNAME_MAX_LEN = 8
 
 # Compiled once per process. Reset via _reset_hostname_regex_cache() in tests.
 _HOSTNAME_REGEX_CACHE: Optional[re.Pattern] = None
+_HOSTNAME_TOKEN_REGEX_CACHE: Optional[re.Pattern] = None
 
 
 def _reset_hostname_regex_cache() -> None:
-    global _HOSTNAME_REGEX_CACHE
+    global _HOSTNAME_REGEX_CACHE, _HOSTNAME_TOKEN_REGEX_CACHE
     _HOSTNAME_REGEX_CACHE = None
+    _HOSTNAME_TOKEN_REGEX_CACHE = None
+
+
+def hostname_len_bounds() -> tuple[int, int]:
+    """The (min, max) trailing-token length bounds, normalized so min <= max."""
+    lo, hi = DEFAULT_HOSTNAME_MIN_LEN, DEFAULT_HOSTNAME_MAX_LEN
+    return (hi, lo) if lo > hi else (lo, hi)
 
 
 def hostname_regex() -> re.Pattern:
@@ -96,6 +106,19 @@ def hostname_regex() -> re.Pattern:
              pattern, lo, hi)
     _HOSTNAME_REGEX_CACHE = compiled
     return compiled
+
+
+def hostname_token_regex() -> re.Pattern:
+    """Length-agnostic sibling of hostname_regex(): DEFAULT_HOSTNAME_REGEX with
+    the `{MIN,MAX}` quantifier relaxed to `+`. Used only to tell a name with no
+    usable trailing token apart from one whose token merely falls outside the
+    [MIN,MAX] length window (below min / above max)."""
+    global _HOSTNAME_TOKEN_REGEX_CACHE
+    if _HOSTNAME_TOKEN_REGEX_CACHE is not None:
+        return _HOSTNAME_TOKEN_REGEX_CACHE
+    _HOSTNAME_TOKEN_REGEX_CACHE = re.compile(
+        DEFAULT_HOSTNAME_REGEX.replace("{MIN,MAX}", "+"))
+    return _HOSTNAME_TOKEN_REGEX_CACHE
 
 
 def supported_vm_types() -> Set[str]:
@@ -253,14 +276,31 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
         return base
 
     if proposed is None:
+        lo, hi = hostname_len_bounds()
+        token_match = hostname_token_regex().search(name)
+        if token_match:
+            # A trailing token exists; it just falls outside the length window
+            # (otherwise the main regex would have matched it).
+            token = token_match.group(1)
+            n = len(token)
+            below = n < lo
+            base["classification"] = "skip_length_out_of_range"
+            base["length_issue"] = "below_min" if below else "above_max"
+            base["candidate_token"] = token
+            base["reason"] = (
+                f"Trailing token {token!r} length {n} is "
+                f"{'below the minimum' if below else 'above the maximum'} "
+                f"({lo}-{hi} allowed)"
+            )
+            return base
         base["classification"] = "skip_invalid_name"
-        base["reason"] = "Name does not end with 3-6 trailing digits"
+        base["reason"] = "Name has no trailing hyphen-delimited alphanumeric token"
         return base
 
     base["classification"] = "eligible"
     base["reason"] = (
         f"Will add hostname tag {proposed!r} "
-        f"(from trailing digits in name; current tag count={tag_count})"
+        f"(from trailing token in name; current tag count={tag_count})"
     )
     return base
 
@@ -315,6 +355,7 @@ def main() -> None:
         "eligible": [],
         "skip_has_tag": [],
         "skip_too_many_tags": [],
+        "skip_length_out_of_range": [],
         "skip_invalid_name": [],
         "skip_edge": [],
         "skip_other_type": [],

@@ -78,6 +78,38 @@ def resolve_plan_dir(plan_dir: Path) -> Path:
         )
     return sorted(candidates, key=lambda p: p.name)[-1]
 
+
+# Plan-time skip buckets written by build_hostname_tag_plan.py, in report order.
+# These VMs never became eligible, so the push loop never sees them; we read the
+# sibling skip_*.json files so the report can show the full picture.
+PLAN_SKIP_BUCKETS = [
+    ("skip_length_out_of_range", "Skipped at plan time - hostname length out of range (below min / above max)"),
+    ("skip_invalid_name", "Skipped at plan time - no usable trailing token in name"),
+    ("skip_edge", "Skipped at plan time - NSX Edge VMs (type=EDGE)"),
+    ("skip_other_type", "Skipped at plan time - other / system VM types (non-REGULAR)"),
+    ("skip_has_tag", "Skipped at plan time - already has a hostname tag"),
+    ("skip_too_many_tags", "Skipped at plan time - at the tag cap"),
+]
+
+
+def load_plan_skips(plan_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
+    """Read the plan-time skip buckets that build_hostname_tag_plan.py wrote
+    next to eligible.json. Only non-empty buckets are returned."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for key, _label in PLAN_SKIP_BUCKETS:
+        p = plan_dir / f"{key}.json"
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rows = data.get("vms") or []
+        if rows:
+            out[key] = rows
+    return out
+
+
 # Pacing between writes
 TAG_UPDATE_INTERVAL_SECONDS = 0.5
 
@@ -110,6 +142,10 @@ def write_push_markdown(out_path: Path, manifest_doc: dict) -> Path:
     lines.append(f"- **Skipped (at tag cap)**: {c.get('skipped_too_many_tags_post_plan', 0)}")
     lines.append(f"- **Missing on target**: {c.get('missing_on_target', 0)}")
     lines.append(f"- **Errors**: {c.get('errors', 0)}")
+    psc = d.get("plan_skip_counts") or {}
+    if psc:
+        detail = ", ".join(f"{k}={v}" for k, v in psc.items())
+        lines.append(f"- **Skipped at plan time (never eligible)**: {sum(psc.values())}  ({detail})")
     if d.get("interactive_mode") is not None:
         lines.append(f"- **Interactive mode**: {d.get('interactive_mode')}  "
                      f"(batch_size started at {d.get('batch_size_initial')}, ended at {d.get('batch_size_final')})")
@@ -164,6 +200,24 @@ def write_push_markdown(out_path: Path, manifest_doc: dict) -> Path:
             lines.append(
                 f"| {i} | {r.get('display_name','')} | "
                 f"`{(r.get('external_id') or '')[:12]}...` | {detail} |"
+            )
+        lines.append("")
+
+    # Plan-time skips: VMs that never became eligible (edge/system/invalid/
+    # out-of-range/etc.), read from the plan's skip_*.json. The push loop never
+    # touches these, so surface them here for a complete before/after picture.
+    plan_skips = d.get("plan_skips") or {}
+    for key, label in PLAN_SKIP_BUCKETS:
+        rows = plan_skips.get(key) or []
+        if not rows:
+            continue
+        lines.append(f"## {label} ({len(rows)})\n")
+        lines.append("| # | VM | Type | Reason |")
+        lines.append("|---:|---|---|---|")
+        for i, r in enumerate(rows, start=1):
+            lines.append(
+                f"| {i} | {r.get('display_name','')} | "
+                f"{r.get('type','')} | {r.get('reason','')} |"
             )
         lines.append("")
 
@@ -336,6 +390,10 @@ def main() -> None:
     eligible_payload = json.loads(eligible_path.read_text(encoding="utf-8"))
     eligible = eligible_payload.get("vms") or []
     log.info("Eligible VMs from plan: %d", len(eligible))
+
+    # Plan-time skip buckets (edge/system/invalid/out-of-range/etc.) so the
+    # report shows what was NOT eligible, not just what got tagged.
+    plan_skips = load_plan_skips(plan_dir)
 
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=False)
 
@@ -546,6 +604,8 @@ def main() -> None:
         "batch_size_final": batch_size,
         "interactive_exit_requested": interactive_exit_requested,
         "results": results,
+        "plan_skips": plan_skips,
+        "plan_skip_counts": {k: len(v) for k, v in plan_skips.items()},
         "manifest_entries": manifest_entries,
     }
     manifest_path.write_text(json.dumps(manifest_doc, indent=2, sort_keys=True), encoding="utf-8")
