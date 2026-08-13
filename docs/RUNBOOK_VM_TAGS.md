@@ -140,7 +140,7 @@ Re-reads live VM state (read-modify-write defense) and previews exactly
 what would be PATCHed for each eligible VM.
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
+python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 \
   --plan-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local
 ```
@@ -155,7 +155,7 @@ A dry-run manifest is written to:
 ## 4) Push — apply
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/push_hostname_tags.py \
+python tools/vm_tags/push_hostname_tags.py \
   --manager nsx-lm1 \
   --plan-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local \
   --apply
@@ -180,7 +180,7 @@ Read-only: for every eligible VM in the plan, confirm the live NSX state
 now carries the expected hostname tag.
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/validate_hostname_tags.py \
+python tools/vm_tags/validate_hostname_tags.py \
   --manager nsx-lm1 \
   --plan-dir nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local
 ```
@@ -200,7 +200,7 @@ Reads the apply manifest from step 4 and previews exactly which
 preserved.
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
+python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
   --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json
 ```
@@ -213,7 +213,7 @@ A revert dry-run audit is written to
 ## 7) Revert — apply
 
 ```bash
-PYTHONPATH="$PWD/app" python tools/vm_tags/revert_hostname_tags.py \
+python tools/vm_tags/revert_hostname_tags.py \
   --manager nsx-lm1 \
   --manifest nsx_vm_tags_manifests/nsx-lm1.lab.local/<TS>_apply.json \
   --apply

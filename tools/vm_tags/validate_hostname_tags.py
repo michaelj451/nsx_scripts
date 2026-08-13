@@ -3,8 +3,11 @@
 tools/vm_tags/validate_hostname_tags.py
 
 Read-only check: for every eligible VM in a push plan, does the live NSX
-state now have the expected hostname tag? Also reports flagged-but-skipped
-classes for visibility.
+state now have the expected hostname tag?
+
+Writes two artifacts under nsx_vm_files/vm_tags_validation/<TS>_<manager>/:
+  - validation_report.json  (full per-VM detail)
+  - validation_report.md    (PASS/FAIL header + verified matches + any issues)
 
 Usage:
   python tools/vm_tags/validate_hostname_tags.py \\
@@ -23,6 +26,7 @@ from typing import Any, Dict, List
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_vm_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.md_utils import align_markdown_tables
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +81,68 @@ def _hostname_tag(tags: List[Dict[str, str]]) -> str | None:
         if isinstance(t, dict) and t.get("scope") == "hostname":
             return t.get("tag")
     return None
+
+
+def write_validation_markdown(out_path: Path, summary: dict, results: dict) -> Path:
+    """Human-readable validation report alongside the JSON, mirroring the
+    push/revert reports: a PASS/FAIL header, the verified-match list, and one
+    table per issue class (only rendered when non-empty)."""
+    c = summary.get("counts", {})
+    bad = (c.get("mismatch_wrong_value", 0)
+           + c.get("missing_hostname_tag", 0)
+           + c.get("missing_on_target", 0))
+    status = "PASS" if bad == 0 else "FAIL"
+
+    lines = []
+    lines.append(f"# VM Hostname Tag Validation - {summary.get('manager','?')} "
+                 f"({summary.get('manager_host','?')})\n")
+    lines.append(f"- **Result**: **{status}**")
+    lines.append(f"- **Ran at**: {summary.get('ran_at','')}")
+    lines.append(f"- **Eligible in plan**: {summary.get('eligible_in_plan', 0)}")
+    lines.append(f"- **Matched (verified)**: **{c.get('match', 0)}**")
+    lines.append(f"- **Mismatched value**: {c.get('mismatch_wrong_value', 0)}")
+    lines.append(f"- **Missing hostname tag**: {c.get('missing_hostname_tag', 0)}")
+    lines.append(f"- **Missing on target (VM not found live)**: {c.get('missing_on_target', 0)}")
+    lines.append("")
+
+    matches = results.get("match") or []
+    lines.append(f"## Verified matches ({len(matches)})\n")
+    if not matches:
+        lines.append("_No verified matches._\n")
+    else:
+        lines.append("| # | VM | Hostname tag | Ext ID |")
+        lines.append("|---:|---|---|---|")
+        for i, m in enumerate(matches, start=1):
+            lines.append(
+                f"| {i} | {m.get('display_name','')} | "
+                f"**`hostname\\|{m.get('hostname_tag','')}`** | "
+                f"`{(m.get('external_id') or '')[:12]}...` |"
+            )
+        lines.append("")
+
+    for key, label, cols in (
+        ("mismatch_wrong_value", "Mismatched value", ("Expected", "Actual")),
+        ("missing_hostname_tag", "Missing hostname tag", ("Expected",)),
+        ("missing_on_target", "Missing on target - VM not found live", ()),
+    ):
+        rows = results.get(key) or []
+        if not rows:
+            continue
+        header = "| # | VM | " + "".join(f"{col} | " for col in cols) + "Ext ID |"
+        sep = "|---:|---|" + "".join("---|" for _ in cols) + "---|"
+        lines.append(f"## {label} ({len(rows)})\n")
+        lines.append(header)
+        lines.append(sep)
+        for i, r in enumerate(rows, start=1):
+            mid = "".join(f"`{r.get(col.lower(),'')}` | " for col in cols)
+            lines.append(
+                f"| {i} | {r.get('display_name','')} | {mid}"
+                f"`{(r.get('external_id') or '')[:12]}...` |"
+            )
+        lines.append("")
+
+    out_path.write_text(align_markdown_tables("\n".join(lines)), encoding="utf-8")
+    return out_path
 
 
 def main() -> None:
@@ -152,6 +218,9 @@ def main() -> None:
         encoding="utf-8",
     )
     log.info("Validation report: %s", val_dir / "validation_report.json")
+    md_path = val_dir / "validation_report.md"
+    write_validation_markdown(md_path, summary, results)
+    log.info("Markdown report: %s", md_path)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
     bad = summary["counts"]["mismatch_wrong_value"] + summary["counts"]["missing_hostname_tag"] + summary["counts"]["missing_on_target"]
