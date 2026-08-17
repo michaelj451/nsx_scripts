@@ -7,21 +7,27 @@ Mirror a group's tag-based MEMBERSHIP CRITERIA into the group's own LABEL tags.
 For every group on the target manager this tool:
   1. Walks the group's membership expression (recursing into NestedExpression,
      so compound/API-authored groups are handled, not just GUI-flattened ones).
-  2. Finds every VM Tag Condition whose TAG VALUE is in the configured match
-     list (default: network, vm -- from NSX_GROUP_LABEL_MATCH_TAGS in .env).
+  2. Finds every VM Tag Condition whose matched field is in the configured
+     match list (default values: network, vm -- from NSX_GROUP_LABEL_MATCH_TAGS
+     in .env). Which field is matched is set by --match-on:
+       scope (DEFAULT): compare the criterion's SCOPE (the corrected
+              orientation, e.g. network|10.6.0.0 matches scope 'network').
+       tag            : compare the criterion's TAG value (legacy behavior,
+              e.g. the old backward 0|network matches tag 'network').
   3. Ensures each matching {scope, tag} also appears on the group's own `tags`
      (the label / "Tags" you see when editing the group in the UI).
 
 Terminology note (this bit is easy to get backwards):
   NSX stores a Tag condition's value as "scope|tag" -- SCOPE before the pipe,
-  TAG after it. In the UI criterion `Virtual Machine | Tag | Equals | network |
-  Scope Equals | 0`, the stored value is "0|network": scope="0", tag="network".
-  The match list holds TAG VALUES (network, vm), i.e. the "Tag" field, NOT the
-  scope. The full {scope, tag} pair is what gets mirrored onto the label.
+  TAG after it. In `Virtual Machine | Tag | Equals | 10.6.0.0 | Scope Equals |
+  network`, the stored value is "network|10.6.0.0": scope="network",
+  tag="10.6.0.0". With the corrected orientation the category lives in the
+  scope, so --match-on scope is the right default. The full {scope, tag} pair
+  is what gets mirrored onto the label regardless of which field is matched.
 
 The operation is additive and surgical:
   - Existing label tags (ANY scope/tag) are preserved untouched.
-  - Only {scope, tag} pairs whose tag value is in the match list are added,
+  - Only {scope, tag} pairs whose matched field is in the match list are added,
     and only if not already present.
   - Groups with no matching criteria are a no-op.
   - _system_owned groups are skipped.
@@ -76,6 +82,10 @@ log = logging.getLogger(__name__)
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
                        "nsx-lm3", "nsx-lm4", "nsx-lm5"]
 DEFAULT_MATCH_TAGS = "network,vm"
+# Which criterion field the match values are compared against. "scope" is the
+# corrected orientation (category lives in scope, e.g. network|10.6.0.0);
+# "tag" is the legacy value-based behavior (e.g. old 0|network).
+DEFAULT_MATCH_ON = "scope"
 THROTTLE_SECONDS = 0.2
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -93,6 +103,18 @@ def resolve_match_tags(cli_value: Optional[str]) -> List[str]:
     """
     raw = cli_value if cli_value is not None else os.getenv("NSX_GROUP_LABEL_MATCH_TAGS", DEFAULT_MATCH_TAGS)
     return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def resolve_match_on(cli_value: Optional[str]) -> str:
+    """Which field of a Tag criterion to compare the match values against:
+    'scope' (default, corrected orientation) or 'tag' (legacy, value-based).
+    Precedence: --match-on flag > NSX_GROUP_LABEL_MATCH_ON > default ('scope').
+    """
+    raw = (cli_value if cli_value is not None
+           else os.getenv("NSX_GROUP_LABEL_MATCH_ON", DEFAULT_MATCH_ON)).strip().lower()
+    if raw not in ("scope", "tag"):
+        raise SystemExit(f"--match-on must be 'scope' or 'tag', got {raw!r}")
+    return raw
 
 
 def output_dir(host: str) -> Path:
@@ -175,16 +197,22 @@ def _condition_scope_tag(cond: Dict[str, Any]) -> Tuple[str, str]:
     return scope.strip(), tag.strip()
 
 
-def desired_label_tags(group: Dict[str, Any], match_tags: Set[str]) -> List[Dict[str, str]]:
-    """Every {scope, tag} from the group's Tag criteria whose TAG VALUE is in
-    `match_tags`. We match on the tag portion (what the UI shows in the "Tag"
-    field) and mirror the full {scope, tag} onto the label."""
+def desired_label_tags(group: Dict[str, Any], match_values: Set[str],
+                       match_on: str = "scope") -> List[Dict[str, str]]:
+    """Every {scope, tag} from the group's Tag criteria whose matched field is
+    in `match_values`, mirrored (full {scope, tag}) onto the label.
+
+    match_on='scope' (default) compares against the criterion's SCOPE field
+    (the corrected orientation, e.g. network|10.6.0.0 -> matches 'network').
+    match_on='tag' compares against the TAG field (legacy value-based, e.g.
+    old 0|network -> matches 'network')."""
     seen: Set[Tuple[str, str]] = set()
     result: List[Dict[str, str]] = []
     for node in _walk_expressions(group):
         if node.get("resource_type") == "Condition" and node.get("key") == "Tag":
             scope, tag = _condition_scope_tag(node)
-            if tag in match_tags and (scope, tag) not in seen:
+            key_val = scope if match_on == "scope" else tag
+            if key_val in match_values and (scope, tag) not in seen:
                 seen.add((scope, tag))
                 result.append({"scope": scope, "tag": tag})
     return result
@@ -226,10 +254,11 @@ def sanitize_for_patch(obj: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 
 
-def plan_group(group: Dict[str, Any], match_tags: Set[str]) -> Dict[str, Any]:
+def plan_group(group: Dict[str, Any], match_values: Set[str],
+               match_on: str = "scope") -> Dict[str, Any]:
     """Compute what (if anything) needs to be added to one group's label."""
     gid = group.get("id")
-    desired = desired_label_tags(group, match_tags)
+    desired = desired_label_tags(group, match_values, match_on)
     existing = existing_tag_pairs(group)
     to_add = [t for t in desired if (t["scope"], t["tag"]) not in existing]
     return {
@@ -242,8 +271,8 @@ def plan_group(group: Dict[str, Any], match_tags: Set[str]) -> Dict[str, Any]:
     }
 
 
-def run(client: NsxPolicyClient, domain_id: str, match_tags: Set[str],
-        dry_run: bool, out_dir: Path) -> Dict[str, Any]:
+def run(client: NsxPolicyClient, domain_id: str, match_values: Set[str],
+        match_on: str, dry_run: bool, out_dir: Path) -> Dict[str, Any]:
     log.info("Listing groups in domain '%s' ...", domain_id)
     groups = client.list_groups(domain_id)
     log.info("Found %d groups", len(groups))
@@ -252,7 +281,7 @@ def run(client: NsxPolicyClient, domain_id: str, match_tags: Set[str],
     manifest_entries: List[Dict[str, Any]] = []
 
     for group in groups:
-        plan = plan_group(group, match_tags)
+        plan = plan_group(group, match_values, match_on)
         gid = plan["group_id"]
 
         if not gid:
@@ -329,8 +358,9 @@ def run(client: NsxPolicyClient, domain_id: str, match_tags: Set[str],
         })
         log.info("APPLIED [%s] to group %s (%s)", add_str, gid, plan["display_name"] or "-")
 
-    summary = _summarize(results, domain_id, match_tags, dry_run)
-    _write_reports(out_dir, results, manifest_entries, summary, client, domain_id, match_tags, dry_run)
+    summary = _summarize(results, domain_id, match_values, match_on, dry_run)
+    _write_reports(out_dir, results, manifest_entries, summary, client, domain_id,
+                   match_values, match_on, dry_run)
     return summary
 
 
@@ -343,7 +373,7 @@ def _tags_list(group: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def _summarize(results: List[Dict[str, Any]], domain_id: str,
-               match_tags: Set[str], dry_run: bool) -> Dict[str, Any]:
+               match_values: Set[str], match_on: str, dry_run: bool) -> Dict[str, Any]:
     by_status: Dict[str, int] = {}
     tags_added = 0
     for r in results:
@@ -353,7 +383,8 @@ def _summarize(results: List[Dict[str, Any]], domain_id: str,
     return {
         "created_at": utc_now_iso(),
         "domain_id": domain_id,
-        "match_tags": sorted(match_tags),
+        "match_tags": sorted(match_values),
+        "match_on": match_on,
         "dry_run": dry_run,
         "groups_seen": len(results),
         "by_status": by_status,
@@ -363,8 +394,8 @@ def _summarize(results: List[Dict[str, Any]], domain_id: str,
 
 def _write_reports(out_dir: Path, results: List[Dict[str, Any]],
                    manifest_entries: List[Dict[str, Any]], summary: Dict[str, Any],
-                   client: NsxPolicyClient, domain_id: str, match_tags: Set[str],
-                   dry_run: bool) -> None:
+                   client: NsxPolicyClient, domain_id: str, match_values: Set[str],
+                   match_on: str, dry_run: bool) -> None:
     write_json(out_dir / "results.json", results)
     write_jsonl(out_dir / "results.jsonl", results)
     write_json(out_dir / "summary.json", summary)
@@ -373,7 +404,8 @@ def _write_reports(out_dir: Path, results: List[Dict[str, Any]],
         "created_at": utc_now_iso(),
         "run_ts": RUN_TS,
         "domain_id": domain_id,
-        "match_tags": sorted(match_tags),
+        "match_tags": sorted(match_values),
+        "match_on": match_on,
         "dry_run": dry_run,
         "manager": getattr(client, "nsxmanager", None),
         "federation_global": getattr(client, "federation_global", None),
@@ -386,7 +418,8 @@ def _write_reports(out_dir: Path, results: List[Dict[str, Any]],
         f"# Group label-tag sync: {'DRY-RUN' if dry_run else 'APPLY'}",
         "",
         f"- Domain: `{domain_id}`",
-        f"- Match tag values: `{', '.join(sorted(match_tags))}`",
+        f"- Match on: `{match_on}` field  (values compared against each criterion's {match_on})",
+        f"- Match values: `{', '.join(sorted(match_values))}`",
         f"- Groups seen: {summary['groups_seen']}",
         f"- Tag additions: {summary['tag_additions']}",
         f"- Status counts: {summary['by_status']}",
@@ -411,7 +444,8 @@ def _write_reports(out_dir: Path, results: List[Dict[str, Any]],
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Mirror VM Tag criteria (matched by tag value) into each group's own label tags."
+        description="Mirror VM Tag criteria into each group's own label tags "
+                    "(match on scope [default] or tag value via --match-on)."
     )
     parser.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES,
                         help="Target manager alias from .env/nsx_constants")
@@ -419,9 +453,13 @@ def main() -> None:
     parser.add_argument("--federation-global", action="store_true",
                         help="Use the federated/global view (LM federated view or GM native).")
     parser.add_argument("--match-tags", default=None,
-                        help="Comma-separated TAG VALUES to mirror (the criterion's 'Tag' field, "
-                             "not the scope). Overrides NSX_GROUP_LABEL_MATCH_TAGS (.env). "
+                        help="Comma-separated VALUES to match (compared against the field named "
+                             "by --match-on). Overrides NSX_GROUP_LABEL_MATCH_TAGS (.env). "
                              "Default: network,vm")
+    parser.add_argument("--match-on", default=None, choices=["scope", "tag"],
+                        help="Which criterion field the values match against: 'scope' (default; "
+                             "corrected orientation where scope=network/vm) or 'tag' (legacy "
+                             "value-based). Overrides NSX_GROUP_LABEL_MATCH_ON (.env).")
     parser.add_argument("--apply", action="store_true",
                         help="Actually PATCH groups. Without this the tool dry-runs.")
     args = parser.parse_args()
@@ -431,6 +469,7 @@ def main() -> None:
     match_tags = resolve_match_tags(args.match_tags)
     if not match_tags:
         raise SystemExit("No match tags configured (set --match-tags or NSX_GROUP_LABEL_MATCH_TAGS).")
+    match_on = resolve_match_on(args.match_on)
 
     target_host = resolve_manager(args.target)
     if not target_host:
@@ -445,10 +484,10 @@ def main() -> None:
     log.info("Group label-tag sync starting")
     log.info("Target: %s (%s)  federation_global=%s  domain=%s",
              args.target, target_host, args.federation_global, args.domain_id)
-    log.info("Match tag values: %s", match_tags)
+    log.info("Match on: %s  values: %s", match_on, match_tags)
     log.info("Mode: %s", "APPLY" if args.apply else "DRY-RUN (default)")
 
-    summary = run(client, args.domain_id, set(match_tags), dry_run, out_dir)
+    summary = run(client, args.domain_id, set(match_tags), match_on, dry_run, out_dir)
     summary.update({
         "target": args.target,
         "target_host": target_host,
