@@ -1,0 +1,17 @@
+# Hostname-tag exclusion list (used by tools/vm_tags/build_hostname_tag_plan.py
+# and tools/reports/dryrun_hostname_tags.py).
+#
+# One hostname VALUE per line -- this is the value the tool would derive and
+# tag (the trailing token of the VM name, e.g. "ax2001", "0202", "OLD").
+# Any VM whose derived hostname value matches a line here (case-insensitive)
+# is classified skip_excluded and listed in its own report section instead of
+# being tagged.
+#
+# Blank lines and lines starting with '#' are ignored.
+#
+# Example (uncomment / edit for your environment):
+#   OLD
+#   decommissioned
+
+new
+old

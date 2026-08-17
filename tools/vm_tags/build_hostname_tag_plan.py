@@ -7,6 +7,9 @@ Offline transform. Read a VM-tag export and classify every VM into one of:
   eligible            : type=REGULAR, name ends in a 3-8 char alphanumeric
                         token after a hyphen, no existing hostname tag.
                         Will be tagged.
+  skip_excluded       : derived hostname value is on the exclusion list
+                        (VM_TAGS_HOSTNAME_EXCLUDE_FILE). Deliberately never
+                        tagged.
   skip_has_tag        : already has a hostname-scope tag. Will be skipped.
                         Logged as separate report (operator review).
   skip_length_out_of_range : trailing token present but its length is below
@@ -147,6 +150,35 @@ def max_tags_per_vm() -> int:
         return 30
 
 
+def load_exclude_values(path: Optional[str] = None) -> Set[str]:
+    """Load the hostname-value exclusion list. A VM whose derived hostname value
+    matches (case-insensitively) an entry here is classified `skip_excluded`
+    instead of `eligible`, so the tool never tags it.
+
+    File format: one hostname value per line (e.g. `OLD`); blank lines and lines
+    starting with `#` are ignored. Path precedence: the `path` arg >
+    VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env). Unset or missing file -> no exclusions.
+    Values are lowercased so matching is case-insensitive.
+
+    Call this ONCE (it logs) and pass the result into classify_vm().
+    """
+    p = (path or os.getenv("VM_TAGS_HOSTNAME_EXCLUDE_FILE") or "").strip()
+    if not p:
+        return set()
+    fp = Path(os.path.expandvars(p)).expanduser()
+    if not fp.exists():
+        log.warning("Hostname exclusion file not found: %s (no exclusions applied)", fp)
+        return set()
+    values: Set[str] = set()
+    for line in fp.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        values.add(s.lower())
+    log.info("Loaded %d hostname exclusion value(s) from %s", len(values), fp)
+    return values
+
+
 def setup_logging(tool: str) -> Path:
     log_dir = Path(nsx_vm_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -227,8 +259,11 @@ def write_tag_inventory_jsonl(vms: List[Dict[str, Any]], out_path: Path) -> int:
     return written
 
 
-def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
-    """Classify a single VM. Returns a dict with classification + reasoning."""
+def classify_vm(vm: Dict[str, Any], exclude_values: Set[str] = frozenset()) -> Dict[str, Any]:
+    """Classify a single VM. Returns a dict with classification + reasoning.
+
+    exclude_values: lowercased hostname values (from load_exclude_values). A VM
+    whose derived hostname value is in this set is classified skip_excluded."""
     name = vm.get("display_name") or ""
     ext_id = vm.get("external_id") or ""
     vm_type = vm.get("type") or "UNKNOWN"
@@ -297,6 +332,14 @@ def classify_vm(vm: Dict[str, Any]) -> Dict[str, Any]:
         base["reason"] = "Name has no trailing hyphen-delimited alphanumeric token"
         return base
 
+    if proposed.lower() in exclude_values:
+        base["classification"] = "skip_excluded"
+        base["reason"] = (
+            f"Hostname value {proposed!r} is on the exclusion list "
+            f"(VM_TAGS_HOSTNAME_EXCLUDE_FILE)"
+        )
+        return base
+
     base["classification"] = "eligible"
     base["reason"] = (
         f"Will add hostname tag {proposed!r} "
@@ -316,6 +359,11 @@ def main() -> None:
         help="Where to write the plan JSON files (default: <NSX_VM_LOG_DIR>/vm_tags_plan/<manager-host>, derived from the export).",
     )
     parser.add_argument("--overwrite", action="store_true", help="Delete --output-dir before writing")
+    parser.add_argument("--exclude-file", default=None,
+                        help="Path to a hostname-value exclusion list (one value per line; blank "
+                             "lines and # comments ignored). A VM whose derived hostname value "
+                             "matches (case-insensitive) is classified skip_excluded and never "
+                             "tagged. Overrides VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env).")
     args = parser.parse_args()
 
     init_cli()
@@ -349,10 +397,12 @@ def main() -> None:
     vms = payload.get("vms") or []
     log.info("Loaded %d VMs from export", len(vms))
 
-    classified = [classify_vm(v) for v in vms]
+    exclude_values = load_exclude_values(args.exclude_file)
+    classified = [classify_vm(v, exclude_values) for v in vms]
 
     buckets: Dict[str, List[Dict[str, Any]]] = {
         "eligible": [],
+        "skip_excluded": [],
         "skip_has_tag": [],
         "skip_too_many_tags": [],
         "skip_length_out_of_range": [],
