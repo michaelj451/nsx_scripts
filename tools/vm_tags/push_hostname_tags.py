@@ -83,6 +83,7 @@ def resolve_plan_dir(plan_dir: Path) -> Path:
 # These VMs never became eligible, so the push loop never sees them; we read the
 # sibling skip_*.json files so the report can show the full picture.
 PLAN_SKIP_BUCKETS = [
+    ("skip_excluded", "Skipped at plan time - on the hostname exclusion list (deliberately not tagged)"),
     ("skip_length_out_of_range", "Skipped at plan time - hostname length out of range (below min / above max)"),
     ("skip_invalid_name", "Skipped at plan time - no usable trailing token in name"),
     ("skip_edge", "Skipped at plan time - NSX Edge VMs (type=EDGE)"),

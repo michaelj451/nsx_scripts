@@ -10,6 +10,7 @@ This script makes NO NSX writes. It reads the live VM state via the fabric
 API and writes plan + classification reports locally.
 
 Flagged conditions (each gets its own JSON report under --output-dir):
+  - skip_excluded            : hostname value is on the exclusion list (never tagged)
   - skip_has_tag             : VMs already carrying a hostname tag
   - skip_length_out_of_range : trailing token below min / above max length
   - skip_invalid_name        : VMs with no usable trailing token in the name
@@ -42,7 +43,7 @@ from nsx.md_utils import align_markdown_tables
 # Re-use the classifier from build_hostname_tag_plan.py to avoid duplication.
 # That file still lives under tools/vm_tags/; we're now under tools/reports/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vm_tags"))
-from build_hostname_tag_plan import classify_vm, write_tag_inventory_jsonl  # type: ignore
+from build_hostname_tag_plan import classify_vm, load_exclude_values, write_tag_inventory_jsonl  # type: ignore
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -76,6 +77,7 @@ def write_plan_markdown(out_dir: Path, summary: dict, buckets: dict) -> Path:
     lines.append("|---|---:|---|")
     meanings = {
         "eligible":            "Will be tagged when push runs with --apply",
+        "skip_excluded":       "On the hostname exclusion list - deliberately not tagged",
         "skip_has_tag":        "Already has a hostname tag - no action",
         "skip_length_out_of_range": "Trailing token below min / above max length - flag for review",
         "skip_invalid_name":   "Name has no usable trailing token - flag for review",
@@ -104,7 +106,7 @@ def write_plan_markdown(out_dir: Path, summary: dict, buckets: dict) -> Path:
         lines.append("")
 
     # Bucket sections - one line per VM in each non-empty skip bucket
-    for key in ("skip_has_tag", "skip_length_out_of_range", "skip_invalid_name", "skip_too_many_tags", "skip_edge", "skip_other_type"):
+    for key in ("skip_excluded", "skip_has_tag", "skip_length_out_of_range", "skip_invalid_name", "skip_too_many_tags", "skip_edge", "skip_other_type"):
         rows = buckets.get(key) or []
         if not rows:
             continue
@@ -163,6 +165,11 @@ def main() -> None:
         help="Where to write the classification reports (default: <NSX_VM_LOG_DIR>/vm_tags_plan/<manager-host>).",
     )
     parser.add_argument("--overwrite", action="store_true", help="Delete --output-dir before writing.")
+    parser.add_argument("--exclude-file", default=None,
+                        help="Path to a hostname-value exclusion list (one value per line; blank "
+                             "lines and # comments ignored). VMs whose derived hostname value "
+                             "matches (case-insensitive) go to skip_excluded. Overrides "
+                             "VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env).")
     args = parser.parse_args()
 
     init_cli()
@@ -191,9 +198,11 @@ def main() -> None:
     vms = client.list_virtual_machines()
     log.info("Total VMs: %d", len(vms))
 
-    classified = [classify_vm(v) for v in vms]
+    exclude_values = load_exclude_values(args.exclude_file)
+    classified = [classify_vm(v, exclude_values) for v in vms]
     buckets = {
         "eligible": [],
+        "skip_excluded": [],
         "skip_has_tag": [],
         "skip_too_many_tags": [],
         "skip_length_out_of_range": [],
@@ -228,6 +237,9 @@ def main() -> None:
         elif cls == "skip_length_out_of_range":
             log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (%s)",
                      name, ext, c.get("reason", "hostname length out of range"))
+        elif cls == "skip_excluded":
+            log.info("[DRY-RUN] VM=%s ext_id=%s: SKIP (%s)",
+                     name, ext, c.get("reason", "on hostname exclusion list"))
         # skip_edge and skip_other_type are noisy for typical labs; log at DEBUG only.
         elif cls in ("skip_edge", "skip_other_type"):
             log.debug("[DRY-RUN] VM=%s ext_id=%s: SKIP (%s)", name, ext, cls)
@@ -248,6 +260,7 @@ def main() -> None:
         len(buckets["skip_has_tag"])
         + len(buckets["skip_invalid_name"])
         + len(buckets["skip_length_out_of_range"])
+        + len(buckets["skip_excluded"])
         + len(buckets["skip_too_many_tags"])
     )
 
