@@ -34,12 +34,14 @@ Usage (apply):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
@@ -48,8 +50,112 @@ from nsx.nsx_policy_client import NsxPolicyClient
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+CHECKPOINT_TOOL_TAG = "revert_hostname_tags"
+CHECKPOINT_SCHEMA_VERSION = 1
 
 TAG_UPDATE_INTERVAL_SECONDS = 0.5
+
+
+def _sha256_of_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _open_checkpoint(path: Path, header: Dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a", encoding="utf-8")
+    if path.stat().st_size == 0:
+        rec = {"type": "header", **header}
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+    return fh
+
+
+def _checkpoint_write(fh, entry: Dict[str, Any]) -> None:
+    fh.write(json.dumps({"type": "entry", **entry}, sort_keys=True) + "\n")
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def _load_resume_checkpoint(
+    path: Path,
+    expected_manager_host: str,
+    expected_manifest_path: Path,
+    expected_manifest_sha256: str,
+    force_manifest_mismatch: bool,
+) -> Tuple[Set[str], Dict[str, Any]]:
+    """
+    Validate an existing revert checkpoint and return (already_reverted_ext_ids, header).
+
+    STRICT by default: refuses on manager mismatch always, and on
+    manifest path / sha256 mismatch unless force_manifest_mismatch=True.
+    """
+    if not path.exists():
+        raise SystemExit(f"--resume file not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise SystemExit(f"--resume file is empty: {path}")
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--resume file header is not JSON: {exc}")
+    if header.get("type") != "header":
+        raise SystemExit(f"--resume first line is not a header (type={header.get('type')!r})")
+    if header.get("tool") != CHECKPOINT_TOOL_TAG:
+        raise SystemExit(
+            f"--resume file was written by tool={header.get('tool')!r}, "
+            f"not {CHECKPOINT_TOOL_TAG!r}. Refusing to load."
+        )
+    if header.get("manager_host") != expected_manager_host:
+        raise SystemExit(
+            f"--resume manager mismatch: checkpoint recorded manager_host="
+            f"{header.get('manager_host')!r} but this run resolves to "
+            f"{expected_manager_host!r}. Refusing to proceed."
+        )
+    manifest_path_ok = str(header.get("source_manifest")) == str(expected_manifest_path)
+    manifest_sha_ok = (
+        header.get("source_manifest_sha256") == expected_manifest_sha256
+        if header.get("source_manifest_sha256") else True
+    )
+    if (not manifest_path_ok or not manifest_sha_ok) and not force_manifest_mismatch:
+        raise SystemExit(
+            "--resume manifest mismatch:\n"
+            f"  checkpoint source_manifest     = {header.get('source_manifest')!r}\n"
+            f"  this run  --manifest           = {str(expected_manifest_path)!r}\n"
+            f"  checkpoint source_manifest_sha = {header.get('source_manifest_sha256')!r}\n"
+            f"  this run  manifest sha256      = {expected_manifest_sha256!r}\n"
+            "Refusing to proceed. Pass --force-manifest-mismatch ONLY if you "
+            "are certain the manifest content is unchanged."
+        )
+    if not manifest_path_ok:
+        log.warning("Resume: manifest path differs but --force-manifest-mismatch is set.")
+    if not manifest_sha_ok:
+        log.warning("Resume: manifest sha256 differs but --force-manifest-mismatch is set.")
+
+    already_reverted: Set[str] = set()
+    for ln in lines[1:]:
+        try:
+            e = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if (
+            e.get("type") == "entry"
+            and e.get("status") == "success"
+            and e.get("external_id")
+        ):
+            already_reverted.add(e["external_id"])
+    return already_reverted, header
 
 
 class _InteractiveExit(Exception):
@@ -157,6 +263,22 @@ def main() -> None:
              "(step-through, safest). Default when dry-run: 0 (no prompts). "
              "Pass --batch-size 0 to disable prompts entirely under --apply.",
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a prior *_revert_apply.progress.jsonl checkpoint from a "
+             "crashed or early-exited revert. VMs already recorded as "
+             "status=success are skipped IF live NSX confirms the tag is "
+             "already gone. Manager and manifest (path + sha256) must match "
+             "the checkpoint (strict). See --force-manifest-mismatch.",
+    )
+    parser.add_argument(
+        "--force-manifest-mismatch",
+        action="store_true",
+        help="With --resume, allow proceeding when the manifest path or "
+             "content sha256 differs from the checkpoint's. Only use this "
+             "when you are certain the manifest content is unchanged.",
+    )
     args = parser.parse_args()
 
     init_cli()
@@ -179,6 +301,33 @@ def main() -> None:
             manifest["manager_host"], manager_host,
         )
 
+    manifest_sha256 = _sha256_of_file(manifest_path)
+    log.info("Source manifest sha256: %s", manifest_sha256)
+
+    dry_run = not args.apply
+
+    out_dir = Path(nsx_log_dir).expanduser().resolve() / "reports" / "vm_tags_revert" / manager_host
+    out_dir.mkdir(parents=True, exist_ok=True)
+    kind = "dryrun" if dry_run else "apply"
+    checkpoint_path = out_dir / f"{RUN_TS}_revert_{kind}.progress.jsonl"
+
+    already_reverted_from_resume: Set[str] = set()
+    resume_header: Optional[Dict[str, Any]] = None
+    if args.resume:
+        resume_path = Path(args.resume).expanduser().resolve()
+        already_reverted_from_resume, resume_header = _load_resume_checkpoint(
+            resume_path,
+            expected_manager_host=manager_host,
+            expected_manifest_path=manifest_path,
+            expected_manifest_sha256=manifest_sha256,
+            force_manifest_mismatch=args.force_manifest_mismatch,
+        )
+        log.info(
+            "RESUME: %d VM(s) already recorded as reverted in %s. Will "
+            "verify each is actually untagged in live NSX before skipping.",
+            len(already_reverted_from_resume), resume_path,
+        )
+
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=False)
     live = client.list_virtual_machines()
     live_by_id = {vm["external_id"]: vm for vm in live if vm.get("external_id")}
@@ -189,9 +338,26 @@ def main() -> None:
         "skipped_tag_no_longer_present": [],
         "missing_on_target": [],
         "errors": [],
+        "skipped_already_reverted_prior_run": [],
+        "checkpoint_vs_live_mismatch": [],
     }
-    dry_run = not args.apply
     last_ts = 0.0
+
+    checkpoint_header = {
+        "tool": CHECKPOINT_TOOL_TAG,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "manager": args.manager,
+        "manager_host": manager_host,
+        "source_manifest": str(manifest_path),
+        "source_manifest_sha256": manifest_sha256,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "run_ts": RUN_TS,
+        "dry_run": dry_run,
+        "resumed_from": str(Path(args.resume).expanduser().resolve()) if args.resume else None,
+        "prior_success_count_from_resume": len(already_reverted_from_resume),
+    }
+    cp_fh = _open_checkpoint(checkpoint_path, checkpoint_header)
+    log.info("Checkpoint (incremental): %s", checkpoint_path)
 
     # Interactive batch state (mirrors push_hostname_tags.py).
     # Defaults:
@@ -222,7 +388,9 @@ def main() -> None:
         live_vm = live_by_id.get(ext_id)
         if live_vm is None:
             log.warning("[MISSING] VM not on target anymore: %s (%s)", display, ext_id)
-            results["missing_on_target"].append({"external_id": ext_id, "display_name": display})
+            row = {"external_id": ext_id, "display_name": display}
+            results["missing_on_target"].append(row)
+            _checkpoint_write(cp_fh, {"status": "missing_on_target", **row})
             continue
 
         current_tags = live_vm.get("tags") or []
@@ -235,26 +403,63 @@ def main() -> None:
                 current_hostname_value = t.get("tag")
                 break
 
-        if current_hostname_idx is None:
-            log.info("[NOOP] %s no longer has any hostname tag — nothing to revert", display)
-            results["skipped_tag_no_longer_present"].append(
-                {"external_id": ext_id, "display_name": display, "manifest_value": added_value}
+        # Resume-aware fast path: if this VM was recorded as reverted in a
+        # prior crashed run, verify with LIVE NSX before skipping.
+        if ext_id in already_reverted_from_resume:
+            live_still_has_target = (
+                current_hostname_value is not None
+                and current_hostname_value == added_value
             )
+            if not live_still_has_target:
+                log.info(
+                    "[RESUME-SKIP] %s already had hostname=%s removed per prior run and live state confirms.",
+                    display, added_value,
+                )
+                row = {
+                    "external_id": ext_id,
+                    "display_name": display,
+                    "manifest_value": added_value,
+                }
+                results["skipped_already_reverted_prior_run"].append(row)
+                _checkpoint_write(cp_fh, {"status": "skipped_already_reverted_prior_run", **row})
+                continue
+            log.warning(
+                "[CHECKPOINT-VS-LIVE MISMATCH] %s recorded as reverted in "
+                "the resume checkpoint but live NSX still shows hostname=%s. "
+                "Skipping this VM (safest). Investigate manually before "
+                "re-running without --resume.",
+                display, current_hostname_value,
+            )
+            row = {
+                "external_id": ext_id,
+                "display_name": display,
+                "manifest_value": added_value,
+                "live_hostname_tag": current_hostname_value,
+            }
+            results["checkpoint_vs_live_mismatch"].append(row)
+            _checkpoint_write(cp_fh, {"status": "checkpoint_vs_live_mismatch", **row})
+            continue
+
+        if current_hostname_idx is None:
+            log.info("[NOOP] %s no longer has any hostname tag; nothing to revert", display)
+            row = {"external_id": ext_id, "display_name": display, "manifest_value": added_value}
+            results["skipped_tag_no_longer_present"].append(row)
+            _checkpoint_write(cp_fh, {"status": "skipped_tag_no_longer_present", **row})
             continue
 
         if current_hostname_value != added_value:
             log.warning(
-                "[GUARD] %s has hostname=%s but manifest added %s — leaving alone",
+                "[GUARD] %s has hostname=%s but manifest added %s. Leaving alone.",
                 display, current_hostname_value, added_value,
             )
-            results["skipped_value_changed"].append(
-                {
-                    "external_id": ext_id,
-                    "display_name": display,
-                    "manifest_value": added_value,
-                    "current_value": current_hostname_value,
-                }
-            )
+            row = {
+                "external_id": ext_id,
+                "display_name": display,
+                "manifest_value": added_value,
+                "current_value": current_hostname_value,
+            }
+            results["skipped_value_changed"].append(row)
+            _checkpoint_write(cp_fh, {"status": "skipped_value_changed", **row})
             continue
 
         # Build new tag list: drop only the matching hostname tag
@@ -279,6 +484,7 @@ def main() -> None:
         if dry_run:
             row["status"] = "dry_run"
             results["reverted"].append(row)
+            _checkpoint_write(cp_fh, row)
             continue
 
         now = time.monotonic()
@@ -289,12 +495,14 @@ def main() -> None:
             client.update_vm_tags(ext_id, new_tags)
             row["status"] = "success"
             results["reverted"].append(row)
+            _checkpoint_write(cp_fh, row)
             last_ts = time.monotonic()
         except Exception as exc:
             log.error("FAILED reverting %s (%s): %s", display, ext_id, exc)
             row["status"] = "error"
             row["error"] = str(exc)
             results["errors"].append(row)
+            _checkpoint_write(cp_fh, row)
             last_ts = time.monotonic()
 
         # ---- Interactive batch boundary ----
@@ -324,10 +532,9 @@ def main() -> None:
         log.warning("Interactive exit requested. Reverted %d of %d entries.",
                     len(results["reverted"]), len(entries))
 
-    # Write revert manifest for audit
-    out_dir = REPO_ROOT / "nsx_vm_tags_manifests" / manager_host
-    out_dir.mkdir(parents=True, exist_ok=True)
-    kind = "dryrun" if dry_run else "apply"
+    # Write revert manifest for audit (out_dir + kind computed earlier so the
+    # checkpoint lives beside it from the first VM decision, at
+    # nsx_logs/reports/vm_tags_revert/<host>/).
     out_path = out_dir / f"{RUN_TS}_revert_{kind}.json"
     doc = {
         "manager": args.manager,
@@ -335,16 +542,39 @@ def main() -> None:
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
         "source_manifest": str(manifest_path),
+        "source_manifest_sha256": manifest_sha256,
+        "resumed_from": checkpoint_header.get("resumed_from"),
         "counts": {k: len(v) for k, v in results.items()},
         "interactive_mode": interactive_mode,
         "batch_size_initial": resolved_batch_size,
         "batch_size_final": batch_size,
         "interactive_exit_requested": interactive_exit_requested,
+        "checkpoint_path": str(checkpoint_path),
         "results": results,
     }
     out_path.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
     log.info("Revert audit written: %s", out_path)
-    print(json.dumps(doc["counts"] | {"manifest": str(out_path), "dry_run": dry_run}, indent=2, sort_keys=True))
+
+    # Close checkpoint and rename to .done.jsonl so orphan-detection
+    # (progress files without a sibling manifest) stays reliable.
+    try:
+        cp_fh.flush()
+        os.fsync(cp_fh.fileno())
+    except OSError:
+        pass
+    cp_fh.close()
+    done_path = checkpoint_path.with_suffix(".done.jsonl")
+    try:
+        checkpoint_path.rename(done_path)
+        log.info("Checkpoint finalized: %s", done_path)
+    except OSError as exc:
+        log.warning("Could not rename checkpoint to .done.jsonl (%s); leaving as-is.", exc)
+
+    print(json.dumps(doc["counts"] | {
+        "manifest": str(out_path),
+        "checkpoint": str(done_path if done_path.exists() else checkpoint_path),
+        "dry_run": dry_run,
+    }, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
