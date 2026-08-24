@@ -1,6 +1,10 @@
 # Hostname-tag exclusion list (used by tools/vm_tags/build_hostname_tag_plan.py
 # and tools/reports/dryrun_hostname_tags.py).
 #
+# AUTO-DISCOVERED: this file at repo root is picked up automatically. No CLI
+# flag or env var needed. Override with --exclude-file <path> or
+# VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env) if you want a different file.
+#
 # One hostname VALUE per line -- this is the value the tool would derive and
 # tag (the trailing token of the VM name, e.g. "ax2001", "0202", "OLD").
 # Any VM whose derived hostname value matches a line here (case-insensitive)

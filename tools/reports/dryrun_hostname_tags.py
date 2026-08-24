@@ -168,8 +168,9 @@ def main() -> None:
     parser.add_argument("--exclude-file", default=None,
                         help="Path to a hostname-value exclusion list (one value per line; blank "
                              "lines and # comments ignored). VMs whose derived hostname value "
-                             "matches (case-insensitive) go to skip_excluded. Overrides "
-                             "VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env).")
+                             "matches (case-insensitive) go to skip_excluded. Precedence: this "
+                             "flag > VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env) > auto-discovered "
+                             "hostname_tag_exclude.txt at repo root.")
     args = parser.parse_args()
 
     init_cli()
