@@ -36,12 +36,14 @@ Usage (apply):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
@@ -51,6 +53,8 @@ from nsx.md_utils import align_markdown_tables
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+CHECKPOINT_TOOL_TAG = "push_hostname_tags"
+CHECKPOINT_SCHEMA_VERSION = 1
 
 # Timestamp dir name pattern produced by dryrun/build-plan (matches RUN_TS).
 _TS_DIR_RE = __import__("re").compile(r"^\d{8}_\d{6}$")
@@ -344,6 +348,115 @@ def _has_scope(tags: List[Dict[str, str]], scope: str) -> str | None:
     return None
 
 
+def _sha256_of_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _open_checkpoint(path: Path, header: Dict[str, Any]):
+    """
+    Open the checkpoint file for append. Writes the header line if the file
+    is new/empty. Every entry written after this MUST go through
+    _checkpoint_write() so it is flushed+fsynced.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a", encoding="utf-8")
+    if path.stat().st_size == 0:
+        rec = {"type": "header", **header}
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+    return fh
+
+
+def _checkpoint_write(fh, entry: Dict[str, Any]) -> None:
+    """Append a single entry line, flush + fsync so it survives a hard kill."""
+    fh.write(json.dumps({"type": "entry", **entry}, sort_keys=True) + "\n")
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def _load_resume_checkpoint(
+    path: Path,
+    expected_manager_host: str,
+    expected_plan_dir: Path,
+    expected_plan_sha256: str,
+    force_plan_mismatch: bool,
+) -> Tuple[Set[str], Dict[str, Any]]:
+    """
+    Validate an existing checkpoint file and return (already_success_ext_ids, header).
+
+    STRICT by default: refuses on manager mismatch always, and on plan_dir /
+    plan_sha256 mismatch unless force_plan_mismatch=True.
+    """
+    if not path.exists():
+        raise SystemExit(f"--resume file not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise SystemExit(f"--resume file is empty: {path}")
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--resume file header is not JSON: {exc}")
+    if header.get("type") != "header":
+        raise SystemExit(f"--resume first line is not a header (type={header.get('type')!r})")
+    if header.get("tool") != CHECKPOINT_TOOL_TAG:
+        raise SystemExit(
+            f"--resume file was written by tool={header.get('tool')!r}, "
+            f"not {CHECKPOINT_TOOL_TAG!r}. Refusing to load."
+        )
+    if header.get("manager_host") != expected_manager_host:
+        raise SystemExit(
+            f"--resume manager mismatch: checkpoint recorded manager_host="
+            f"{header.get('manager_host')!r} but this run resolves to "
+            f"{expected_manager_host!r}. Refusing to proceed (never override this)."
+        )
+    plan_dir_ok = str(header.get("plan_dir")) == str(expected_plan_dir)
+    plan_sha_ok = (
+        header.get("plan_sha256") == expected_plan_sha256
+        if header.get("plan_sha256") else True
+    )
+    if (not plan_dir_ok or not plan_sha_ok) and not force_plan_mismatch:
+        raise SystemExit(
+            "--resume plan mismatch:\n"
+            f"  checkpoint plan_dir     = {header.get('plan_dir')!r}\n"
+            f"  this run  plan_dir      = {str(expected_plan_dir)!r}\n"
+            f"  checkpoint plan_sha256  = {header.get('plan_sha256')!r}\n"
+            f"  this run  plan_sha256   = {expected_plan_sha256!r}\n"
+            "Refusing to proceed. Pass --force-plan-mismatch ONLY if you "
+            "are certain the plan content is unchanged (e.g. the plan dir "
+            "was moved but its eligible.json is identical)."
+        )
+    if not plan_dir_ok:
+        log.warning("Resume: plan_dir differs but --force-plan-mismatch is set. Proceeding.")
+    if not plan_sha_ok:
+        log.warning("Resume: plan_sha256 differs but --force-plan-mismatch is set. Proceeding.")
+
+    already_success: Set[str] = set()
+    for ln in lines[1:]:
+        try:
+            e = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if (
+            e.get("type") == "entry"
+            and e.get("status") == "success"
+            and e.get("external_id")
+        ):
+            already_success.add(e["external_id"])
+    return already_success, header
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Add hostname tags to VMs per the plan. Never removes existing tags."
@@ -373,6 +486,23 @@ def main() -> None:
              "(step-through, safest). Default when dry-run: 0 (no prompts). "
              "Pass --batch-size 0 to disable prompts entirely under --apply.",
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a prior *_apply.progress.jsonl checkpoint from a crashed "
+             "or early-exited push. VMs already recorded as status=success in "
+             "the checkpoint are skipped IF live NSX confirms the tag is "
+             "present. Manager and plan (dir + sha256) must match the "
+             "checkpoint (strict). See --force-plan-mismatch to override the "
+             "plan check only.",
+    )
+    parser.add_argument(
+        "--force-plan-mismatch",
+        action="store_true",
+        help="With --resume, allow proceeding when the plan_dir or plan "
+             "content sha256 differs from the checkpoint's. Only use this "
+             "when you are certain the plan content is unchanged.",
+    )
     args = parser.parse_args()
 
     init_cli()
@@ -392,9 +522,41 @@ def main() -> None:
     eligible = eligible_payload.get("vms") or []
     log.info("Eligible VMs from plan: %d", len(eligible))
 
-    # Plan-time skip buckets (edge/system/invalid/out-of-range/etc.) so the
-    # report shows what was NOT eligible, not just what got tagged.
+    # Plan-time skip buckets (edge/system/invalid/out-of-range/excluded/etc.)
+    # so the report shows what was NOT eligible, not just what got tagged.
     plan_skips = load_plan_skips(plan_dir)
+
+    plan_sha256 = _sha256_of_file(eligible_path)
+    log.info("Plan eligible.json sha256: %s", plan_sha256)
+
+    dry_run_flag = not args.apply
+
+    # Manifest/checkpoint dir - created early so the checkpoint can be
+    # written incrementally starting at the first VM decision.
+    manifests_dir = (
+        Path(nsx_log_dir).expanduser().resolve()
+        / "reports" / "vm_tags_push" / manager_host
+    )
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    manifest_kind = "dryrun" if dry_run_flag else "apply"
+    checkpoint_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.progress.jsonl"
+
+    already_success_from_resume: Set[str] = set()
+    resume_header: Optional[Dict[str, Any]] = None
+    if args.resume:
+        resume_path = Path(args.resume).expanduser().resolve()
+        already_success_from_resume, resume_header = _load_resume_checkpoint(
+            resume_path,
+            expected_manager_host=manager_host,
+            expected_plan_dir=plan_dir,
+            expected_plan_sha256=plan_sha256,
+            force_plan_mismatch=args.force_plan_mismatch,
+        )
+        log.info(
+            "RESUME: %d VM(s) already recorded as success in %s. Will "
+            "verify each is still tagged in live NSX before skipping.",
+            len(already_success_from_resume), resume_path,
+        )
 
     client = NsxPolicyClient(nsxmanager=manager_host, federation_global=False)
 
@@ -406,7 +568,6 @@ def main() -> None:
     # Read the same cap the planner used. Defensive re-check below: if a VM's
     # live tag count has crept up to the cap between plan and push, we refuse
     # the push for that VM (don't push to a VM at or above the NSX limit).
-    import os
     try:
         max_tags_cap = int(os.getenv("VM_TAGS_MAX_TAGS_PER_VM", "30"))
         if max_tags_cap <= 0:
@@ -422,9 +583,27 @@ def main() -> None:
         "skipped_too_many_tags_post_plan": [],
         "missing_on_target": [],
         "errors": [],
+        "skipped_already_applied_prior_run": [],
+        "checkpoint_vs_live_mismatch": [],
     }
-    dry_run = not args.apply
+    dry_run = dry_run_flag
     last_ts = 0.0
+
+    checkpoint_header = {
+        "tool": CHECKPOINT_TOOL_TAG,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "manager": args.manager,
+        "manager_host": manager_host,
+        "plan_dir": str(plan_dir),
+        "plan_sha256": plan_sha256,
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "run_ts": RUN_TS,
+        "dry_run": dry_run,
+        "resumed_from": str(Path(args.resume).expanduser().resolve()) if args.resume else None,
+        "prior_success_count_from_resume": len(already_success_from_resume),
+    }
+    cp_fh = _open_checkpoint(checkpoint_path, checkpoint_header)
+    log.info("Checkpoint (incremental): %s", checkpoint_path)
 
     # Interactive batch state.
     # Defaults (mirrors groups.py pattern):
@@ -455,30 +634,68 @@ def main() -> None:
         live_vm = live_by_id.get(ext_id)
         if live_vm is None:
             log.warning("[MISSING] VM not present on target: %s (%s)", display, ext_id)
-            results["missing_on_target"].append(
-                {"external_id": ext_id, "display_name": display}
-            )
+            row = {"external_id": ext_id, "display_name": display}
+            results["missing_on_target"].append(row)
+            _checkpoint_write(cp_fh, {"status": "missing_on_target", **row})
             continue
 
         current_tags = live_vm.get("tags") or []
         current_tag_count = len(current_tags)
 
+        # Resume-aware fast path: if this VM was recorded as success in a
+        # prior crashed run, verify with LIVE NSX before skipping.
+        if ext_id in already_success_from_resume:
+            live_has_expected = any(
+                isinstance(t, dict) and t.get("scope") == "hostname" and t.get("tag") == proposed
+                for t in current_tags
+            )
+            if live_has_expected:
+                log.info(
+                    "[RESUME-SKIP] %s already tagged hostname=%s per prior run and live state confirms.",
+                    display, proposed,
+                )
+                row = {
+                    "external_id": ext_id,
+                    "display_name": display,
+                    "hostname_tag": proposed,
+                }
+                results["skipped_already_applied_prior_run"].append(row)
+                _checkpoint_write(cp_fh, {"status": "skipped_already_applied_prior_run", **row})
+                continue
+            log.warning(
+                "[CHECKPOINT-VS-LIVE MISMATCH] %s recorded success in the "
+                "resume checkpoint but live NSX does NOT show hostname=%s. "
+                "Skipping this VM (safest). Investigate manually before "
+                "re-running without --resume.",
+                display, proposed,
+            )
+            row = {
+                "external_id": ext_id,
+                "display_name": display,
+                "manifest_value": proposed,
+                "live_hostname_tag": _has_scope(current_tags, "hostname"),
+                "current_tag_count": current_tag_count,
+            }
+            results["checkpoint_vs_live_mismatch"].append(row)
+            _checkpoint_write(cp_fh, {"status": "checkpoint_vs_live_mismatch", **row})
+            continue
+
         # Defensive: re-check the tag-count cap against live state in case
         # tags grew between plan-build and push.
         if current_tag_count >= max_tags_cap:
             log.warning(
-                "[RACE] VM tag count reached cap since plan was built: %s now has %d tags (cap=%d) — skipping",
+                "[RACE] VM tag count reached cap since plan was built: %s now has %d tags (cap=%d). Skipping.",
                 display, current_tag_count, max_tags_cap,
             )
-            results["skipped_too_many_tags_post_plan"].append(
-                {
-                    "external_id": ext_id,
-                    "display_name": display,
-                    "current_tag_count": current_tag_count,
-                    "max_tags_cap": max_tags_cap,
-                    "plan_proposed_tag": proposed,
-                }
-            )
+            row = {
+                "external_id": ext_id,
+                "display_name": display,
+                "current_tag_count": current_tag_count,
+                "max_tags_cap": max_tags_cap,
+                "plan_proposed_tag": proposed,
+            }
+            results["skipped_too_many_tags_post_plan"].append(row)
+            _checkpoint_write(cp_fh, {"status": "skipped_too_many_tags_post_plan", **row})
             continue
 
         existing_hostname = _has_scope(current_tags, "hostname")
@@ -486,17 +703,17 @@ def main() -> None:
             # Race: plan said no hostname tag, but one appeared between plan
             # and push. Don't touch.
             log.warning(
-                "[RACE] VM acquired hostname tag since plan was built: %s now has hostname=%s — skipping",
+                "[RACE] VM acquired hostname tag since plan was built: %s now has hostname=%s. Skipping.",
                 display, existing_hostname,
             )
-            results["skipped_already_has_hostname_post_plan"].append(
-                {
-                    "external_id": ext_id,
-                    "display_name": display,
-                    "current_hostname_tag": existing_hostname,
-                    "plan_proposed_tag": proposed,
-                }
-            )
+            row = {
+                "external_id": ext_id,
+                "display_name": display,
+                "current_hostname_tag": existing_hostname,
+                "plan_proposed_tag": proposed,
+            }
+            results["skipped_already_has_hostname_post_plan"].append(row)
+            _checkpoint_write(cp_fh, {"status": "skipped_already_has_hostname_post_plan", **row})
             continue
 
         # Defensive: if the exact tag exists already (re-run), idempotent no-op
@@ -505,9 +722,9 @@ def main() -> None:
             for t in current_tags
         ):
             log.info("[NOOP] VM already has hostname=%s: %s", proposed, display)
-            results["skipped_already_has_exact_tag"].append(
-                {"external_id": ext_id, "display_name": display, "hostname_tag": proposed}
-            )
+            row = {"external_id": ext_id, "display_name": display, "hostname_tag": proposed}
+            results["skipped_already_has_exact_tag"].append(row)
+            _checkpoint_write(cp_fh, {"status": "skipped_already_has_exact_tag", **row})
             continue
 
         combined = _build_combined_tags(current_tags, "hostname", proposed)
@@ -531,6 +748,7 @@ def main() -> None:
         if dry_run:
             manifest_entry["status"] = "dry_run"
             manifest_entries.append(manifest_entry)
+            _checkpoint_write(cp_fh, manifest_entry)
             continue
 
         # Pacing
@@ -544,6 +762,7 @@ def main() -> None:
             manifest_entry["status"] = "success"
             results["applied"].append(manifest_entry)
             manifest_entries.append(manifest_entry)
+            _checkpoint_write(cp_fh, manifest_entry)
             last_ts = time.monotonic()
         except Exception as exc:
             log.error("FAILED updating tags for %s (%s): %s", display, ext_id, exc)
@@ -551,6 +770,7 @@ def main() -> None:
             manifest_entry["error"] = str(exc)
             results["errors"].append(manifest_entry)
             manifest_entries.append(manifest_entry)
+            _checkpoint_write(cp_fh, manifest_entry)
             last_ts = time.monotonic()
 
         # ---- Interactive batch boundary ----
@@ -580,10 +800,9 @@ def main() -> None:
         log.warning("Interactive exit requested. Processed %d of %d eligible VM(s).",
                     len(results["applied"]), len(eligible))
 
-    # Write manifest
-    manifests_dir = REPO_ROOT / "nsx_vm_tags_manifests" / manager_host
-    manifests_dir.mkdir(parents=True, exist_ok=True)
-    manifest_kind = "dryrun" if dry_run else "apply"
+    # Write manifest (manifests_dir + manifest_kind computed earlier so the
+    # checkpoint lives beside it from the first VM decision, at
+    # nsx_logs/reports/vm_tags_push/<host>/).
     manifest_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.json"
     manifest_doc = {
         "manager": args.manager,
@@ -591,6 +810,8 @@ def main() -> None:
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
         "plan_dir": str(plan_dir),
+        "plan_sha256": plan_sha256,
+        "resumed_from": checkpoint_header.get("resumed_from"),
         "counts": {
             "applied": len(results["applied"]),
             "skipped_already_has_hostname_post_plan": len(results["skipped_already_has_hostname_post_plan"]),
@@ -598,12 +819,15 @@ def main() -> None:
             "skipped_too_many_tags_post_plan": len(results["skipped_too_many_tags_post_plan"]),
             "missing_on_target": len(results["missing_on_target"]),
             "errors": len(results["errors"]),
+            "skipped_already_applied_prior_run": len(results["skipped_already_applied_prior_run"]),
+            "checkpoint_vs_live_mismatch": len(results["checkpoint_vs_live_mismatch"]),
         },
         "max_tags_cap": max_tags_cap,
         "interactive_mode": interactive_mode,
         "batch_size_initial": resolved_batch_size,
         "batch_size_final": batch_size,
         "interactive_exit_requested": interactive_exit_requested,
+        "checkpoint_path": str(checkpoint_path),
         "results": results,
         "plan_skips": plan_skips,
         "plan_skip_counts": {k: len(v) for k, v in plan_skips.items()},
@@ -614,9 +838,26 @@ def main() -> None:
     md_path = manifests_dir / f"{RUN_TS}_{manifest_kind}.md"
     write_push_markdown(md_path, manifest_doc)
     log.info("Markdown report: %s", md_path)
+
+    # Close checkpoint and rename to .done.jsonl so orphan-detection
+    # (progress files without a sibling manifest) stays reliable.
+    try:
+        cp_fh.flush()
+        os.fsync(cp_fh.fileno())
+    except OSError:
+        pass
+    cp_fh.close()
+    done_path = checkpoint_path.with_suffix(".done.jsonl")
+    try:
+        checkpoint_path.rename(done_path)
+        log.info("Checkpoint finalized: %s", done_path)
+    except OSError as exc:
+        log.warning("Could not rename checkpoint to .done.jsonl (%s); leaving as-is.", exc)
+
     print(json.dumps(manifest_doc["counts"] | {
         "manifest": str(manifest_path),
         "markdown": str(md_path),
+        "checkpoint": str(done_path if done_path.exists() else checkpoint_path),
         "dry_run": dry_run,
     }, indent=2, sort_keys=True))
 

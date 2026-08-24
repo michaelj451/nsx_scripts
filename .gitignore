@@ -52,6 +52,7 @@ multi_manager_pull/
 nsx_filtered_bundle/
 nsx_wipe_bundle/
 nsx_fabric_capture/
+nsx_health_backup/
 
 # Palo Alto / Panorama tool report root (hidden, separate from NSX log dir).
 # The .gitkeep is preserved so the dir exists on fresh clones.

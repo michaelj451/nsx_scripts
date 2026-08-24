@@ -150,32 +150,65 @@ def max_tags_per_vm() -> int:
         return 30
 
 
+DEFAULT_EXCLUDE_FILENAME = "hostname_tag_exclude.txt"
+
+
 def load_exclude_values(path: Optional[str] = None) -> Set[str]:
     """Load the hostname-value exclusion list. A VM whose derived hostname value
     matches (case-insensitively) an entry here is classified `skip_excluded`
     instead of `eligible`, so the tool never tags it.
 
     File format: one hostname value per line (e.g. `OLD`); blank lines and lines
-    starting with `#` are ignored. Path precedence: the `path` arg >
-    VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env). Unset or missing file -> no exclusions.
+    starting with `#` are ignored. Path precedence:
+      1. explicit `path` arg (from --exclude-file)
+      2. VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env)
+      3. auto-discovered default at REPO_ROOT/hostname_tag_exclude.txt
     Values are lowercased so matching is case-insensitive.
 
     Call this ONCE (it logs) and pass the result into classify_vm().
     """
-    p = (path or os.getenv("VM_TAGS_HOSTNAME_EXCLUDE_FILE") or "").strip()
-    if not p:
+    source = None
+    fp: Optional[Path] = None
+
+    explicit = (path or "").strip()
+    envvar = (os.getenv("VM_TAGS_HOSTNAME_EXCLUDE_FILE") or "").strip()
+
+    if explicit:
+        fp = Path(os.path.expandvars(explicit)).expanduser()
+        source = "--exclude-file"
+    elif envvar:
+        fp = Path(os.path.expandvars(envvar)).expanduser()
+        source = "VM_TAGS_HOSTNAME_EXCLUDE_FILE"
+    else:
+        default_fp = REPO_ROOT / DEFAULT_EXCLUDE_FILENAME
+        if default_fp.exists():
+            fp = default_fp
+            source = f"default ({DEFAULT_EXCLUDE_FILENAME} at repo root)"
+
+    if fp is None:
+        log.info(
+            "No hostname exclusion file: --exclude-file not set, "
+            "VM_TAGS_HOSTNAME_EXCLUDE_FILE unset, and %s not present at repo "
+            "root. No exclusions applied.", DEFAULT_EXCLUDE_FILENAME,
+        )
         return set()
-    fp = Path(os.path.expandvars(p)).expanduser()
     if not fp.exists():
-        log.warning("Hostname exclusion file not found: %s (no exclusions applied)", fp)
+        log.warning(
+            "Hostname exclusion file (%s) not found: %s. No exclusions applied.",
+            source, fp,
+        )
         return set()
+
     values: Set[str] = set()
     for line in fp.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             continue
         values.add(s.lower())
-    log.info("Loaded %d hostname exclusion value(s) from %s", len(values), fp)
+    log.info(
+        "Loaded %d hostname exclusion value(s) from %s (%s)",
+        len(values), fp, source,
+    )
     return values
 
 
@@ -360,10 +393,13 @@ def main() -> None:
     )
     parser.add_argument("--overwrite", action="store_true", help="Delete --output-dir before writing")
     parser.add_argument("--exclude-file", default=None,
+                        # Precedence: --exclude-file > VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env)
+                        # > REPO_ROOT/hostname_tag_exclude.txt (auto-discovered).
                         help="Path to a hostname-value exclusion list (one value per line; blank "
                              "lines and # comments ignored). A VM whose derived hostname value "
                              "matches (case-insensitive) is classified skip_excluded and never "
-                             "tagged. Overrides VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env).")
+                             "tagged. Precedence: this flag > VM_TAGS_HOSTNAME_EXCLUDE_FILE (.env) "
+                             "> auto-discovered hostname_tag_exclude.txt at repo root.")
     args = parser.parse_args()
 
     init_cli()
