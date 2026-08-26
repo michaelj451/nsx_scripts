@@ -71,6 +71,7 @@ from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nsx_group_ip_remap_offline import (  # noqa: E402
+    _canonical_ip_token,
     _load_mapping_csv as _load_csv_mapping,
     _remap_group_payload as _csv_remap_group,
 )
@@ -176,6 +177,17 @@ def _extract_ip_entries(group: Dict[str, Any]) -> List[str]:
                 if isinstance(ip, str):
                     out.add(ip)
     return sorted(out)
+
+
+def _ip_diff(before: List[str], after: List[str]) -> Tuple[List[str], List[str]]:
+    """(added, removed) between two IP entry lists, compared on canonical form
+    so `10.6.0.1` and `10.6.0.1/32` are the same entry. Returned strings are the
+    original (as-held) forms so the audit trail shows what NSX actually holds."""
+    before_by_canon = {_canonical_ip_token(ip): ip for ip in before}
+    after_by_canon = {_canonical_ip_token(ip): ip for ip in after}
+    added = sorted(v for c, v in after_by_canon.items() if c not in before_by_canon)
+    removed = sorted(v for c, v in before_by_canon.items() if c not in after_by_canon)
+    return added, removed
 
 
 def _format_entries(entries: List[str], *, max_items: int = 6) -> str:
@@ -359,7 +371,22 @@ def _latest_unreverted_baseline(reports_dir: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _pushed_ids_path(baseline_path: Path) -> Path:
+    """Companion file to a baseline: the ids of every group the matching push
+    actually wrote (PUT or PATCH). Revert restores only these."""
+    return baseline_path.with_name(baseline_path.name.replace("_target_baseline", "_pushed_ids"))
+
+
+def _write_pushed_ids(baseline_path: Path, pushed_ids: List[str]) -> Path:
+    p = _pushed_ids_path(baseline_path)
+    p.write_text(json.dumps(pushed_ids, indent=2), encoding="utf-8")
+    return p
+
+
 def _mark_baseline_reverted(path: Path) -> None:
+    pushed = _pushed_ids_path(path)
+    if pushed.exists():
+        pushed.rename(pushed.with_suffix(".json.reverted"))
     path.rename(path.with_suffix(".json.reverted"))
 
 
@@ -447,88 +474,6 @@ def _strip_fabric_paths_in_expression(
             continue
         final.append(item)
     return final, stripped
-
-
-def _add_mapped_segment_cidrs_in_expression(
-    expression: List[Any],
-    *,
-    segments_by_path: Dict[str, List[str]],
-    csv_mapping: Any,                            # PrefixMappingTable from nsx_group_ip_remap_offline
-) -> Tuple[List[Any], int, int, List[Dict[str, Any]]]:
-    """For each segment path in a group's PathExpression, look up the segment's
-    native CIDR, run it through the CSV remap, and (if the CSV maps it) splice
-    a new IPAddressExpression after the PathExpression — joined with OR — that
-    contains ONLY the mapped CIDR. The original PathExpression is left intact.
-
-    Skip behavior:
-      - segment path not in segments_by_path → recorded as unmapped (segment lookup failed)
-      - CIDR not in CSV → recorded as unmapped (CSV didn't match)
-      - Either way, no IPAddressExpression is added for that segment — operator
-        sees the result in the forensic JSON `segments_unmapped.json` report
-
-    Returns:
-      (new_expression, mapped_count, unmapped_segments_count, unmapped_records)
-    """
-    if not isinstance(expression, list):
-        return expression, 0, 0, []
-
-    mapped_count = 0
-    unmapped_records: List[Dict[str, Any]] = []
-    inserts: Dict[int, List[str]] = {}   # index -> list of mapped CIDRs to splice in after that index
-
-    for i, item in enumerate(expression):
-        if not (isinstance(item, dict) and item.get("resource_type") == "PathExpression"):
-            continue
-
-        paths = item.get("paths") or []
-        added_for_this_pathexpr: List[str] = []
-        seen: set = set()
-
-        for p in paths:
-            if not (isinstance(p, str) and SEGMENT_PATH_RE.match(p.strip())):
-                continue
-            sp = p.strip()
-            native_cidrs = segments_by_path.get(sp)
-            if not native_cidrs:
-                unmapped_records.append({
-                    "segment_path": sp,
-                    "reason": "segment not in segment_details.json (segment_paths_lookup_miss)",
-                })
-                continue
-            for native in native_cidrs:
-                mapped_list, row = csv_mapping.map_token(native)
-                if not mapped_list:
-                    unmapped_records.append({
-                        "segment_path": sp,
-                        "native_cidr": native,
-                        "reason": "no CSV row covers this CIDR",
-                    })
-                    continue
-                for m in mapped_list:
-                    if m not in seen:
-                        seen.add(m)
-                        added_for_this_pathexpr.append(m)
-                        mapped_count += 1
-
-        if added_for_this_pathexpr:
-            inserts[i] = added_for_this_pathexpr
-
-    if not inserts:
-        return expression, 0, len(unmapped_records), unmapped_records
-
-    # Splice inserts: walk expression, for each index in `inserts` insert
-    # `OR + IPAddressExpression(mapped_cidrs)` right after the original entry.
-    result: List[Any] = []
-    for idx, item in enumerate(expression):
-        result.append(item)
-        if idx in inserts:
-            result.append({"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"})
-            result.append({
-                "resource_type": "IPAddressExpression",
-                "ip_addresses": inserts[idx],
-            })
-
-    return result, mapped_count, len(unmapped_records), unmapped_records
 
 
 def _transform_segments_in_expression(
@@ -786,15 +731,6 @@ def cmd_push(args: argparse.Namespace) -> int:
         if not seg_path.exists():
             raise SystemExit(f"--segments-from file not found: {seg_path}")
         segments_by_path = _load_segment_cidr_map(seg_path)
-    elif args.segments_mode == "add-mapped":
-        if not args.segments_from:
-            raise SystemExit("--segments-mode add-mapped requires --segments-from <segment_details.json>")
-        if not args.csv_remap:
-            raise SystemExit("--segments-mode add-mapped requires --csv-remap <csv>")
-        seg_path = Path(args.segments_from).expanduser().resolve()
-        if not seg_path.exists():
-            raise SystemExit(f"--segments-from file not found: {seg_path}")
-        segments_by_path = _load_segment_cidr_map(seg_path)
 
     # Validate / load CSV remap if requested
     csv_mapping = None
@@ -852,10 +788,15 @@ def cmd_push(args: argparse.Namespace) -> int:
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
     baseline_path = None
     baseline_dict: Dict[str, Dict[str, Any]] = {}
+    # Ids of every group this run actually writes. Persisted next to the
+    # baseline after every successful write so revert can restore ONLY these,
+    # even if the run is interrupted partway through.
+    pushed_ids: List[str] = []
     if args.apply:
         log.info("Capturing target baseline (current customer groups on %s) ...", target_host)
         baseline_dict = _capture_target_groups(client, args.domain_id)
         baseline_path = _append_baseline(reports_dir, baseline_dict)
+        _write_pushed_ids(baseline_path, pushed_ids)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
 
     # Interactive batch state.
@@ -894,6 +835,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_unresolved = 0
     total_csv_changed = 0
     total_csv_added = 0
+    total_csv_skipped = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
 
@@ -934,6 +876,19 @@ def cmd_push(args: argparse.Namespace) -> int:
                     total_csv_added += csv_added_count
                 row["csv_changed"] = csv_changed
                 row["csv_added_count"] = csv_added_count
+                # Ranges and IPv6 are never remapped (by design); record them so
+                # the operator can see exactly which entries were left as-is.
+                csv_skipped = csv_report.get("skipped_values") or []
+                if csv_skipped:
+                    row["csv_skipped_values"] = csv_skipped
+                    total_csv_skipped += len(csv_skipped)
+                    log.info("[%d/%d] %s: %d entr%s left untouched (never remapped): %s",
+                             i, len(files), gid, len(csv_skipped),
+                             "y" if len(csv_skipped) == 1 else "ies",
+                             _format_entries([f"{s['value']} ({s['reason']})" for s in csv_skipped]))
+                csv_unmapped = csv_report.get("unmapped_values") or []
+                if csv_unmapped:
+                    row["csv_unmapped_values"] = csv_unmapped
 
             paths_seen = 0
             converted_here = 0
@@ -995,8 +950,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             # full in the row's JSON/JSONL for forensic auditability).
             before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
             after_ips  = _extract_ip_entries(obj)
-            ips_added   = sorted(set(after_ips)  - set(before_ips))
-            ips_removed = sorted(set(before_ips) - set(after_ips))
+            ips_added, ips_removed = _ip_diff(before_ips, after_ips)
             row["ips_before"]      = before_ips    # full list, for audit replayability
             row["ips_after"]       = after_ips     # full list, for audit replayability
             row["before_ip_count"] = len(before_ips)
@@ -1056,6 +1010,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                     raise
 
             ok += 1
+            if gid not in pushed_ids:
+                pushed_ids.append(gid)
+                _write_pushed_ids(baseline_path, pushed_ids)
             seg_note = ""
             if paths_seen:
                 seg_note = (f"  segments_seen={paths_seen} converted={converted_here}"
@@ -1175,6 +1132,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                 ok += 1
                 failed -= 1
                 progress = True
+                if gid not in pushed_ids:
+                    pushed_ids.append(gid)
+                    _write_pushed_ids(baseline_path, pushed_ids)
                 log.info("[retry-%d] %s — %s", retry_round, gid, row["status"])
                 time.sleep(THROTTLE_SECONDS)
             except Exception as e:
@@ -1228,6 +1188,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "segments_unresolved": total_unresolved,
             "csv_groups_changed": total_csv_changed,
             "csv_total_added_values": total_csv_added,
+            "csv_total_skipped_values": total_csv_skipped,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
             "interactive_mode":          interactive_mode,
@@ -1236,6 +1197,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             "interactive_exit_requested":     interactive_exit_requested,
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
+        "pushed_ids_file": str(_pushed_ids_path(baseline_path)) if baseline_path else None,
+        "pushed_ids_count": len(pushed_ids),
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
@@ -1385,13 +1348,43 @@ def cmd_revert(args: argparse.Namespace) -> int:
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
     log.info("  Baseline contains %d customer group(s)", len(baseline))
 
+    # Scope: which groups does this revert touch?
+    #   pushed (default) = only the groups the matching push actually wrote
+    #                      (from <ts>_pushed_ids.json). Everything else on the
+    #                      target is left alone, including edits made since.
+    #   all              = legacy behaviour: PUT every baseline group back and
+    #                      DELETE any customer group not in the baseline.
+    pushed_path = _pushed_ids_path(baseline_path)
+    pushed_ids: List[str] | None = None
+    if args.scope == "pushed":
+        if not pushed_path.exists():
+            raise SystemExit(
+                f"No pushed-ids file next to the baseline ({pushed_path.name}). "
+                "This baseline predates scoped revert. Re-run with --scope all to "
+                "restore the entire baseline (restores every customer group and "
+                "deletes any group not in the baseline)."
+            )
+        pushed_ids = json.loads(pushed_path.read_text(encoding="utf-8"))
+        log.info("  Scope: pushed (%d group(s) written by the matching push)", len(pushed_ids))
+    else:
+        log.warning("  Scope: all. Every baseline group will be restored and any "
+                    "customer group not in the baseline will be DELETED.")
+
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
     current = _capture_target_groups(client, args.domain_id)
     log.info("  Currently %d customer group(s) on target", len(current))
 
-    to_restore = [(gid, payload) for gid, payload in baseline.items()]
-    to_delete = [gid for gid in current.keys() if gid not in baseline]
-    log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
+    if pushed_ids is not None:
+        to_restore = [(gid, baseline[gid]) for gid in pushed_ids if gid in baseline]
+        # Pushed but absent from the baseline = the push created it; remove it.
+        to_delete = [gid for gid in pushed_ids if gid not in baseline and gid in current]
+        already_gone = [gid for gid in pushed_ids if gid not in baseline and gid not in current]
+        for gid in already_gone:
+            log.info("  [skip] %s: created by push but no longer on target", gid)
+    else:
+        to_restore = [(gid, payload) for gid, payload in baseline.items()]
+        to_delete = [gid for gid in current.keys() if gid not in baseline]
+    log.info("Plan: restore=%d  delete=%d  (scope=%s)", len(to_restore), len(to_delete), args.scope)
 
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
@@ -1449,9 +1442,12 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "target": {"alias": args.target, "host": target_host,
                    "federation_global": args.federation_global, "domain_id": args.domain_id},
         "baseline_file": str(baseline_path) + ".reverted",
+        "scope": args.scope,
+        "pushed_ids_file": (str(pushed_path) + ".reverted") if pushed_ids is not None else None,
         "totals": {
             "restored_ok": restored_ok, "restored_failed": restored_failed,
             "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
+            "baseline_groups_untouched": len(baseline) - len(to_restore),
         },
         "log_file": str(log_file),
         "errors_log": str(errors_log),
@@ -1498,16 +1494,12 @@ def main() -> int:
     pp.add_argument("--federation-global", action="store_true")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
-    pp.add_argument("--segments-mode", choices=["keep", "strip", "convert", "add-mapped"], default="keep",
+    pp.add_argument("--segments-mode", choices=["keep", "strip", "convert"], default="keep",
                     help="How to handle /infra/segments/* refs in groups: "
-                         "keep (default) = push as-is; "
+                         "keep (default) = push as-is, segment refs are never remapped; "
                          "strip = remove segment paths from PathExpression entries (phase 1); "
                          "convert = replace segment refs with IPAddressExpression CIDRs read from "
-                         "--segments-from (phase 2); "
-                         "add-mapped = KEEP segment paths AND splice an extra IPAddressExpression "
-                         "containing only the CSV-mapped equivalent of each segment's CIDR. "
-                         "Requires both --segments-from AND --csv-remap. Unmapped CIDRs are "
-                         "skipped and logged to segments_unmapped.json. "
+                         "--segments-from (phase 2). "
                          "Other expression types are always preserved.")
     pp.add_argument("--segments-from", default=None,
                     help="Path to segment_details.json (e.g. nsx_capture/<host>/segment_inventory/"
@@ -1552,6 +1544,13 @@ def main() -> int:
                     help="Defaults to nsx_groups_export/<target-host>/push_report/.")
     pr.add_argument("--from-baseline", default=None,
                     help="Specific baseline file (overrides auto-selected latest).")
+    pr.add_argument("--scope", choices=["pushed", "all"], default="pushed",
+                    help="pushed (default) = restore only the groups the matching push wrote "
+                         "(read from <ts>_pushed_ids.json next to the baseline); groups the push "
+                         "created are deleted, everything else on the target is untouched. "
+                         "all = legacy full-baseline revert: PUT every baseline group back and "
+                         "DELETE any customer group not in the baseline. Required for baselines "
+                         "captured before scoped revert existed.")
     pr.set_defaults(func=cmd_revert)
 
     args = p.parse_args()

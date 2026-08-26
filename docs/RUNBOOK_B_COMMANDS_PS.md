@@ -76,11 +76,22 @@ python tools/nsx/groups.py push `
 Each `revert` pops the most recent unreverted baseline. Workflow B
 typically runs one push at a time, so one revert undoes that push.
 
+By default revert touches **only the groups that push wrote** (listed in
+`<RUN_TS>_pushed_ids.json` next to the baseline). Everything else on the
+manager is left alone. Dry-run first (no `--apply`) to see the plan.
+
 ```powershell
+python tools/nsx/groups.py revert --target nsx-lm1 `
+  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report
+
 python tools/nsx/groups.py revert --target nsx-lm1 `
   --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report `
   --apply
 ```
+
+Old baselines with no `pushed_ids.json` need `--scope all` (legacy
+full-baseline revert: restores every customer group and deletes any group not
+in the baseline).
 
 Multiple stacked B pushes? Each revert pops the latest. Repeat as needed.
 

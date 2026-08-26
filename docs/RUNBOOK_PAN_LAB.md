@@ -54,7 +54,31 @@ PANORAMA_API_KEY=<long-base64-key-from-panorama>
 PANORAMA_TLS_VERIFY=false
 ```
 
-To mint a key once via the XML API:
+To prove the credentials work and mint a key, use the auth script (read-only
+against Panorama: keygen + `show system info` + name-only listings):
+
+```bash
+# Check whatever .env currently says (key stays masked)
+python tools/pan/panorama_auth.py
+
+# Generate a key from username/password and store it in .env as PANORAMA_API_KEY
+python tools/pan/panorama_auth.py --keygen --write-env
+```
+
+It prints the target, which `.env` variables supplied it, the auth method
+used, the Panorama hostname / serial / PAN-OS version, and how many device
+groups and templates the account can see. A JSON report (key fingerprint
+only, never the key) lands in `.pano_reports/`. Exit code `0` = authenticated,
+`1` = auth or API failure, `2` = `.env` incomplete, `3` = `--write-env` refused.
+
+Both Panorama clients read the same variables (see `app/palo/pan_env.py`):
+
+| Client | Use for |
+|---|---|
+| `app/palo/panorama_api_client.py` | xpath-level XML API: config get/set/edit/delete, commit, config pulls |
+| `app/palo/panos_client.py` | pan-os-python object model (device groups, address objects, rules); `PanosClient.from_env()` |
+
+The raw XML equivalent, if you ever need it by hand:
 
 ```bash
 curl -ks "https://pano4.lab.local/api/?type=keygen&user=USERNAME&password=PASSWORD"

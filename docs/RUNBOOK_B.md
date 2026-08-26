@@ -161,16 +161,30 @@ Every row in `groups.json` / `groups.jsonl` carries the full IP state:
 {
   "id": "ip-address-group",
   "status": "success_patch",
-  "before_ip_count": 3,
+  "before_ip_count": 4,
   "after_ip_count":  7,
-  "ips_before": ["10.7.0.50", "10.7.0.51", "10.7.1.0/24"],
-  "ips_after":  ["10.6.0.50", "10.6.0.51", "10.6.0.52-10.6.0.53",
-                 "10.6.1.0/24", "10.7.0.50", "10.7.0.51", "10.7.1.0/24"],
-  "ips_added":   ["10.6.0.50", "10.6.0.51", "10.6.0.52-10.6.0.53", "10.6.1.0/24"],
+  "ips_before": ["10.6.0.50", "10.6.0.51", "10.6.0.52-10.6.0.53", "10.6.1.0/24"],
+  "ips_after":  ["10.6.0.50", "10.6.0.51", "10.6.0.52-10.6.0.53", "10.6.1.0/24",
+                 "10.7.0.50", "10.7.0.51", "10.7.1.0/24"],
+  "ips_added":   ["10.7.0.50", "10.7.0.51", "10.7.1.0/24"],
   "ips_removed": [],
-  "csv_added_count": 3
+  "csv_added_count": 3,
+  "csv_skipped_values": [
+    {"value": "10.6.0.52-10.6.0.53", "expression_index": 0, "reason": "range"}
+  ]
 }
 ```
+
+Entries the remap deliberately leaves alone are listed under
+`csv_skipped_values` with a reason (`range` or `ipv6`), and the run total is
+in `summary.json` as `csv_total_skipped_values`. Valid IPv4 entries that no
+CSV row covers are listed under `csv_unmapped_values`.
+
+`ips_added` / `ips_removed` compare entries on canonical form, so
+`10.6.0.101/32` on the target and `10.6.0.101` in the bundle are the same
+entry: a format-only difference is never counted as a removal. The remap
+itself never rewrites an existing entry (a `/32` stays a `/32`, and its
+mapped value is emitted as a `/32` too).
 
 That's a self-contained replayable record per group — diff `ips_before` against `ips_after` and you have exactly what the push did.
 
@@ -222,7 +236,6 @@ Example:
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
   --csv-remap data/nonprod_map.csv \
-  --mapped-only \
   --batch-size 1 \
   --apply
 
@@ -256,7 +269,10 @@ old_subnet,new_subnet
 See `data/nonprod_map.csv` for the lab example.
 
 - More-specific rows beat less-specific rows (the `/32` beats the `/24` which beats the `/16` when an IP is covered by all three).
-- A token (IP or CIDR) that doesn't fall inside any row is **not mapped**. With `--mapped-only` it's dropped; without it, the original is kept.
+- A token (IP or CIDR) that doesn't fall inside any row is **not mapped**; the original is kept and the token is listed in the row's `csv_unmapped_values`.
+- **IP ranges (`a-b`) and IPv6 entries are never remapped.** They are left in place verbatim and listed in the row's `csv_skipped_values`. CSV rows that use a range or IPv6 are rejected at load and reported in `summary.json` under `csv_invalid_rows`.
+- **Segment, path, and tag expressions are never remapped.** Only `IPAddressExpression` lists are touched; with the default `--segments-mode keep`, segment references pass through untouched.
+- A CSV row whose `new_subnet` is smaller than its `old_subnet` (for example `/24` to `/25`) is rejected, because part of the old range would have nowhere to map. A duplicate `old_subnet` is rejected too (the first row wins).
 
 ---
 
@@ -269,9 +285,32 @@ python tools/nsx/groups.py revert --target nsx-lm1 \
 ```
 
 Each revert pops the most recent unreverted baseline file
-(`<RUN_TS>_target_baseline.json`) and PUTs the captured payload back, plus
-deletes anything that exists on the target but wasn't in the baseline.
-After success, the baseline file is renamed `<RUN_TS>_target_baseline.json.reverted`.
+(`<RUN_TS>_target_baseline.json`) and, by default, restores **only the groups
+that push actually wrote**. The push records every group it PUT or PATCHed in
+a companion file, `<RUN_TS>_pushed_ids.json`, updated after each successful
+write (so an interrupted push still has an accurate list). Revert then:
+
+- PUTs the baseline payload back for every pushed group that existed before the push;
+- DELETEs any pushed group that did not exist in the baseline (the push created it);
+- leaves every other group on the manager untouched, including any edits made since the push.
+
+After success, both files are renamed `*.json.reverted`.
+
+`--scope all` is the legacy full-baseline revert (PUT every baseline group back
+and DELETE any customer group not in the baseline). It is required for
+baselines captured before `pushed_ids.json` existed, and it will clobber
+unrelated group changes made since the push, so dry-run it first.
+
+```bash
+# Dry-run first: prints the restore / delete plan without writing
+python tools/nsx/groups.py revert --target nsx-lm1 \
+  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report
+
+# Legacy full-baseline revert (only for old baselines with no pushed_ids file)
+python tools/nsx/groups.py revert --target nsx-lm1 \
+  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report \
+  --scope all --apply
+```
 
 If you've stacked multiple Workflow B pushes, each `revert` undoes the
 latest. Repeat until you're back where you want to be:
@@ -294,7 +333,7 @@ nsx-lm1 (source AND target)
       │        nsx_export/, groups_additive/, segment_inventory/, ...
       │          │
       │          │  B.2) groups.py push --target nsx-lm1
-      │          │       --csv-remap <csv> [--mapped-only]
+      │          │       --csv-remap <csv>  (ranges / IPv6 / segments never remapped)
       │          │       [--apply]
       └──────────┤
                  ▼

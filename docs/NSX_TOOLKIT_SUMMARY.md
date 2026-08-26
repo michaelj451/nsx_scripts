@@ -138,7 +138,7 @@ target's own VM inventory.
 
 ### CSV subnet remap (Workflow B)
 
-`groups.py push` also supports `--csv-remap <csv> [--mapped-only]`:
+`groups.py push` also supports `--csv-remap <csv>`:
 
 ```csv
 old_subnet,new_subnet
@@ -147,9 +147,13 @@ old_subnet,new_subnet
 10.6.0.0/16,10.7.0.0/16
 ```
 
-- **Longest-prefix match wins** — `10.6.0.101/32` beats `10.6.0.0/16`.
-- **`--mapped-only`** drops IPs that don't match any CSV row. Without it,
-  mapped IPs are added alongside the originals (additive remap).
+- **Longest-prefix match wins**: `10.6.0.101/32` beats `10.6.0.0/16`.
+- **Strict-additive**: originals are kept verbatim (a `/32` stays a `/32`)
+  and mapped values are appended. `--mapped-only` is refused with
+  `--csv-remap`; the only way to remove IPs is `groups.py revert`.
+- **Never remapped**: IP ranges (`a-b`), IPv6 entries, and segment / path /
+  tag expressions. Ranges and IPv6 are left in place and reported per group
+  under `csv_skipped_values`; CSV rows using them are rejected at load.
 - Bidirectional mode (`--bidirectional`) treats each row as a two-way mapping
   for round-trip migrations.
 
@@ -281,6 +285,13 @@ Every `*.py revert --apply` does this:
 
 This means **each push phase is independently revertible**, and a stack of
 pushes can be unwound in any order by repeatedly running the matching revert.
+
+`groups.py` narrows step 2 by default: the push records every group it wrote
+in `<RUN_TS>_pushed_ids.json` next to the baseline, and `groups.py revert`
+restores or deletes **only those groups**, leaving the rest of the manager
+untouched (important for Workflow B, which runs in place on a live manager).
+`--scope all` selects the full-baseline behaviour described above. The
+services / policies / rules / segments tools still revert the full baseline.
 
 A typical 6-phase Workflow A clone has 6 baselines stacked. Reverting in
 reverse dependency order (rules → policies → groups Part 3 → Part 2 → Part 1 →

@@ -77,42 +77,21 @@ class PanoramaClient:
             PANORAMA_API_KEY                            (preferred when set)
             PANORAMA_TLS_VERIFY=false                   (defaults to true)
         """
-        host = (os.environ.get("panorama")
-                or os.environ.get("ppanorama")
-                or os.environ.get("PANORAMA_URL")
-                or os.environ.get("PANORAMA_HOST"))
-        if not host:
-            raise PanoramaApiError(
-                status_code=0, code=None,
-                message="Panorama host not set in .env (looked for "
-                        "ppanorama, PANORAMA_URL, PANORAMA_HOST).",
-            )
-        # Normalize to https://<host>
-        host = host.strip().rstrip("/")
-        if not host.startswith(("http://", "https://")):
-            host = f"https://{host}"
-        verify = os.environ.get("PANORAMA_TLS_VERIFY", "true").lower() != "false"
+        # Variable lookup lives in app/palo/pan_env.py so this client, the
+        # pan-os-python client, and tools/pan/panorama_auth.py all agree.
+        from palo.pan_env import PanoramaEnvError, resolve_panorama_env
+
+        try:
+            env = resolve_panorama_env()
+        except PanoramaEnvError as exc:
+            raise PanoramaApiError(status_code=0, code=None, message=str(exc)) from exc
 
         # Prefer API key when present (avoids round-tripping the password each run)
-        api_key = (os.environ.get("PANORAMA_API_KEY")
-                   or os.environ.get("ppanorama_api_key"))
+        api_key = env.api_key
         if not api_key:
-            username = (os.environ.get("PANORAMA_USERNAME")
-                        or os.environ.get("ppanorama_username")
-                        or os.environ.get("vm_username"))
-            password = (os.environ.get("PANORAMA_PASSWORD")
-                        or os.environ.get("ppanorama_password")
-                        or os.environ.get("vm_password"))
-            if not (username and password):
-                raise PanoramaApiError(
-                    status_code=0, code=None,
-                    message=("No PANORAMA_API_KEY and no "
-                             "PANORAMA_USERNAME/PANORAMA_PASSWORD nor "
-                             "vm_username/vm_password in .env."),
-                )
-            log.info("Generating Panorama API key for user %r ...", username)
-            api_key = cls._keygen(host, username, password, verify)
-        return cls(base_url=host, api_key=api_key, verify=verify)
+            log.info("Generating Panorama API key for user %r ...", env.username)
+            api_key = cls._keygen(env.url, env.username, env.password, env.verify)
+        return cls(base_url=env.url, api_key=api_key, verify=env.verify)
 
     # -----------------------------------------------------------------------
     # Low-level transport
