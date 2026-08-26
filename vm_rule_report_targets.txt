@@ -1,0 +1,13 @@
+# VM Rule Membership report target list.
+# Used by tools/reports/report_vms_in_rules.py.
+#
+# AUTO-DISCOVERED: this file at repo root is picked up automatically.
+# Override with --vm-list <path> or VM_RULE_REPORT_LIST (.env) for a
+# different file.
+#
+# One VM display_name per line. Case-insensitive exact match. Blank lines
+# and lines starting with `#` are ignored.
+#
+# Example (uncomment / edit for your environment):
+ubuntu22-speedtest-10.6.0.101-ax2001
+ubuntu22-speedtest-10.6.2.102-gh0202  
