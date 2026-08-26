@@ -31,6 +31,7 @@ nsx_export_verify/
 nsx_sibling_groups/
 nsx_stripped_groups/
 nsx_capture/
+nsx_backup/
 nsx_transformed/
 nsx_push/
 nsx_services*/

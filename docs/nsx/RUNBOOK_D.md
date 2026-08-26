@@ -148,12 +148,12 @@ window.
 
 | Tool | Phase | Purpose |
 |---|---|---|
-| [tools/nsx/capture_nsx_state.py](../tools/nsx/capture_nsx_state.py) | 0 | Pre-flight capture + auto-IP-report + flat-export bundles |
-| [tools/nsx/report_groups_with_ips.py](../tools/nsx/report_groups_with_ips.py) | 0 | CSV coverage analysis (auto-fires from capture) |
-| [tools/nsx/build_sibling_groups.py](../tools/nsx/build_sibling_groups.py) | 1 | Offline transform — emits siblings + pure-IP remap bundle |
-| [tools/nsx/groups.py](../tools/nsx/groups.py) `push` | 2a, 2b, 5 | Push siblings (2a) / pure-IP remap with `--csv-remap` (2b) / forced strip with `--intentional-ip-removal` (5) |
-| [tools/nsx/rules.py](../tools/nsx/rules.py) `amend-refs` | 3 | Append sibling refs to rules' source/destination groups (strict-additive) |
-| [tools/nsx/validate_wf_d.py](../tools/nsx/validate_wf_d.py) | 4 | Post-push validator — G1/G2/G3/S1/S2/R1/R2 checks against live target |
+| [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | 0 | Pre-flight capture + auto-IP-report + flat-export bundles |
+| [tools/nsx/report_groups_with_ips.py](../../tools/nsx/report_groups_with_ips.py) | 0 | CSV coverage analysis (auto-fires from capture) |
+| [tools/nsx/build_sibling_groups.py](../../tools/nsx/build_sibling_groups.py) | 1 | Offline transform — emits siblings + pure-IP remap bundle |
+| [tools/nsx/groups.py](../../tools/nsx/groups.py) `push` | 2a, 2b, 5 | Push siblings (2a) / pure-IP remap with `--csv-remap` (2b) / forced strip with `--intentional-ip-removal` (5) |
+| [tools/nsx/rules.py](../../tools/nsx/rules.py) `amend-refs` | 3 | Append sibling refs to rules' source/destination groups (strict-additive) |
+| [tools/nsx/validate_wf_d.py](../../tools/nsx/validate_wf_d.py) | 4 | Post-push validator — G1/G2/G3/S1/S2/R1/R2 checks against live target |
 
 ### Key flags on `build_sibling_groups.py`
 

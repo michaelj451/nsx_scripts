@@ -219,8 +219,10 @@ def main() -> None:
     parser.add_argument(
         "--source-manager",
         required=True,
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
-        help="Source Local Manager where current VM group membership and VIF IPs exist.",
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        help="Source manager. For LMs, current VM group membership and VIF IPs are "
+             "captured live. Global Managers have no VM inventory API, so a GM source "
+             "automatically runs as --no-live-query (groups copied as-is, no VM IP enrichment).",
     )
 
     parser.add_argument("--domain-id", default="default")
@@ -279,6 +281,17 @@ def main() -> None:
 
     init_cli()
     log_file = _setup_logging()
+
+    # Global Managers have no VM inventory surface (evaluated-member and VIF
+    # IP lookups are LM-only APIs), so live enrichment cannot work there.
+    # Force the offline copy path instead of failing the capture.
+    if args.source_manager.startswith("nsx-gm") and not args.no_live_query:
+        log.warning(
+            "Source %s is a Global Manager: VM live-member enrichment is an LM-only API. "
+            "Forcing --no-live-query (groups are copied as-is, no captured VM IPs).",
+            args.source_manager,
+        )
+        args.no_live_query = True
 
     source_host = resolve_manager(args.source_manager)
     if not source_host:

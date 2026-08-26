@@ -463,8 +463,8 @@ windows.
 
 ## See also
 
-- [REPORTS_DATA_SOURCES.md](REPORTS_DATA_SOURCES.md) - where each tool reads/writes (NSX endpoints + disk paths)
+- [REPORTS_DATA_SOURCES.md](../reference/REPORTS_DATA_SOURCES.md) - where each tool reads/writes (NSX endpoints + disk paths)
 - [RUNBOOK_VM_TAGS_COMMANDS_PS.md](RUNBOOK_VM_TAGS_COMMANDS_PS.md) - VM-tags workflow narrative (dryrun -> push -> validate -> revert)
 - [RUNBOOK_VM_TAGS.md](RUNBOOK_VM_TAGS.md) - bash / narrative form
 - [RUNBOOK_RULES_USAGE_PS.md](RUNBOOK_RULES_USAGE_PS.md) - deeper dive on the rules report
-- [QUICKREF_PS.md](QUICKREF_PS.md) - one-liner commands for the whole toolkit
+- [QUICKREF_PS.md](../reference/QUICKREF_PS.md) - one-liner commands for the whole toolkit

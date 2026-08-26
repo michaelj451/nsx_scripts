@@ -6,8 +6,8 @@ Covers NSX endpoints hit, local files read, and files written. Use this
 when planning federation deployments, debugging missing data, or
 understanding read/write blast radius.
 
-Runbook counterparts: [RUNBOOK_REPORTS.md](RUNBOOK_REPORTS.md) (bash),
-[RUNBOOK_REPORTS_PS.md](RUNBOOK_REPORTS_PS.md) (PowerShell).
+Runbook counterparts: [RUNBOOK_REPORTS.md](../nsx/RUNBOOK_REPORTS.md) (bash),
+[RUNBOOK_REPORTS_PS.md](../nsx/RUNBOOK_REPORTS_PS.md) (PowerShell).
 
 ---
 

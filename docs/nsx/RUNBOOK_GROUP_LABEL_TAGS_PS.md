@@ -169,4 +169,4 @@ All bundles land under `$env:NSX_LOG_DIR\reports\` (default
 ## See also
 
 - [RUNBOOK_GROUP_LABEL_TAGS.md](RUNBOOK_GROUP_LABEL_TAGS.md) - full narrative + bash variant
-- [REPORTS_DATA_SOURCES.md](REPORTS_DATA_SOURCES.md) - where tag/group data comes from
+- [REPORTS_DATA_SOURCES.md](../reference/REPORTS_DATA_SOURCES.md) - where tag/group data comes from

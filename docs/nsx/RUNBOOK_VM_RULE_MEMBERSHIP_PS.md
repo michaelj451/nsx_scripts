@@ -145,4 +145,4 @@ Per-run log lives at `nsx_logs\vm_rule_membership_<UTC_TS>.log`.
 ## See also
 
 - [RUNBOOK_VM_RULE_MEMBERSHIP.md](RUNBOOK_VM_RULE_MEMBERSHIP.md) - macOS / Linux variant of this runbook
-- [REPORTS_DATA_SOURCES.md](REPORTS_DATA_SOURCES.md) - data-source breakdown for all report tools
+- [REPORTS_DATA_SOURCES.md](../reference/REPORTS_DATA_SOURCES.md) - data-source breakdown for all report tools

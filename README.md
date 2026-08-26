@@ -40,17 +40,21 @@ push, revert, report — is replayed against each vendor's API or config format.
 
 ## Which runbook do I want?
 
+Full index of every doc, grouped by area: [docs/README.md](docs/README.md).
+
 ### NSX workflows (mature, validated round-trip in lab)
 
 | Workflow | Source → Target | Scope | Runbook |
 |---|---|---|---|
-| **A — Clone** — stand up a new LM with the same DFW config | `nsx-lm1` (live) → `nsx-lm2` (new) | services + groups + policies + rules | [docs/RUNBOOK_A.md](docs/RUNBOOK_A.md) |
-| **B — Subnet remap in place** — rewrite group IPs on one LM using a CSV map | `nsx-lm1` → `nsx-lm1` | groups only (PATCH) | [docs/RUNBOOK_B.md](docs/RUNBOOK_B.md) |
-| **C — Lab decomposition** — split tag+IP groups into siblings on a non-prod target | `nsx-lm1` → `nsx-lm3` | groups (sibling-decompose) + amend rules | [docs/RUNBOOK_C.md](docs/RUNBOOK_C.md) |
-| **D — Production in-place remap to siblings** — additive prod amendment with Phase-2 forced strip option | `nsx-lm1` → `nsx-lm1` | groups + rules + optional Phase-2 strip | [docs/RUNBOOK_D.md](docs/RUNBOOK_D.md) |
-| **VM hostname tagging** — give every regular VM an NSX tag matching its trailing digits | `nsx-lm1` → `nsx-lm1` | VM tags only (append, never replace) | [docs/RUNBOOK_VM_TAGS.md](docs/RUNBOOK_VM_TAGS.md) |
-| **Capture-first variant of A+D** — single-capture clone + WF-D in one flow (lab validation pattern) | `nsx-lm1` → any non-prod | full | [docs/RUNBOOK_FROM_CAPTURE.md](docs/RUNBOOK_FROM_CAPTURE.md) |
-| **Filter-copy** - clone only policies of chosen categories, plus their transitive deps (groups, services, nested groups) | `nsx-lm1` -> any target | filtered subset of services + groups + policies + rules | [docs/RUNBOOK_FILTER_COPY.md](docs/RUNBOOK_FILTER_COPY.md) |
+| **A — Clone** — stand up a new LM with the same DFW config | `nsx-lm1` (live) → `nsx-lm2` (new) | services + groups + policies + rules | [docs/nsx/RUNBOOK_A.md](docs/nsx/RUNBOOK_A.md) |
+| **B — Subnet remap in place** — rewrite group IPs on one LM using a CSV map | `nsx-lm1` → `nsx-lm1` | groups only (PATCH) | [docs/nsx/RUNBOOK_B.md](docs/nsx/RUNBOOK_B.md) |
+| **C — Lab decomposition** — split tag+IP groups into siblings on a non-prod target | `nsx-lm1` → `nsx-lm3` | groups (sibling-decompose) + amend rules | [docs/nsx/RUNBOOK_C.md](docs/nsx/RUNBOOK_C.md) |
+| **D — Production in-place remap to siblings** — additive prod amendment with Phase-2 forced strip option | `nsx-lm1` → `nsx-lm1` | groups + rules + optional Phase-2 strip | [docs/nsx/RUNBOOK_D.md](docs/nsx/RUNBOOK_D.md) |
+| **VM hostname tagging** — give every regular VM an NSX tag matching its trailing digits | `nsx-lm1` → `nsx-lm1` | VM tags only (append, never replace) | [docs/nsx/RUNBOOK_VM_TAGS.md](docs/nsx/RUNBOOK_VM_TAGS.md) |
+| **Capture-first variant of A+D** — single-capture clone + WF-D in one flow (lab validation pattern) | `nsx-lm1` → any non-prod | full | [docs/nsx/RUNBOOK_FROM_CAPTURE.md](docs/nsx/RUNBOOK_FROM_CAPTURE.md) |
+| **Filter-copy** - clone only policies of chosen categories, plus their transitive deps (groups, services, nested groups) | `nsx-lm1` -> any target | filtered subset of services + groups + policies + rules | [docs/nsx/RUNBOOK_FILTER_COPY.md](docs/nsx/RUNBOOK_FILTER_COPY.md) |
+| **BACKUP** - read-only config backup with kept timestamped history; restore = push the bundle back | any manager(s) -> local `nsx_backup/` | definitions only (GET-only; no additive enrichment) | [docs/nsx/RUNBOOK_BACKUP.md](docs/nsx/RUNBOOK_BACKUP.md) |
+| **IP remap audit** - what looks mapped vs gaps, per the CSV; cron-safe exit code | any manager (read-only) | groups' IP entries | [docs/nsx/RUNBOOK_B.md](docs/nsx/RUNBOOK_B.md) section B.4 |
 
 Each runbook has a `_PS.md` PowerShell variant where applicable.
 
@@ -58,7 +62,7 @@ Each runbook has a `_PS.md` PowerShell variant where applicable.
 
 | Report | What it does | Runbook |
 |---|---|---|
-| **Rules usage report** — every rule classified HOT / USED / STALE / UNUSED / DORMANT, with optional "no hits in N days" filter; works on LM or GM (full federation walk) | Read-only, GETs only, double-locked | [docs/RUNBOOK_RULES_USAGE.md](docs/RUNBOOK_RULES_USAGE.md) |
+| **Rules usage report** — every rule classified HOT / USED / STALE / UNUSED / DORMANT, with optional "no hits in N days" filter; works on LM or GM (full federation walk) | Read-only, GETs only, double-locked | [docs/nsx/RUNBOOK_RULES_USAGE.md](docs/nsx/RUNBOOK_RULES_USAGE.md) |
 
 ### Palo Alto
 
@@ -67,8 +71,8 @@ to enforce the production/lab boundary:
 
 | Surface | When to use | Runbook |
 |---|---|---|
-| **Lab (Panorama API)** — `pano4.lab.local` only. Pull config snapshots, mass-modify rules, stage changes to candidate. | Development, testing, exploration on the home lab Panorama. **Never against production.** | [docs/RUNBOOK_PAN_LAB.md](docs/RUNBOOK_PAN_LAB.md) / [_PS.md](docs/RUNBOOK_PAN_LAB_PS.md) |
-| **Production (manual, no API)** — runs locally on operator machine, reads exported Panorama XML, makes zero network calls. | Customer engagements. CAB analysis. Anything that touches a Panorama you don't own. | [docs/RUNBOOK_PAN_PROD.md](docs/RUNBOOK_PAN_PROD.md) / [_PS.md](docs/RUNBOOK_PAN_PROD_PS.md) |
+| **Lab (Panorama API)** — `pano4.lab.local` only. Pull config snapshots, mass-modify rules, stage changes to candidate. | Development, testing, exploration on the home lab Panorama. **Never against production.** | [docs/pan/RUNBOOK_PAN_LAB.md](docs/pan/RUNBOOK_PAN_LAB.md) / [_PS.md](docs/pan/RUNBOOK_PAN_LAB_PS.md) |
+| **Production (manual, no API)** — runs locally on operator machine, reads exported Panorama XML, makes zero network calls. | Customer engagements. CAB analysis. Anything that touches a Panorama you don't own. | [docs/pan/RUNBOOK_PAN_PROD.md](docs/pan/RUNBOOK_PAN_PROD.md) / [_PS.md](docs/pan/RUNBOOK_PAN_PROD_PS.md) |
 
 Tools per surface:
 

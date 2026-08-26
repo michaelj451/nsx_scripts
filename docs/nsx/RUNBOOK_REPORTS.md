@@ -460,7 +460,7 @@ windows.
 
 ## See also
 
-- [REPORTS_DATA_SOURCES.md](REPORTS_DATA_SOURCES.md) - where each tool reads/writes (NSX endpoints + disk paths)
+- [REPORTS_DATA_SOURCES.md](../reference/REPORTS_DATA_SOURCES.md) - where each tool reads/writes (NSX endpoints + disk paths)
 - [RUNBOOK_VM_TAGS.md](RUNBOOK_VM_TAGS.md) - VM-tags workflow narrative
 - [RUNBOOK_VM_TAGS_COMMANDS.md](RUNBOOK_VM_TAGS_COMMANDS.md) - bash command reference
 - [RUNBOOK_RULES_USAGE.md](RUNBOOK_RULES_USAGE.md) - deeper dive on the rules report

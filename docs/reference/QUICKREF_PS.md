@@ -65,7 +65,7 @@ python tools/nsx/rules.py push --target nsx-lm3 `
   --rules-dir "$bundle\rules\security-policies" --apply
 ```
 
-Full detail: [RUNBOOK_FILTER_COPY_PS.md](RUNBOOK_FILTER_COPY_PS.md).
+Full detail: [RUNBOOK_FILTER_COPY_PS.md](../nsx/RUNBOOK_FILTER_COPY_PS.md).
 
 ---
 
@@ -129,7 +129,7 @@ Get-Content "$bundle\manifest.json" | ConvertFrom-Json | Select-Object -ExpandPr
 | Also include Infrastructure rules | `--categories Application,Infrastructure` |
 | Use a different consolidated-policy id or display | `--new-policy-id my-policy --new-policy-display "My Policy"` |
 
-Full detail: [RUNBOOK_FILTER_COPY_PS.md](RUNBOOK_FILTER_COPY_PS.md) (same push chain, this workflow is a variant of the filter-copy pattern).
+Full detail: [RUNBOOK_FILTER_COPY_PS.md](../nsx/RUNBOOK_FILTER_COPY_PS.md) (same push chain, this workflow is a variant of the filter-copy pattern).
 
 ---
 
@@ -186,7 +186,7 @@ Get-Content "$latest\dormant_rules.jsonl" | ForEach-Object { ConvertFrom-Json $_
   Format-Table policy_id, rule_display, rule_age_days
 ```
 
-Full detail: [RUNBOOK_RULES_USAGE_PS.md](RUNBOOK_RULES_USAGE_PS.md).
+Full detail: [RUNBOOK_RULES_USAGE_PS.md](../nsx/RUNBOOK_RULES_USAGE_PS.md).
 
 ---
 
@@ -207,13 +207,13 @@ Full detail: [RUNBOOK_RULES_USAGE_PS.md](RUNBOOK_RULES_USAGE_PS.md).
 - Every push tool is dry-run by default. `--apply` is required to write.
 - Every push captures a pre-write baseline for LIFO revert.
 - Source managers are never written to.
-- `wipe_target_manager.py` also dry-runs by default (see [RUNBOOK_FILTER_COPY_PS.md](RUNBOOK_FILTER_COPY_PS.md) for wipe usage).
+- `wipe_target_manager.py` also dry-runs by default (see [RUNBOOK_FILTER_COPY_PS.md](../nsx/RUNBOOK_FILTER_COPY_PS.md) for wipe usage).
 
 ## See also
 
-- [RUNBOOK_A_COMMANDS_PS.md](RUNBOOK_A_COMMANDS_PS.md) - full-manager clone (Workflow A)
-- [RUNBOOK_B_COMMANDS_PS.md](RUNBOOK_B_COMMANDS_PS.md) - CSV subnet remap in place
-- [RUNBOOK_C_COMMANDS_PS.md](RUNBOOK_C_COMMANDS_PS.md) - lab sibling-group decomposition
-- [RUNBOOK_D_COMMANDS_PS.md](RUNBOOK_D_COMMANDS_PS.md) - production in-place sibling remap
-- [RUNBOOK_FILTER_COPY_PS.md](RUNBOOK_FILTER_COPY_PS.md) - selective category copy (this workflow)
-- [RUNBOOK_RULES_USAGE_PS.md](RUNBOOK_RULES_USAGE_PS.md) - rules-usage report deep dive
+- [RUNBOOK_A_COMMANDS_PS.md](../nsx/RUNBOOK_A_COMMANDS_PS.md) - full-manager clone (Workflow A)
+- [RUNBOOK_B_COMMANDS_PS.md](../nsx/RUNBOOK_B_COMMANDS_PS.md) - CSV subnet remap in place
+- [RUNBOOK_C_COMMANDS_PS.md](../nsx/RUNBOOK_C_COMMANDS_PS.md) - lab sibling-group decomposition
+- [RUNBOOK_D_COMMANDS_PS.md](../nsx/RUNBOOK_D_COMMANDS_PS.md) - production in-place sibling remap
+- [RUNBOOK_FILTER_COPY_PS.md](../nsx/RUNBOOK_FILTER_COPY_PS.md) - selective category copy (this workflow)
+- [RUNBOOK_RULES_USAGE_PS.md](../nsx/RUNBOOK_RULES_USAGE_PS.md) - rules-usage report deep dive
