@@ -38,6 +38,7 @@ Precedence for the list path: --vm-list > VM_RULE_REPORT_LIST (.env)
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -86,14 +87,24 @@ def setup_logging(tool: str) -> Path:
 
 # ---------- VM-list loader ----------
 
-def load_vm_names(explicit_path: Optional[str]) -> Tuple[List[str], Path]:
+def load_vm_names(
+    explicit_path: Optional[str],
+) -> Tuple[List[Tuple[str, Optional[List[str]]]], Path]:
     """
-    Load the VM display-name list. Returns (names, source_path).
-    Precedence:
+    Load the VM target list. Returns (entries, source_path) where each entry
+    is (name, ips_or_None):
+      - ips=None  -> name-only entry, NSX will be queried to resolve it
+      - ips=list  -> planned/external entry: use these IPs directly, skip NSX lookup
+
+    File format per non-blank, non-comment line:
+      <name>                       # NSX lookup
+      <name>,<ip>                  # planned VM with one IP
+      <name>,<ip1>,<ip2>,...       # planned VM with multiple IPs
+
+    Precedence for the list path:
       1. explicit --vm-list
       2. VM_RULE_REPORT_LIST env var
       3. auto-discovered REPO_ROOT/vm_rule_report_targets.txt
-    Blank lines and `#` comments are ignored. Order + duplicates preserved.
     """
     explicit = (explicit_path or "").strip()
     envvar = (os.getenv("VM_RULE_REPORT_LIST") or "").strip()
@@ -121,14 +132,45 @@ def load_vm_names(explicit_path: Optional[str]) -> Tuple[List[str], Path]:
     if not fp.exists():
         raise SystemExit(f"VM list file not found ({source}): {fp}")
 
-    names: List[str] = []
-    for line in fp.read_text(encoding="utf-8").splitlines():
+    entries: List[Tuple[str, Optional[List[str]]]] = []
+    for lineno, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        names.append(s)
-    log.info("Loaded %d VM name(s) from %s (%s)", len(names), fp, source)
-    return names, fp
+        parts = [p.strip() for p in s.split(",")]
+        if not parts[0]:
+            log.warning("Line %d: blank name, skipping: %r", lineno, line)
+            continue
+        name = parts[0]
+        ip_tokens = [p for p in parts[1:] if p]
+        if not ip_tokens:
+            entries.append((name, None))
+            continue
+        valid_ips: List[str] = []
+        for tok in ip_tokens:
+            try:
+                ipaddress.ip_address(tok)
+                valid_ips.append(tok)
+            except ValueError:
+                log.warning(
+                    "Line %d: %r has invalid IP %r; ignoring that token.",
+                    lineno, name, tok,
+                )
+        if not valid_ips:
+            log.warning(
+                "Line %d: %r had IP tokens but none parsed; treating as name-only.",
+                lineno, name,
+            )
+            entries.append((name, None))
+        else:
+            entries.append((name, valid_ips))
+    n_named = sum(1 for _, ips in entries if ips is None)
+    n_planned = sum(1 for _, ips in entries if ips is not None)
+    log.info(
+        "Loaded %d entry/-ies from %s (%s): name-only=%d, planned-with-ip=%d",
+        len(entries), fp, source, n_named, n_planned,
+    )
+    return entries, fp
 
 
 # ---------- helpers ----------
@@ -161,6 +203,18 @@ def _has_any(refs: Optional[List[Any]]) -> bool:
 def _md_esc(s: Any) -> str:
     """Escape pipes in markdown-cell content."""
     return str(s).replace("|", "\\|") if s is not None else ""
+
+
+def _short(s: Any, maxlen: int = 40) -> str:
+    """Truncate long strings with a trailing ellipsis so a single very long
+    rule / group name can't blow up the whole table's column widths."""
+    if s is None:
+        return ""
+    text = str(s)
+    if len(text) <= maxlen:
+        return text
+    # Reserve 3 chars for the ellipsis
+    return text[: max(1, maxlen - 3)] + "..."
 
 
 # ---------- data pull ----------
@@ -277,6 +331,103 @@ def discover_federation_sites(gm_client: NsxPolicyClient) -> List[Dict[str, Any]
     sites = r.get("results") or []
     log.info("Federation sites discovered: %d", len(sites))
     return sites
+
+
+def pull_group_ip_memberships(
+    client: NsxPolicyClient,
+    groups_by_path: Dict[str, Dict[str, Any]],
+    site_clients_for_members: Optional[Dict[str, NsxPolicyClient]] = None,
+) -> Dict[str, Set[str]]:
+    """
+    For each group, fetch /members/ip-addresses (returns every IP or CIDR the
+    group evaluates to, including from IP-only expressions). Returns
+    group_path -> set(ip_or_cidr strings). Errors per group are logged and
+    the group ends up with an empty set.
+
+    In GM federation mode, per-site clients are unioned.
+    """
+    result: Dict[str, Set[str]] = {}
+    for gpath, meta in groups_by_path.items():
+        domain_id = meta["domain_id"]
+        gid = meta["id"]
+        ips: Set[str] = set()
+        if site_clients_for_members:
+            iter_clients = site_clients_for_members.items()
+        else:
+            iter_clients = [("(single)", client)]
+        for label, cli in iter_clients:
+            try:
+                path = cli._policy_path(
+                    f"/domains/{cli._q(domain_id)}/groups/{cli._q(gid)}/members/ip-addresses"
+                )
+                r = cli._get(path)
+            except Exception as exc:
+                log.warning("group=%s/%s (%s): /members/ip-addresses failed: %s",
+                            domain_id, gid, label, exc)
+                continue
+            for ip in (r.get("results") or []):
+                if isinstance(ip, str) and ip.strip():
+                    ips.add(ip.strip())
+        result[gpath] = ips
+    total_ips = sum(len(v) for v in result.values())
+    log.info("Group IP memberships fetched: %d total IP/CIDR entries across %d group(s)",
+             total_ips, len(result))
+    return result
+
+
+def _parse_ip_or_cidr(s: str) -> Optional[Tuple[str, Any]]:
+    """Return ('addr', ip_address) or ('net', ip_network) or None if unparseable."""
+    try:
+        if "/" in s:
+            return ("net", ipaddress.ip_network(s, strict=False))
+        return ("addr", ipaddress.ip_address(s))
+    except (ValueError, TypeError):
+        return None
+
+
+def match_vm_ips_to_groups(
+    vm_ips: Dict[str, List[str]],
+    group_ips: Dict[str, Set[str]],
+) -> Dict[str, Set[str]]:
+    """Given ext_id -> [vm ip strings] and group_path -> {group ip/cidr strings},
+    return ext_id -> set(group_paths) where the VM's IPs are covered by the
+    group's IP entries. Handles IPv4 + IPv6. CIDR containment respected."""
+    parsed_groups: Dict[str, List[Tuple[str, Any]]] = {}
+    for gpath, ips in group_ips.items():
+        parsed: List[Tuple[str, Any]] = []
+        for s in ips:
+            entry = _parse_ip_or_cidr(s)
+            if entry is not None:
+                parsed.append(entry)
+        parsed_groups[gpath] = parsed
+
+    out: Dict[str, Set[str]] = {}
+    for ext_id, ip_list in vm_ips.items():
+        vm_addrs = []
+        for s in ip_list:
+            try:
+                vm_addrs.append(ipaddress.ip_address(s))
+            except (ValueError, TypeError):
+                continue
+        if not vm_addrs:
+            continue
+        matched: Set[str] = set()
+        for gpath, entries in parsed_groups.items():
+            hit = False
+            for kind, val in entries:
+                if kind == "addr":
+                    if any(a == val for a in vm_addrs):
+                        hit = True
+                        break
+                else:  # net
+                    if any(a in val for a in vm_addrs):
+                        hit = True
+                        break
+            if hit:
+                matched.add(gpath)
+        if matched:
+            out[ext_id] = matched
+    return out
 
 
 def build_site_clients_for_federation(
@@ -431,15 +582,43 @@ def rule_touches_targets(
 # ---------- rendering ----------
 
 def _fmt_group_list(paths: List[str], any_flag: bool,
-                    groups_by_path: Dict[str, Dict[str, Any]]) -> str:
+                    groups_by_path: Dict[str, Dict[str, Any]],
+                    per_name_maxlen: int = 30) -> str:
     parts: List[str] = []
     if any_flag:
         parts.append("**ANY**")
     for p in paths:
         gname = (groups_by_path.get(p) or {}).get("display_name") or p.split("/")[-1]
-        parts.append(_md_esc(gname))
+        parts.append(_md_esc(_short(gname, per_name_maxlen)))
     if not parts:
         parts.append("(none)")
+    return ", ".join(parts)
+
+
+def _fmt_group_list_for_vm(
+    paths: List[str],
+    any_flag: bool,
+    groups_by_path: Dict[str, Dict[str, Any]],
+    vm_groups: Set[str],
+    per_name_maxlen: int = 30,
+) -> str:
+    """VM-scoped version: only shows groups from `paths` that this VM is
+    actually a member of, so the Src/Dst cell describes THIS VM's match
+    (not the rule's full group list).
+
+    - If the side is ANY on the rule, show 'ANY'.
+    - If the VM isn't a member of any group on this side, show '-'.
+    - Otherwise show the intersection.
+    """
+    if any_flag:
+        return "**ANY**"
+    matched = [p for p in paths if p in vm_groups]
+    if not matched:
+        return "-"
+    parts: List[str] = []
+    for p in matched:
+        gname = (groups_by_path.get(p) or {}).get("display_name") or p.split("/")[-1]
+        parts.append(_md_esc(_short(gname, per_name_maxlen)))
     return ", ".join(parts)
 
 
@@ -463,6 +642,7 @@ def render_markdown(
     hits: List[Dict[str, Any]],
     groups_by_path: Dict[str, Dict[str, Any]],
     total_rules: int,
+    vm_to_groups: Dict[str, Set[str]],
     federation_mode: str = "lm",
     site_display: Optional[Dict[str, str]] = None,
 ) -> str:
@@ -478,9 +658,15 @@ def render_markdown(
             f"- **Federated sites**: {len(site_display)} "
             f"({', '.join(sorted(site_display.values()))})"
         )
-    lines.append(f"- **VMs requested**: {len(vm_names_input)}")
-    lines.append(f"- **VMs matched on NSX**: {len(resolved)}")
-    lines.append(f"- **Names not found**: {len(not_found)}")
+    n_nsx = sum(1 for m in resolved.values() if m.get("kind") == "NSX")
+    n_nsx_ip = sum(1 for m in resolved.values() if m.get("kind") == "NSX+ip")
+    n_planned = sum(1 for m in resolved.values() if m.get("kind") == "planned")
+    lines.append(f"- **Entries requested**: {len(vm_names_input)}")
+    lines.append(
+        f"- **Resolved**: {len(resolved)}   "
+        f"(NSX={n_nsx}, NSX+explicit-IPs={n_nsx_ip}, planned={n_planned})"
+    )
+    lines.append(f"- **Names not found (name-only entries, no NSX match)**: {len(not_found)}")
     if duplicate_names:
         lines.append(f"- **Duplicate/ambiguous input names**: {len(duplicate_names)}")
     lines.append(f"- **Rules scanned**: {total_rules}")
@@ -490,28 +676,33 @@ def render_markdown(
     # -------- resolved VMs --------
     lines.append(f"## Requested VMs matched ({len(resolved)})\n")
     if not resolved:
-        lines.append("_No requested VM names matched a live VM on NSX._\n")
+        lines.append("_No requested VM names resolved (either not found on NSX and no IPs supplied)._\n")
     else:
         if show_site_col:
-            lines.append("| # | VM name | Site | External ID | Groups | Rules hit |")
-            lines.append("|---:|---|---|---|---:|---:|")
+            lines.append("| # | VM name | Kind | Site | IPs | Groups | Rules hit |")
+            lines.append("|---:|---|---|---|---|---:|---:|")
         else:
-            lines.append("| # | VM name | External ID | Groups | Rules hit |")
-            lines.append("|---:|---|---|---:|---:|")
+            lines.append("| # | VM name | Kind | IPs | Groups | Rules hit |")
+            lines.append("|---:|---|---|---|---:|---:|")
         for i, (name, meta) in enumerate(resolved.items(), start=1):
+            kind = meta.get("kind", "NSX")
+            ips = meta.get("ips") or []
+            ips_cell = _md_esc(_short(", ".join(ips) if ips else "-", 50))
             if show_site_col:
                 site = site_display.get(meta.get("site_id") or "", "-")
                 lines.append(
                     f"| {i} | {_md_esc(meta.get('display_name'))} | "
+                    f"{kind} | "
                     f"{_md_esc(site)} | "
-                    f"`{_md_esc((meta.get('external_id') or '')[:20])}...` | "
+                    f"{ips_cell} | "
                     f"{meta.get('group_count', 0)} | "
                     f"{meta.get('rule_hit_count', 0)} |"
                 )
             else:
                 lines.append(
                     f"| {i} | {_md_esc(meta.get('display_name'))} | "
-                    f"`{_md_esc((meta.get('external_id') or '')[:20])}...` | "
+                    f"{kind} | "
+                    f"{ips_cell} | "
                     f"{meta.get('group_count', 0)} | "
                     f"{meta.get('rule_hit_count', 0)} |"
                 )
@@ -531,52 +722,47 @@ def render_markdown(
             lines.append(f"- {_md_esc(n)}")
         lines.append("")
 
-    # -------- matched VMs with zero rules --------
-    zero_rule_vms = [name for name, m in resolved.items()
-                     if m.get("rule_hit_count", 0) == 0]
-    if zero_rule_vms:
-        lines.append(f"## Matched VMs NOT in any rule ({len(zero_rule_vms)})\n")
-        for n in zero_rule_vms:
-            lines.append(f"- {_md_esc(n)}")
+    # -------- per-VM rule tables (the main event) --------
+    # Build: ext_id -> [(rule_dict, info_dict, sides_list), ...] preserving
+    # NSX rule order (already the order in `hits`).
+    per_vm: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any], List[str]]]] = {}
+    for h in hits:
+        for ext_id, sides in h["info"]["by_side"].items():
+            per_vm.setdefault(ext_id, []).append((h["rule"], h["info"], sides))
+
+    lines.append(f"## Rules per VM\n")
+    if not resolved:
+        lines.append("_No matched VMs to report on._\n")
+    for name, meta in resolved.items():
+        ext = meta["external_id"]
+        rules_for_vm = per_vm.get(ext, [])
+        n = len(rules_for_vm)
+        header = f"### {_md_esc(name)}   `{n} rule{'s' if n != 1 else ''}`"
+        if show_site_col:
+            site = site_display.get(meta.get("site_id") or "", "-")
+            header += f"   _(site: {_md_esc(site)})_"
+        lines.append(header + "\n")
+        if not rules_for_vm:
+            lines.append("_Not referenced by any rule._\n")
+            continue
+        lines.append("| # | Policy | Rule | Action | Source | Destination | Hit as |")
+        lines.append("|---:|---|---|---|---|---|---|")
+        vm_groups = vm_to_groups.get(ext, set())
+        for i, (r, info, sides) in enumerate(rules_for_vm, start=1):
+            global_flag = " *(global)*" if (info["any_src"] and info["any_dst"]) else ""
+            disabled = " *(disabled)*" if r.get("disabled") else ""
+            action = (r.get("action") or "?").upper()
+            lines.append(
+                f"| {i} | "
+                f"{_md_esc(_short(r.get('_policy_display'), 30))} | "
+                f"{_md_esc(_short(r.get('display_name'), 40))}{disabled} | "
+                f"{action}{global_flag} | "
+                f"{_fmt_group_list_for_vm(info['src_groups'], info['any_src'], groups_by_path, vm_groups)} | "
+                f"{_fmt_group_list_for_vm(info['dst_groups'], info['any_dst'], groups_by_path, vm_groups)} | "
+                f"{', '.join(sides)} |"
+            )
         lines.append("")
 
-    # -------- per-rule sections (the main event) --------
-    lines.append(f"## Rules hitting the requested VMs ({len(hits)})\n")
-    if not hits:
-        lines.append("_None of the matched VMs are referenced by any rule "
-                     "(directly or via group membership)._\n")
-    for i, h in enumerate(hits, start=1):
-        r = h["rule"]
-        info = h["info"]
-        global_flag = " **[GLOBAL - ANY-src AND ANY-dst]**" if (info["any_src"] and info["any_dst"]) else ""
-        disabled = " _(disabled)_" if r.get("disabled") else ""
-        lines.append(
-            f"### {i}. `{_md_esc(r.get('_policy_display'))}` "
-            f"› **{_md_esc(r.get('display_name'))}** "
-            f"[{_md_esc(r.get('action') or '?')}]"
-            f"{global_flag}{disabled}\n"
-        )
-        lines.append(
-            f"- Policy: `{_md_esc(r.get('_policy_display'))}` "
-            f"({_md_esc(r.get('_category') or 'no-category')})"
-        )
-        lines.append(f"- Rule ID: `{_md_esc(r.get('id'))}`")
-        lines.append(f"- Direction: {_md_esc(r.get('direction') or 'IN_OUT')}   "
-                     f"IP protocol: {_md_esc(r.get('ip_protocol') or 'IPV4_IPV6')}")
-        lines.append(f"- Source: {_fmt_group_list(info['src_groups'], info['any_src'], groups_by_path)}")
-        lines.append(f"- Destination: {_fmt_group_list(info['dst_groups'], info['any_dst'], groups_by_path)}")
-        lines.append(f"- Applied To (scope): {_fmt_group_list(info['scope_groups'], info['any_scope'], groups_by_path)}")
-        lines.append(f"- Services: {_md_esc(_fmt_service_list(r.get('services')))}")
-        lines.append("")
-        lines.append("| VM | Hit as |")
-        lines.append("|---|---|")
-        for ext, sides in sorted(
-            info["by_side"].items(),
-            key=lambda kv: (h["ext_id_to_name"].get(kv[0], kv[0]).lower()),
-        ):
-            name = h["ext_id_to_name"].get(ext, ext[:12] + "...")
-            lines.append(f"| {_md_esc(name)} | {', '.join(sides)} |")
-        lines.append("")
     return align_markdown_tables("\n".join(lines))
 
 
@@ -687,36 +873,80 @@ def main() -> None:
     by_name, by_ext = build_vm_index(vms)
     log.info("VMs indexed: %d (by-name unique keys=%d)", len(vms), len(by_name))
 
-    # ---- resolve target names ----
-    resolved: Dict[str, Dict[str, Any]] = {}  # display_name -> {external_id, display_name, ...}
+    # ---- resolve target entries ----
+    # Each input entry is (name, ips_or_None):
+    #   ips is None    -> name-only, look up on NSX
+    #   ips is a list  -> planned/IP-only; skip NSX lookup, use given IPs
+    resolved: Dict[str, Dict[str, Any]] = {}  # display_name -> meta
     not_found: List[str] = []
     duplicate_names: List[str] = []
     seen: Set[str] = set()
-    for raw in names_input:
-        key = raw.strip().lower()
+    vm_ips: Dict[str, List[str]] = {}   # ext_id (or synthetic) -> [ip strings]
+    for raw_name, raw_ips in names_input:
+        key = raw_name.strip().lower()
         if not key:
             continue
         if key in seen:
-            duplicate_names.append(raw)
+            duplicate_names.append(raw_name)
             continue
         seen.add(key)
+        explicit_ips = list(raw_ips) if raw_ips else []
+
         vm = by_name.get(key)
-        if not vm:
-            not_found.append(raw)
+        if vm:
+            # NSX-matched: auto-fetch IPs from fabric dict, union with explicit
+            ext = vm.get("external_id") or vm.get("id")
+            display = vm.get("display_name") or raw_name
+            if not ext:
+                # Rare: NSX returned a VM but no id. Fall back to planned if
+                # we have explicit IPs, else not_found.
+                if explicit_ips:
+                    synth_ext = f"planned:{raw_name}"
+                    resolved[raw_name] = {
+                        "external_id": synth_ext,
+                        "display_name": raw_name,
+                        "kind": "planned",
+                        "tags": [],
+                        "site_id": None,
+                        "ips": explicit_ips,
+                    }
+                    vm_ips[synth_ext] = explicit_ips
+                else:
+                    not_found.append(raw_name)
+                continue
+            auto_ips = sorted(NsxPolicyClient._collect_ips_recursive(vm))
+            merged_ips = sorted(set(auto_ips) | set(explicit_ips))
+            resolved[display] = {
+                "external_id": ext,
+                "display_name": display,
+                "kind": "NSX+ip" if explicit_ips else "NSX",
+                "tags": vm.get("tags") or [],
+                "site_id": vm_ext_to_site.get(ext),
+                "ips": merged_ips,
+                "explicit_ips": explicit_ips,
+                "auto_ips": auto_ips,
+            }
+            vm_ips[ext] = merged_ips
             continue
-        ext = vm.get("external_id") or vm.get("id")
-        display = vm.get("display_name") or raw
-        if not ext:
-            not_found.append(raw)
-            continue
-        resolved[display] = {
-            "external_id": ext,
-            "display_name": display,
-            "tags": vm.get("tags") or [],
-            "site_id": vm_ext_to_site.get(ext),
-        }
+
+        # Name NOT on NSX. If explicit IPs supplied, treat as planned/IP-only.
+        if explicit_ips:
+            synth_ext = f"planned:{raw_name}"
+            resolved[raw_name] = {
+                "external_id": synth_ext,
+                "display_name": raw_name,
+                "kind": "planned",
+                "tags": [],
+                "site_id": None,
+                "ips": explicit_ips,
+                "explicit_ips": explicit_ips,
+                "auto_ips": [],
+            }
+            vm_ips[synth_ext] = explicit_ips
+        else:
+            not_found.append(raw_name)
     log.info(
-        "Requested %d name(s): resolved=%d, not_found=%d, duplicates=%d",
+        "Requested %d entry/-ies: resolved=%d, not_found=%d, duplicates=%d",
         len(names_input), len(resolved), len(not_found), len(duplicate_names),
     )
 
@@ -740,6 +970,23 @@ def main() -> None:
         site_clients_for_members=site_fed_clients if is_gm_federation else None,
     )
     vm_to_groups = build_vm_to_groups(group_to_members)
+
+    # ---- augment memberships by IP ----
+    # Groups can include IP addresses / CIDRs (either as their only members or
+    # mixed with tag/segment/path). NSX evaluates DFW rules against packet IPs,
+    # so a VM whose IP falls inside a group's IP set is effectively a member
+    # for rule-matching purposes. Fetch /members/ip-addresses per group and
+    # add matches into vm_to_groups.
+    group_ips = pull_group_ip_memberships(
+        client,
+        groups_by_path,
+        site_clients_for_members=site_fed_clients if is_gm_federation else None,
+    )
+    ip_based_matches = match_vm_ips_to_groups(vm_ips, group_ips)
+    for ext, gps in ip_based_matches.items():
+        vm_to_groups.setdefault(ext, set()).update(gps)
+    log.info("IP-based membership added: %d VM(s) matched %d additional group(s)",
+             len(ip_based_matches), sum(len(v) for v in ip_based_matches.values()))
 
     # Attach per-VM group counts to the resolved dict for the summary table
     for meta in resolved.values():
@@ -785,16 +1032,18 @@ def main() -> None:
 
     # ---- render + write ----
     ran_at = datetime.now(timezone.utc).isoformat()
+    input_names_only = [n for (n, _ips) in names_input]
     md_text = render_markdown(
         manager_host=manager_host,
         ran_at=ran_at,
-        vm_names_input=names_input,
+        vm_names_input=input_names_only,
         resolved=resolved,
         not_found=not_found,
         duplicate_names=duplicate_names,
         hits=hits,
         groups_by_path=groups_by_path,
         total_rules=len(all_rules),
+        vm_to_groups=vm_to_groups,
         federation_mode=("gm" if is_gm_federation else "lm"),
         site_display=site_display,
     )
@@ -807,7 +1056,9 @@ def main() -> None:
         "manager_host": manager_host,
         "ran_at": ran_at,
         "vm_list_source": str(list_path),
-        "vm_names_input": names_input,
+        "vm_entries_input": [
+            {"name": n, "planned_ips": ips} for (n, ips) in names_input
+        ],
         "federation_mode": "gm" if is_gm_federation else "lm",
         "federation_sites": [
             {"site_id": sid, "display_name": name}

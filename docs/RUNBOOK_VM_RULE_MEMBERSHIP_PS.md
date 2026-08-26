@@ -24,15 +24,24 @@ manager aliases.
 
 ## Step 1: Prepare the VM target list
 
-Edit `vm_rule_report_targets.txt` at the repo root. One VM `display_name`
-per line, `#` comments allowed, blank lines ignored. Case-insensitive
-match.
+Edit `vm_rule_report_targets.txt` at the repo root. `#` comments and blank
+lines ignored. Two entry styles:
 
 ```
-# Example
+# Just a name -> NSX lookup; IPs auto-fetched from VM VIFs.
 ubuntu22-speedtest-10.6.0.101-ax2001
 ubuntu22-speedtest-10.6.2.102-gh0202
+
+# name,ip[,ip,...] -> NSX lookup + explicit IPs. If the name matches on NSX,
+# both auto-fetched AND explicit IPs are used for group-IP matching. If the
+# name does NOT match on NSX (planned VM), falls back to IP-only mode.
+future-web-01,10.6.0.50
+new-app,10.7.5.100,10.7.5.101
+probe,10.6.0.99
 ```
+
+Case-insensitive match on the name. Invalid IP tokens are logged and skipped.
+Report `Kind` column shows `NSX`, `NSX+ip`, or `planned` per entry.
 
 Alternative locations (only if you don't want to use the repo-root file):
 
