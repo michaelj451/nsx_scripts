@@ -107,6 +107,16 @@ flag is **refused** when combined with `--csv-remap` (the only way to
 remove IPs is `groups.py revert`, which restores the auto-captured
 baseline).
 
+**Scope: IP-Addresses-Only groups by default.** The remap applies only to
+groups with `group_type: IPAddress` (the GUI's "IP Addresses Only" type).
+Generic groups, even ones containing only an IP list, are pushed with their
+payload untouched, logged per group, and counted in `summary.json` as
+`csv_generic_groups_skipped`. Pass `--remap-generic` to include generic
+groups in the remap. The two types carry an identical `IPAddressExpression`
+structure; the scope is a policy choice (a locked static list is safe to
+rewrite mechanically, a generic group may be under dynamic management), not a
+technical limitation.
+
 When `--csv-remap` is in play, `--batch-size` **defaults to 1** so you
 step through every change one at a time. Bump higher at any prompt as
 confidence grows (`5`, `25`, `100`, `500` …). Type `n` to reset to 1.
@@ -197,6 +207,7 @@ That's a self-contained replayable record per group — diff `ips_before` agains
 | `--csv-remap <csv>` | off | Apply CSV subnet mapping to `IPAddressExpression` IPs. Strict-additive: originals kept, mapped values appended |
 | `--mapped-only` | off | **Refused** when combined with `--csv-remap` (destructive mode is blocked by contract). Only meaningful without `--csv-remap` |
 | `--bidirectional` | off | With `--csv-remap`: treat each CSV row as a bidirectional mapping |
+| `--remap-generic` | off | With `--csv-remap`: ALSO remap generic groups. Default scope is IP-Addresses-Only groups (`group_type: IPAddress`); generic groups are pushed untouched and counted as `csv_generic_groups_skipped` |
 | `--segments-mode {keep,strip,convert}` | `keep` | For Workflow B, leave at `keep` (default) so segment refs in groups aren't disturbed |
 | `--batch-size N` | `0` (off) | **Interactive batching.** Pauses every `N` applied updates, prints a compact per-group diff (status, +added/-removed IPs, segment/CSV/fabric notes), and prompts. Default `0` = fully automated. Set to `1` to step through every change; bump higher as confidence grows. Only takes effect with `--apply`. See below. |
 | `--apply` | off | Required to actually mutate. Default is dry-run. |
@@ -296,10 +307,17 @@ write (so an interrupted push still has an accurate list). Revert then:
 
 After success, both files are renamed `*.json.reverted`.
 
+**Deletes are off by default.** Any group revert would DELETE (one the push
+created, or with `--scope all` any customer group not in the baseline) is
+left in place and listed in the revert summary as `deletes_blocked` unless
+`--allow-delete` is given. `--scope all` refuses to run at all without it.
+
 `--scope all` is the legacy full-baseline revert (PUT every baseline group back
 and DELETE any customer group not in the baseline). It is required for
 baselines captured before `pushed_ids.json` existed, and it will clobber
-unrelated group changes made since the push, so dry-run it first.
+unrelated group changes made since the push, so dry-run it first. Note that a
+restore is itself a removal of the IPs the push added; that is what revert is
+for, and it stays behind `--apply`.
 
 ```bash
 # Dry-run first: prints the restore / delete plan without writing
@@ -319,6 +337,52 @@ latest. Repeat until you're back where you want to be:
 # How many unreverted Workflow B baselines exist?
 find nsx_capture/nsx-lm1.lab.local/groups_additive -path "*/baselines/*.json" -not -name "*.reverted"
 ```
+
+---
+
+## B.4) Audit: what looks mapped, and what might be a gap
+
+`audit_ip_remap.py` is the post-flight (and ongoing) check for an in-place
+remap. It is **read-only** (one GET of the customer groups) and **never
+proposes a removal**. Run it after a push, and on a schedule afterwards, with
+the same CSV the push used:
+
+```bash
+# Local Manager
+python tools/nsx/audit_ip_remap.py --target nsx-lm1 --csv data/nonprod_map.csv
+
+# Global Manager
+python tools/nsx/audit_ip_remap.py --target nsx-gm1 --federation-global --csv data/nonprod_map.csv
+
+# Or from an export on disk (no NSX call at all)
+python tools/nsx/audit_ip_remap.py --groups-dir nsx_groups_export/nsx-lm1.lab.local/groups --csv data/nonprod_map.csv
+```
+
+Output lands in `$NSX_LOG_DIR/reports/ip_remap_audit/<host>/<UTC ts>/`:
+`ip_remap_audit.md` (the report), `ip_remap_audit.json` (per-group detail),
+`gaps.json`, `summary.json`, and a log.
+
+The report is ordered so the things that need eyes come first:
+
+| Section | Contains | Meaning |
+|---|---|---|
+| **1a. Originals with no mapped equivalent** | original IP present, CSV maps it, mapped value absent (IP-only groups by default; all groups with `--include-generic`) | the remap did not reach this entry (check `failures.json` from the push) or it was added after the remap |
+| **1b. Generic-group candidates** | CSV-covered originals sitting in GENERIC groups | informational, not gaps: the push skips generic groups by default. Shows exactly what a push with `--remap-generic` would add |
+| **1c. Mapped-side values whose original is absent** | value inside a `new_subnet`, matching `old_subnet` value absent | original removed since the remap, or the value legitimately lived in the new range already; review, do not remove |
+| **1d. IPv4 entries not covered by the CSV** | valid IPv4 entries no row covers | expected outside the remapped ranges; if one of these should map, the CSV needs a row |
+| **2. Mapped** | `original -> mapped` pairs both present | what the remap achieved, with the CSV row that produced each pair |
+| **3. Not remapped by design** | IP ranges and IPv6 | listed so nobody wonders why they were left alone |
+| **4. Per-group status** | one line per group with IP entries | quick scan; flags groups whose IPs live in a `NestedExpression` (the remap never touches nested bodies, so covered entries there will sit in 1a) |
+
+The audit's scope mirrors the push: by default only IP-Addresses-Only groups
+are expected to be remapped, and generic-group misses land in 1b as
+candidates. If the push ran with `--remap-generic`, audit with
+`--include-generic` so those count as gaps in 1a instead.
+
+Exit code is `1` when 1a or 1c is non-empty; candidates alone never trip it
+(`--no-fail-on-gaps` to always return 0). It can run from cron and alert on
+drift. Entries are compared on canonical form, so `10.6.0.1/32` and
+`10.6.0.1` count as the same entry.
 
 ---
 

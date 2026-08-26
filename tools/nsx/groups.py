@@ -778,6 +778,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     if csv_mapping is not None:
         log.info("  CSV remap       : %s  (mapped-only=%s, bidirectional=%s)",
                  args.csv_remap, args.mapped_only, args.bidirectional)
+        log.info("  Remap scope     : %s",
+                 "ALL groups (--remap-generic)" if args.remap_generic
+                 else "IP-Addresses-Only groups (default; generic groups untouched)")
     log.info("  Groups dir      : %s", groups_dir)
     log.info("  Reports dir     : %s", reports_dir)
     log.info("=" * 60)
@@ -836,6 +839,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_csv_changed = 0
     total_csv_added = 0
     total_csv_skipped = 0
+    total_csv_generic_skipped = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
 
@@ -862,7 +866,20 @@ def cmd_push(args: argparse.Namespace) -> int:
             # --- CSV remap (Workflow B) — runs BEFORE segment handling ---
             csv_changed = False
             csv_added_count = 0
-            if csv_mapping is not None:
+            # Default scope: only IP-Addresses-Only groups (group_type contains
+            # "IPAddress") are remapped. Generic groups keep their captured
+            # payload untouched unless --remap-generic is given.
+            csv_remap_applies = csv_mapping is not None and (
+                "IPAddress" in (obj.get("group_type") or []) or args.remap_generic
+            )
+            if csv_mapping is not None and not csv_remap_applies:
+                row["csv_changed"] = False
+                row["csv_remap_skipped"] = "generic_group"
+                total_csv_generic_skipped += 1
+                log.info("[%d/%d] %s: generic group, CSV remap not applied "
+                         "(default remaps IP-Addresses-Only groups; use --remap-generic to include it)",
+                         i, len(files), gid)
+            if csv_remap_applies:
                 updated, csv_report = _csv_remap_group(
                     group=obj,
                     mapping=csv_mapping,
@@ -1172,6 +1189,8 @@ def cmd_push(args: argparse.Namespace) -> int:
         "segments_mode": args.segments_mode,
         "segments_from": str(args.segments_from) if args.segments_from else None,
         "csv_remap": str(args.csv_remap) if args.csv_remap else None,
+        "csv_remap_scope": (("all_groups" if args.remap_generic else "ip_only_groups")
+                            if args.csv_remap else None),
         "mapped_only": args.mapped_only if args.csv_remap else None,
         "bidirectional": args.bidirectional if args.csv_remap else None,
         "csv_invalid_rows": csv_invalid_rows if args.csv_remap else None,
@@ -1189,6 +1208,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "csv_groups_changed": total_csv_changed,
             "csv_total_added_values": total_csv_added,
             "csv_total_skipped_values": total_csv_skipped,
+            "csv_generic_groups_skipped": total_csv_generic_skipped,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
             "interactive_mode":          interactive_mode,
@@ -1367,6 +1387,12 @@ def cmd_revert(args: argparse.Namespace) -> int:
         pushed_ids = json.loads(pushed_path.read_text(encoding="utf-8"))
         log.info("  Scope: pushed (%d group(s) written by the matching push)", len(pushed_ids))
     else:
+        if not args.allow_delete:
+            raise SystemExit(
+                "--scope all restores every baseline group AND deletes any customer group "
+                "not in the baseline. Deletes are disabled by default; pass --allow-delete "
+                "to confirm you want groups removed."
+            )
         log.warning("  Scope: all. Every baseline group will be restored and any "
                     "customer group not in the baseline will be DELETED.")
 
@@ -1384,7 +1410,18 @@ def cmd_revert(args: argparse.Namespace) -> int:
     else:
         to_restore = [(gid, payload) for gid, payload in baseline.items()]
         to_delete = [gid for gid in current.keys() if gid not in baseline]
-    log.info("Plan: restore=%d  delete=%d  (scope=%s)", len(to_restore), len(to_delete), args.scope)
+
+    # Never remove a group that currently exists unless the operator opted in.
+    # Restores (PUT of the baseline payload) still happen: that is what a
+    # revert is. Only whole-group DELETEs are gated.
+    deletes_blocked: List[str] = []
+    if to_delete and not args.allow_delete:
+        deletes_blocked = list(to_delete)
+        to_delete = []
+        log.warning("  %d group(s) would be DELETED but --allow-delete was not given; "
+                    "they will be left in place: %s", len(deletes_blocked), deletes_blocked)
+    log.info("Plan: restore=%d  delete=%d  blocked_deletes=%d  (scope=%s)",
+             len(to_restore), len(to_delete), len(deletes_blocked), args.scope)
 
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
@@ -1447,6 +1484,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "totals": {
             "restored_ok": restored_ok, "restored_failed": restored_failed,
             "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
+            "deletes_blocked": deletes_blocked,
             "baseline_groups_untouched": len(baseline) - len(to_restore),
         },
         "log_file": str(log_file),
@@ -1515,6 +1553,11 @@ def main() -> int:
                          "applies when transforming exported YAMLs without CSV remap.")
     pp.add_argument("--bidirectional", action="store_true",
                     help="With --csv-remap: treat each CSV row as a bidirectional mapping.")
+    pp.add_argument("--remap-generic", action="store_true",
+                    help="With --csv-remap: ALSO apply the remap to generic groups. By default "
+                         "only IP-Addresses-Only groups (group_type IPAddress) are remapped; "
+                         "generic groups are pushed with their payload untouched and counted in "
+                         "the summary as csv_generic_groups_skipped.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <groups-dir>/../push_report/.")
     pp.add_argument("--batch-size", type=int, default=None,
@@ -1551,6 +1594,11 @@ def main() -> int:
                          "all = legacy full-baseline revert: PUT every baseline group back and "
                          "DELETE any customer group not in the baseline. Required for baselines "
                          "captured before scoped revert existed.")
+    pr.add_argument("--allow-delete", action="store_true",
+                    help="Permit revert to DELETE groups (those the push created, or with --scope all "
+                         "any customer group not in the baseline). Off by default: without it, "
+                         "groups that would be deleted are left in place and listed in the summary "
+                         "as deletes_blocked, and --scope all is refused.")
     pr.set_defaults(func=cmd_revert)
 
     args = p.parse_args()

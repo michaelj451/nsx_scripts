@@ -465,3 +465,20 @@ windows.
 - [RUNBOOK_VM_TAGS_COMMANDS.md](RUNBOOK_VM_TAGS_COMMANDS.md) - bash command reference
 - [RUNBOOK_RULES_USAGE.md](RUNBOOK_RULES_USAGE.md) - deeper dive on the rules report
 - [RUNBOOK_REPORTS_PS.md](RUNBOOK_REPORTS_PS.md) - Windows PowerShell mirror of this doc
+
+---
+
+## 6. IP remap audit (Workflow B post-flight)
+
+Lives in `tools/nsx/`, not `tools/reports/`, because it is tied to the
+group remap workflow. Read-only; reports what looks CSV-remapped on a manager
+and what might be a gap, gaps first. Full description and section table in
+[RUNBOOK_B.md](RUNBOOK_B.md#b4-audit-what-looks-mapped-and-what-might-be-a-gap).
+
+```bash
+python tools/nsx/audit_ip_remap.py --target nsx-lm1 --csv data/nonprod_map.csv
+python tools/nsx/audit_ip_remap.py --target nsx-gm1 --federation-global --csv data/nonprod_map.csv
+```
+
+Output: `$NSX_LOG_DIR/reports/ip_remap_audit/<host>/<ts>/ip_remap_audit.md`
+(plus JSON). Exit code `1` when gaps exist.

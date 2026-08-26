@@ -151,6 +151,10 @@ old_subnet,new_subnet
 - **Strict-additive**: originals are kept verbatim (a `/32` stays a `/32`)
   and mapped values are appended. `--mapped-only` is refused with
   `--csv-remap`; the only way to remove IPs is `groups.py revert`.
+- **Scope**: only IP-Addresses-Only groups (`group_type: IPAddress`) are
+  remapped by default; generic groups are pushed untouched and counted as
+  `csv_generic_groups_skipped`. `--remap-generic` widens the scope to all
+  groups.
 - **Never remapped**: IP ranges (`a-b`), IPv6 entries, and segment / path /
   tag expressions. Ranges and IPv6 are left in place and reported per group
   under `csv_skipped_values`; CSV rows using them are rejected at load.
