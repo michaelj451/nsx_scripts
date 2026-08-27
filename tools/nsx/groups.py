@@ -60,17 +60,19 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
 from nsx.cli_bootstrap import init_cli
+from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nsx_group_ip_remap_offline import (  # noqa: E402
+    _canonical_ip_token,
     _load_mapping_csv as _load_csv_mapping,
     _remap_group_payload as _csv_remap_group,
 )
@@ -178,6 +180,17 @@ def _extract_ip_entries(group: Dict[str, Any]) -> List[str]:
     return sorted(out)
 
 
+def _ip_diff(before: List[str], after: List[str]) -> Tuple[List[str], List[str]]:
+    """(added, removed) between two IP entry lists, compared on canonical form
+    so `10.6.0.1` and `10.6.0.1/32` are the same entry. Returned strings are the
+    original (as-held) forms so the audit trail shows what NSX actually holds."""
+    before_by_canon = {_canonical_ip_token(ip): ip for ip in before}
+    after_by_canon = {_canonical_ip_token(ip): ip for ip in after}
+    added = sorted(v for c, v in after_by_canon.items() if c not in before_by_canon)
+    removed = sorted(v for c, v in before_by_canon.items() if c not in after_by_canon)
+    return added, removed
+
+
 def _format_entries(entries: List[str], *, max_items: int = 6) -> str:
     """Compact one-line representation. Truncates with '... +N more' for long lists."""
     if not entries:
@@ -243,13 +256,209 @@ def _iter_group_files(groups_dir: Path) -> List[Path]:
     return sorted(files)
 
 
+def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
+                          rows: List[Dict[str, Any]]) -> Path:
+    """Human-readable report for a CSV remap push (dry-run or apply), in the
+    same style as the audit and hostname-tag validation reports. Written next
+    to summary.json as remap_report.md."""
+    t = summary["totals"]
+    apply_mode = summary["mode"] == "APPLY"
+    verb = "Added" if apply_mode else "Would add"
+
+    def code(v: Any) -> str:
+        return f"`{v}`"
+
+    def name(r: Dict[str, Any]) -> str:
+        """Group column: the display name (falls back to the id)."""
+        return str(r.get("display_name") or r.get("id"))
+
+    def gidc(r: Dict[str, Any]) -> str:
+        """Id column: always the NSX id, code-formatted."""
+        return code(r.get("id"))
+
+    def vals(items: List[str], cap: int = 8) -> str:
+        if not items:
+            return ""
+        shown = ", ".join(code(x) for x in items[:cap])
+        extra = len(items) - cap
+        return shown + (f", +{extra} more" if extra > 0 else "")
+
+    if apply_mode:
+        # Only rows actually written count as changes. A row the CSV transform
+        # touched but the live diff found already satisfied is a no-change row
+        # (common when the capture bundle is older than a previous apply).
+        changed = [r for r in rows
+                   if str(r.get("status", "")).startswith("success") and r.get("ips_added")]
+        ips_added_total = sum(len(r.get("ips_added") or []) for r in changed)
+    else:
+        changed = [r for r in rows if r.get("csv_changed")]
+        ips_added_total = t.get("csv_total_added_values", 0)
+    no_change = [r for r in rows if r.get("status") == "skipped_no_change"]
+    generic_skipped = [r for r in rows if r.get("csv_remap_skipped") == "generic_group"]
+    failures = [r for r in rows if str(r.get("status", "")).startswith("failed")]
+
+    contract = t.get("additive_only_contract", "n/a")
+    result = "FAILURES" if failures else ("CHANGES" if changed else "NO CHANGES NEEDED")
+
+    L: List[str] = []
+    L.append(f"# CSV IP remap {'apply' if apply_mode else 'dry-run'}: {summary['target']['alias']}")
+    L.append("")
+    L.append("| Field | Value |")
+    L.append("|---|---|")
+    L.append(f"| Generated (UTC) | {summary['ran_at'][:19].replace('T', ' ')} |")
+    L.append(f"| Mode | **{summary['mode']}** |")
+    L.append(f"| Target | {summary['target']['alias']} ({summary['target']['host']}), domain {code(summary['target']['domain_id'])} |")
+    L.append(f"| Groups dir | {code(summary['groups_dir'])} |")
+    L.append(f"| CSV | {code(summary['csv_remap'])} ({len(summary.get('csv_invalid_rows') or [])} invalid rows) |")
+    L.append(f"| Remap scope | {'all groups (--remap-generic)' if summary.get('csv_remap_scope') == 'all_groups' else 'IP-Addresses-Only groups (default)'} |")
+    if t.get("interactive_mode"):
+        L.append(f"| Batch ramp | started at {t['interactive_batch_size_initial']}, "
+                 f"ended at {t['interactive_batch_size_final']}, "
+                 f"{len(summary.get('interactive_decisions') or [])} prompt decision(s)"
+                 f"{'; operator exited early' if t.get('interactive_exit_requested') else ''} |")
+    L.append(f"| Groups | {t['files_seen']} seen: {t['ok']} written, {t.get('dry_run', 0)} dry-run, "
+             f"{t['skipped']} skipped ({t.get('csv_no_change_skipped', 0)} no-change), {t['failed']} failed |")
+    L.append(f"| IPs {'added' if apply_mode else 'to add'} | {ips_added_total} (removed: {t.get('total_ips_removed', 0)}) |")
+    L.append(f"| Already remapped | {t.get('csv_already_mapped_pairs', 0)} pair(s) detected |")
+    L.append(f"| Additive-only contract | **{contract}** |")
+    L.append(f"| **Result** | **{result}** |")
+    L.append("")
+    L.append("Strict-additive: originals are never rewritten or removed. Re-running this "
+             "push when nothing is left to add sends no API writes at all.")
+    L.append("")
+
+    L.append(f"## 1. {verb} ({ips_added_total} IPs in {len(changed)} groups)")
+    L.append("")
+    if changed:
+        L.append(f"| Group | Id | Type | {verb} | From original | CSV row | Status |")
+        L.append("|---|---|---|---|---|---:|---|")
+        for r in changed:
+            added = r.get("ips_added") if apply_mode else r.get("csv_added_values", [])
+            pairs = {_canonical_ip_token(p["mapped"]): p for p in r.get("csv_added_pairs", [])}
+            for v in added:
+                p = pairs.get(_canonical_ip_token(v))
+                why = code(p["original"]) if p else "(capture bundle, not CSV)"
+                rowno = p["csv_row"] if p else ""
+                L.append(f"| {name(r)} | {gidc(r)} | {r.get('group_type', '')} | {code(v)} "
+                         f"| {why} | {rowno} | {r.get('status')} |")
+    else:
+        L.append("None. Every mapped value the CSV calls for is already present.")
+    L.append("")
+
+    sec = 2
+    already = [(r, p) for r in rows for p in r.get("csv_already_mapped", [])]
+    L.append(f"## {sec}. Already remapped, detected ({len(already)} pairs in "
+             f"{len({r.get('id') for r, _ in already})} groups)")
+    sec += 1
+    L.append("")
+    if already:
+        L.append("Both the original and its mapped value are present: completed by an "
+                 "earlier run, or already satisfied. Nothing is sent for these.")
+        L.append("")
+        L.append("| Group | Id | Type | Original | Mapped (present) | CSV row |")
+        L.append("|---|---|---|---|---|---:|")
+        for r, p in already:
+            L.append(f"| {name(r)} | {gidc(r)} | {r.get('group_type', '')} | {code(p['original'])} "
+                     f"| {code(p['mapped'])} | {p['csv_row']} |")
+    else:
+        L.append("None detected.")
+    L.append("")
+
+    if failures:
+        L.append(f"## {sec}. Failures ({len(failures)})")
+        sec += 1
+        L.append("")
+        L.append("| Group | Id | Status | Error |")
+        L.append("|---|---|---|---|")
+        for r in failures:
+            L.append(f"| {name(r)} | {gidc(r)} | {r.get('status')} | {str(r.get('error', ''))[:140]} |")
+        L.append("")
+
+    L.append(f"## {sec}. Left alone")
+    L.append("")
+    if no_change:
+        L.append(f"**No changes needed ({len(no_change)}):** nothing sent to NSX for "
+                 + ", ".join(name(r) for r in no_change) + ".")
+        L.append("")
+    if generic_skipped:
+        with_candidates = [r for r in generic_skipped if r.get("csv_generic_candidate_values")]
+        without = [r for r in generic_skipped if not r.get("csv_generic_candidate_values")]
+        if with_candidates:
+            n_vals = sum(len(r["csv_generic_candidate_values"]) for r in with_candidates)
+            L.append(f"**Generic groups the CSV covers ({len(with_candidates)} groups, {n_vals} values):** "
+                     "out of scope for this run; a `--remap-generic` push would add:")
+            L.append("")
+            L.append("| Group | Id | Would add with --remap-generic | Count |")
+            L.append("|---|---|---|---:|")
+            for r in with_candidates:
+                cand = r["csv_generic_candidate_values"]
+                L.append(f"| {name(r)} | {gidc(r)} | {vals(cand)} | {len(cand)} |")
+            L.append("")
+        if without:
+            L.append(f"**Generic groups, out of scope, nothing to map ({len(without)}):** "
+                     + ", ".join(name(r) for r in without) + ".")
+            L.append("")
+    by_design = [(r, s) for r in rows for s in r.get("csv_skipped_values", [])]
+    if by_design:
+        L.append("**Never remapped by design:**")
+        L.append("")
+        L.append("| Group | Id | Entry | Reason |")
+        L.append("|---|---|---|---|")
+        for r, s in by_design:
+            L.append(f"| {name(r)} | {gidc(r)} | {code(s['value'])} | {s['reason']} |")
+        L.append("")
+    uncovered = [(r, r.get("csv_unmapped_values")) for r in rows if r.get("csv_unmapped_values")]
+    if uncovered:
+        L.append("**IPv4 entries no CSV row covers:**")
+        L.append("")
+        L.append("| Group | Id | Entries |")
+        L.append("|---|---|---|")
+        for r, u in uncovered:
+            L.append(f"| {name(r)} | {gidc(r)} | {vals(u)} |")
+        L.append("")
+
+    decisions = summary.get("interactive_decisions") or []
+    if decisions:
+        L.append("## Confidence ramp (operator decisions)")
+        L.append("")
+        L.append("| Time (UTC) | After N applied | Decision | Batch size |")
+        L.append("|---|---:|---|---|")
+        for d in decisions:
+            L.append(f"| {d['ts'][11:19]} | {d['applied_count']} | {d['decision']} "
+                     f"| {d['batch_size_before']} -> {d['batch_size_after']} |")
+        L.append("")
+
+    text = align_markdown_tables("\n".join(L)) + "\n"
+    # Latest report at a stable name, plus a timestamped copy so re-runs into
+    # the same reports dir never erase a prior run's report.
+    path = reports_dir / "remap_report.md"
+    path.write_text(text, encoding="utf-8")
+    (reports_dir / f"remap_report_{RUN_TS}.md").write_text(text, encoding="utf-8")
+    return path
+
+
 class _InteractiveExit(Exception):
     """Signals operator chose to exit the interactive batch loop cleanly."""
 
 
-def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
+def _record_decision(decisions: Optional[List[Dict[str, Any]]], applied_count: int,
+                     decision: str, before: int, after: int) -> None:
+    if decisions is None:
+        return
+    decisions.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "applied_count": applied_count,
+        "decision": decision,
+        "batch_size_before": before,
+        "batch_size_after": after,
+    })
+
+
+def _prompt_batch_continue(applied_count: int, current_batch_size: int,
+                           decisions: Optional[List[Dict[str, Any]]] = None) -> int:
     """Prompt after a batch of applied group updates. Returns the batch size
-    to use for the next batch.
+    to use for the next batch. Every operator decision is logged AND appended
+    to `decisions` so summary.json carries the full confidence-ramp history.
 
     Allowed responses:
       y / yes / <Enter>  -> continue at current batch size
@@ -257,31 +466,39 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
       <positive number>  -> continue at that new batch size
       x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
     """
+    prompt_text = (f"Applied {applied_count} group update(s). "
+                   f"Continue with current batch_size={current_batch_size}? "
+                   f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: ")
     while True:
+        # Log the prompt itself so the log file has context for the response.
+        log.info("PROMPT: %s", prompt_text.strip())
         try:
-            answer = input(
-                f"\nApplied {applied_count} group update(s). "
-                f"Continue with current batch_size={current_batch_size}? "
-                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
-            ).strip().lower()
+            answer = input(f"\n{prompt_text}").strip().lower()
         except EOFError:
-            # Non-interactive stdin (piped, no TTY) — treat as auto-approve
+            # Non-interactive stdin (piped, no TTY): treat as auto-approve
             log.warning("Non-interactive stdin at batch boundary; auto-approving (batch_size=%d).",
                         current_batch_size)
+            _record_decision(decisions, applied_count, "auto_approve_non_tty",
+                             current_batch_size, current_batch_size)
             return current_batch_size
 
         if answer in ("", "y", "yes"):
             log.info("Operator approved batch (continue at batch_size=%d) after %d applied update(s).",
                      current_batch_size, applied_count)
+            _record_decision(decisions, applied_count, "approve",
+                             current_batch_size, current_batch_size)
             return current_batch_size
 
         if answer in ("n", "no"):
             log.warning("Operator chose RESET-TO-1 after %d applied update(s) "
                         "(was batch_size=%d).", applied_count, current_batch_size)
+            _record_decision(decisions, applied_count, "reset_to_1", current_batch_size, 1)
             return 1
 
         if answer in ("x", "exit", "quit", "q"):
             log.warning("Operator chose EXIT after %d applied update(s).", applied_count)
+            _record_decision(decisions, applied_count, "exit",
+                             current_batch_size, current_batch_size)
             raise _InteractiveExit(f"Stopped by operator after {applied_count} update(s).")
 
         try:
@@ -291,6 +508,7 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
                 continue
             log.info("Operator changed batch_size from %d to %d after %d applied update(s).",
                      current_batch_size, new_value, applied_count)
+            _record_decision(decisions, applied_count, "resize", current_batch_size, new_value)
             return new_value
         except ValueError:
             print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
@@ -359,7 +577,22 @@ def _latest_unreverted_baseline(reports_dir: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _pushed_ids_path(baseline_path: Path) -> Path:
+    """Companion file to a baseline: the ids of every group the matching push
+    actually wrote (PUT or PATCH). Revert restores only these."""
+    return baseline_path.with_name(baseline_path.name.replace("_target_baseline", "_pushed_ids"))
+
+
+def _write_pushed_ids(baseline_path: Path, pushed_ids: List[str]) -> Path:
+    p = _pushed_ids_path(baseline_path)
+    p.write_text(json.dumps(pushed_ids, indent=2), encoding="utf-8")
+    return p
+
+
 def _mark_baseline_reverted(path: Path) -> None:
+    pushed = _pushed_ids_path(path)
+    if pushed.exists():
+        pushed.rename(pushed.with_suffix(".json.reverted"))
     path.rename(path.with_suffix(".json.reverted"))
 
 
@@ -447,88 +680,6 @@ def _strip_fabric_paths_in_expression(
             continue
         final.append(item)
     return final, stripped
-
-
-def _add_mapped_segment_cidrs_in_expression(
-    expression: List[Any],
-    *,
-    segments_by_path: Dict[str, List[str]],
-    csv_mapping: Any,                            # PrefixMappingTable from nsx_group_ip_remap_offline
-) -> Tuple[List[Any], int, int, List[Dict[str, Any]]]:
-    """For each segment path in a group's PathExpression, look up the segment's
-    native CIDR, run it through the CSV remap, and (if the CSV maps it) splice
-    a new IPAddressExpression after the PathExpression — joined with OR — that
-    contains ONLY the mapped CIDR. The original PathExpression is left intact.
-
-    Skip behavior:
-      - segment path not in segments_by_path → recorded as unmapped (segment lookup failed)
-      - CIDR not in CSV → recorded as unmapped (CSV didn't match)
-      - Either way, no IPAddressExpression is added for that segment — operator
-        sees the result in the forensic JSON `segments_unmapped.json` report
-
-    Returns:
-      (new_expression, mapped_count, unmapped_segments_count, unmapped_records)
-    """
-    if not isinstance(expression, list):
-        return expression, 0, 0, []
-
-    mapped_count = 0
-    unmapped_records: List[Dict[str, Any]] = []
-    inserts: Dict[int, List[str]] = {}   # index -> list of mapped CIDRs to splice in after that index
-
-    for i, item in enumerate(expression):
-        if not (isinstance(item, dict) and item.get("resource_type") == "PathExpression"):
-            continue
-
-        paths = item.get("paths") or []
-        added_for_this_pathexpr: List[str] = []
-        seen: set = set()
-
-        for p in paths:
-            if not (isinstance(p, str) and SEGMENT_PATH_RE.match(p.strip())):
-                continue
-            sp = p.strip()
-            native_cidrs = segments_by_path.get(sp)
-            if not native_cidrs:
-                unmapped_records.append({
-                    "segment_path": sp,
-                    "reason": "segment not in segment_details.json (segment_paths_lookup_miss)",
-                })
-                continue
-            for native in native_cidrs:
-                mapped_list, row = csv_mapping.map_token(native)
-                if not mapped_list:
-                    unmapped_records.append({
-                        "segment_path": sp,
-                        "native_cidr": native,
-                        "reason": "no CSV row covers this CIDR",
-                    })
-                    continue
-                for m in mapped_list:
-                    if m not in seen:
-                        seen.add(m)
-                        added_for_this_pathexpr.append(m)
-                        mapped_count += 1
-
-        if added_for_this_pathexpr:
-            inserts[i] = added_for_this_pathexpr
-
-    if not inserts:
-        return expression, 0, len(unmapped_records), unmapped_records
-
-    # Splice inserts: walk expression, for each index in `inserts` insert
-    # `OR + IPAddressExpression(mapped_cidrs)` right after the original entry.
-    result: List[Any] = []
-    for idx, item in enumerate(expression):
-        result.append(item)
-        if idx in inserts:
-            result.append({"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"})
-            result.append({
-                "resource_type": "IPAddressExpression",
-                "ip_addresses": inserts[idx],
-            })
-
-    return result, mapped_count, len(unmapped_records), unmapped_records
 
 
 def _transform_segments_in_expression(
@@ -786,15 +937,6 @@ def cmd_push(args: argparse.Namespace) -> int:
         if not seg_path.exists():
             raise SystemExit(f"--segments-from file not found: {seg_path}")
         segments_by_path = _load_segment_cidr_map(seg_path)
-    elif args.segments_mode == "add-mapped":
-        if not args.segments_from:
-            raise SystemExit("--segments-mode add-mapped requires --segments-from <segment_details.json>")
-        if not args.csv_remap:
-            raise SystemExit("--segments-mode add-mapped requires --csv-remap <csv>")
-        seg_path = Path(args.segments_from).expanduser().resolve()
-        if not seg_path.exists():
-            raise SystemExit(f"--segments-from file not found: {seg_path}")
-        segments_by_path = _load_segment_cidr_map(seg_path)
 
     # Validate / load CSV remap if requested
     csv_mapping = None
@@ -842,6 +984,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     if csv_mapping is not None:
         log.info("  CSV remap       : %s  (mapped-only=%s, bidirectional=%s)",
                  args.csv_remap, args.mapped_only, args.bidirectional)
+        log.info("  Remap scope     : %s",
+                 "ALL groups (--remap-generic)" if args.remap_generic
+                 else "IP-Addresses-Only groups (default; generic groups untouched)")
     log.info("  Groups dir      : %s", groups_dir)
     log.info("  Reports dir     : %s", reports_dir)
     log.info("=" * 60)
@@ -852,10 +997,15 @@ def cmd_push(args: argparse.Namespace) -> int:
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
     baseline_path = None
     baseline_dict: Dict[str, Dict[str, Any]] = {}
+    # Ids of every group this run actually writes. Persisted next to the
+    # baseline after every successful write so revert can restore ONLY these,
+    # even if the run is interrupted partway through.
+    pushed_ids: List[str] = []
     if args.apply:
         log.info("Capturing target baseline (current customer groups on %s) ...", target_host)
         baseline_dict = _capture_target_groups(client, args.domain_id)
         baseline_path = _append_baseline(reports_dir, baseline_dict)
+        _write_pushed_ids(baseline_path, pushed_ids)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
 
     # Interactive batch state.
@@ -877,6 +1027,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     applied_in_batch = 0
     batch_summary_rows: List[Dict[str, Any]] = []  # rows collected since last prompt
     interactive_exit_requested = False
+    interactive_decisions: List[Dict[str, Any]] = []   # full confidence-ramp history for summary.json
     if interactive_mode:
         log.info("=" * 60)
         log.info("INTERACTIVE MODE — batch_size=%d. Will prompt after every %d applied update(s).",
@@ -894,6 +1045,11 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_unresolved = 0
     total_csv_changed = 0
     total_csv_added = 0
+    total_csv_skipped = 0
+    total_csv_generic_skipped = 0
+    total_csv_generic_candidates = 0
+    total_csv_already_mapped = 0
+    total_csv_no_change = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
 
@@ -920,7 +1076,36 @@ def cmd_push(args: argparse.Namespace) -> int:
             # --- CSV remap (Workflow B) — runs BEFORE segment handling ---
             csv_changed = False
             csv_added_count = 0
-            if csv_mapping is not None:
+            row["group_type"] = "ip-only" if "IPAddress" in (obj.get("group_type") or []) else "generic"
+            # Default scope: only IP-Addresses-Only groups (group_type contains
+            # "IPAddress") are remapped. Generic groups keep their captured
+            # payload untouched unless --remap-generic is given.
+            csv_remap_applies = csv_mapping is not None and (
+                "IPAddress" in (obj.get("group_type") or []) or args.remap_generic
+            )
+            if csv_mapping is not None and not csv_remap_applies:
+                row["csv_changed"] = False
+                row["csv_remap_skipped"] = "generic_group"
+                total_csv_generic_skipped += 1
+                # Analysis only: compute what --remap-generic WOULD add to this
+                # group so the report can surface it. The payload is untouched.
+                _, gen_report = _csv_remap_group(group=obj, mapping=csv_mapping, mapped_only=False)
+                if gen_report.get("already_mapped"):
+                    row["csv_already_mapped"] = gen_report["already_mapped"]
+                    total_csv_already_mapped += len(gen_report["already_mapped"])
+                gen_candidates = gen_report.get("added_values") or []
+                if gen_candidates:
+                    row["csv_generic_candidate_values"] = gen_candidates
+                    total_csv_generic_candidates += len(gen_candidates)
+                    log.info("[%d/%d] %s: generic group, CSV remap not applied; "
+                             "--remap-generic would add %d value(s): %s",
+                             i, len(files), gid, len(gen_candidates),
+                             _format_entries(gen_candidates))
+                else:
+                    log.info("[%d/%d] %s: generic group, CSV remap not applied "
+                             "(default remaps IP-Addresses-Only groups; use --remap-generic to include it)",
+                             i, len(files), gid)
+            if csv_remap_applies:
                 updated, csv_report = _csv_remap_group(
                     group=obj,
                     mapping=csv_mapping,
@@ -930,10 +1115,28 @@ def cmd_push(args: argparse.Namespace) -> int:
                     obj = updated
                     csv_changed = True
                     csv_added_count = csv_report.get("added_count", 0)
+                    row["csv_added_values"] = csv_report.get("added_values") or []
+                    row["csv_added_pairs"] = csv_report.get("added_pairs") or []
                     total_csv_changed += 1
                     total_csv_added += csv_added_count
                 row["csv_changed"] = csv_changed
                 row["csv_added_count"] = csv_added_count
+                if csv_report.get("already_mapped"):
+                    row["csv_already_mapped"] = csv_report["already_mapped"]
+                    total_csv_already_mapped += len(csv_report["already_mapped"])
+                # Ranges and IPv6 are never remapped (by design); record them so
+                # the operator can see exactly which entries were left as-is.
+                csv_skipped = csv_report.get("skipped_values") or []
+                if csv_skipped:
+                    row["csv_skipped_values"] = csv_skipped
+                    total_csv_skipped += len(csv_skipped)
+                    log.info("[%d/%d] %s: %d entr%s left untouched (never remapped): %s",
+                             i, len(files), gid, len(csv_skipped),
+                             "y" if len(csv_skipped) == 1 else "ies",
+                             _format_entries([f"{s['value']} ({s['reason']})" for s in csv_skipped]))
+                csv_unmapped = csv_report.get("unmapped_values") or []
+                if csv_unmapped:
+                    row["csv_unmapped_values"] = csv_unmapped
 
             paths_seen = 0
             converted_here = 0
@@ -995,8 +1198,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             # full in the row's JSON/JSONL for forensic auditability).
             before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
             after_ips  = _extract_ip_entries(obj)
-            ips_added   = sorted(set(after_ips)  - set(before_ips))
-            ips_removed = sorted(set(before_ips) - set(after_ips))
+            ips_added, ips_removed = _ip_diff(before_ips, after_ips)
             row["ips_before"]      = before_ips    # full list, for audit replayability
             row["ips_after"]       = after_ips     # full list, for audit replayability
             row["before_ip_count"] = len(before_ips)
@@ -1045,6 +1247,22 @@ def cmd_push(args: argparse.Namespace) -> int:
                 log.warning("[%d/%d] %s — INTENTIONAL IP REMOVAL: %d IP(s) %s",
                             i, len(files), gid, len(ips_removed), ips_removed)
 
+            # --- ZERO-IMPACT RERUN GUARD (CSV remap) -------------------------
+            # The remap contract is "idempotently ADD IPs". When the diff
+            # against the live baseline shows nothing to add (removals were
+            # already refused above), this push has nothing to change: skip
+            # the API write entirely. No PUT means no _revision bump and no
+            # realization cycle, so re-running the workflow any number of
+            # times leaves zero footprint on the manager.
+            if csv_mapping is not None and gid in baseline_dict and not ips_added:
+                row["status"] = "skipped_no_change"
+                skipped += 1
+                total_csv_no_change += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: no IP additions needed; nothing sent to NSX",
+                         i, len(files), ok, failed, skipped, gid)
+                rows.append(row)
+                continue
+
             try:
                 client.put_group(gid, obj, domain_id=args.domain_id)
                 row["status"] = "success_put"
@@ -1056,6 +1274,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                     raise
 
             ok += 1
+            if gid not in pushed_ids:
+                pushed_ids.append(gid)
+                _write_pushed_ids(baseline_path, pushed_ids)
             seg_note = ""
             if paths_seen:
                 seg_note = (f"  segments_seen={paths_seen} converted={converted_here}"
@@ -1086,7 +1307,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                                  j, str(br.get("id"))[:40], br.get("status"), delta, added, notes_str)
                     log.info("=" * 60)
                     try:
-                        batch_size = _prompt_batch_continue(applied_in_batch, batch_size)
+                        batch_size = _prompt_batch_continue(applied_in_batch, batch_size,
+                                                            interactive_decisions)
                     except _InteractiveExit:
                         interactive_exit_requested = True
                         rows.append(row)
@@ -1175,6 +1397,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                 ok += 1
                 failed -= 1
                 progress = True
+                if gid not in pushed_ids:
+                    pushed_ids.append(gid)
+                    _write_pushed_ids(baseline_path, pushed_ids)
                 log.info("[retry-%d] %s — %s", retry_round, gid, row["status"])
                 time.sleep(THROTTLE_SECONDS)
             except Exception as e:
@@ -1212,6 +1437,8 @@ def cmd_push(args: argparse.Namespace) -> int:
         "segments_mode": args.segments_mode,
         "segments_from": str(args.segments_from) if args.segments_from else None,
         "csv_remap": str(args.csv_remap) if args.csv_remap else None,
+        "csv_remap_scope": (("all_groups" if args.remap_generic else "ip_only_groups")
+                            if args.csv_remap else None),
         "mapped_only": args.mapped_only if args.csv_remap else None,
         "bidirectional": args.bidirectional if args.csv_remap else None,
         "csv_invalid_rows": csv_invalid_rows if args.csv_remap else None,
@@ -1228,6 +1455,11 @@ def cmd_push(args: argparse.Namespace) -> int:
             "segments_unresolved": total_unresolved,
             "csv_groups_changed": total_csv_changed,
             "csv_total_added_values": total_csv_added,
+            "csv_total_skipped_values": total_csv_skipped,
+            "csv_generic_groups_skipped": total_csv_generic_skipped,
+            "csv_generic_candidate_values": total_csv_generic_candidates,
+            "csv_already_mapped_pairs": total_csv_already_mapped,
+            "csv_no_change_skipped": total_csv_no_change,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
             "interactive_mode":          interactive_mode,
@@ -1235,7 +1467,10 @@ def cmd_push(args: argparse.Namespace) -> int:
             "interactive_batch_size_final":   batch_size if interactive_mode else 0,
             "interactive_exit_requested":     interactive_exit_requested,
         },
+        "interactive_decisions": interactive_decisions,
         "baseline_file": str(baseline_path) if baseline_path else None,
+        "pushed_ids_file": str(_pushed_ids_path(baseline_path)) if baseline_path else None,
+        "pushed_ids_count": len(pushed_ids),
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
@@ -1333,6 +1568,12 @@ def cmd_push(args: argparse.Namespace) -> int:
         "n/a (intentional-ip-removal)" if args.intentional_ip_removal
         else ("pass" if contract_ok else "violated")
     )
+    # Markdown report (CSV remap runs only), in the audit-report style.
+    if csv_mapping is not None:
+        md_path = _write_remap_markdown(reports_dir, summary, rows)
+        summary["report_md"] = str(md_path)
+        log.info("Markdown report: %s", md_path)
+
     # Rewrite summary.json with the contract status appended (initial write above happened before this).
     (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1385,13 +1626,60 @@ def cmd_revert(args: argparse.Namespace) -> int:
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
     log.info("  Baseline contains %d customer group(s)", len(baseline))
 
+    # Scope: which groups does this revert touch?
+    #   pushed (default) = only the groups the matching push actually wrote
+    #                      (from <ts>_pushed_ids.json). Everything else on the
+    #                      target is left alone, including edits made since.
+    #   all              = legacy behaviour: PUT every baseline group back and
+    #                      DELETE any customer group not in the baseline.
+    pushed_path = _pushed_ids_path(baseline_path)
+    pushed_ids: List[str] | None = None
+    if args.scope == "pushed":
+        if not pushed_path.exists():
+            raise SystemExit(
+                f"No pushed-ids file next to the baseline ({pushed_path.name}). "
+                "This baseline predates scoped revert. Re-run with --scope all to "
+                "restore the entire baseline (restores every customer group and "
+                "deletes any group not in the baseline)."
+            )
+        pushed_ids = json.loads(pushed_path.read_text(encoding="utf-8"))
+        log.info("  Scope: pushed (%d group(s) written by the matching push)", len(pushed_ids))
+    else:
+        if not args.allow_delete:
+            raise SystemExit(
+                "--scope all restores every baseline group AND deletes any customer group "
+                "not in the baseline. Deletes are disabled by default; pass --allow-delete "
+                "to confirm you want groups removed."
+            )
+        log.warning("  Scope: all. Every baseline group will be restored and any "
+                    "customer group not in the baseline will be DELETED.")
+
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
     current = _capture_target_groups(client, args.domain_id)
     log.info("  Currently %d customer group(s) on target", len(current))
 
-    to_restore = [(gid, payload) for gid, payload in baseline.items()]
-    to_delete = [gid for gid in current.keys() if gid not in baseline]
-    log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
+    if pushed_ids is not None:
+        to_restore = [(gid, baseline[gid]) for gid in pushed_ids if gid in baseline]
+        # Pushed but absent from the baseline = the push created it; remove it.
+        to_delete = [gid for gid in pushed_ids if gid not in baseline and gid in current]
+        already_gone = [gid for gid in pushed_ids if gid not in baseline and gid not in current]
+        for gid in already_gone:
+            log.info("  [skip] %s: created by push but no longer on target", gid)
+    else:
+        to_restore = [(gid, payload) for gid, payload in baseline.items()]
+        to_delete = [gid for gid in current.keys() if gid not in baseline]
+
+    # Never remove a group that currently exists unless the operator opted in.
+    # Restores (PUT of the baseline payload) still happen: that is what a
+    # revert is. Only whole-group DELETEs are gated.
+    deletes_blocked: List[str] = []
+    if to_delete and not args.allow_delete:
+        deletes_blocked = list(to_delete)
+        to_delete = []
+        log.warning("  %d group(s) would be DELETED but --allow-delete was not given; "
+                    "they will be left in place: %s", len(deletes_blocked), deletes_blocked)
+    log.info("Plan: restore=%d  delete=%d  blocked_deletes=%d  (scope=%s)",
+             len(to_restore), len(to_delete), len(deletes_blocked), args.scope)
 
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
@@ -1449,9 +1737,13 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "target": {"alias": args.target, "host": target_host,
                    "federation_global": args.federation_global, "domain_id": args.domain_id},
         "baseline_file": str(baseline_path) + ".reverted",
+        "scope": args.scope,
+        "pushed_ids_file": (str(pushed_path) + ".reverted") if pushed_ids is not None else None,
         "totals": {
             "restored_ok": restored_ok, "restored_failed": restored_failed,
             "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
+            "deletes_blocked": deletes_blocked,
+            "baseline_groups_untouched": len(baseline) - len(to_restore),
         },
         "log_file": str(log_file),
         "errors_log": str(errors_log),
@@ -1498,16 +1790,12 @@ def main() -> int:
     pp.add_argument("--federation-global", action="store_true")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
-    pp.add_argument("--segments-mode", choices=["keep", "strip", "convert", "add-mapped"], default="keep",
+    pp.add_argument("--segments-mode", choices=["keep", "strip", "convert"], default="keep",
                     help="How to handle /infra/segments/* refs in groups: "
-                         "keep (default) = push as-is; "
+                         "keep (default) = push as-is, segment refs are never remapped; "
                          "strip = remove segment paths from PathExpression entries (phase 1); "
                          "convert = replace segment refs with IPAddressExpression CIDRs read from "
-                         "--segments-from (phase 2); "
-                         "add-mapped = KEEP segment paths AND splice an extra IPAddressExpression "
-                         "containing only the CSV-mapped equivalent of each segment's CIDR. "
-                         "Requires both --segments-from AND --csv-remap. Unmapped CIDRs are "
-                         "skipped and logged to segments_unmapped.json. "
+                         "--segments-from (phase 2). "
                          "Other expression types are always preserved.")
     pp.add_argument("--segments-from", default=None,
                     help="Path to segment_details.json (e.g. nsx_capture/<host>/segment_inventory/"
@@ -1523,6 +1811,11 @@ def main() -> int:
                          "applies when transforming exported YAMLs without CSV remap.")
     pp.add_argument("--bidirectional", action="store_true",
                     help="With --csv-remap: treat each CSV row as a bidirectional mapping.")
+    pp.add_argument("--remap-generic", action="store_true",
+                    help="With --csv-remap: ALSO apply the remap to generic groups. By default "
+                         "only IP-Addresses-Only groups (group_type IPAddress) are remapped; "
+                         "generic groups are pushed with their payload untouched and counted in "
+                         "the summary as csv_generic_groups_skipped.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <groups-dir>/../push_report/.")
     pp.add_argument("--batch-size", type=int, default=None,
@@ -1552,6 +1845,18 @@ def main() -> int:
                     help="Defaults to nsx_groups_export/<target-host>/push_report/.")
     pr.add_argument("--from-baseline", default=None,
                     help="Specific baseline file (overrides auto-selected latest).")
+    pr.add_argument("--scope", choices=["pushed", "all"], default="pushed",
+                    help="pushed (default) = restore only the groups the matching push wrote "
+                         "(read from <ts>_pushed_ids.json next to the baseline); groups the push "
+                         "created are deleted, everything else on the target is untouched. "
+                         "all = legacy full-baseline revert: PUT every baseline group back and "
+                         "DELETE any customer group not in the baseline. Required for baselines "
+                         "captured before scoped revert existed.")
+    pr.add_argument("--allow-delete", action="store_true",
+                    help="Permit revert to DELETE groups (those the push created, or with --scope all "
+                         "any customer group not in the baseline). Off by default: without it, "
+                         "groups that would be deleted are left in place and listed in the summary "
+                         "as deletes_blocked, and --scope all is refused.")
     pr.set_defaults(func=cmd_revert)
 
     args = p.parse_args()

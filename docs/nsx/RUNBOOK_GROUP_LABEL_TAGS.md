@@ -61,7 +61,7 @@ the **tag value** (the "Tag" field, not the scope), and mirrors the full
 
 ## 0) Environment setup
 
-Same env as the rest of the toolkit - see [README.md](../README.md).
+Same env as the rest of the toolkit - see [README.md](../../README.md).
 Shorthand:
 
 ```bash
@@ -224,5 +224,5 @@ membership is left exactly as-is.
 ## See also
 
 - [RUNBOOK_GROUP_LABEL_TAGS_PS.md](RUNBOOK_GROUP_LABEL_TAGS_PS.md) - Windows PowerShell variant
-- [REPORTS_DATA_SOURCES.md](REPORTS_DATA_SOURCES.md) - where tag/group data comes from
+- [REPORTS_DATA_SOURCES.md](../reference/REPORTS_DATA_SOURCES.md) - where tag/group data comes from
 - [RUNBOOK_VM_TAGS.md](RUNBOOK_VM_TAGS.md) - the sibling workflow that tags the VMs those criteria match

@@ -42,7 +42,7 @@ Nothing else is ever removed.
 
 ## 0) Environment setup
 
-Same env as the rest of the toolkit — see [README.md](README.md) for the
+Same env as the rest of the toolkit — see the repo [README.md](../../README.md) for the
 macOS/Linux/Windows variants. Shorthand:
 
 ```bash

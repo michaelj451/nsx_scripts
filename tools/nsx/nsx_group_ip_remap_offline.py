@@ -11,11 +11,15 @@ No NSX API calls.
 No PATCH/PUT/POST/DELETE.
 
 Key behavior:
-  - Supports subnet mappings with longest-prefix match
+  - Supports IPv4 subnet mappings with longest-prefix match
   - /32 wins over /31, /30, /29, /24, /16, etc.
-  - Additive by default
+  - Additive by default; original entries are kept verbatim (a `/32` stays a `/32`)
   - --mapped-only replaces IPAddressExpression values with mapped values only
-  - Keeps original tag/dynamic group conditions unchanged
+  - IP ranges (a-b) and IPv6 entries are NEVER remapped: they are left in place
+    and listed under `skipped_values` in the per-group report
+  - Segment / path / tag expressions are never touched
+  - --prepared-root is purged before writing (--no-clean to keep it) and must
+    not overlap --export-root
 """
 
 from __future__ import annotations
@@ -168,17 +172,60 @@ def _purge_dir(path: Path) -> None:
 # IP / subnet mapping helpers
 # =============================================================================
 
-def _to_network(value: str) -> ipaddress.IPv4Network:
+def _to_network(value: str) -> ipaddress._BaseNetwork:
+    """Parse an IP or CIDR into a network object. A bare address becomes a
+    host network (/32 for IPv4, /128 for IPv6)."""
     value = str(value).strip()
     if "/" not in value:
-        value = f"{value}/32"
+        addr = ipaddress.ip_address(value)
+        value = f"{value}/{addr.max_prefixlen}"
     return ipaddress.ip_network(value, strict=False)
 
 
-def _format_network_or_ip(net: ipaddress.IPv4Network) -> str:
-    if net.prefixlen == 32:
+def _format_network_or_ip(net: ipaddress._BaseNetwork) -> str:
+    if net.prefixlen == net.max_prefixlen:
         return str(net.network_address)
     return str(net)
+
+
+# Token kinds the remap deliberately does NOT touch. Both are left in place
+# verbatim and surfaced in the per-group report so the operator can see them.
+SKIP_RANGE = "range"      # a-b IP ranges: never remapped (by design)
+SKIP_IPV6 = "ipv6"        # IPv6 addresses / networks: never remapped (by design)
+SKIP_INVALID = "invalid"  # not an IP, CIDR, or range at all
+
+
+def _token_kind(value: str) -> Optional[str]:
+    """Classify a token: None if it is a remappable IPv4 IP/CIDR, otherwise
+    one of SKIP_RANGE / SKIP_IPV6 / SKIP_INVALID."""
+    value = str(value).strip()
+    if not value:
+        return SKIP_INVALID
+    if _token_is_range(value):
+        return SKIP_RANGE
+    try:
+        net = _to_network(value)
+    except ValueError:
+        return SKIP_INVALID
+    if net.version != 4:
+        return SKIP_IPV6
+    return None
+
+
+def _same_ip_form(original: str, mapped: str) -> str:
+    """Give the mapped value the same host-form as the original token, so a
+    `/32` in the source stays a `/32` in the output. NSX treats `10.0.0.1`
+    and `10.0.0.1/32` as distinct strings, and the push-side contract diff
+    compares strings; changing the form would look like a removal."""
+    original = str(original).strip()
+    if "/" in original and "/" not in mapped:
+        try:
+            net = _to_network(original)
+        except ValueError:
+            return mapped
+        if net.prefixlen == net.max_prefixlen:
+            return f"{mapped}/{net.prefixlen}"
+    return mapped
 
 
 def _canonical_ip_token(value: str) -> str:
@@ -200,27 +247,6 @@ def _canonical_ip_token(value: str) -> str:
         return value
 
 
-def _validate_ip_token(value: str) -> bool:
-    value = str(value).strip()
-    if not value:
-        return False
-
-    if "-" in value and "/" not in value:
-        left, right = [x.strip() for x in value.split("-", 1)]
-        try:
-            ipaddress.ip_address(left)
-            ipaddress.ip_address(right)
-            return True
-        except ValueError:
-            return False
-
-    try:
-        _to_network(value)
-        return True
-    except ValueError:
-        return False
-
-
 def _token_is_range(value: str) -> bool:
     return "-" in str(value) and "/" not in str(value)
 
@@ -232,7 +258,7 @@ def _map_network_by_offset(
 ) -> Optional[str]:
     source_net = _to_network(source_value)
 
-    if source_net.prefixlen == 32:
+    if source_net.prefixlen == source_net.max_prefixlen:
         src_ip = int(source_net.network_address)
         offset = src_ip - int(src_net.network_address)
         mapped_ip_int = int(dst_net.network_address) + offset
@@ -318,18 +344,17 @@ class PrefixMappingTable:
         )
 
     def map_token(self, token: str) -> tuple[list[str], Optional[dict[str, Any]]]:
-        token = _canonical_ip_token(token)
+        """Map one IPv4 IP/CIDR token. Returns ([mapped], row) or ([], None).
 
-        if _token_is_range(token):
-            for row in self.rows:
-                if row["source"] == token:
-                    return [row["destination"]], row
+        Ranges and IPv6 are never mapped (see _token_kind) and never raise.
+        The mapped value keeps the host-form of the input: `10.6.0.1/32`
+        maps to `10.7.0.1/32`, `10.6.0.1` maps to `10.7.0.1`.
+        """
+        raw = str(token).strip()
+        if _token_kind(raw) is not None:
             return [], None
 
-        try:
-            token_net = _to_network(token)
-        except ValueError:
-            return [], None
+        token_net = _to_network(raw)
 
         for row in self.rows:
             src_net: ipaddress.IPv4Network = row["src_net"]
@@ -338,13 +363,13 @@ class PrefixMappingTable:
                 continue
 
             mapped = _map_network_by_offset(
-                source_value=token,
+                source_value=raw,
                 src_net=row["src_net"],
                 dst_net=row["dst_net"],
             )
 
             if mapped:
-                return [mapped], row
+                return [_same_ip_form(raw, mapped)], row
 
         return [], None
 
@@ -377,8 +402,39 @@ def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[PrefixMappingTab
                 "right_value": right_raw,
             }
 
-            if not _validate_ip_token(left_raw) or not _validate_ip_token(right_raw):
-                invalid_rows.append({**row_report, "reason": "Invalid IP/CIDR/range token"})
+            # Only IPv4 IP/CIDR pairs are accepted. Ranges and IPv6 are never
+            # remapped by design, so a CSV row using them is reported and skipped.
+            bad_reason = None
+            for side, raw in (("left", left_raw), ("right", right_raw)):
+                kind = _token_kind(raw)
+                if kind == SKIP_RANGE:
+                    bad_reason = f"{side} value is an IP range; ranges are never remapped"
+                elif kind == SKIP_IPV6:
+                    bad_reason = f"{side} value is IPv6; IPv6 is never remapped"
+                elif kind == SKIP_INVALID:
+                    bad_reason = f"{side} value is not a valid IPv4 IP or CIDR"
+                if bad_reason:
+                    break
+            if bad_reason:
+                invalid_rows.append({**row_report, "reason": bad_reason})
+                continue
+
+            # Reject CIDRs not on their network boundary (e.g. 10.10.3.0/23:
+            # a /23 starts on an even third octet, so this silently means
+            # 10.10.2.0/23). Guessing here would remap to the wrong place.
+            boundary_bad = None
+            for side, raw in (("left", left_raw), ("right", right_raw)):
+                if "/" in raw:
+                    try:
+                        ipaddress.ip_network(raw, strict=True)
+                    except ValueError:
+                        actual = _format_network_or_ip(_to_network(raw))
+                        boundary_bad = (f"{side} value {raw} is not on a /"
+                                        f"{raw.rsplit('/', 1)[1]} boundary (it would silently "
+                                        f"mean {actual}); fix the network address or the prefix")
+                        break
+            if boundary_bad:
+                invalid_rows.append({**row_report, "reason": boundary_bad})
                 continue
 
             left = _canonical_ip_token(left_raw)
@@ -386,6 +442,22 @@ def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[PrefixMappingTab
 
             if left == right:
                 invalid_rows.append({**row_report, "reason": "Left and right values are the same"})
+                continue
+
+            left_net = _to_network(left)
+            right_net = _to_network(right)
+            if right_net.prefixlen > left_net.prefixlen:
+                invalid_rows.append({**row_report, "reason": (
+                    f"new_subnet /{right_net.prefixlen} is smaller than old_subnet "
+                    f"/{left_net.prefixlen}; part of the old range would have nowhere to map"
+                )})
+                continue
+
+            dup = next((r for r in table.rows if r["src_net"] == left_net and r["direction"] == "forward"), None)
+            if dup is not None:
+                invalid_rows.append({**row_report, "reason": (
+                    f"duplicate old_subnet {left}; already mapped to {dup['destination']} on row {dup['row']}"
+                )})
                 continue
 
             try:
@@ -411,10 +483,13 @@ def _is_ip_expression(expr: dict) -> bool:
 
 
 def _expression_ip_values(expr: dict) -> list[str]:
+    """Return the expression's ip_addresses as the exact strings NSX holds
+    (whitespace-trimmed only). Originals are never rewritten: the push-side
+    additive contract compares strings, so `10.6.0.1/32` must stay `10.6.0.1/32`."""
     values = expr.get("ip_addresses", [])
     if not isinstance(values, list):
         return []
-    return [_canonical_ip_token(v) for v in values if str(v).strip()]
+    return [str(v).strip() for v in values if str(v).strip()]
 
 
 def _strip_readonly_fields(payload: dict) -> dict:
@@ -458,6 +533,10 @@ def _remap_group_payload(
         "timestamp": _utc_now_iso(),
         "matched_values": [],
         "added_values": [],
+        "added_pairs": [],        # {original, mapped, csv_row}: provenance of each added value
+        "already_mapped": [],     # {original, mapped, csv_row}: pair complete before this run
+        "skipped_values": [],     # ranges / IPv6 / junk left untouched, with reason
+        "unmapped_values": [],    # valid IPv4 tokens no CSV row covers
         "mapping_hits": [],
         "expression_changes": [],
         "mapped_only": mapped_only,
@@ -476,19 +555,39 @@ def _remap_group_payload(
             continue
 
         existing_values = _expression_ip_values(expr)
-        existing_set = set(existing_values)
+        # Compare on canonical form so `10.7.0.1` and `10.7.0.1/32` count as
+        # the same entry when deciding what is genuinely new.
+        existing_canon = {_canonical_ip_token(v) for v in existing_values}
 
         mapped_for_expression: list[str] = []
+        mapped_canon: set[str] = set()
         matched_here: list[str] = []
 
         for value in existing_values:
+            kind = _token_kind(value)
+            if kind is not None:
+                report["skipped_values"].append({
+                    "value": value,
+                    "expression_index": idx,
+                    "reason": kind,
+                })
+                continue
+
             mapped_values, mapping_row = mapping.map_token(value)
 
             if not mapped_values:
+                report["unmapped_values"].append(value)
                 continue
 
             matched_here.append(value)
             report["matched_values"].append(value)
+
+            # Detect pairs that were completed by an earlier run (or were
+            # always present): the mapped value already exists in the group.
+            if mapping_row and _canonical_ip_token(mapped_values[0]) in existing_canon:
+                pair = {"original": value, "mapped": mapped_values[0], "csv_row": mapping_row["row"]}
+                if pair not in report["already_mapped"]:
+                    report["already_mapped"].append(pair)
 
             if mapping_row:
                 report["mapping_hits"].append({
@@ -502,19 +601,24 @@ def _remap_group_payload(
                 })
 
             for mapped in sorted(mapped_values):
-                mapped = _canonical_ip_token(mapped)
-                if mapped not in mapped_for_expression:
-                    mapped_for_expression.append(mapped)
+                canon = _canonical_ip_token(mapped)
+                if canon in mapped_canon:
+                    continue
+                mapped_canon.add(canon)
+                mapped_for_expression.append(mapped)
 
         if not mapped_for_expression:
             continue
 
         if mapped_only:
-            final_values = sorted(set(mapped_for_expression))
+            final_values = sorted(mapped_for_expression)
             added_values = final_values
         else:
-            final_values = sorted(set(existing_values + mapped_for_expression))
-            added_values = sorted(v for v in final_values if v not in existing_set)
+            # Originals are kept verbatim and in their original order; only
+            # genuinely new mapped values are appended.
+            added_values = sorted(v for v in mapped_for_expression
+                                  if _canonical_ip_token(v) not in existing_canon)
+            final_values = existing_values + added_values
 
         if not added_values and not mapped_only:
             continue
@@ -534,10 +638,25 @@ def _remap_group_payload(
             "mapped_only": mapped_only,
         })
 
+    report["unmapped_values"] = sorted(set(report["unmapped_values"]))
+    report["skipped_count"] = len(report["skipped_values"])
+
     if report["expression_changes"]:
         report["status"] = "changed"
         report["added_values"] = sorted(group_added)
         report["added_count"] = len(group_added)
+        # Provenance: which original produced each added value, via which CSV row.
+        added_canon = {_canonical_ip_token(v) for v in report["added_values"]}
+        seen_pairs: set = set()
+        for h in report["mapping_hits"]:
+            m = h["mapped_values"][0]
+            mc = _canonical_ip_token(m)
+            key = (h["source_value"], mc)
+            if mc in added_canon and key not in seen_pairs:
+                seen_pairs.add(key)
+                report["added_pairs"].append({
+                    "original": h["source_value"], "mapped": m, "csv_row": h["mapping_row"],
+                })
     else:
         report["matched_values"] = sorted(set(report["matched_values"]))
         report["added_count"] = 0
@@ -565,7 +684,14 @@ def main() -> None:
         action="store_true",
         help="Replace IPAddressExpression values with mapped destination values only.",
     )
-    parser.add_argument("--clean", action="store_true", default=True)
+    parser.add_argument(
+        "--clean",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Delete --prepared-root before writing (default). Use --no-clean to keep "
+             "existing files there. --prepared-root is never allowed to be, contain, "
+             "or sit inside --export-root.",
+    )
     parser.add_argument(
         "--keep-readonly-fields",
         action="store_true",
@@ -584,6 +710,22 @@ def main() -> None:
         if args.reports_dir
         else prepared_root.parent / "reports" / "group-ip-remap"
     )
+
+    # Guard: --prepared-root is purged below, so it must never overlap the
+    # export tree (same dir, a parent of it, or a child of it).
+    if not export_root.exists():
+        raise SystemExit(f"--export-root does not exist: {export_root}")
+    if (
+        prepared_root == export_root
+        or prepared_root in export_root.parents
+        or export_root in prepared_root.parents
+    ):
+        raise SystemExit(
+            f"--prepared-root ({prepared_root}) overlaps --export-root ({export_root}); "
+            "refusing, because --prepared-root is purged before writing."
+        )
+    if prepared_root == REPO_ROOT or prepared_root in REPO_ROOT.parents:
+        raise SystemExit(f"--prepared-root ({prepared_root}) is the repo root or above it; refusing.")
 
     if args.clean:
         _purge_dir(prepared_root)

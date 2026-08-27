@@ -1,0 +1,30 @@
+# VM Rule Membership report target list.
+# Used by tools/reports/report_vms_in_rules.py.
+#
+# AUTO-DISCOVERED: this file at repo root is picked up automatically.
+# Override with --vm-list <path> or VM_RULE_REPORT_LIST (.env) for a
+# different file.
+#
+# Entry styles (one per line):
+#
+#   name                    -> NSX lookup; IPs auto-fetched from VM VIFs.
+#                              Case-insensitive match on display_name.
+#   name,ip                 -> NSX lookup + explicit IP. If the name matches
+#                              on NSX, both auto-fetched AND explicit IPs are
+#                              used for group-IP matching. If the name does
+#                              NOT match on NSX (e.g. a planned VM), the
+#                              entry falls back to IP-only mode.
+#   name,ip1,ip2,...        -> Same, multiple IPs allowed.
+#
+# Blank lines and lines starting with `#` are ignored. Commas around fields
+# are trimmed. Invalid IP tokens are logged and skipped.
+#
+# Examples (uncomment / edit for your environment):
+#   ubuntu22-speedtest-10.6.0.101-ax2001
+#   ubuntu22-speedtest-10.6.2.102-gh0202
+#   future-web-01,10.6.0.50
+#   new-app,10.7.5.100,10.7.5.101
+#   probe,10.6.0.99
+ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101
+ubuntu22-speedtest-10.6.2.102-gh0202,10.6.2.102
+ubuntu22-speedtest-10.6.1.102-0102

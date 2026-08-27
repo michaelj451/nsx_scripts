@@ -47,7 +47,29 @@ PANORAMA_TLS_VERIFY=false
 
 Username/password are **reused from `vm_username` / `vm_password`** (already in `.env` for the VM-tagging toolkit). The Panorama client will look there if `PANORAMA_USERNAME` / `PANORAMA_PASSWORD` aren't set.
 
-To mint an API key once (PAN-native, more secure than storing the password):
+To prove the credentials work and mint a key, use the auth script (read-only
+against Panorama: keygen + `show system info` + name-only listings):
+
+```powershell
+# Check whatever .env currently says (key stays masked)
+python tools/pan/panorama_auth.py
+
+# Generate a key from username/password and store it in .env as PANORAMA_API_KEY
+python tools/pan/panorama_auth.py --keygen --write-env
+```
+
+It prints the target, which `.env` variables supplied it, the auth method
+used, the Panorama hostname / serial / PAN-OS version, and how many device
+groups and templates the account can see. A JSON report (key fingerprint
+only, never the key) lands in `.pano_reports\`. Exit code `0` = authenticated,
+`1` = auth or API failure, `2` = `.env` incomplete, `3` = `--write-env` refused.
+
+Both Panorama clients read the same variables (see `app/palo/pan_env.py`):
+`app/palo/panorama_api_client.py` for xpath-level XML API work, and
+`app/palo/panos_client.py` (`PanosClient.from_env()`) for the pan-os-python
+object model.
+
+The raw XML equivalent, if you ever need it by hand:
 
 ```powershell
 Invoke-RestMethod `
