@@ -21,7 +21,7 @@ What's captured:
     manifest.json                          captured-at, captured-from, options, steps
     summary.txt                            human-readable summary
     nsx_export/<host>/                     raw NSX state (groups + services + policies + rules)
-    groups_additive/                       groups with captured VM IPs (snapshot at capture time, GET-only)
+    groups_additive/                       export copy; add --live-query to freeze evaluated VM IPs in (LM only)
     segment_inventory/                     every referenced segment + live segment details
     affected_rule_reports/                 cross-reference of rules ↔ groups (offline)
     vm_tag_inventory/                      VM + tag state (LM only, GET-only)
@@ -241,9 +241,16 @@ def main() -> int:
                        "the latest capture (previous capture artifacts are deleted). "
                        "Pass --output-dir to preserve specific bundles."
                    ))
-    # Live-member enrichment and segment inventory are MANDATORY — they're what
-    # makes the bundle self-sufficient for offline transform. Skipping them would
-    # leave dynamic groups without IPs and segment refs unresolvable.
+    # Segment inventory stays MANDATORY (offline transform needs it). Live
+    # VM-member enrichment is OPT-IN via --live-query: by default the
+    # groups_additive/ tree is a faithful copy of the export with no inventory
+    # calls. Workflows that push captured VM IPs (Workflow A Part 3) must
+    # capture with --live-query.
+    p.add_argument("--live-query", action="store_true", default=False,
+                   help="Opt in to live VM-member enrichment: evaluate each group's members on the "
+                        "source and freeze their VM IPs into groups_additive/ (LM sources only; "
+                        "ignored for GM). Default off: groups_additive/ is a faithful copy of the "
+                        "export. Required when Workflow A Part 3 will push captured VM IPs.")
     p.add_argument("--with-vm-tags", action="store_true", default=True,
                    help="Capture VM tag state (LM only). Default ON; ignored for GM.")
     p.add_argument("--no-vm-tags", action="store_false", dest="with_vm_tags",
@@ -340,11 +347,10 @@ def main() -> int:
     source_export_dir = export_root / source_host
     source_groups_dir = source_export_dir / "domains" / args.domain_id / "groups"
 
-    # 2. Snapshot each group's evaluated VM members + their IPs (GET-only).
-    # Result is frozen to disk in groups_additive/ — push tools read from
-    # disk, NOT from NSX, so this is a one-time live read at capture time.
-    # MANDATORY:
-    # this is what gives the offline transform actual VM IPs to operate on.
+    # 2. Build groups_additive/. Default: a faithful copy of the export (no
+    # inventory calls). With --live-query (LM sources only): also snapshot each
+    # group's evaluated VM members and freeze their IPs into the copies; push
+    # tools read from disk, NOT from NSX, so that is a one-time live read.
     cmd = [
         sys.executable, "tools/nsx/build_group_ip_additive_from_live_members.py",
         "--source-manager", args.source,
@@ -355,6 +361,8 @@ def main() -> int:
         "--copy-first",
         "--continue-on-group-error",
     ]
+    if args.live_query and not args.federation_global:
+        cmd.append("--live-query")
     steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     # 3. Segment inventory WITH live details so transform can run offline. MANDATORY:

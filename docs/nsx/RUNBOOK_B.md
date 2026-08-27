@@ -30,7 +30,7 @@ Manager roles:
 Properties:
 
 - **Source manager is only touched in two phases: capture, then push.** Everything between (`groups_additive` synthesis, CSV remap) is offline.
-- Live VM membership is resolved by NSX at capture time and frozen to disk in `groups_additive/`.
+- `groups_additive/` is a faithful copy of the export by default (no inventory calls). Freezing live VM membership into it is opt-in: `capture_nsx_state.py --live-query` (LM only). Workflow B's IP-only default scope does not need it.
 - All transformations are deterministic and reviewable in the bundle before push.
 - Dry-run is the default safe mode. `--apply` is required to actually mutate.
 - Every push writes a `summary.json` + per-class JSON + log files into a `push_report/` directory and **captures a baseline** of the target's pre-push state for revert.
@@ -79,7 +79,7 @@ nsx_capture/nsx-lm1.lab.local/
 ├── manifest.json
 ├── summary.txt
 ├── nsx_export/<host>/                   ← raw NSX policy state
-├── groups_additive/                     ← groups with captured (snapshot-at-export-time) VM IPs
+├── groups_additive/                     ← export copy (VM-IP freeze is opt-in: --live-query)
 │   └── domains/default/groups/<short>.yaml
 ├── segment_inventory/                   ← path → CIDR map (informational; not used by Workflow B)
 │   └── segment_details.json

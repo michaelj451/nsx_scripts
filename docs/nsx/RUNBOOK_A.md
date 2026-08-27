@@ -57,7 +57,7 @@ $env:PYTHONPATH = "$PWD\app"
 ## EXPORT — 7 commands, source-side, GET-only (run once)
 
 ```bash
-python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # --live-query freezes VM IPs; REQUIRED for Part 3
 python tools/nsx/services.py    export --source nsx-lm1
 python tools/nsx/groups.py      export --source nsx-lm1
 python tools/nsx/policies.py    export --source nsx-lm1

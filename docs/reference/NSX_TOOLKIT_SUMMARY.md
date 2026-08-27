@@ -346,7 +346,7 @@ Plus:
 
 ```bash
 # EXPORT — read-only against nsx-lm1, run once
-python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # VM-IP freeze is opt-in; needed for Part 3
 python tools/nsx/services.py    export --source nsx-lm1
 python tools/nsx/groups.py      export --source nsx-lm1
 python tools/nsx/policies.py    export --source nsx-lm1
@@ -387,7 +387,7 @@ python tools/nsx/services.py revert --target nsx-lm2 --reports-dir nsx_services_
 
 ```bash
 # CAPTURE (read-only)
-python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # VM-IP freeze is opt-in; needed for Part 3
 
 # PUSH groups-only with CSV subnet remap (writes back to lm1)
 python tools/nsx/groups.py push --target nsx-lm1 \

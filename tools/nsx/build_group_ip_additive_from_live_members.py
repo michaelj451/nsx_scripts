@@ -263,18 +263,22 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--live-query",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt IN to contacting the source NSX manager to build the VM IP "
+            "index and evaluate per-group live members, freezing the resulting "
+            "VM IPs into the additive bundle. DEFAULT IS OFF: the output tree "
+            "is a copy of the export with group expressions preserved as-is "
+            "(no VM IP enrichment, no inventory calls). Only needed for "
+            "workflows that push captured VM IPs (e.g. Workflow A Part 3)."
+        ),
+    )
+    parser.add_argument(
         "--no-live-query",
         action="store_true",
-        help=(
-            "Do NOT contact the source NSX manager. Skip the VM IP index build "
-            "and the per-group evaluated-member lookup. The output tree is "
-            "produced by copying the source export only — group expressions "
-            "are preserved as-is, including any dynamic Condition / "
-            "PathExpression entries. Useful when the source manager is "
-            "unreachable, when you want a byte-for-byte clone of the export, "
-            "or when downstream tools depend on the output path existing. "
-            "Implies --copy-first behavior."
-        ),
+        help="Deprecated: this is now the default. Kept for compatibility; overrides --live-query.",
     )
 
     args = parser.parse_args()
@@ -282,13 +286,16 @@ def main() -> None:
     init_cli()
     log_file = _setup_logging()
 
+    # Resolve the live-query decision. Default: OFFLINE COPY (no NSX inventory
+    # calls). --live-query opts in; the deprecated --no-live-query still wins.
+    args.no_live_query = args.no_live_query or not args.live_query
+
     # Global Managers have no VM inventory surface (evaluated-member and VIF
     # IP lookups are LM-only APIs), so live enrichment cannot work there.
-    # Force the offline copy path instead of failing the capture.
     if args.source_manager.startswith("nsx-gm") and not args.no_live_query:
         log.warning(
             "Source %s is a Global Manager: VM live-member enrichment is an LM-only API. "
-            "Forcing --no-live-query (groups are copied as-is, no captured VM IPs).",
+            "Ignoring --live-query (groups are copied as-is, no captured VM IPs).",
             args.source_manager,
         )
         args.no_live_query = True
