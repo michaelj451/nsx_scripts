@@ -88,6 +88,11 @@ Point at a GM with `--federation-global` and the tool talks to the GM ONLY:
 6. Correlate and emit ONE report showing per-VM which site it lives on
    (`Site` column) and which federated rules touch it.
 
+Location-scoped domains (domain id equal to a site id, e.g.
+`labdc1-w01-lnsx`) are queried ONLY at their own site; cross-site NOT_FOUND
+responses for a group not realized at a site are benign and logged at debug,
+with one summary count at the end.
+
 Optional: `--with-vm-inventory` ALSO connects directly to each site LM for
 fabric VM inventory, which enriches the report with VM IP addresses.
 Unreachable LMs are warnings, never fatal (targets with explicit IPs in the
