@@ -419,6 +419,24 @@ def _load_mapping_csv(path: Path, bidirectional: bool) -> tuple[PrefixMappingTab
                 invalid_rows.append({**row_report, "reason": bad_reason})
                 continue
 
+            # Reject CIDRs not on their network boundary (e.g. 10.10.3.0/23:
+            # a /23 starts on an even third octet, so this silently means
+            # 10.10.2.0/23). Guessing here would remap to the wrong place.
+            boundary_bad = None
+            for side, raw in (("left", left_raw), ("right", right_raw)):
+                if "/" in raw:
+                    try:
+                        ipaddress.ip_network(raw, strict=True)
+                    except ValueError:
+                        actual = _format_network_or_ip(_to_network(raw))
+                        boundary_bad = (f"{side} value {raw} is not on a /"
+                                        f"{raw.rsplit('/', 1)[1]} boundary (it would silently "
+                                        f"mean {actual}); fix the network address or the prefix")
+                        break
+            if boundary_bad:
+                invalid_rows.append({**row_report, "reason": boundary_bad})
+                continue
+
             left = _canonical_ip_token(left_raw)
             right = _canonical_ip_token(right_raw)
 

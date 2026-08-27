@@ -258,6 +258,7 @@ python tools/nsx/groups.py push --target nsx-lm1 \
 
 ### Review gates after push
 
+- `<push_report>/remap_report.md`: the human-readable report (header + result, what was added or would be added per group, what was left alone and why, never-remapped entries, CSV coverage misses, and the operator's batch-ramp decisions)
 - `<push_report>/summary.json` — totals: ok / failed / skipped / dry_run / `csv_groups_changed` / `csv_total_added_values` / `retry_rounds`
 - `<push_report>/groups.jsonl` — per-group rows
 - `<push_report>/<tool>_push_<ts>.log` — interleaved INFO log

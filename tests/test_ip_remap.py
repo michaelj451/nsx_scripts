@@ -81,8 +81,10 @@ class MappingTableTests(unittest.TestCase):
         cls.table, cls.invalid = remap._load_mapping_csv(NONPROD_CSV, bidirectional=False)
 
     def test_lab_csv_loads_clean(self):
+        """data/nonprod_map.csv is live lab data the operator edits; assert it
+        parses clean, not that it has any particular number of rows."""
         self.assertEqual(self.invalid, [])
-        self.assertEqual(len(self.table.rows), 17)
+        self.assertGreater(len(self.table.rows), 0)
 
     def test_longest_prefix_wins(self):
         mapped, row = self.table.map_token("10.6.0.101")
@@ -139,6 +141,17 @@ class MappingCsvValidationTests(unittest.TestCase):
         table, invalid = remap._load_mapping_csv(_csv("old_subnet,new_subnet\n10.20.0.0/24,10.21.0.0/23\n"), False)
         self.assertEqual(invalid, [])
         self.assertEqual(table.map_token("10.20.0.5")[0], ["10.21.0.5"])
+
+    def test_off_boundary_cidr_is_rejected_with_hint(self):
+        """10.10.3.0/23 is not a valid /23 boundary; it silently means
+        10.10.2.0/23, so the loader must refuse rather than guess."""
+        _, invalid = remap._load_mapping_csv(_csv("old_subnet,new_subnet\n10.10.2.0/23,10.10.3.0/23\n"), False)
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("boundary", invalid[0]["reason"])
+        self.assertIn("10.10.2.0/23", invalid[0]["reason"])
+        table, invalid = remap._load_mapping_csv(_csv("old_subnet,new_subnet\n10.10.2.0/24,10.10.3.0/24\n"), False)
+        self.assertEqual(invalid, [])
+        self.assertEqual(table.map_token("10.10.2.0/24")[0], ["10.10.3.0/24"])
 
     def test_duplicate_old_subnet_is_rejected_first_row_wins(self):
         table, invalid = remap._load_mapping_csv(_csv(
@@ -278,6 +291,40 @@ class GroupsPushHelpersTests(unittest.TestCase):
         self.assertEqual([(d["batch_size_before"], d["batch_size_after"]) for d in decisions],
                          [(1, 1), (1, 25), (25, 1), (1, 1)])
         self.assertTrue(all("ts" in d and "applied_count" in d for d in decisions))
+
+    def test_remap_markdown_report(self):
+        import tempfile
+        summary = {
+            "mode": "DRY-RUN", "ran_at": "2026-08-27T00:00:00+00:00",
+            "target": {"alias": "nsx-lm3", "host": "nsx-lm3.lab.local", "domain_id": "default"},
+            "groups_dir": "/g", "csv_remap": "/m.csv", "csv_invalid_rows": [],
+            "csv_remap_scope": "ip_only_groups",
+            "interactive_decisions": [{"ts": "2026-08-27T00:00:01+00:00", "applied_count": 1,
+                                       "decision": "resize", "batch_size_before": 1, "batch_size_after": 25}],
+            "totals": {"files_seen": 3, "ok": 1, "failed": 0, "skipped": 2,
+                       "csv_no_change_skipped": 1, "csv_total_added_values": 2,
+                       "total_ips_removed": 0, "additive_only_contract": "pass",
+                       "interactive_mode": True, "interactive_batch_size_initial": 1,
+                       "interactive_batch_size_final": 25, "interactive_exit_requested": False},
+        }
+        rows = [
+            {"id": "ip-grp", "group_type": "ip-only", "status": "success_put", "csv_changed": True,
+             "csv_added_count": 2, "csv_added_values": ["10.7.0.1", "10.7.0.2"],
+             "ips_added": ["10.7.0.1", "10.7.0.2"],
+             "csv_skipped_values": [{"value": "10.6.0.1-10.6.0.2", "reason": "range", "expression_index": 0}]},
+            {"id": "steady", "group_type": "ip-only", "status": "skipped_no_change"},
+            {"id": "gen", "group_type": "generic", "status": "dry_run", "csv_remap_skipped": "generic_group",
+             "csv_unmapped_values": ["1.2.3.4"]},
+        ]
+        out = Path(tempfile.mkdtemp())
+        path = groups._write_remap_markdown(out, summary, rows)
+        md = path.read_text()
+        for expected in ("# CSV IP remap dry-run: nsx-lm3", "Would add", "`10.7.0.1`",
+                         "No changes needed (1)", "`steady`", "Generic groups, out of scope (1)",
+                         "Never remapped by design", "range", "no CSV row covers", "`1.2.3.4`",
+                         "Confidence ramp", "1 -> 25", "**pass**"):
+            self.assertIn(expected, md)
+        self.assertNotIn(chr(0x2014), md)
 
     def test_batch_prompt_non_tty_auto_approves_and_records(self):
         import builtins

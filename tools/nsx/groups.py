@@ -65,6 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from nsx.cli_bootstrap import init_cli
+from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
@@ -253,6 +254,127 @@ def _iter_group_files(groups_dir: Path) -> List[Path]:
                 continue
             files.append(p)
     return sorted(files)
+
+
+def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
+                          rows: List[Dict[str, Any]]) -> Path:
+    """Human-readable report for a CSV remap push (dry-run or apply), in the
+    same style as the audit and hostname-tag validation reports. Written next
+    to summary.json as remap_report.md."""
+    t = summary["totals"]
+    apply_mode = summary["mode"] == "APPLY"
+    verb = "Added" if apply_mode else "Would add"
+
+    def code(v: Any) -> str:
+        return f"`{v}`"
+
+    def vals(items: List[str], cap: int = 8) -> str:
+        if not items:
+            return ""
+        shown = ", ".join(code(x) for x in items[:cap])
+        extra = len(items) - cap
+        return shown + (f", +{extra} more" if extra > 0 else "")
+
+    changed = [r for r in rows if r.get("csv_changed")]
+    no_change = [r for r in rows if r.get("status") == "skipped_no_change"]
+    generic_skipped = [r for r in rows if r.get("csv_remap_skipped") == "generic_group"]
+    failures = [r for r in rows if str(r.get("status", "")).startswith("failed")]
+
+    contract = t.get("additive_only_contract", "n/a")
+    result = "FAILURES" if failures else ("CHANGES" if changed else "NO CHANGES NEEDED")
+
+    L: List[str] = []
+    L.append(f"# CSV IP remap {'apply' if apply_mode else 'dry-run'}: {summary['target']['alias']}")
+    L.append("")
+    L.append("| Field | Value |")
+    L.append("|---|---|")
+    L.append(f"| Generated (UTC) | {summary['ran_at'][:19].replace('T', ' ')} |")
+    L.append(f"| Mode | **{summary['mode']}** |")
+    L.append(f"| Target | {summary['target']['alias']} ({summary['target']['host']}), domain {code(summary['target']['domain_id'])} |")
+    L.append(f"| Groups dir | {code(summary['groups_dir'])} |")
+    L.append(f"| CSV | {code(summary['csv_remap'])} ({len(summary.get('csv_invalid_rows') or [])} invalid rows) |")
+    L.append(f"| Remap scope | {'all groups (--remap-generic)' if summary.get('csv_remap_scope') == 'all_groups' else 'IP-Addresses-Only groups (default)'} |")
+    if t.get("interactive_mode"):
+        L.append(f"| Batch ramp | started at {t['interactive_batch_size_initial']}, "
+                 f"ended at {t['interactive_batch_size_final']}, "
+                 f"{len(summary.get('interactive_decisions') or [])} prompt decision(s)"
+                 f"{'; operator exited early' if t.get('interactive_exit_requested') else ''} |")
+    L.append(f"| Groups | {t['files_seen']} seen: {t['ok']} written, {t.get('dry_run', 0)} dry-run, "
+             f"{t['skipped']} skipped ({t.get('csv_no_change_skipped', 0)} no-change), {t['failed']} failed |")
+    L.append(f"| IPs added | {t['csv_total_added_values']} (removed: {t.get('total_ips_removed', 0)}) |")
+    L.append(f"| Additive-only contract | **{contract}** |")
+    L.append(f"| **Result** | **{result}** |")
+    L.append("")
+    L.append("Strict-additive: originals are never rewritten or removed. Re-running this "
+             "push when nothing is left to add sends no API writes at all.")
+    L.append("")
+
+    L.append(f"## 1. {verb} ({t['csv_total_added_values']} IPs in {len(changed)} groups)")
+    L.append("")
+    if changed:
+        L.append(f"| Group | Type | {verb} | Count | Status |")
+        L.append("|---|---|---|---:|---|")
+        for r in changed:
+            added = r.get("ips_added") if apply_mode and r.get("ips_added") is not None else r.get("csv_added_values", [])
+            L.append(f"| {code(r.get('id'))} | {r.get('group_type', '')} | {vals(added)} "
+                     f"| {r.get('csv_added_count', 0)} | {r.get('status')} |")
+    else:
+        L.append("None. Every mapped value the CSV calls for is already present.")
+    L.append("")
+
+    if failures:
+        L.append(f"## 2. Failures ({len(failures)})")
+        L.append("")
+        L.append("| Group | Status | Error |")
+        L.append("|---|---|---|")
+        for r in failures:
+            L.append(f"| {code(r.get('id'))} | {r.get('status')} | {str(r.get('error', ''))[:140]} |")
+        L.append("")
+
+    L.append(f"## {'3' if failures else '2'}. Left alone")
+    L.append("")
+    if no_change:
+        L.append(f"**No changes needed ({len(no_change)}):** nothing sent to NSX for "
+                 + ", ".join(code(r.get("id")) for r in no_change) + ".")
+        L.append("")
+    if generic_skipped:
+        L.append(f"**Generic groups, out of scope ({len(generic_skipped)}):** "
+                 + ", ".join(code(r.get("id")) for r in generic_skipped)
+                 + ". Use `--remap-generic` to include them.")
+        L.append("")
+    by_design = [(r.get("id"), s) for r in rows for s in r.get("csv_skipped_values", [])]
+    if by_design:
+        L.append("**Never remapped by design:**")
+        L.append("")
+        L.append("| Group | Entry | Reason |")
+        L.append("|---|---|---|")
+        for gid, s in by_design:
+            L.append(f"| {code(gid)} | {code(s['value'])} | {s['reason']} |")
+        L.append("")
+    uncovered = [(r.get("id"), r.get("csv_unmapped_values")) for r in rows if r.get("csv_unmapped_values")]
+    if uncovered:
+        L.append("**IPv4 entries no CSV row covers:**")
+        L.append("")
+        L.append("| Group | Entries |")
+        L.append("|---|---|")
+        for gid, u in uncovered:
+            L.append(f"| {code(gid)} | {vals(u)} |")
+        L.append("")
+
+    decisions = summary.get("interactive_decisions") or []
+    if decisions:
+        L.append("## Confidence ramp (operator decisions)")
+        L.append("")
+        L.append("| Time (UTC) | After N applied | Decision | Batch size |")
+        L.append("|---|---:|---|---|")
+        for d in decisions:
+            L.append(f"| {d['ts'][11:19]} | {d['applied_count']} | {d['decision']} "
+                     f"| {d['batch_size_before']} -> {d['batch_size_after']} |")
+        L.append("")
+
+    path = reports_dir / "remap_report.md"
+    path.write_text(align_markdown_tables("\n".join(L)) + "\n", encoding="utf-8")
+    return path
 
 
 class _InteractiveExit(Exception):
@@ -892,6 +1014,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             # --- CSV remap (Workflow B) — runs BEFORE segment handling ---
             csv_changed = False
             csv_added_count = 0
+            row["group_type"] = "ip-only" if "IPAddress" in (obj.get("group_type") or []) else "generic"
             # Default scope: only IP-Addresses-Only groups (group_type contains
             # "IPAddress") are remapped. Generic groups keep their captured
             # payload untouched unless --remap-generic is given.
@@ -915,6 +1038,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                     obj = updated
                     csv_changed = True
                     csv_added_count = csv_report.get("added_count", 0)
+                    row["csv_added_values"] = csv_report.get("added_values") or []
                     total_csv_changed += 1
                     total_csv_added += csv_added_count
                 row["csv_changed"] = csv_changed
@@ -1361,6 +1485,12 @@ def cmd_push(args: argparse.Namespace) -> int:
         "n/a (intentional-ip-removal)" if args.intentional_ip_removal
         else ("pass" if contract_ok else "violated")
     )
+    # Markdown report (CSV remap runs only), in the audit-report style.
+    if csv_mapping is not None:
+        md_path = _write_remap_markdown(reports_dir, summary, rows)
+        summary["report_md"] = str(md_path)
+        log.info("Markdown report: %s", md_path)
+
     # Rewrite summary.json with the contract status appended (initial write above happened before this).
     (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
