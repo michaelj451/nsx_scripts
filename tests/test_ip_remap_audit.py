@@ -223,6 +223,15 @@ class RenderAndLoadTests(unittest.TestCase):
         self.assertIn("10.6.0.52-10.6.0.53", md)  # by design in 3
         self.assertNotIn(EM_DASH, md)
 
+    def test_render_shows_display_name_when_it_differs(self):
+        fwd, rev, invalid, csv = _tables()
+        g = _group("a8b5ed22-0000", [_ipx("10.6.0.101")])
+        g["display_name"] = "friendly-name"
+        rows = audit.audit_groups({"a8b5ed22-0000": g}, fwd, rev)
+        md = audit.render_markdown(rows, audit.summarize(rows), label="lab", source_desc="test",
+                                   domain_id="default", csv_path=csv, csv_rows=len(fwd.rows), csv_invalid=invalid)
+        self.assertIn("friendly-name (`a8b5ed22-0000`)", md)
+
     def test_render_clean(self):
         fwd, rev, invalid, csv = _tables()
         rows = audit.audit_groups({"ok": _group("ok", [_ipx("10.6.0.101", "10.7.0.101")])}, fwd, rev)

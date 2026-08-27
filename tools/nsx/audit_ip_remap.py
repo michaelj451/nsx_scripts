@@ -273,6 +273,16 @@ def _code(s: Any) -> str:
     return f"`{s}`"
 
 
+def _label(r: Dict[str, Any]) -> str:
+    """Group cell: display name first (the GUI identity), id in backticks when
+    it differs; GUI-created groups get a UUID id but a readable name."""
+    gid = r.get("id")
+    name = r.get("display_name")
+    if name and name != gid:
+        return f"{name} ({_code(gid)})"
+    return _code(gid)
+
+
 def _inline(values: List[str]) -> str:
     shown = ", ".join(_code(v) for v in values[:MAX_INLINE])
     extra = len(values) - MAX_INLINE
@@ -330,7 +340,7 @@ def render_markdown(
         L.append("|---|---|---|---:|---|")
         for r in rows:
             for g in r["gaps_missing_mapped"]:
-                L.append(f"| {_code(r['id'])} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
+                L.append(f"| {_label(r)} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
                          f"| {g['csv_row']} | {_code(g['location'])} |")
     else:
         L.append("None.")
@@ -351,7 +361,7 @@ def render_markdown(
         L.append("|---|---|---|---:|---|")
         for r in rows:
             for g in r["generic_remap_candidates"]:
-                L.append(f"| {_code(r['id'])} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
+                L.append(f"| {_label(r)} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
                          f"| {g['csv_row']} | {_code(g['location'])} |")
     else:
         L.append("None.")
@@ -369,7 +379,7 @@ def render_markdown(
         L.append("|---|---|---|---:|---|")
         for r in rows:
             for o in r["orphan_mapped_values"]:
-                L.append(f"| {_code(r['id'])} | {_code(o['present_value'])} | {_code(o['expected_original'])} "
+                L.append(f"| {_label(r)} | {_code(o['present_value'])} | {_code(o['expected_original'])} "
                          f"| {o['csv_row']} | {_code(o['location'])} |")
     else:
         L.append("None.")
@@ -387,7 +397,7 @@ def render_markdown(
         for r in rows:
             if r["uncovered_ipv4"]:
                 vals = [u["value"] for u in r["uncovered_ipv4"]]
-                L.append(f"| {_code(r['id'])} | {_inline(vals)} | {len(vals)} |")
+                L.append(f"| {_label(r)} | {_inline(vals)} | {len(vals)} |")
     else:
         L.append("None.")
     L.append("")
@@ -403,7 +413,7 @@ def render_markdown(
         L.append("|---|---|---|---:|---|")
         for r in mapped_groups:
             for m in r["mapped_pairs"]:
-                L.append(f"| {_code(r['id'])} | {_code(m['original'])} | {_code(m['mapped'])} "
+                L.append(f"| {_label(r)} | {_code(m['original'])} | {_code(m['mapped'])} "
                          f"| {m['csv_row']} | {_code(m['location'])} |")
     else:
         L.append("None.")
@@ -419,7 +429,7 @@ def render_markdown(
         L.append("|---|---|---|---|")
         for r in rows:
             for b in r["not_remapped_by_design"]:
-                L.append(f"| {_code(r['id'])} | {_code(b['value'])} | {b['reason']} | {_code(b['location'])} |")
+                L.append(f"| {_label(r)} | {_code(b['value'])} | {b['reason']} | {_code(b['location'])} |")
     else:
         L.append("None.")
     L.append("")
@@ -432,7 +442,7 @@ def render_markdown(
     for r in rows:
         if not r["entry_count"]:
             continue
-        L.append(f"| {_code(r['id'])} | {r['group_type']} | {r['status']} | {r['entry_count']} | {len(r['mapped_pairs'])} "
+        L.append(f"| {_label(r)} | {r['group_type']} | {r['status']} | {r['entry_count']} | {len(r['mapped_pairs'])} "
                  f"| {len(r['gaps_missing_mapped'])} | {len(r['generic_remap_candidates'])} | {len(r['orphan_mapped_values'])} "
                  f"| {len(r['uncovered_ipv4'])} | {len(r['not_remapped_by_design'])} "
                  f"| {'yes' if r['has_nested_ips'] else ''} |")
@@ -467,7 +477,7 @@ def render_markdown(
             L.append("|---|---|---|")
             for r in rows:
                 for x in r["invalid_entries"]:
-                    L.append(f"| {_code(r['id'])} | {_code(x['value'])} | {_code(x['location'])} |")
+                    L.append(f"| {_label(r)} | {_code(x['value'])} | {_code(x['location'])} |")
             L.append("")
 
     return align_markdown_tables("\n".join(L)) + "\n"

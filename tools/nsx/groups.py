@@ -268,6 +268,15 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
     def code(v: Any) -> str:
         return f"`{v}`"
 
+    def label(r: Dict[str, Any]) -> str:
+        """Group cell: display name first (the GUI identity), id in backticks
+        when it differs; GUI-created groups get a UUID id but a readable name."""
+        gid = r.get("id")
+        name = r.get("display_name")
+        if name and name != gid:
+            return f"{name} ({code(gid)})"
+        return code(gid)
+
     def vals(items: List[str], cap: int = 8) -> str:
         if not items:
             return ""
@@ -311,6 +320,7 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
     L.append(f"| Groups | {t['files_seen']} seen: {t['ok']} written, {t.get('dry_run', 0)} dry-run, "
              f"{t['skipped']} skipped ({t.get('csv_no_change_skipped', 0)} no-change), {t['failed']} failed |")
     L.append(f"| IPs {'added' if apply_mode else 'to add'} | {ips_added_total} (removed: {t.get('total_ips_removed', 0)}) |")
+    L.append(f"| Already remapped | {t.get('csv_already_mapped_pairs', 0)} pair(s) detected |")
     L.append(f"| Additive-only contract | **{contract}** |")
     L.append(f"| **Result** | **{result}** |")
     L.append("")
@@ -325,49 +335,82 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
         L.append("|---|---|---|---:|---|")
         for r in changed:
             added = r.get("ips_added") if apply_mode else r.get("csv_added_values", [])
-            L.append(f"| {code(r.get('id'))} | {r.get('group_type', '')} | {vals(added)} "
+            L.append(f"| {label(r)} | {r.get('group_type', '')} | {vals(added)} "
                      f"| {len(added)} | {r.get('status')} |")
     else:
         L.append("None. Every mapped value the CSV calls for is already present.")
     L.append("")
 
+    sec = 2
+    already = [(r, p) for r in rows for p in r.get("csv_already_mapped", [])]
+    L.append(f"## {sec}. Already remapped, detected ({len(already)} pairs in "
+             f"{len({r.get('id') for r, _ in already})} groups)")
+    sec += 1
+    L.append("")
+    if already:
+        L.append("Both the original and its mapped value are present: completed by an "
+                 "earlier run, or already satisfied. Nothing is sent for these.")
+        L.append("")
+        L.append("| Group | Type | Original | Mapped (present) | CSV row |")
+        L.append("|---|---|---|---|---:|")
+        for r, p in already:
+            L.append(f"| {label(r)} | {r.get('group_type', '')} | {code(p['original'])} "
+                     f"| {code(p['mapped'])} | {p['csv_row']} |")
+    else:
+        L.append("None detected.")
+    L.append("")
+
     if failures:
-        L.append(f"## 2. Failures ({len(failures)})")
+        L.append(f"## {sec}. Failures ({len(failures)})")
+        sec += 1
         L.append("")
         L.append("| Group | Status | Error |")
         L.append("|---|---|---|")
         for r in failures:
-            L.append(f"| {code(r.get('id'))} | {r.get('status')} | {str(r.get('error', ''))[:140]} |")
+            L.append(f"| {label(r)} | {r.get('status')} | {str(r.get('error', ''))[:140]} |")
         L.append("")
 
-    L.append(f"## {'3' if failures else '2'}. Left alone")
+    L.append(f"## {sec}. Left alone")
     L.append("")
     if no_change:
         L.append(f"**No changes needed ({len(no_change)}):** nothing sent to NSX for "
-                 + ", ".join(code(r.get("id")) for r in no_change) + ".")
+                 + ", ".join(label(r) for r in no_change) + ".")
         L.append("")
     if generic_skipped:
-        L.append(f"**Generic groups, out of scope ({len(generic_skipped)}):** "
-                 + ", ".join(code(r.get("id")) for r in generic_skipped)
-                 + ". Use `--remap-generic` to include them.")
-        L.append("")
-    by_design = [(r.get("id"), s) for r in rows for s in r.get("csv_skipped_values", [])]
+        with_candidates = [r for r in generic_skipped if r.get("csv_generic_candidate_values")]
+        without = [r for r in generic_skipped if not r.get("csv_generic_candidate_values")]
+        if with_candidates:
+            n_vals = sum(len(r["csv_generic_candidate_values"]) for r in with_candidates)
+            L.append(f"**Generic groups the CSV covers ({len(with_candidates)} groups, {n_vals} values):** "
+                     "out of scope for this run; a `--remap-generic` push would add:")
+            L.append("")
+            L.append("| Group | Would add with --remap-generic | Count |")
+            L.append("|---|---|---:|")
+            for r in with_candidates:
+                cand = r["csv_generic_candidate_values"]
+                L.append(f"| {label(r)} | {vals(cand)} | {len(cand)} |")
+            L.append("")
+        if without:
+            L.append(f"**Generic groups, out of scope, nothing to map ({len(without)}):** "
+                     + ", ".join(label(r) for r in without) + ".")
+            L.append("")
+    by_design = [(r, s) for r in rows for s in r.get("csv_skipped_values", [])]
     if by_design:
         L.append("**Never remapped by design:**")
         L.append("")
         L.append("| Group | Entry | Reason |")
         L.append("|---|---|---|")
-        for gid, s in by_design:
-            L.append(f"| {code(gid)} | {code(s['value'])} | {s['reason']} |")
+        for r, s in by_design:
+            L.append(f"| {label(r)} | {code(s['value'])} | {s['reason']} |")
         L.append("")
-    uncovered = [(r.get("id"), r.get("csv_unmapped_values")) for r in rows if r.get("csv_unmapped_values")]
+    uncovered = [(r, r.get("csv_unmapped_values")) for r in rows if r.get("csv_unmapped_values")]
     if uncovered:
         L.append("**IPv4 entries no CSV row covers:**")
         L.append("")
         L.append("| Group | Entries |")
         L.append("|---|---|")
-        for gid, u in uncovered:
-            L.append(f"| {code(gid)} | {vals(u)} |")
+        for r, u in uncovered:
+            L.append(f"| {label(r)} | {vals(u)} |")
         L.append("")
 
     decisions = summary.get("interactive_decisions") or []
@@ -1000,6 +1043,8 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_csv_added = 0
     total_csv_skipped = 0
     total_csv_generic_skipped = 0
+    total_csv_generic_candidates = 0
+    total_csv_already_mapped = 0
     total_csv_no_change = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
@@ -1038,9 +1083,24 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row["csv_changed"] = False
                 row["csv_remap_skipped"] = "generic_group"
                 total_csv_generic_skipped += 1
-                log.info("[%d/%d] %s: generic group, CSV remap not applied "
-                         "(default remaps IP-Addresses-Only groups; use --remap-generic to include it)",
-                         i, len(files), gid)
+                # Analysis only: compute what --remap-generic WOULD add to this
+                # group so the report can surface it. The payload is untouched.
+                _, gen_report = _csv_remap_group(group=obj, mapping=csv_mapping, mapped_only=False)
+                if gen_report.get("already_mapped"):
+                    row["csv_already_mapped"] = gen_report["already_mapped"]
+                    total_csv_already_mapped += len(gen_report["already_mapped"])
+                gen_candidates = gen_report.get("added_values") or []
+                if gen_candidates:
+                    row["csv_generic_candidate_values"] = gen_candidates
+                    total_csv_generic_candidates += len(gen_candidates)
+                    log.info("[%d/%d] %s: generic group, CSV remap not applied; "
+                             "--remap-generic would add %d value(s): %s",
+                             i, len(files), gid, len(gen_candidates),
+                             _format_entries(gen_candidates))
+                else:
+                    log.info("[%d/%d] %s: generic group, CSV remap not applied "
+                             "(default remaps IP-Addresses-Only groups; use --remap-generic to include it)",
+                             i, len(files), gid)
             if csv_remap_applies:
                 updated, csv_report = _csv_remap_group(
                     group=obj,
@@ -1056,6 +1116,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                     total_csv_added += csv_added_count
                 row["csv_changed"] = csv_changed
                 row["csv_added_count"] = csv_added_count
+                if csv_report.get("already_mapped"):
+                    row["csv_already_mapped"] = csv_report["already_mapped"]
+                    total_csv_already_mapped += len(csv_report["already_mapped"])
                 # Ranges and IPv6 are never remapped (by design); record them so
                 # the operator can see exactly which entries were left as-is.
                 csv_skipped = csv_report.get("skipped_values") or []
@@ -1389,6 +1452,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             "csv_total_added_values": total_csv_added,
             "csv_total_skipped_values": total_csv_skipped,
             "csv_generic_groups_skipped": total_csv_generic_skipped,
+            "csv_generic_candidate_values": total_csv_generic_candidates,
+            "csv_already_mapped_pairs": total_csv_already_mapped,
             "csv_no_change_skipped": total_csv_no_change,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,

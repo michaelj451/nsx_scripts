@@ -533,6 +533,7 @@ def _remap_group_payload(
         "timestamp": _utc_now_iso(),
         "matched_values": [],
         "added_values": [],
+        "already_mapped": [],     # {original, mapped, csv_row}: pair complete before this run
         "skipped_values": [],     # ranges / IPv6 / junk left untouched, with reason
         "unmapped_values": [],    # valid IPv4 tokens no CSV row covers
         "mapping_hits": [],
@@ -579,6 +580,13 @@ def _remap_group_payload(
 
             matched_here.append(value)
             report["matched_values"].append(value)
+
+            # Detect pairs that were completed by an earlier run (or were
+            # always present): the mapped value already exists in the group.
+            if mapping_row and _canonical_ip_token(mapped_values[0]) in existing_canon:
+                pair = {"original": value, "mapped": mapped_values[0], "csv_row": mapping_row["row"]}
+                if pair not in report["already_mapped"]:
+                    report["already_mapped"].append(pair)
 
             if mapping_row:
                 report["mapping_hits"].append({

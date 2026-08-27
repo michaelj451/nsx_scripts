@@ -312,15 +312,22 @@ class GroupsPushHelpersTests(unittest.TestCase):
              "csv_added_count": 2, "csv_added_values": ["10.7.0.1", "10.7.0.2"],
              "ips_added": ["10.7.0.1", "10.7.0.2"],
              "csv_skipped_values": [{"value": "10.6.0.1-10.6.0.2", "reason": "range", "expression_index": 0}]},
-            {"id": "steady", "group_type": "ip-only", "status": "skipped_no_change"},
+            {"id": "steady", "group_type": "ip-only", "status": "skipped_no_change",
+             "csv_already_mapped": [{"original": "10.6.0.5", "mapped": "10.7.0.5", "csv_row": 2}]},
             {"id": "gen", "group_type": "generic", "status": "dry_run", "csv_remap_skipped": "generic_group",
+             "csv_generic_candidate_values": ["10.7.5.0/24"],
              "csv_unmapped_values": ["1.2.3.4"]},
+            {"id": "gen-plain", "group_type": "generic", "status": "dry_run",
+             "csv_remap_skipped": "generic_group"},
         ]
         out = Path(tempfile.mkdtemp())
         path = groups._write_remap_markdown(out, summary, rows)
         md = path.read_text()
         for expected in ("# CSV IP remap dry-run: nsx-lm3", "Would add", "`10.7.0.1`",
-                         "No changes needed (1)", "`steady`", "Generic groups, out of scope (1)",
+                         "No changes needed (1)", "`steady`",
+                         "Already remapped, detected (1 pairs in 1 groups)", "`10.7.0.5`",
+                         "Generic groups the CSV covers (1 groups, 1 values)", "`10.7.5.0/24`",
+                         "Generic groups, out of scope, nothing to map (1)", "`gen-plain`",
                          "Never remapped by design", "range", "no CSV row covers", "`1.2.3.4`",
                          "Confidence ramp", "1 -> 25", "**pass**"):
             self.assertIn(expected, md)
@@ -343,8 +350,8 @@ class GroupsPushHelpersTests(unittest.TestCase):
                        "interactive_batch_size_final": 0, "interactive_exit_requested": False},
         }
         rows = [
-            {"id": "written", "group_type": "ip-only", "status": "success_patch",
-             "csv_changed": True, "csv_added_count": 1,
+            {"id": "written", "display_name": "written-friendly", "group_type": "ip-only",
+             "status": "success_patch", "csv_changed": True, "csv_added_count": 1,
              "csv_added_values": ["10.7.0.9"], "ips_added": ["10.7.0.9"]},
             {"id": "stale-bundle", "group_type": "ip-only", "status": "skipped_no_change",
              "csv_changed": True, "csv_added_count": 2,
@@ -353,7 +360,7 @@ class GroupsPushHelpersTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp())
         md = groups._write_remap_markdown(out, summary, rows).read_text()
         self.assertIn("## 1. Added (1 IPs in 1 groups)", md)
-        self.assertIn("`written`", md)
+        self.assertIn("written-friendly (`written`)", md)
         self.assertIn("No changes needed (1)", md)
         self.assertIn("`stale-bundle`", md)
         self.assertNotIn("| `stale-bundle` | ip-only |", md)   # not in the Added table
