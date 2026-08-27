@@ -258,6 +258,21 @@ def pull_groups_with_members(
     groups_by_path: Dict[str, Dict[str, Any]] = {}
     group_to_members: Dict[str, Set[str]] = {}
     member_meta: Dict[str, Dict[str, Any]] = {}
+    site_fail_counts: Dict[str, int] = {}
+    site_first_error: Dict[str, str] = {}
+    benign_skips = 0   # cross-site NOT_FOUND: group not realized at that site
+
+    def _eps_for_domain(domain_id: str) -> Dict[str, str]:
+        """Location-scoped domains (domain id == a site id) exist only at
+        their own site; querying other sites' enforcement points is a
+        guaranteed NOT_FOUND. Global domains fan out to every site."""
+        if gm_site_eps and domain_id in gm_site_eps:
+            return {domain_id: gm_site_eps[domain_id]}
+        return gm_site_eps or {}
+
+    def _is_not_found(exc: Exception) -> bool:
+        s = str(exc)
+        return "could not be found" in s.lower() or "NOT_FOUND" in s or " 600]" in s
 
     for domain_id in domain_ids:
         try:
@@ -285,18 +300,28 @@ def pull_groups_with_members(
                 "/members/virtual-machines"
             )
             if gm_site_eps:
-                # Federated: one GM-proxied call per site, unioned.
-                for site_id, ep in gm_site_eps.items():
+                # Federated: one GM-proxied call per relevant site, unioned.
+                for site_id, ep in _eps_for_domain(domain_id).items():
                     try:
                         r = client._get(members_path, params={
                             "enforcement_point_path": ep, "page_size": 1000,
                         })
                         members = r.get("results") or []
                     except Exception as exc:
-                        log.warning(
-                            "site=%s group=%s/%s member-fetch via GM failed: %s",
-                            site_id, domain_id, gid, exc,
-                        )
+                        if _is_not_found(exc):
+                            # Group not realized at this site: benign in
+                            # federated setups with location-scoped spans.
+                            benign_skips += 1
+                            log.debug("site=%s group=%s/%s not realized there (skipped)",
+                                      site_id, domain_id, gid)
+                            continue
+                        site_fail_counts[site_id] = site_fail_counts.get(site_id, 0) + 1
+                        site_first_error.setdefault(site_id, f"group {domain_id}/{gid}: {exc}")
+                        if site_fail_counts[site_id] <= 3:
+                            log.warning(
+                                "site=%s group=%s/%s member-fetch via GM failed: %s",
+                                site_id, domain_id, gid, exc,
+                            )
                         continue
                     for m in members:
                         mid = NsxPolicyClient._extract_vm_id_from_member(m)
@@ -334,6 +359,24 @@ def pull_groups_with_members(
                          i, len(groups), domain_id)
     log.info("Groups indexed: %d across %d domain(s)",
              len(groups_by_path), len(domain_ids))
+    if benign_skips:
+        log.info("Cross-site lookups skipped as not-realized-at-site (benign): %d",
+                 benign_skips)
+    total_groups = len(groups_by_path)
+    for site_id, fails in site_fail_counts.items():
+        if fails >= total_groups and total_groups:
+            log.error(
+                "site=%s: member fetch failed for ALL %d group(s). The GM could "
+                "not proxy to this site (site disconnected from GM, wrong "
+                "enforcement point, or GM version without proxy support). "
+                "First error: %s",
+                site_id, fails, site_first_error.get(site_id, "?"),
+            )
+        elif fails:
+            log.warning("site=%s: member fetch failed for %d/%d group(s); "
+                        "first error: %s",
+                        site_id, fails, total_groups,
+                        site_first_error.get(site_id, "?"))
     return groups_by_path, group_to_members, member_meta
 
 
@@ -376,14 +419,21 @@ def pull_group_ip_memberships(
             f"/domains/{client._q(domain_id)}/groups/{client._q(gid)}/members/ip-addresses"
         )
         if gm_site_eps:
+            eps = ({domain_id: gm_site_eps[domain_id]}
+                   if domain_id in gm_site_eps else gm_site_eps)
             param_sets = [(sid, {"enforcement_point_path": ep, "page_size": 1000})
-                          for sid, ep in gm_site_eps.items()]
+                          for sid, ep in eps.items()]
         else:
             param_sets = [("(single)", {"page_size": 1000})]
         for label, params in param_sets:
             try:
                 r = client._get(path, params=params)
             except Exception as exc:
+                s = str(exc)
+                if "could not be found" in s.lower() or "NOT_FOUND" in s:
+                    log.debug("group=%s/%s (%s): not realized there (skipped)",
+                              domain_id, gid, label)
+                    continue
                 log.warning("group=%s/%s (%s): /members/ip-addresses failed: %s",
                             domain_id, gid, label, exc)
                 continue
@@ -872,9 +922,26 @@ def main() -> None:
             if not sid:
                 continue
             site_display[sid] = s.get("display_name") or sid
-            gm_site_eps[sid] = (
+            # Discover the site's enforcement point instead of assuming its id
+            # is "default" (real deployments and UUID site ids can differ).
+            ep_path = None
+            try:
+                r = client._get(client.POLICY_ROOT
+                                + f"/sites/{client._q(sid)}/enforcement-points")
+                eps = r.get("results") or []
+                if eps:
+                    ep_path = eps[0].get("path")
+                    if len(eps) > 1:
+                        log.info("site %s has %d enforcement points; using %s",
+                                 sid, len(eps), ep_path)
+            except Exception as exc:
+                log.warning("site %s: enforcement-point discovery failed (%s); "
+                            "assuming .../enforcement-points/default",
+                            sid, str(exc)[:100])
+            gm_site_eps[sid] = ep_path or (
                 f"/global-infra/sites/{sid}/enforcement-points/default"
             )
+            log.info("  site %s -> enforcement point %s", sid, gm_site_eps[sid])
 
         vms: List[Dict[str, Any]] = []
         if args.with_vm_inventory:
