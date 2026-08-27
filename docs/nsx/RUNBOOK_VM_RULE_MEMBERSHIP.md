@@ -72,20 +72,26 @@ python tools/reports/report_vms_in_rules.py --manager nsx-lm1 --overwrite
 
 ### GM (federated) mode - one report across all sites
 
-Point at a GM with `--federation-global` and the tool will:
+Point at a GM with `--federation-global` and the tool talks to the GM ONLY:
 
 1. Discover federation sites from GM (`/global-manager/api/v1/global-infra/sites`).
-2. For each site, connect directly to the LM to pull fabric VM inventory
-   (fabric API is LM-only, one client per site with `federation_global=False`).
-3. Pull federated groups from GM.
-4. For each group, UNION its members across every site (one live
-   `/members/virtual-machines` per site per group, using `federation_global=True`
-   clients). This works around the known GM member endpoint returning 400
-   without an enforcement point.
+2. Pull federated groups from GM.
+3. For each group, UNION its members across every site with one GM-proxied
+   call per site per group: `/members/virtual-machines` (and
+   `/members/ip-addresses`) with `?enforcement_point_path=/global-infra/sites/
+   <site>/enforcement-points/default`. A bare GM member call returns 400; the
+   enforcement-point form is proxied by the GM to each site, so NO direct LM
+   connections are needed.
+4. Build the VM universe (names, ids, tags, site) from those member objects,
+   so name matching works without fabric inventory.
 5. Pull federated rules from GM.
 6. Correlate and emit ONE report showing per-VM which site it lives on
-   (new `Site` column in the matched-VMs table) and which federated rules
-   touch it.
+   (`Site` column) and which federated rules touch it.
+
+Optional: `--with-vm-inventory` ALSO connects directly to each site LM for
+fabric VM inventory, which enriches the report with VM IP addresses.
+Unreachable LMs are warnings, never fatal (targets with explicit IPs in the
+list keep their IPs either way).
 
 ```bash
 python tools/reports/report_vms_in_rules.py \
@@ -93,9 +99,9 @@ python tools/reports/report_vms_in_rules.py \
   --federation-global
 ```
 
-Requires that each federated site's ID resolves to a reachable LM hostname
-(same convention `report_groups_usage.py` uses). Sites that fail to connect
-are logged with a WARN and their VMs won't appear in the report.
+LM reachability is only needed with `--with-vm-inventory` (each site ID must
+then resolve to a reachable LM hostname). Without it, the report is complete
+minus fabric-sourced VM IPs.
 
 ## Step 3: Read the report
 
