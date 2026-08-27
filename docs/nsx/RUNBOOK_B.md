@@ -238,7 +238,8 @@ Each batch printout shows one line per applied group:
 Notes:
 - The diff is computed against the auto-captured baseline (state of each group BEFORE the push), so `added=` is exactly what NSX received that wasn't there before.
 - If stdin is not a TTY (piped/non-interactive shell), prompts auto-approve at the current batch size to keep CI/test runs unblocked.
-- The push summary records `interactive_mode`, `interactive_batch_size_initial`, `interactive_batch_size_final`, and `interactive_exit_requested` so the audit trail captures what happened.
+- The push summary records `interactive_mode`, `interactive_batch_size_initial`, `interactive_batch_size_final`, and `interactive_exit_requested`, plus `interactive_decisions`: the full confidence-ramp history, one record per prompt (`approve` / `resize` / `reset_to_1` / `exit` / `auto_approve_non_tty`, each with UTC timestamp, applied count, and batch size before/after). The same decisions are written to the run log, including the prompt text itself.
+- Re-runs are zero-impact: a group whose diff shows nothing to add is `skipped_no_change` and **no API write is sent at all** (no PUT, no `_revision` bump, no realization cycle). Running the workflow 50 times yields one run of additions and 49 runs of pure GETs; `summary.json` counts these under `csv_no_change_skipped`.
 
 Example:
 

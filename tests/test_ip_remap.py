@@ -258,6 +258,39 @@ class GroupsPushHelpersTests(unittest.TestCase):
     def test_add_mapped_segments_mode_is_gone(self):
         self.assertFalse(hasattr(groups, "_add_mapped_segment_cidrs_in_expression"))
 
+    def test_batch_prompt_records_every_decision(self):
+        """Confidence-ramp history: approve, resize up, reset to 1, exit are all
+        captured for summary.json, and the returned batch sizes match."""
+        import builtins
+        answers = iter(["", "25", "n", "x"])
+        original_input = builtins.input
+        builtins.input = lambda *_: next(answers)
+        try:
+            decisions = []
+            self.assertEqual(groups._prompt_batch_continue(1, 1, decisions), 1)    # approve
+            self.assertEqual(groups._prompt_batch_continue(1, 1, decisions), 25)   # ramp up
+            self.assertEqual(groups._prompt_batch_continue(25, 25, decisions), 1)  # back off
+            with self.assertRaises(groups._InteractiveExit):
+                groups._prompt_batch_continue(1, 1, decisions)                     # stop
+        finally:
+            builtins.input = original_input
+        self.assertEqual([d["decision"] for d in decisions], ["approve", "resize", "reset_to_1", "exit"])
+        self.assertEqual([(d["batch_size_before"], d["batch_size_after"]) for d in decisions],
+                         [(1, 1), (1, 25), (25, 1), (1, 1)])
+        self.assertTrue(all("ts" in d and "applied_count" in d for d in decisions))
+
+    def test_batch_prompt_non_tty_auto_approves_and_records(self):
+        import builtins
+        def raise_eof(*_): raise EOFError
+        original_input = builtins.input
+        builtins.input = raise_eof
+        try:
+            decisions = []
+            self.assertEqual(groups._prompt_batch_continue(5, 10, decisions), 10)
+        finally:
+            builtins.input = original_input
+        self.assertEqual(decisions[0]["decision"], "auto_approve_non_tty")
+
 
 if __name__ == "__main__":
     unittest.main()

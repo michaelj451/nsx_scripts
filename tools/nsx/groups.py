@@ -60,7 +60,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -259,9 +259,24 @@ class _InteractiveExit(Exception):
     """Signals operator chose to exit the interactive batch loop cleanly."""
 
 
-def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
+def _record_decision(decisions: Optional[List[Dict[str, Any]]], applied_count: int,
+                     decision: str, before: int, after: int) -> None:
+    if decisions is None:
+        return
+    decisions.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "applied_count": applied_count,
+        "decision": decision,
+        "batch_size_before": before,
+        "batch_size_after": after,
+    })
+
+
+def _prompt_batch_continue(applied_count: int, current_batch_size: int,
+                           decisions: Optional[List[Dict[str, Any]]] = None) -> int:
     """Prompt after a batch of applied group updates. Returns the batch size
-    to use for the next batch.
+    to use for the next batch. Every operator decision is logged AND appended
+    to `decisions` so summary.json carries the full confidence-ramp history.
 
     Allowed responses:
       y / yes / <Enter>  -> continue at current batch size
@@ -269,31 +284,39 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
       <positive number>  -> continue at that new batch size
       x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
     """
+    prompt_text = (f"Applied {applied_count} group update(s). "
+                   f"Continue with current batch_size={current_batch_size}? "
+                   f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: ")
     while True:
+        # Log the prompt itself so the log file has context for the response.
+        log.info("PROMPT: %s", prompt_text.strip())
         try:
-            answer = input(
-                f"\nApplied {applied_count} group update(s). "
-                f"Continue with current batch_size={current_batch_size}? "
-                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
-            ).strip().lower()
+            answer = input(f"\n{prompt_text}").strip().lower()
         except EOFError:
-            # Non-interactive stdin (piped, no TTY) — treat as auto-approve
+            # Non-interactive stdin (piped, no TTY): treat as auto-approve
             log.warning("Non-interactive stdin at batch boundary; auto-approving (batch_size=%d).",
                         current_batch_size)
+            _record_decision(decisions, applied_count, "auto_approve_non_tty",
+                             current_batch_size, current_batch_size)
             return current_batch_size
 
         if answer in ("", "y", "yes"):
             log.info("Operator approved batch (continue at batch_size=%d) after %d applied update(s).",
                      current_batch_size, applied_count)
+            _record_decision(decisions, applied_count, "approve",
+                             current_batch_size, current_batch_size)
             return current_batch_size
 
         if answer in ("n", "no"):
             log.warning("Operator chose RESET-TO-1 after %d applied update(s) "
                         "(was batch_size=%d).", applied_count, current_batch_size)
+            _record_decision(decisions, applied_count, "reset_to_1", current_batch_size, 1)
             return 1
 
         if answer in ("x", "exit", "quit", "q"):
             log.warning("Operator chose EXIT after %d applied update(s).", applied_count)
+            _record_decision(decisions, applied_count, "exit",
+                             current_batch_size, current_batch_size)
             raise _InteractiveExit(f"Stopped by operator after {applied_count} update(s).")
 
         try:
@@ -303,6 +326,7 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
                 continue
             log.info("Operator changed batch_size from %d to %d after %d applied update(s).",
                      current_batch_size, new_value, applied_count)
+            _record_decision(decisions, applied_count, "resize", current_batch_size, new_value)
             return new_value
         except ValueError:
             print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
@@ -821,6 +845,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     applied_in_batch = 0
     batch_summary_rows: List[Dict[str, Any]] = []  # rows collected since last prompt
     interactive_exit_requested = False
+    interactive_decisions: List[Dict[str, Any]] = []   # full confidence-ramp history for summary.json
     if interactive_mode:
         log.info("=" * 60)
         log.info("INTERACTIVE MODE — batch_size=%d. Will prompt after every %d applied update(s).",
@@ -840,6 +865,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_csv_added = 0
     total_csv_skipped = 0
     total_csv_generic_skipped = 0
+    total_csv_no_change = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
 
@@ -1016,6 +1042,22 @@ def cmd_push(args: argparse.Namespace) -> int:
                 log.warning("[%d/%d] %s — INTENTIONAL IP REMOVAL: %d IP(s) %s",
                             i, len(files), gid, len(ips_removed), ips_removed)
 
+            # --- ZERO-IMPACT RERUN GUARD (CSV remap) -------------------------
+            # The remap contract is "idempotently ADD IPs". When the diff
+            # against the live baseline shows nothing to add (removals were
+            # already refused above), this push has nothing to change: skip
+            # the API write entirely. No PUT means no _revision bump and no
+            # realization cycle, so re-running the workflow any number of
+            # times leaves zero footprint on the manager.
+            if csv_mapping is not None and gid in baseline_dict and not ips_added:
+                row["status"] = "skipped_no_change"
+                skipped += 1
+                total_csv_no_change += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: no IP additions needed; nothing sent to NSX",
+                         i, len(files), ok, failed, skipped, gid)
+                rows.append(row)
+                continue
+
             try:
                 client.put_group(gid, obj, domain_id=args.domain_id)
                 row["status"] = "success_put"
@@ -1060,7 +1102,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                                  j, str(br.get("id"))[:40], br.get("status"), delta, added, notes_str)
                     log.info("=" * 60)
                     try:
-                        batch_size = _prompt_batch_continue(applied_in_batch, batch_size)
+                        batch_size = _prompt_batch_continue(applied_in_batch, batch_size,
+                                                            interactive_decisions)
                     except _InteractiveExit:
                         interactive_exit_requested = True
                         rows.append(row)
@@ -1209,6 +1252,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "csv_total_added_values": total_csv_added,
             "csv_total_skipped_values": total_csv_skipped,
             "csv_generic_groups_skipped": total_csv_generic_skipped,
+            "csv_no_change_skipped": total_csv_no_change,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
             "interactive_mode":          interactive_mode,
@@ -1216,6 +1260,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             "interactive_batch_size_final":   batch_size if interactive_mode else 0,
             "interactive_exit_requested":     interactive_exit_requested,
         },
+        "interactive_decisions": interactive_decisions,
         "baseline_file": str(baseline_path) if baseline_path else None,
         "pushed_ids_file": str(_pushed_ids_path(baseline_path)) if baseline_path else None,
         "pushed_ids_count": len(pushed_ids),

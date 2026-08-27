@@ -30,6 +30,7 @@ a matching revert.
 | Single-capture clone + WF-D | [RUNBOOK_FROM_CAPTURE.md](nsx/RUNBOOK_FROM_CAPTURE.md) | included | [ps](nsx/RUNBOOK_FROM_CAPTURE_PS.md) | One capture, then run everything else off it |
 | Selective category copy | [RUNBOOK_FILTER_COPY.md](nsx/RUNBOOK_FILTER_COPY.md) | included | [ps](nsx/RUNBOOK_FILTER_COPY_PS.md) | Copy chosen DFW policies plus only their transitive dependencies |
 | Services only | [RUNBOOK_SERVICES.md](nsx/RUNBOOK_SERVICES.md) | included | included | Export / push / revert customer services alone |
+| GM to LM copy | `tools/nsx/transform_gm_export_to_lm.py` | tool docstring | n/a | Rewrite a Global Manager export's `/global-infra/` refs (and optionally the domain) so the standard Workflow A pushes land it on a Local Manager |
 
 ## Backup (separate from capture on purpose)
 
