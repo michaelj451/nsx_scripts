@@ -275,7 +275,16 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
         extra = len(items) - cap
         return shown + (f", +{extra} more" if extra > 0 else "")
 
-    changed = [r for r in rows if r.get("csv_changed")]
+    if apply_mode:
+        # Only rows actually written count as changes. A row the CSV transform
+        # touched but the live diff found already satisfied is a no-change row
+        # (common when the capture bundle is older than a previous apply).
+        changed = [r for r in rows
+                   if str(r.get("status", "")).startswith("success") and r.get("ips_added")]
+        ips_added_total = sum(len(r.get("ips_added") or []) for r in changed)
+    else:
+        changed = [r for r in rows if r.get("csv_changed")]
+        ips_added_total = t.get("csv_total_added_values", 0)
     no_change = [r for r in rows if r.get("status") == "skipped_no_change"]
     generic_skipped = [r for r in rows if r.get("csv_remap_skipped") == "generic_group"]
     failures = [r for r in rows if str(r.get("status", "")).startswith("failed")]
@@ -301,7 +310,7 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
                  f"{'; operator exited early' if t.get('interactive_exit_requested') else ''} |")
     L.append(f"| Groups | {t['files_seen']} seen: {t['ok']} written, {t.get('dry_run', 0)} dry-run, "
              f"{t['skipped']} skipped ({t.get('csv_no_change_skipped', 0)} no-change), {t['failed']} failed |")
-    L.append(f"| IPs added | {t['csv_total_added_values']} (removed: {t.get('total_ips_removed', 0)}) |")
+    L.append(f"| IPs {'added' if apply_mode else 'to add'} | {ips_added_total} (removed: {t.get('total_ips_removed', 0)}) |")
     L.append(f"| Additive-only contract | **{contract}** |")
     L.append(f"| **Result** | **{result}** |")
     L.append("")
@@ -309,15 +318,15 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
              "push when nothing is left to add sends no API writes at all.")
     L.append("")
 
-    L.append(f"## 1. {verb} ({t['csv_total_added_values']} IPs in {len(changed)} groups)")
+    L.append(f"## 1. {verb} ({ips_added_total} IPs in {len(changed)} groups)")
     L.append("")
     if changed:
         L.append(f"| Group | Type | {verb} | Count | Status |")
         L.append("|---|---|---|---:|---|")
         for r in changed:
-            added = r.get("ips_added") if apply_mode and r.get("ips_added") is not None else r.get("csv_added_values", [])
+            added = r.get("ips_added") if apply_mode else r.get("csv_added_values", [])
             L.append(f"| {code(r.get('id'))} | {r.get('group_type', '')} | {vals(added)} "
-                     f"| {r.get('csv_added_count', 0)} | {r.get('status')} |")
+                     f"| {len(added)} | {r.get('status')} |")
     else:
         L.append("None. Every mapped value the CSV calls for is already present.")
     L.append("")
@@ -372,8 +381,12 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
                      f"| {d['batch_size_before']} -> {d['batch_size_after']} |")
         L.append("")
 
+    text = align_markdown_tables("\n".join(L)) + "\n"
+    # Latest report at a stable name, plus a timestamped copy so re-runs into
+    # the same reports dir never erase a prior run's report.
     path = reports_dir / "remap_report.md"
-    path.write_text(align_markdown_tables("\n".join(L)) + "\n", encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+    (reports_dir / f"remap_report_{RUN_TS}.md").write_text(text, encoding="utf-8")
     return path
 
 

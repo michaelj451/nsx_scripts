@@ -326,6 +326,40 @@ class GroupsPushHelpersTests(unittest.TestCase):
             self.assertIn(expected, md)
         self.assertNotIn(chr(0x2014), md)
 
+    def test_remap_markdown_apply_counts_only_written_rows(self):
+        """A csv_changed row the live diff found already satisfied must land
+        under no-changes, not under Added; the Added count comes from what
+        was actually written."""
+        import tempfile
+        summary = {
+            "mode": "APPLY", "ran_at": "2026-08-27T00:00:00+00:00",
+            "target": {"alias": "nsx-lm3", "host": "h", "domain_id": "default"},
+            "groups_dir": "/g", "csv_remap": "/m.csv", "csv_invalid_rows": [],
+            "csv_remap_scope": "ip_only_groups", "interactive_decisions": [],
+            "totals": {"files_seen": 2, "ok": 1, "failed": 0, "skipped": 1, "dry_run": 0,
+                       "csv_no_change_skipped": 1, "csv_total_added_values": 3,
+                       "total_ips_removed": 0, "additive_only_contract": "pass",
+                       "interactive_mode": False, "interactive_batch_size_initial": 0,
+                       "interactive_batch_size_final": 0, "interactive_exit_requested": False},
+        }
+        rows = [
+            {"id": "written", "group_type": "ip-only", "status": "success_patch",
+             "csv_changed": True, "csv_added_count": 1,
+             "csv_added_values": ["10.7.0.9"], "ips_added": ["10.7.0.9"]},
+            {"id": "stale-bundle", "group_type": "ip-only", "status": "skipped_no_change",
+             "csv_changed": True, "csv_added_count": 2,
+             "csv_added_values": ["10.7.0.1", "10.7.0.2"], "ips_added": []},
+        ]
+        out = Path(tempfile.mkdtemp())
+        md = groups._write_remap_markdown(out, summary, rows).read_text()
+        self.assertIn("## 1. Added (1 IPs in 1 groups)", md)
+        self.assertIn("`written`", md)
+        self.assertIn("No changes needed (1)", md)
+        self.assertIn("`stale-bundle`", md)
+        self.assertNotIn("| `stale-bundle` | ip-only |", md)   # not in the Added table
+        self.assertTrue((out / "remap_report.md").exists())
+        self.assertEqual(len(list(out.glob("remap_report_*.md"))), 1)
+
     def test_batch_prompt_non_tty_auto_approves_and_records(self):
         import builtins
         def raise_eof(*_): raise EOFError
