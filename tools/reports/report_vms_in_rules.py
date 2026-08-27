@@ -236,23 +236,28 @@ def build_vm_index(vms: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]]
 def pull_groups_with_members(
     client: NsxPolicyClient,
     domain_ids: List[str],
-    site_clients_for_members: Optional[Dict[str, NsxPolicyClient]] = None,
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Set[str]]]:
+    gm_site_eps: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Set[str]], Dict[str, Dict[str, Any]]]:
     """
     For every group in every domain, fetch live VM members via
     /members/virtual-machines. Returns:
       groups_by_path: group_path -> {id, display_name, domain_id, member_count}
       group_to_members: group_path -> set(external_id)
+      member_meta: external_id -> {display_name, site_id, tags} harvested from
+        the member objects themselves (the GM-only VM universe).
 
-    If `site_clients_for_members` is provided (GM federation mode), member
-    lookups fan out to EACH site's LM (using federation_global=True clients)
-    and are UNIONed per group, because a GM's /members endpoint returns 400
-    without an enforcement point. Otherwise the single `client` is used.
+    If `gm_site_eps` is provided (GM federation mode: site_id -> enforcement
+    point path), member lookups go THROUGH THE GM with an
+    `enforcement_point_path` query parameter, one call per site per group, and
+    are UNIONed. No direct LM connections are made: a bare GM /members call
+    returns 400, but the enforcement-point form is proxied by the GM to each
+    site. Otherwise the single `client` is queried directly (LM mode).
 
     Errors on a single group are logged and skipped (empty member set).
     """
     groups_by_path: Dict[str, Dict[str, Any]] = {}
     group_to_members: Dict[str, Set[str]] = {}
+    member_meta: Dict[str, Dict[str, Any]] = {}
 
     for domain_id in domain_ids:
         try:
@@ -275,16 +280,21 @@ def pull_groups_with_members(
                 "path": gpath,
             }
             ext_ids: Set[str] = set()
-            if site_clients_for_members:
-                # Federated: union members across sites
-                for site_id, site_client in site_clients_for_members.items():
+            members_path = client._policy_path(
+                f"/domains/{client._q(domain_id)}/groups/{client._q(gid)}"
+                "/members/virtual-machines"
+            )
+            if gm_site_eps:
+                # Federated: one GM-proxied call per site, unioned.
+                for site_id, ep in gm_site_eps.items():
                     try:
-                        members = site_client.list_policy_group_member_vms(
-                            group_id=gid, domain_id=domain_id
-                        )
+                        r = client._get(members_path, params={
+                            "enforcement_point_path": ep, "page_size": 1000,
+                        })
+                        members = r.get("results") or []
                     except Exception as exc:
                         log.warning(
-                            "site=%s group=%s/%s member-fetch failed: %s",
+                            "site=%s group=%s/%s member-fetch via GM failed: %s",
                             site_id, domain_id, gid, exc,
                         )
                         continue
@@ -292,6 +302,11 @@ def pull_groups_with_members(
                         mid = NsxPolicyClient._extract_vm_id_from_member(m)
                         if mid:
                             ext_ids.add(mid)
+                            member_meta.setdefault(mid, {
+                                "display_name": m.get("display_name"),
+                                "site_id": site_id,
+                                "tags": m.get("tags") or [],
+                            })
             else:
                 try:
                     members = client.list_policy_group_member_vms(
@@ -307,6 +322,11 @@ def pull_groups_with_members(
                     mid = NsxPolicyClient._extract_vm_id_from_member(m)
                     if mid:
                         ext_ids.add(mid)
+                        member_meta.setdefault(mid, {
+                            "display_name": m.get("display_name"),
+                            "site_id": None,
+                            "tags": m.get("tags") or [],
+                        })
             group_to_members[gpath] = ext_ids
             groups_by_path[gpath]["member_count"] = len(ext_ids)
             if i % 25 == 0:
@@ -314,7 +334,7 @@ def pull_groups_with_members(
                          i, len(groups), domain_id)
     log.info("Groups indexed: %d across %d domain(s)",
              len(groups_by_path), len(domain_ids))
-    return groups_by_path, group_to_members
+    return groups_by_path, group_to_members, member_meta
 
 
 def discover_federation_sites(gm_client: NsxPolicyClient) -> List[Dict[str, Any]]:
@@ -336,7 +356,7 @@ def discover_federation_sites(gm_client: NsxPolicyClient) -> List[Dict[str, Any]
 def pull_group_ip_memberships(
     client: NsxPolicyClient,
     groups_by_path: Dict[str, Dict[str, Any]],
-    site_clients_for_members: Optional[Dict[str, NsxPolicyClient]] = None,
+    gm_site_eps: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Set[str]]:
     """
     For each group, fetch /members/ip-addresses (returns every IP or CIDR the
@@ -344,23 +364,25 @@ def pull_group_ip_memberships(
     group_path -> set(ip_or_cidr strings). Errors per group are logged and
     the group ends up with an empty set.
 
-    In GM federation mode, per-site clients are unioned.
+    In GM federation mode, the calls go THROUGH THE GM (enforcement_point_path
+    per site) and are unioned; no direct LM connections.
     """
     result: Dict[str, Set[str]] = {}
     for gpath, meta in groups_by_path.items():
         domain_id = meta["domain_id"]
         gid = meta["id"]
         ips: Set[str] = set()
-        if site_clients_for_members:
-            iter_clients = site_clients_for_members.items()
+        path = client._policy_path(
+            f"/domains/{client._q(domain_id)}/groups/{client._q(gid)}/members/ip-addresses"
+        )
+        if gm_site_eps:
+            param_sets = [(sid, {"enforcement_point_path": ep, "page_size": 1000})
+                          for sid, ep in gm_site_eps.items()]
         else:
-            iter_clients = [("(single)", client)]
-        for label, cli in iter_clients:
+            param_sets = [("(single)", {"page_size": 1000})]
+        for label, params in param_sets:
             try:
-                path = cli._policy_path(
-                    f"/domains/{cli._q(domain_id)}/groups/{cli._q(gid)}/members/ip-addresses"
-                )
-                r = cli._get(path)
+                r = client._get(path, params=params)
             except Exception as exc:
                 log.warning("group=%s/%s (%s): /members/ip-addresses failed: %s",
                             domain_id, gid, label, exc)
@@ -799,6 +821,14 @@ def main() -> None:
         "--federation-global", action="store_true",
         help="Query the federated /global-infra/ view (use with GM sources).",
     )
+    parser.add_argument(
+        "--with-vm-inventory", action="store_true",
+        help="GM mode only: ALSO connect directly to each site LM for fabric "
+             "VM inventory, which adds VM IP addresses to the report. Default "
+             "is GM-only: membership and VM identity come through the GM's "
+             "enforcement-point proxy, and unreachable LMs are warnings, "
+             "never fatal.",
+    )
     args = parser.parse_args()
 
     init_cli()
@@ -824,39 +854,84 @@ def main() -> None:
     vm_ext_to_site: Dict[str, str] = {}
     site_display: Dict[str, str] = {}
     site_fabric_clients: Dict[str, NsxPolicyClient] = {}
-    site_fed_clients: Dict[str, NsxPolicyClient] = {}
+    gm_site_eps: Dict[str, str] = {}
+    pre_domain_ids: Optional[List[str]] = None
+    pre_groups: Optional[Tuple[Dict[str, Dict[str, Any]],
+                               Dict[str, Set[str]],
+                               Dict[str, Dict[str, Any]]]] = None
 
     if is_gm_federation:
         log.info("Detected GM federation mode. Discovering sites.")
         sites = discover_federation_sites(client)
         if not sites:
             raise SystemExit(
-                "GM federation mode: no sites discovered. Cannot fetch VM "
-                "inventory without at least one site."
+                "GM federation mode: no sites discovered. Nothing to query."
             )
-        site_fabric_clients, site_fed_clients, site_display = (
-            build_site_clients_for_federation(sites)
-        )
-        if not site_fabric_clients:
-            raise SystemExit(
-                "GM federation mode: no site LMs reachable. Check .env "
-                "hostnames and network connectivity, then retry."
-            )
-        vms: List[Dict[str, Any]] = []
-        for sid, fab_c in site_fabric_clients.items():
-            try:
-                site_vms = fab_c.list_virtual_machines()
-            except Exception as exc:
-                log.warning("Site %s (%s): list_virtual_machines failed: %s",
-                            sid, site_display.get(sid, sid), exc)
+        for s in sites:
+            sid = s.get("id")
+            if not sid:
                 continue
-            for vm in site_vms:
-                ext = vm.get("external_id") or vm.get("id")
-                if ext:
-                    vm_ext_to_site[ext] = sid
-            vms.extend(site_vms)
-            log.info("Site %s (%s): %d VM(s) pulled",
-                     sid, site_display.get(sid, sid), len(site_vms))
+            site_display[sid] = s.get("display_name") or sid
+            gm_site_eps[sid] = (
+                f"/global-infra/sites/{sid}/enforcement-points/default"
+            )
+
+        vms: List[Dict[str, Any]] = []
+        if args.with_vm_inventory:
+            # OPTIONAL enrichment: direct LM fabric inventory adds VM IPs.
+            # Unreachable sites are warnings, never fatal.
+            site_fabric_clients, _unused_fed, _disp = (
+                build_site_clients_for_federation(sites)
+            )
+            if not site_fabric_clients:
+                log.warning("--with-vm-inventory: no site LMs reachable; "
+                            "continuing GM-only (VM IPs unavailable).")
+            for sid, fab_c in site_fabric_clients.items():
+                try:
+                    site_vms = fab_c.list_virtual_machines()
+                except Exception as exc:
+                    log.warning("Site %s (%s): list_virtual_machines failed: %s",
+                                sid, site_display.get(sid, sid), exc)
+                    continue
+                for vm in site_vms:
+                    ext = vm.get("external_id") or vm.get("id")
+                    if ext:
+                        vm_ext_to_site[ext] = sid
+                vms.extend(site_vms)
+                log.info("Site %s (%s): %d VM(s) pulled",
+                         sid, site_display.get(sid, sid), len(site_vms))
+        else:
+            log.info("GM mode: no direct LM connections. VM identity comes from "
+                     "the GM member proxy; add --with-vm-inventory to enrich "
+                     "with fabric VM IPs from the site LMs.")
+
+        # Groups + members THROUGH the GM (enforcement-point proxy). This also
+        # yields the VM universe for name matching, so LM access is optional.
+        try:
+            domains = client.list_domains()
+        except Exception as exc:
+            raise SystemExit(f"list_domains failed: {exc}")
+        pre_domain_ids = [d.get("id") for d in domains if d.get("id")]
+        if not pre_domain_ids:
+            raise SystemExit("No domains returned from NSX.")
+        g_by_path, g_to_members, member_meta = pull_groups_with_members(
+            client, pre_domain_ids, gm_site_eps=gm_site_eps,
+        )
+        pre_groups = (g_by_path, g_to_members, member_meta)
+        known_ext = {v.get("external_id") or v.get("id") for v in vms}
+        synthesized = 0
+        for ext, meta in member_meta.items():
+            if meta.get("site_id"):
+                vm_ext_to_site.setdefault(ext, meta["site_id"])
+            if ext not in known_ext:
+                vms.append({"external_id": ext,
+                            "display_name": meta.get("display_name"),
+                            "tags": meta.get("tags") or []})
+                synthesized += 1
+        if synthesized:
+            log.info("VM universe from GM member proxy: %d VM(s)%s",
+                     synthesized,
+                     "" if args.with_vm_inventory else " (no fabric IPs)")
     elif args.federation_global:
         # Federation on an LM: unusual but not fatal. Fabric API still LM-only.
         log.info("federation_global=True on an LM (not a GM). "
@@ -955,20 +1030,25 @@ def main() -> None:
                                        for m in resolved.values()}
 
     # ---- pull domains, groups + members, rules ----
-    try:
-        domains = client.list_domains()
-    except Exception as exc:
-        raise SystemExit(f"list_domains failed: {exc}")
-    domain_ids = [d.get("id") for d in domains if d.get("id")]
-    if not domain_ids:
-        raise SystemExit("No domains returned from NSX.")
+    if pre_domain_ids is not None:
+        domain_ids = pre_domain_ids
+    else:
+        try:
+            domains = client.list_domains()
+        except Exception as exc:
+            raise SystemExit(f"list_domains failed: {exc}")
+        domain_ids = [d.get("id") for d in domains if d.get("id")]
+        if not domain_ids:
+            raise SystemExit("No domains returned from NSX.")
     log.info("Domains: %s", ", ".join(domain_ids))
 
-    groups_by_path, group_to_members = pull_groups_with_members(
-        client,
-        domain_ids,
-        site_clients_for_members=site_fed_clients if is_gm_federation else None,
-    )
+    if pre_groups is not None:
+        groups_by_path, group_to_members, _member_meta = pre_groups
+    else:
+        groups_by_path, group_to_members, _member_meta = pull_groups_with_members(
+            client,
+            domain_ids,
+        )
     vm_to_groups = build_vm_to_groups(group_to_members)
 
     # ---- augment memberships by IP ----
@@ -980,7 +1060,7 @@ def main() -> None:
     group_ips = pull_group_ip_memberships(
         client,
         groups_by_path,
-        site_clients_for_members=site_fed_clients if is_gm_federation else None,
+        gm_site_eps=gm_site_eps if is_gm_federation else None,
     )
     ip_based_matches = match_vm_ips_to_groups(vm_ips, group_ips)
     for ext, gps in ip_based_matches.items():
