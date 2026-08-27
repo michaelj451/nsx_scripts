@@ -533,6 +533,7 @@ def _remap_group_payload(
         "timestamp": _utc_now_iso(),
         "matched_values": [],
         "added_values": [],
+        "added_pairs": [],        # {original, mapped, csv_row}: provenance of each added value
         "already_mapped": [],     # {original, mapped, csv_row}: pair complete before this run
         "skipped_values": [],     # ranges / IPv6 / junk left untouched, with reason
         "unmapped_values": [],    # valid IPv4 tokens no CSV row covers
@@ -644,6 +645,18 @@ def _remap_group_payload(
         report["status"] = "changed"
         report["added_values"] = sorted(group_added)
         report["added_count"] = len(group_added)
+        # Provenance: which original produced each added value, via which CSV row.
+        added_canon = {_canonical_ip_token(v) for v in report["added_values"]}
+        seen_pairs: set = set()
+        for h in report["mapping_hits"]:
+            m = h["mapped_values"][0]
+            mc = _canonical_ip_token(m)
+            key = (h["source_value"], mc)
+            if mc in added_canon and key not in seen_pairs:
+                seen_pairs.add(key)
+                report["added_pairs"].append({
+                    "original": h["source_value"], "mapped": m, "csv_row": h["mapping_row"],
+                })
     else:
         report["matched_values"] = sorted(set(report["matched_values"]))
         report["added_count"] = 0

@@ -230,7 +230,7 @@ class RenderAndLoadTests(unittest.TestCase):
         rows = audit.audit_groups({"a8b5ed22-0000": g}, fwd, rev)
         md = audit.render_markdown(rows, audit.summarize(rows), label="lab", source_desc="test",
                                    domain_id="default", csv_path=csv, csv_rows=len(fwd.rows), csv_invalid=invalid)
-        self.assertIn("friendly-name (`a8b5ed22-0000`)", md)
+        self.assertIn("| friendly-name | `a8b5ed22-0000` |", " ".join(md.split()))
 
     def test_render_clean(self):
         fwd, rev, invalid, csv = _tables()

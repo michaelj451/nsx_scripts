@@ -273,14 +273,14 @@ def _code(s: Any) -> str:
     return f"`{s}`"
 
 
-def _label(r: Dict[str, Any]) -> str:
-    """Group cell: display name first (the GUI identity), id in backticks when
-    it differs; GUI-created groups get a UUID id but a readable name."""
-    gid = r.get("id")
-    name = r.get("display_name")
-    if name and name != gid:
-        return f"{name} ({_code(gid)})"
-    return _code(gid)
+def _gname(r: Dict[str, Any]) -> str:
+    """Group column: the display name (falls back to the id)."""
+    return str(r.get("display_name") or r.get("id"))
+
+
+def _gid(r: Dict[str, Any]) -> str:
+    """Id column: always the NSX id, code-formatted."""
+    return _code(r.get("id"))
 
 
 def _inline(values: List[str]) -> str:
@@ -336,11 +336,11 @@ def render_markdown(
                  "there. Either the remap never reached this group (check the push report's "
                  "`failures.json`), or the entry was added after the remap ran.")
         L.append("")
-        L.append("| Group | Original | Expected mapped | CSV row | Location |")
-        L.append("|---|---|---|---:|---|")
+        L.append("| Group | Id | Original | Expected mapped | CSV row | Location |")
+        L.append("|---|---|---|---|---:|---|")
         for r in rows:
             for g in r["gaps_missing_mapped"]:
-                L.append(f"| {_label(r)} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
+                L.append(f"| {_gname(r)} | {_gid(r)} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
                          f"| {g['csv_row']} | {_code(g['location'])} |")
     else:
         L.append("None.")
@@ -357,11 +357,11 @@ def render_markdown(
                  "groups by default, so these are informational, not gaps. A push with "
                  "--remap-generic would add the expected mapped values below.")
         L.append("")
-        L.append("| Group | Original | Would map to | CSV row | Location |")
-        L.append("|---|---|---|---:|---|")
+        L.append("| Group | Id | Original | Would map to | CSV row | Location |")
+        L.append("|---|---|---|---|---:|---|")
         for r in rows:
             for g in r["generic_remap_candidates"]:
-                L.append(f"| {_label(r)} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
+                L.append(f"| {_gname(r)} | {_gid(r)} | {_code(g['original'])} | {_code(g['expected_mapped'])} "
                          f"| {g['csv_row']} | {_code(g['location'])} |")
     else:
         L.append("None.")
@@ -375,11 +375,11 @@ def render_markdown(
                  "or the value legitimately lived in the new range before the remap. Review; "
                  "do not remove.")
         L.append("")
-        L.append("| Group | Present value | Expected original | CSV row | Location |")
-        L.append("|---|---|---|---:|---|")
+        L.append("| Group | Id | Present value | Expected original | CSV row | Location |")
+        L.append("|---|---|---|---|---:|---|")
         for r in rows:
             for o in r["orphan_mapped_values"]:
-                L.append(f"| {_label(r)} | {_code(o['present_value'])} | {_code(o['expected_original'])} "
+                L.append(f"| {_gname(r)} | {_gid(r)} | {_code(o['present_value'])} | {_code(o['expected_original'])} "
                          f"| {o['csv_row']} | {_code(o['location'])} |")
     else:
         L.append("None.")
@@ -392,12 +392,12 @@ def render_markdown(
         L.append("No CSV row covers these, so the remap left them alone. Expected for IPs outside "
                  "the remapped ranges; if any of these should have been remapped, the CSV needs a row.")
         L.append("")
-        L.append("| Group | Entries | Count |")
-        L.append("|---|---|---:|")
+        L.append("| Group | Id | Entries | Count |")
+        L.append("|---|---|---|---:|")
         for r in rows:
             if r["uncovered_ipv4"]:
                 vals = [u["value"] for u in r["uncovered_ipv4"]]
-                L.append(f"| {_label(r)} | {_inline(vals)} | {len(vals)} |")
+                L.append(f"| {_gname(r)} | {_gid(r)} | {_inline(vals)} | {len(vals)} |")
     else:
         L.append("None.")
     L.append("")
@@ -409,11 +409,11 @@ def render_markdown(
     if mapped_groups:
         L.append("Both the original and its CSV-mapped equivalent are present on the manager.")
         L.append("")
-        L.append("| Group | Original | Mapped | CSV row | Location |")
-        L.append("|---|---|---|---:|---|")
+        L.append("| Group | Id | Original | Mapped | CSV row | Location |")
+        L.append("|---|---|---|---|---:|---|")
         for r in mapped_groups:
             for m in r["mapped_pairs"]:
-                L.append(f"| {_label(r)} | {_code(m['original'])} | {_code(m['mapped'])} "
+                L.append(f"| {_gname(r)} | {_gid(r)} | {_code(m['original'])} | {_code(m['mapped'])} "
                          f"| {m['csv_row']} | {_code(m['location'])} |")
     else:
         L.append("None.")
@@ -425,11 +425,11 @@ def render_markdown(
     if summary["not_remapped_by_design"]:
         L.append("IP ranges and IPv6 entries are never remapped. Listed so nobody wonders why.")
         L.append("")
-        L.append("| Group | Entry | Reason | Location |")
-        L.append("|---|---|---|---|")
+        L.append("| Group | Id | Entry | Reason | Location |")
+        L.append("|---|---|---|---|---|")
         for r in rows:
             for b in r["not_remapped_by_design"]:
-                L.append(f"| {_label(r)} | {_code(b['value'])} | {b['reason']} | {_code(b['location'])} |")
+                L.append(f"| {_gname(r)} | {_gid(r)} | {_code(b['value'])} | {b['reason']} | {_code(b['location'])} |")
     else:
         L.append("None.")
     L.append("")
@@ -437,12 +437,12 @@ def render_markdown(
     # ---- 4. Per-group status --------------------------------------------
     L.append("## 4. Per-group status")
     L.append("")
-    L.append("| Group | Type | Status | IP entries | Mapped | Gaps | Candidates | Review | Uncovered | By design | Nested IPs |")
-    L.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|")
+    L.append("| Group | Id | Type | Status | IP entries | Mapped | Gaps | Candidates | Review | Uncovered | By design | Nested IPs |")
+    L.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|")
     for r in rows:
         if not r["entry_count"]:
             continue
-        L.append(f"| {_label(r)} | {r['group_type']} | {r['status']} | {r['entry_count']} | {len(r['mapped_pairs'])} "
+        L.append(f"| {_gname(r)} | {_gid(r)} | {r['group_type']} | {r['status']} | {r['entry_count']} | {len(r['mapped_pairs'])} "
                  f"| {len(r['gaps_missing_mapped'])} | {len(r['generic_remap_candidates'])} | {len(r['orphan_mapped_values'])} "
                  f"| {len(r['uncovered_ipv4'])} | {len(r['not_remapped_by_design'])} "
                  f"| {'yes' if r['has_nested_ips'] else ''} |")
@@ -473,11 +473,11 @@ def render_markdown(
         if summary["invalid_entries"]:
             L.append(f"### Entries that are not an IP, CIDR, or range ({summary['invalid_entries']})")
             L.append("")
-            L.append("| Group | Entry | Location |")
-            L.append("|---|---|---|")
+            L.append("| Group | Id | Entry | Location |")
+            L.append("|---|---|---|---|")
             for r in rows:
                 for x in r["invalid_entries"]:
-                    L.append(f"| {_label(r)} | {_code(x['value'])} | {_code(x['location'])} |")
+                    L.append(f"| {_gname(r)} | {_gid(r)} | {_code(x['value'])} | {_code(x['location'])} |")
             L.append("")
 
     return align_markdown_tables("\n".join(L)) + "\n"

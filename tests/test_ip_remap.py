@@ -310,6 +310,8 @@ class GroupsPushHelpersTests(unittest.TestCase):
         rows = [
             {"id": "ip-grp", "group_type": "ip-only", "status": "success_put", "csv_changed": True,
              "csv_added_count": 2, "csv_added_values": ["10.7.0.1", "10.7.0.2"],
+             "csv_added_pairs": [{"original": "10.6.0.1", "mapped": "10.7.0.1", "csv_row": 2},
+                                  {"original": "10.6.0.2", "mapped": "10.7.0.2", "csv_row": 3}],
              "ips_added": ["10.7.0.1", "10.7.0.2"],
              "csv_skipped_values": [{"value": "10.6.0.1-10.6.0.2", "reason": "range", "expression_index": 0}]},
             {"id": "steady", "group_type": "ip-only", "status": "skipped_no_change",
@@ -323,14 +325,19 @@ class GroupsPushHelpersTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp())
         path = groups._write_remap_markdown(out, summary, rows)
         md = path.read_text()
-        for expected in ("# CSV IP remap dry-run: nsx-lm3", "Would add", "`10.7.0.1`",
-                         "No changes needed (1)", "`steady`",
-                         "Already remapped, detected (1 pairs in 1 groups)", "`10.7.0.5`",
+        sq = " ".join(md.split())   # collapse table padding for exact row checks
+        for expected in ("# CSV IP remap dry-run: nsx-lm3", "Would add", "From original",
+                         "No changes needed (1):** nothing sent to NSX for steady.",
+                         "Already remapped, detected (1 pairs in 1 groups)",
                          "Generic groups the CSV covers (1 groups, 1 values)", "`10.7.5.0/24`",
-                         "Generic groups, out of scope, nothing to map (1)", "`gen-plain`",
+                         "Generic groups, out of scope, nothing to map (1):** gen-plain.",
                          "Never remapped by design", "range", "no CSV row covers", "`1.2.3.4`",
                          "Confidence ramp", "1 -> 25", "**pass**"):
             self.assertIn(expected, md)
+        for row in ("| ip-grp | `ip-grp` | ip-only | `10.7.0.1` | `10.6.0.1` | 2 | success_put |",
+                    "| steady | `steady` | ip-only | `10.6.0.5` | `10.7.0.5` | 2 |",
+                    "| gen | `gen` | `10.7.5.0/24` | 1 |"):
+            self.assertIn(row, sq)
         self.assertNotIn(chr(0x2014), md)
 
     def test_remap_markdown_apply_counts_only_written_rows(self):
@@ -359,11 +366,12 @@ class GroupsPushHelpersTests(unittest.TestCase):
         ]
         out = Path(tempfile.mkdtemp())
         md = groups._write_remap_markdown(out, summary, rows).read_text()
+        sq = " ".join(md.split())
         self.assertIn("## 1. Added (1 IPs in 1 groups)", md)
-        self.assertIn("written-friendly (`written`)", md)
+        self.assertIn("| written-friendly | `written` | ip-only | `10.7.0.9` |", sq)
         self.assertIn("No changes needed (1)", md)
-        self.assertIn("`stale-bundle`", md)
-        self.assertNotIn("| `stale-bundle` | ip-only |", md)   # not in the Added table
+        self.assertIn("stale-bundle", md)
+        self.assertNotIn("| stale-bundle | `stale-bundle` | ip-only |", sq)   # not in the Added table
         self.assertTrue((out / "remap_report.md").exists())
         self.assertEqual(len(list(out.glob("remap_report_*.md"))), 1)
 
