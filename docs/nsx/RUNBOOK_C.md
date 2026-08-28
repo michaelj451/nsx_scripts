@@ -34,6 +34,8 @@ inventory changes flowing through dynamic-group evaluation, etc.).
 read-only diff between a REFERENCE bundle and the TARGET's live state.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Compare lm1's groups_additive bundle against what's currently on lm2
 python tools/nsx/compare_group_ips.py \
   --reference-source nsx-lm1 \
@@ -191,6 +193,8 @@ contract automatically applies:
 - Per-row report carries `ips_before`, `ips_after`, `ips_added`, `ips_removed: []`
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Land siblings with both source IPs and CSV-mapped equivalents in one push
 python tools/nsx/groups.py push --target nsx-lm2 \
   --groups-dir nsx_sibling_groups/nsx-lm1.lab.local/groups \
@@ -302,6 +306,8 @@ With `--include-scope`, a third `scope` entry appears in `per_field_diff` for an
 In reverse order, each phase pops its baseline cleanly:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 5. amend-refs revert — restores each rule's pre-amend payload
 python tools/nsx/rules.py revert --target nsx-lm2 \
   --reports-dir nsx_rules_export/nsx-lm2.lab.local/push_report --apply

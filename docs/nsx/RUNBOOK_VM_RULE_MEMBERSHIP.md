@@ -58,6 +58,8 @@ python tools/reports/report_vms_in_rules.py --manager nsx-lm1
 Common variations:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Explicit list file
 python tools/reports/report_vms_in_rules.py --manager nsx-lm1 \
   --vm-list some_other_list.txt
@@ -118,6 +120,8 @@ minus fabric-sourced VM IPs.
 ## Step 3: Read the report
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 LATEST=$(ls -1td nsx_logs/reports/vm_rule_membership/nsx-lm1.lab.local/*/ | head -1)
 echo "Latest run: $LATEST"
 

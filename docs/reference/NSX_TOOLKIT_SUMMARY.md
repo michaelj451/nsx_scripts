@@ -345,6 +345,8 @@ Plus:
 ### Workflow A — clone lm1 → lm2
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # EXPORT — read-only against nsx-lm1, run once
 python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # VM-IP freeze is opt-in; needed for Part 3
 python tools/nsx/services.py    export --source nsx-lm1
@@ -386,6 +388,8 @@ python tools/nsx/services.py revert --target nsx-lm2 --reports-dir nsx_services_
 ### Workflow B — in-place CSV remap on lm1
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # CAPTURE (read-only)
 python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # VM-IP freeze is opt-in; needed for Part 3
 

@@ -57,6 +57,8 @@ $env:PYTHONPATH = "$PWD\app"
 ## EXPORT — 7 commands, source-side, GET-only (run once)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # --live-query freezes VM IPs; REQUIRED for Part 3
 python tools/nsx/services.py    export --source nsx-lm1
 python tools/nsx/groups.py      export --source nsx-lm1
@@ -253,6 +255,8 @@ Run in reverse dependency order so a parent is never deleted before its
 children:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 1. rules (must precede policies — rules are children of policies)
 python tools/nsx/rules.py revert --target nsx-lm2 \
   --reports-dir nsx_rules_export/nsx-lm1.lab.local/push_report \
@@ -289,6 +293,8 @@ After the chain finishes, every `*_target_baseline.json` should be
 renamed to `*_target_baseline.json.reverted`. You can verify with:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 find nsx_*_export nsx_capture -path "*/push_report/baselines/*.json" -not -name "*.reverted" 2>/dev/null
 # (empty output = clean revert stack)
 ```
@@ -298,6 +304,8 @@ find nsx_*_export nsx_capture -path "*/push_report/baselines/*.json" -not -name 
 ## SEGMENTS — optional, only when the target has matching transport zones
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python tools/nsx/segments.py push --target nsx-lm2 \
   --segments-dir nsx_segments_export/nsx-lm1.lab.local/segments \
   --apply

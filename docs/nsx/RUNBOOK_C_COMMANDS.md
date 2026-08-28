@@ -57,6 +57,8 @@ python tools/nsx/capture_nsx_state.py --source nsx-lm1
 ## 2. Transform: build siblings + stripped originals (offline)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # (a) Read from lm1's capture bundle — siblings reflect lm1's view
 python tools/nsx/build_sibling_groups.py --source nsx-lm1
 
@@ -119,6 +121,8 @@ Strict-additive — never removes a ref. Same prompt vocabulary as `groups.py pu
 ## Revert sequence (reverse order)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 5. amend-refs revert
 python tools/nsx/rules.py revert --target nsx-lm2 \
   --reports-dir nsx_rules_export/nsx-lm2.lab.local/push_report --apply

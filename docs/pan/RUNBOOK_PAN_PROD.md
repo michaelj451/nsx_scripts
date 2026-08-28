@@ -179,6 +179,8 @@ python tools/pan/recommend_dg.py \
 ### Tuning the affinity window
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Widen to /16 — useful when /24 is too narrow and the address space is sparser
 python tools/pan/recommend_dg.py --config $CFG --src-ip 10.50.5.10 --dst-ip 8.8.8.8 \
   --protocol tcp --dst-port 443 --subnet-mask 16

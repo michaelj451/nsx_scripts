@@ -17,6 +17,8 @@ and must not be confused with it:
 ## Take a backup
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 export PYTHONPATH="$PWD/app"
 
 # One or many managers in one run. GM aliases automatically use the
@@ -73,6 +75,8 @@ baseline first, and group revert deletes stay blocked unless `--allow-delete`
 is given.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 B=nsx_backup/nsx-lm1.lab.local/latest
 
 # Order: services -> groups -> policies (policies carry their rules)

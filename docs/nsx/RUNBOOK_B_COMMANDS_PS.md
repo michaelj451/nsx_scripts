@@ -1,107 +1,137 @@
-# Runbook B — Commands (in-place against `nsx-lm1`) — Windows PowerShell
+# Runbook B Commands (in-place against `nsx-lm1`) : Windows PowerShell
 
-Bare commands only, PowerShell variant. See [RUNBOOK_B.md](RUNBOOK_B.md) for explanations,
-or [RUNBOOK_B_COMMANDS.md](RUNBOOK_B_COMMANDS.md) for the bash/zsh equivalent.
+Bare commands only, PowerShell variant. See [RUNBOOK_B.md](RUNBOOK_B.md) for
+explanations, or [RUNBOOK_B_COMMANDS.md](RUNBOOK_B_COMMANDS.md) for macOS/Linux bash.
 
 > Workflow B operates **in-place on `nsx-lm1`**. No clone happens.
-> Use `groups.py push --csv-remap` to rewrite IPs in existing `IPAddressExpression` entries (re-IP).
-> Line continuation in PowerShell is the backtick `` ` `` at end of line.
+> `groups.py push --csv-remap` idempotently ADDS mapped IPs to
+> `IPAddressExpression` entries. Strict-additive: no IP is ever removed.
+> Default scope is IP-Addresses-Only groups; `--remap-generic` widens it.
 
-## Env
+## 0) Env
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
+
+# Set ONCE per session; every command below follows.
+$M = "nsx-gm1"
+$H = "nsx-gm1.lab.local"
+
+# Keep push reports OUTSIDE the capture bundle: re-captures wipe the bundle,
+# and the revert baselines + pushed_ids.json must survive them.
+$R = "nsx_remap_$M"
 ```
 
 ---
 
-## CAPTURE — read-only baseline of `nsx-lm1` (run once)
+## 1) CAPTURE : read-only snapshot of `nsx-lm1`
+
+Re-run this before every push session so the bundle matches the manager.
 
 ```powershell
-python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/capture_nsx_state.py --source $M
 ```
 
-Produces (consumed by the Workflow B push below):
-
-```
-nsx_capture/nsx-lm1.lab.local/
-├── groups_additive/domains/default/groups/...      ← Workflow B push input
-└── manifest.json, summary.txt, logs/
-```
+Input for the push below:
+`nsx_capture/$H/groups_additive/domains/default/groups/`
 
 ---
 
-## PUSH — in-place CSV IP remap on `nsx-lm1`
-
-> All pushes default to **dry-run**. Add `--apply` to actually write. Baseline captured for revert.
-
-Rewrites every IP in `IPAddressExpression` entries via the CSV mapping —
-**strict-additive**: originals are kept, mapped values are appended,
-**no IP is ever removed**. `--mapped-only` is refused with `--csv-remap`.
-`--batch-size` defaults to **1** when `--csv-remap` is set (step-through
-every change; bump higher at any prompt).
+## 2) DRY RUN : see the plan, write nothing
 
 ```powershell
 python tools/nsx/groups.py push `
-  --target nsx-lm1 `
-  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups `
+  --target $M `
+  --groups-dir nsx_capture/$H/groups_additive/domains/default/groups `
   --csv-remap data/nonprod_map.csv `
+  --reports-dir $R/dryrun
+```
+
+Review gates before going any further:
+
+- `$R/dryrun/remap_report.md` : header Result line, section 1 "Would add"
+  (value, source original, CSV row), already-remapped pairs, generic-group
+  candidates, never-remapped ranges/IPv6, CSV coverage misses
+- `$R/dryrun/summary.json` : `csv_invalid_rows` must be empty
+
+---
+
+## 3) APPLY : step-through at batch size 1, ramp as confidence grows
+
+```powershell
+python tools/nsx/groups.py push `
+  --target $M `
+  --groups-dir nsx_capture/$H/groups_additive/domains/default/groups `
+  --csv-remap data/nonprod_map.csv `
+  --reports-dir $R/push_report `
   --apply
 ```
 
-### Interactive batch mode (`--batch-size N`)
+At each prompt: `Enter` continue at current size, `<number>` change size
+(e.g. `25`), `n` reset to 1, `x` clean exit. Every decision lands in
+`summary.json` as `interactive_decisions`. Start at a different size with
+`--batch-size N`; `--batch-size 0` disables prompts (automation).
 
-When `--csv-remap` is set, `--batch-size` defaults to **1** automatically.
-Pass `--batch-size N` to start at a different size. At each prompt:
-`Y`/Enter (continue same size), `n` (reset to 1), `x` (clean exit), or
-`<number>` (change size). See [RUNBOOK_B.md](RUNBOOK_B.md) for full details.
+Re-running the same apply is a no-op by design: rows with nothing to add are
+`skipped_no_change` and NOTHING is sent to NSX (no revision bumps). Review
+after: `$R/push_report/remap_report.md`.
+
+To also remap generic groups (off by default):
 
 ```powershell
-# Start at 10 instead of the default 1
 python tools/nsx/groups.py push `
-  --target nsx-lm1 `
-  --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups `
+  --target $M `
+  --groups-dir nsx_capture/$H/groups_additive/domains/default/groups `
   --csv-remap data/nonprod_map.csv `
-  --batch-size 10 `
+  --remap-generic `
+  --reports-dir $R/push_report `
   --apply
 ```
 
 ---
 
-## REVERT — restore `nsx-lm1` to its pre-push state
-
-Each `revert` pops the most recent unreverted baseline. Workflow B
-typically runs one push at a time, so one revert undoes that push.
-
-By default revert touches **only the groups that push wrote** (listed in
-`<RUN_TS>_pushed_ids.json` next to the baseline). Everything else on the
-manager is left alone. Dry-run first (no `--apply`) to see the plan.
+## 4) AUDIT : reconcile the manager against the CSV (read-only, cron-safe)
 
 ```powershell
-python tools/nsx/groups.py revert --target nsx-lm1 `
-  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report
+python tools/nsx/audit_ip_remap.py --target $M --csv data/nonprod_map.csv
+```
 
-python tools/nsx/groups.py revert --target nsx-lm1 `
-  --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report `
+Exit `0` = clean; `1` = gaps in section 1a/1c. Generic-group candidates are
+informational unless you audit with `--include-generic`. Report lands under
+`$env:NSX_LOG_DIR/reports/ip_remap_audit/$H/<ts>/`.
+
+---
+
+## 5) REVERT : undo a push (scoped to what that push wrote)
+
+Each `revert` pops the most recent unreverted baseline. By default it touches
+ONLY the groups listed in `<RUN_TS>_pushed_ids.json` next to the baseline;
+everything else on the manager is left alone. Dry-run first.
+
+```powershell
+python tools/nsx/groups.py revert --target $M `
+  --reports-dir $R/push_report
+
+python tools/nsx/groups.py revert --target $M `
+  --reports-dir $R/push_report `
   --apply
 ```
 
-Old baselines with no `pushed_ids.json` need `--scope all` (legacy
-full-baseline revert: restores every customer group and deletes any group not
-in the baseline).
+Notes:
 
-Multiple stacked B pushes? Each revert pops the latest. Repeat as needed.
+- Group DELETEs are blocked unless `--allow-delete` is given (blocked ones
+  are listed in the summary as `deletes_blocked`).
+- Baselines from before scoped revert existed need `--scope all
+  --allow-delete` (legacy full-baseline restore; dry-run it first).
 
-To confirm the revert stack is fully drained:
+Stacked pushes? Each revert pops the latest. Confirm the stack is drained:
 
 ```powershell
-Get-ChildItem -Recurse `
-  -Path nsx_capture/nsx-lm1.lab.local/groups_additive `
+Get-ChildItem -Recurse -Path $R/push_report/baselines `
   -Filter "*_target_baseline.json" -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -like "*\baselines\*" } |
-  Select-Object FullName
-# (no output = all baselines consumed)
+  Where-Object { $_.Name -notlike "*.reverted" }
+# (empty output = all baselines consumed)
 ```

@@ -123,6 +123,8 @@ confidence grows (`5`, `25`, `100`, `500` …). Type `n` to reset to 1.
 Type `x` for a clean exit.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run (default — safe, no writes)
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
@@ -244,6 +246,8 @@ Notes:
 Example:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Start cautious — one-at-a-time review
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
@@ -322,6 +326,8 @@ restore is itself a removal of the IPs the push added; that is what revert is
 for, and it stays behind `--apply`.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run first: prints the restore / delete plan without writing
 python tools/nsx/groups.py revert --target nsx-lm1 \
   --reports-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/push_report
@@ -336,6 +342,8 @@ If you've stacked multiple Workflow B pushes, each `revert` undoes the
 latest. Repeat until you're back where you want to be:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # How many unreverted Workflow B baselines exist?
 find nsx_capture/nsx-lm1.lab.local/groups_additive -path "*/baselines/*.json" -not -name "*.reverted"
 ```
@@ -350,6 +358,8 @@ proposes a removal**. Run it after a push, and on a schedule afterwards, with
 the same CSV the push used:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Local Manager
 python tools/nsx/audit_ip_remap.py --target nsx-lm1 --csv data/nonprod_map.csv
 

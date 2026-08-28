@@ -89,6 +89,8 @@ any VM needs operator attention before pushing.
 ### Sample queries against `vm_tag_inventory.jsonl`
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # How many tags does each VM have, sorted descending?
 jq -r '.display_name + "\t" + (.tag_count|tostring)' \
   nsx_vm_files/vm_tags_plan/nsx-lm1.lab.local/vm_tag_inventory.jsonl \

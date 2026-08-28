@@ -334,6 +334,8 @@ When to **skip** 2b:
   run 2b later in its own change window
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_pure_ip_remap/nsx-lm1.lab.local/groups \
@@ -358,6 +360,8 @@ Strict-additive — appends sibling refs to `source_groups` and
 removes any existing ref. Never deletes a rule.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/rules.py amend-refs --target nsx-lm1 \
   --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json
@@ -428,6 +432,8 @@ rebuild without that flag so `nsx_stripped_groups/<host>/groups/` is
 produced:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python tools/nsx/build_sibling_groups.py \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
@@ -438,6 +444,8 @@ python tools/nsx/build_sibling_groups.py \
 ### 5b. Push stripped originals — REQUIRES `--intentional-ip-removal`
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups \
@@ -472,6 +480,8 @@ dangling rule refs (if amend-refs ran, revert it before deleting any
 sibling — NSX 409s on DELETE for groups still referenced by rules).
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Phase 5 revert (restores IPs to tag-side originals)
 python tools/nsx/groups.py revert --target nsx-lm1 \
   --reports-dir nsx_stripped_groups/nsx-lm1.lab.local/push_report --apply

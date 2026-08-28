@@ -46,6 +46,8 @@ Phases:
 ## Env
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
@@ -156,6 +158,8 @@ in mixed mode, and any subsequent WF-D run will produce siblings
 **alongside** that mixed state — not a clean separation.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Part 2 — segment paths → CIDRs (inside group payloads, no segment objects pushed)
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_groups_export/$SRC_HOST/groups \
@@ -222,6 +226,8 @@ python tools/nsx/build_sibling_groups.py \
 ### 5a. Siblings (required for WF-D) — dry-run + apply
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_sibling_groups/$SRC_HOST/groups
@@ -262,6 +268,8 @@ Pushes the source's pure-IP groups (like `ip-address-group`,
 additive**: mapped IPs added alongside existing IPs; nothing removed.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_pure_ip_remap/$SRC_HOST/groups \
@@ -291,6 +299,8 @@ Confirm: `additive_only_contract: "pass"`, `total_ips_removed: 0`,
 NOT part of WF-D itself. Run when CAB approves the rule-side activation:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python tools/nsx/rules.py amend-refs --target $DST \
   --sibling-map nsx_sibling_groups/$SRC_HOST/sibling_map.json
 # dry-run output should look right; then:
@@ -370,6 +380,8 @@ strip bundle. For Phase 2, rebuild **without** that flag so
 `nsx_stripped_groups/<host>/groups/` is produced:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python tools/nsx/build_sibling_groups.py \
   --source $SRC \
   --csv-remap data/nonprod_map.csv \
@@ -383,6 +395,8 @@ python tools/nsx/build_sibling_groups.py \
 ### 7b. Push the stripped originals — REQUIRES `--intentional-ip-removal`
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # DRY RUN first — confirm the per-row IP-removal counts look right
 python tools/nsx/groups.py push --target $DST \
   --groups-dir nsx_stripped_groups/$SRC_HOST/groups \
@@ -440,6 +454,8 @@ python tools/nsx/rules.py revert --target $DST \
 ### Revert the WF-A clone (LIFO, reverse order)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 1. rules
 python tools/nsx/rules.py revert --target $DST \
   --reports-dir nsx_rules_export/$SRC_HOST/push_report --apply

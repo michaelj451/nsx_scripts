@@ -58,6 +58,8 @@ To prove the credentials work and mint a key, use the auth script (read-only
 against Panorama: keygen + `show system info` + name-only listings):
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Check whatever .env currently says (key stays masked)
 python tools/pan/panorama_auth.py
 
@@ -202,6 +204,8 @@ If you need to revert just **our** changes specifically (without touching unrela
 After `--apply`, re-pulling the candidate config lets you confirm everything landed:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Capture the candidate after our apply
 CFG=$(python tools/pan/pull_panorama_config.py)
 
@@ -236,6 +240,8 @@ See [RUNBOOK_PAN_PROD.md](RUNBOOK_PAN_PROD.md) for the full analysis toolkit (`c
 ### Snapshot → analyze → modify → re-snapshot → verify
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 1. Baseline snapshot
 BEFORE=$(python tools/pan/pull_panorama_config.py --running)
 

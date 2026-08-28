@@ -137,6 +137,8 @@ A GM exposes each federated LM as a domain. The loader can fill each one
 independently with a different prefix and base-CIDR:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # domain that fronts nsx-lm3 — uses 10.5.x.x for IP material
 .venv/bin/python tools/test/create_load_objects.py \
   --mode gm --host nsx-gm2.lab.local \
@@ -199,6 +201,8 @@ being referenced by other objects`.
 ### Example — wipe `nsx-lm3` (LM, everything)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # dry-run preview (default if --apply is absent)
 PYTHONPATH="$PWD/app" python tools/test/wipe_app_policies_then_groups.py \
   --target nsx-lm3.lab.local --domain-id default --include-services
@@ -211,6 +215,8 @@ PYTHONPATH="$PWD/app" python tools/test/wipe_app_policies_then_groups.py \
 ### Example — wipe `nsx-gm2` (GM, everything)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # dry-run preview
 PYTHONPATH="$PWD/app" python tools/test/wipe_app_policies_then_groups.py \
   --target nsx-gm2.lab.local --federation-global --include-services
@@ -244,6 +250,8 @@ PYTHONPATH="$PWD/app" python tools/test/wipe_app_policies_then_groups.py \
 ## End-to-end load / wipe cycle
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 1. Load
 NSX_USER="$NSX_USERNAME" NSX_PASS="$NSX_PASSWORD" \
   .venv/bin/python tools/test/create_load_objects.py \
