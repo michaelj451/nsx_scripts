@@ -993,7 +993,7 @@ def main() -> None:
              "never fatal.",
     )
     args = parser.parse_args()
-    if args.rate_limit:
+    if args.rate_limit is not None:
         os.environ["NSX_API_MAX_RPS"] = str(args.rate_limit)
 
     init_cli()
