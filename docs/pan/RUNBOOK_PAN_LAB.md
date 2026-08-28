@@ -101,6 +101,29 @@ curl -ks "https://pano4.lab.local/api/?type=keygen&user=USERNAME&password=PASSWO
 
 ---
 
+## 0b. Authenticate with .env credentials (get a token)
+
+```bash
+python tools/pan/panorama_auth.py                      # check creds, masked token
+python tools/pan/panorama_auth.py --keygen --write-env # mint + persist PANORAMA_API_KEY
+```
+
+With `PANORAMA_API_KEY` persisted, every pan tool skips per-run keygen.
+
+## 0c. Live policy lookup (lab convenience)
+
+`check_policy_match.py` stays offline-by-design, but `--live candidate|running`
+first pulls the config with the .env-authenticated client (GET-only, saved to
+`tools/pan/configs/`), then runs the identical offline evaluation:
+
+```bash
+python tools/pan/check_policy_match.py --live candidate \
+  --src-ip 10.20.5.7 --dst-ip 192.168.10.42 --protocol tcp --dst-port 443
+```
+
+Production use keeps `--config <exported.xml>` (no network); see
+[RUNBOOK_PAN_PROD.md](RUNBOOK_PAN_PROD.md).
+
 ## 1. Pull a config snapshot — `pull_panorama_config.py`
 
 Read-only. Saves a single XML file to `tools/pan/configs/` (gitignored).
