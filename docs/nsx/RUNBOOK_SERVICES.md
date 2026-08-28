@@ -29,6 +29,8 @@ export PYTHONPATH="$PWD/app"
 ## 1. Export services from source
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Source: nsx-lm1 → https://nsx-lm1.lab.local
 python tools/nsx/services.py export --source nsx-lm1
 ```
@@ -56,6 +58,8 @@ Behavior:
 ### 2a. Dry-run (default — no writes)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Target: nsx-lm2 → https://nsx-lm2.lab.local
 python tools/nsx/services.py push \
   --target nsx-lm2 \
@@ -67,6 +71,8 @@ Iterates every YAML, parses, confirms the `id` field, prints what would be pushe
 ### 2b. Apply
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Target: nsx-lm2 → https://nsx-lm2.lab.local
 python tools/nsx/services.py push \
   --target nsx-lm2 \

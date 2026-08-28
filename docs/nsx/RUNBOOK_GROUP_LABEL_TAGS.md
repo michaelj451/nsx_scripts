@@ -92,6 +92,8 @@ python tools/nsx/sync_group_label_tags.py --target nsx-lm1
 Federated view / Global Manager:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Local Manager, federated view
 python tools/nsx/sync_group_label_tags.py --target nsx-lm1 --federation-global
 
@@ -115,6 +117,8 @@ Per-group `status` values: `dry_run`, `applied`, `no_change`, `noop`
 Inspect the diff:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 plan_dir=$(ls -dt "$NSX_LOG_DIR"/reports/group_label_tags/nsx-lm1.lab.local/*/ | head -1)
 cat "$plan_dir/plan.md"
 

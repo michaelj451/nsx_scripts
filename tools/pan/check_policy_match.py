@@ -919,8 +919,16 @@ def verdict_to_json(verdict: Verdict) -> Dict[str, Any]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    p.add_argument("--config", required=True,
-                   help="Path to exported Panorama running-config XML.")
+    src_grp = p.add_mutually_exclusive_group(required=True)
+    src_grp.add_argument("--config",
+                         help="Path to exported Panorama running-config XML "
+                              "(fully offline; no network).")
+    src_grp.add_argument("--live", choices=["candidate", "running"],
+                         help="Pull the config from Panorama first using the "
+                              ".env credentials (via pull_panorama_config.py, "
+                              "GET-only), save it under tools/pan/configs/, then "
+                              "run the same offline evaluation on that file. "
+                              "Lab convenience; production stays file-driven.")
     dg_grp = p.add_mutually_exclusive_group()
     dg_grp.add_argument("--device-group",
                         help="Target device-group name (the DG whose firewall would "
@@ -965,12 +973,34 @@ def main() -> int:
                         "rule_filter.txt exists.")
     args = p.parse_args()
 
+    import time as _time
+    logging.Formatter.converter = _time.gmtime   # timestamps really are UTC
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s UTC [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
         stream=sys.stderr,
     )
+
+    if args.live:
+        # One GET-only pull with the .env-authenticated client, then the
+        # engine below stays byte-identical to the offline path.
+        import subprocess
+        pull_cmd = [sys.executable, str(Path(__file__).resolve().parent / "pull_panorama_config.py")]
+        if args.live == "running":
+            pull_cmd.append("--running")
+        log.info("--live %s: pulling config from Panorama (GET-only) ...", args.live)
+        proc = subprocess.run(pull_cmd, capture_output=True, text=True,
+                              cwd=Path(__file__).resolve().parents[2])
+        if proc.returncode != 0:
+            print(proc.stderr, file=sys.stderr)
+            raise SystemExit(f"--live pull failed (exit {proc.returncode}); "
+                             "check .env Panorama credentials (tools/pan/panorama_auth.py)")
+        pulled = proc.stdout.strip().splitlines()[-1].strip()
+        if not pulled or not Path(pulled).exists():
+            raise SystemExit(f"--live pull did not yield a config file (got {pulled!r})")
+        log.info("--live: using pulled config %s", pulled)
+        args.config = pulled
 
     config = PanoramaConfig(Path(args.config))
 

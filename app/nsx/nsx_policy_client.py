@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
+import time
 from typing import Any, Dict, Iterator, List, Optional, Set
 from urllib.parse import quote as _urlquote
 
@@ -32,7 +35,8 @@ class NsxApiError(Exception):
 
 
 class NsxPolicyClient:
-    def __init__(self, nsxmanager: str = nsx_gm1, *, federation_global: bool = False):
+    def __init__(self, nsxmanager: str = nsx_gm1, *, federation_global: bool = False,
+                 max_rps: Optional[float] = None):
         logging.info(
             f"Creating NSX session for manager: {nsxmanager} "
             f"(federation_global={federation_global})"
@@ -73,6 +77,34 @@ class NsxPolicyClient:
 
         self.session, self.xsrf_token = self.get_nsx_session()
         self.session.headers.setdefault("Content-Type", "application/json")
+
+        # Client-side rate limiting. Precedence: constructor param, then
+        # NSX_API_MAX_RPS from .env, then the DEFAULT of 5 req/s. Set
+        # NSX_API_MAX_RPS=0 (or max_rps=0) to disable pacing entirely.
+        # Independently, 429/503 responses are retried with backoff honoring
+        # Retry-After (NSX_API_RETRY_MAX attempts, default 5).
+        DEFAULT_MAX_RPS = 5.0
+        if max_rps is None:
+            env_val = (os.getenv("NSX_API_MAX_RPS") or "").strip()
+            if env_val == "":
+                max_rps = DEFAULT_MAX_RPS
+            else:
+                try:
+                    max_rps = float(env_val)
+                except ValueError:
+                    logging.getLogger(__name__).warning(
+                        "NSX_API_MAX_RPS=%r is not a number; using default %.1f",
+                        env_val, DEFAULT_MAX_RPS)
+                    max_rps = DEFAULT_MAX_RPS
+        self._min_interval = (1.0 / max_rps) if max_rps and max_rps > 0 else 0.0
+        self._retry_max = int(os.getenv("NSX_API_RETRY_MAX") or 5)
+        self._pace_lock = threading.Lock()
+        self._last_request = 0.0
+        if self._min_interval:
+            level = (logging.DEBUG if max_rps == DEFAULT_MAX_RPS else logging.INFO)
+            logging.getLogger(__name__).log(
+                level, "NSX client rate limit: %.1f req/s (min interval %.3fs)",
+                max_rps, self._min_interval)
 
         self.status = "success"
         self.errors: List[str] = []
@@ -168,34 +200,73 @@ class NsxPolicyClient:
         except Exception:
             return {"raw": resp.text}
 
+    def _pace(self) -> None:
+        """Enforce the client-side minimum interval between requests."""
+        if not self._min_interval:
+            return
+        with self._pace_lock:
+            now = time.monotonic()
+            wait = self._min_interval - (now - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+
+    def _send(self, send_fn, method: str, path: str):
+        """Single choke point: pace every request; retry 429/503 with backoff,
+        honoring the server's Retry-After header when present."""
+        attempts = 0
+        while True:
+            self._pace()
+            resp = send_fn()
+            if resp.status_code in (429, 503) and attempts < self._retry_max:
+                attempts += 1
+                retry_after = 0.0
+                try:
+                    retry_after = float(resp.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    pass
+                delay = retry_after or min(0.5 * (2 ** attempts), 10.0)
+                logging.getLogger(__name__).warning(
+                    "NSX %s %s throttled (HTTP %d); retry %d/%d in %.1fs",
+                    method, path, resp.status_code, attempts, self._retry_max, delay)
+                time.sleep(delay)
+                continue
+            self._raise_for_resp(resp, method, path)
+            return resp
+
     def _get(
         self,
         path: str,
         params: Optional[dict] = None,
         timeout: int = 30,
     ) -> Dict[str, Any]:
-        resp = self.session.get(self._url(path), params=params, timeout=timeout)
-        self._raise_for_resp(resp, "GET", path)
+        resp = self._send(
+            lambda: self.session.get(self._url(path), params=params, timeout=timeout),
+            "GET", path)
         return self._json_or_empty(resp)
 
     def _put(self, path: str, payload: dict, timeout: int = 60) -> Dict[str, Any]:
-        resp = self.session.put(self._url(path), json=payload, timeout=timeout)
-        self._raise_for_resp(resp, "PUT", path)
+        resp = self._send(
+            lambda: self.session.put(self._url(path), json=payload, timeout=timeout),
+            "PUT", path)
         return self._json_or_empty(resp) or {"status": "ok"}
 
     def _patch(self, path: str, payload: dict, timeout: int = 60) -> Dict[str, Any]:
-        resp = self.session.patch(self._url(path), json=payload, timeout=timeout)
-        self._raise_for_resp(resp, "PATCH", path)
+        resp = self._send(
+            lambda: self.session.patch(self._url(path), json=payload, timeout=timeout),
+            "PATCH", path)
         return self._json_or_empty(resp) or {"status": "ok"}
 
     def _post(self, path: str, payload: dict | None = None, timeout: int = 60) -> Dict[str, Any]:
-        resp = self.session.post(self._url(path), json=payload, timeout=timeout)
-        self._raise_for_resp(resp, "POST", path)
+        resp = self._send(
+            lambda: self.session.post(self._url(path), json=payload, timeout=timeout),
+            "POST", path)
         return self._json_or_empty(resp) or {"status": "ok"}
 
     def _delete(self, path: str, timeout: int = 60) -> Dict[str, Any]:
-        resp = self.session.delete(self._url(path), timeout=timeout)
-        self._raise_for_resp(resp, "DELETE", path)
+        resp = self._send(
+            lambda: self.session.delete(self._url(path), timeout=timeout),
+            "DELETE", path)
         return self._json_or_empty(resp) or {"status": "ok"}
 
     # ---------------------------

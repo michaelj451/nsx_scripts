@@ -239,6 +239,8 @@ history-derived fields, and now `domain_id`. The `.jsonl` form is one rule
 per line — usable with `jq`:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Top 5 rules by byte_count
 jq -s 'sort_by(-.byte_count) | .[:5] | .[] | {domain_id, rule_id, byte_count, hit_count}' \
   $NSX_LOG_DIR/rules_usage_report/nsx-lm1.lab.local/<UTC_TS>/rules_usage.jsonl
@@ -354,6 +356,8 @@ jq -s 'sort_by(.classification, -.hit_count) | .[] |
 ### Confirm `amend-refs` broadened enforcement (before/after diff)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Before amend-refs
 python tools/reports/report_rules_usage.py --target nsx-lm1
 SNAP_BEFORE=$(ls -1dt $NSX_LOG_DIR/rules_usage_report/nsx-lm1.lab.local/* | head -1)

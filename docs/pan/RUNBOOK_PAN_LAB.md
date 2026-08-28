@@ -58,6 +58,8 @@ To prove the credentials work and mint a key, use the auth script (read-only
 against Panorama: keygen + `show system info` + name-only listings):
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Check whatever .env currently says (key stays masked)
 python tools/pan/panorama_auth.py
 
@@ -98,6 +100,29 @@ curl -ks "https://pano4.lab.local/api/?type=keygen&user=USERNAME&password=PASSWO
 | Write semantics | Changes are staged to CANDIDATE config — operator must commit in Panorama UI |
 
 ---
+
+## 0b. Authenticate with .env credentials (get a token)
+
+```bash
+python tools/pan/panorama_auth.py                      # check creds, masked token
+python tools/pan/panorama_auth.py --keygen --write-env # mint + persist PANORAMA_API_KEY
+```
+
+With `PANORAMA_API_KEY` persisted, every pan tool skips per-run keygen.
+
+## 0c. Live policy lookup (lab convenience)
+
+`check_policy_match.py` stays offline-by-design, but `--live candidate|running`
+first pulls the config with the .env-authenticated client (GET-only, saved to
+`tools/pan/configs/`), then runs the identical offline evaluation:
+
+```bash
+python tools/pan/check_policy_match.py --live candidate \
+  --src-ip 10.20.5.7 --dst-ip 192.168.10.42 --protocol tcp --dst-port 443
+```
+
+Production use keeps `--config <exported.xml>` (no network); see
+[RUNBOOK_PAN_PROD.md](RUNBOOK_PAN_PROD.md).
 
 ## 1. Pull a config snapshot — `pull_panorama_config.py`
 
@@ -202,6 +227,8 @@ If you need to revert just **our** changes specifically (without touching unrela
 After `--apply`, re-pulling the candidate config lets you confirm everything landed:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Capture the candidate after our apply
 CFG=$(python tools/pan/pull_panorama_config.py)
 
@@ -236,6 +263,8 @@ See [RUNBOOK_PAN_PROD.md](RUNBOOK_PAN_PROD.md) for the full analysis toolkit (`c
 ### Snapshot → analyze → modify → re-snapshot → verify
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 1. Baseline snapshot
 BEFORE=$(python tools/pan/pull_panorama_config.py --running)
 

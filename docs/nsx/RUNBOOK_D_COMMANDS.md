@@ -72,6 +72,8 @@ python tools/nsx/build_sibling_groups.py \
 ## 2a. Push siblings (MANDATORY)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_sibling_groups/nsx-lm1.lab.local/groups
@@ -89,6 +91,8 @@ Baseline auto-captured at `nsx_sibling_groups/nsx-lm1.lab.local/push_report/base
 ## 2b. Pure-IP remap (OPTIONAL — separate change window)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_pure_ip_remap/nsx-lm1.lab.local/groups \
@@ -107,6 +111,8 @@ Strict-additive: adds mapped IPs alongside existing IPs; never removes anything.
 ## 3. Amend rules to reference siblings (OPTIONAL — separate change window)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/rules.py amend-refs --target nsx-lm1 \
   --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json
@@ -150,6 +156,8 @@ python tools/nsx/build_sibling_groups.py \
 ### 5b. Push stripped originals (force flag required)
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Dry-run
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups \
@@ -178,6 +186,8 @@ python tools/nsx/validate_wf_d.py \
 Revert in reverse to avoid dangling rule refs (NSX 409s on DELETE if rules still reference the sibling).
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 5 — restore IPs to tag-side originals
 python tools/nsx/groups.py revert --target nsx-lm1 \
   --reports-dir nsx_stripped_groups/nsx-lm1.lab.local/push_report --apply

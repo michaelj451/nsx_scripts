@@ -142,6 +142,8 @@ nsx_filtered_bundle/<UTC_TS>/nsx-lm1.lab.local/
 `manifest.json` records exactly what the filter kept and what it skipped:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 BUNDLE=$(ls -1dt nsx_filtered_bundle/*/nsx-lm1.lab.local | head -1)
 
 # Which policies were kept?
@@ -249,6 +251,8 @@ python tools/nsx/rules.py push --target nsx-lm4 \
 ## Step 4 - Verify
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 python tools/nsx/capture_nsx_state.py --source nsx-lm4
 # Then inspect nsx_capture/nsx-lm4.lab.local/ and compare counts against
 # the filter manifest to make sure everything landed.
@@ -305,6 +309,8 @@ Target: nsx-lm4 (empty sandbox).
 Filter: Application category only.
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # 1. Capture (about 5 seconds against a small lab)
 python tools/nsx/capture_nsx_state.py --source nsx-lm1
 

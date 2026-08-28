@@ -95,6 +95,8 @@ Emits `diff.json` showing per-rule hit_count deltas, transitions
 ### View the results
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Latest bundle path
 latest=$(ls -1dt nsx_logs/reports/rules_usage/nsx-gm1.lab.local/*/ | head -1)
 latest=${latest%/}
@@ -174,6 +176,8 @@ added to the table so you can see membership breakdown per LM.
 ### View the results
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 latest=$(ls -1dt nsx_logs/reports/groups_usage/nsx-gm1.lab.local/*/ | head -1)
 latest=${latest%/}
 cat "$latest/report.md"
@@ -239,6 +243,8 @@ python tools/reports/report_tag_map.py --target nsx-gm1 \
 ### View the results
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 latest=$(ls -1dt nsx_logs/reports/tag_map/nsx-gm1.lab.local/*/ | head -1)
 latest=${latest%/}
 cat "$latest/report.md"
@@ -292,6 +298,8 @@ Read-only. Classifies every VM on the manager into:
 ### View the results
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 latest=$(ls -1dt nsx_logs/reports/vm_tags_plan/nsx-lm1.lab.local/*/ | head -1)
 latest=${latest%/}
 cat "$latest/plan.md"

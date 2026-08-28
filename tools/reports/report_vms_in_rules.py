@@ -233,10 +233,56 @@ def build_vm_index(vms: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]]
     return by_name, by_ext
 
 
+def _load_members_cache(path: Path, minutes: int, referenced: Set[str]):
+    """Load the on-disk member cache when fresh AND it covers every
+    rule-referenced group. Returns (groups_by_path, group_to_members,
+    member_meta, group_ips) or None."""
+    if minutes <= 0 or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        age_min = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(data["ts"])).total_seconds() / 60.0
+        if age_min > minutes:
+            log.info("Member cache is %.1f min old (> %d): refetching.", age_min, minutes)
+            return None
+        cached_keys = set(data["group_to_members"].keys())
+        missing = {x for x in referenced if x not in cached_keys}
+        if missing:
+            log.info("Member cache lacks %d rule-referenced group(s): refetching.", len(missing))
+            return None
+        return (
+            data["groups_by_path"],
+            {k: set(v) for k, v in data["group_to_members"].items()},
+            data["member_meta"],
+            {k: set(v) for k, v in data["group_ips"].items()},
+        )
+    except Exception as exc:
+        log.warning("Member cache unreadable (%s): refetching.", exc)
+        return None
+
+
+def _save_members_cache(path: Path, groups_by_path, group_to_members,
+                        member_meta, group_ips) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "groups_by_path": groups_by_path,
+            "group_to_members": {k: sorted(v) for k, v in group_to_members.items()},
+            "member_meta": member_meta,
+            "group_ips": {k: sorted(v) for k, v in group_ips.items()},
+        }, sort_keys=True), encoding="utf-8")
+        log.info("Member cache saved: %s", path)
+    except Exception as exc:
+        log.warning("Member cache save failed: %s", exc)
+
+
 def pull_groups_with_members(
     client: NsxPolicyClient,
     domain_ids: List[str],
     gm_site_eps: Optional[Dict[str, str]] = None,
+    only_paths: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Set[str]], Dict[str, Dict[str, Any]]]:
     """
     For every group in every domain, fetch live VM members via
@@ -261,6 +307,8 @@ def pull_groups_with_members(
     site_fail_counts: Dict[str, int] = {}
     site_first_error: Dict[str, str] = {}
     benign_skips = 0   # cross-site NOT_FOUND: group not realized at that site
+    api_calls = 0
+    pruned = 0
 
     def _eps_for_domain(domain_id: str) -> Dict[str, str]:
         """Location-scoped domains (domain id == a site id) exist only at
@@ -294,44 +342,64 @@ def pull_groups_with_members(
                 "domain_id": domain_id,
                 "path": gpath,
             }
+            if only_paths is not None and gpath not in only_paths:
+                # No rule references this group: its membership cannot affect
+                # the report. Indexed for display, members not fetched.
+                group_to_members[gpath] = set()
+                groups_by_path[gpath]["member_count"] = 0
+                groups_by_path[gpath]["members_fetched"] = False
+                pruned += 1
+                continue
+            groups_by_path[gpath]["members_fetched"] = True
             ext_ids: Set[str] = set()
             members_path = client._policy_path(
                 f"/domains/{client._q(domain_id)}/groups/{client._q(gid)}"
                 "/members/virtual-machines"
             )
             if gm_site_eps:
-                # Federated: one GM-proxied call per relevant site, unioned.
+                # Federated: GM-proxied, per relevant site, paginated, unioned.
                 for site_id, ep in _eps_for_domain(domain_id).items():
-                    try:
-                        r = client._get(members_path, params={
-                            "enforcement_point_path": ep, "page_size": 1000,
-                        })
+                    cursor = None
+                    failed = False
+                    while True:
+                        params = {"enforcement_point_path": ep, "page_size": 1000}
+                        if cursor:
+                            params["cursor"] = cursor
+                        try:
+                            r = client._get(members_path, params=params)
+                            api_calls += 1
+                        except Exception as exc:
+                            if _is_not_found(exc):
+                                # Group not realized at this site: benign in
+                                # federated setups with location-scoped spans.
+                                benign_skips += 1
+                                log.debug("site=%s group=%s/%s not realized there (skipped)",
+                                          site_id, domain_id, gid)
+                            else:
+                                site_fail_counts[site_id] = site_fail_counts.get(site_id, 0) + 1
+                                site_first_error.setdefault(site_id, f"group {domain_id}/{gid}: {exc}")
+                                if site_fail_counts[site_id] <= 3:
+                                    log.warning(
+                                        "site=%s group=%s/%s member-fetch via GM failed: %s",
+                                        site_id, domain_id, gid, exc,
+                                    )
+                            failed = True
+                            break
                         members = r.get("results") or []
-                    except Exception as exc:
-                        if _is_not_found(exc):
-                            # Group not realized at this site: benign in
-                            # federated setups with location-scoped spans.
-                            benign_skips += 1
-                            log.debug("site=%s group=%s/%s not realized there (skipped)",
-                                      site_id, domain_id, gid)
-                            continue
-                        site_fail_counts[site_id] = site_fail_counts.get(site_id, 0) + 1
-                        site_first_error.setdefault(site_id, f"group {domain_id}/{gid}: {exc}")
-                        if site_fail_counts[site_id] <= 3:
-                            log.warning(
-                                "site=%s group=%s/%s member-fetch via GM failed: %s",
-                                site_id, domain_id, gid, exc,
-                            )
+                        for m in members:
+                            mid = NsxPolicyClient._extract_vm_id_from_member(m)
+                            if mid:
+                                ext_ids.add(mid)
+                                member_meta.setdefault(mid, {
+                                    "display_name": m.get("display_name"),
+                                    "site_id": site_id,
+                                    "tags": m.get("tags") or [],
+                                })
+                        cursor = r.get("cursor")
+                        if not cursor or not members:
+                            break
+                    if failed:
                         continue
-                    for m in members:
-                        mid = NsxPolicyClient._extract_vm_id_from_member(m)
-                        if mid:
-                            ext_ids.add(mid)
-                            member_meta.setdefault(mid, {
-                                "display_name": m.get("display_name"),
-                                "site_id": site_id,
-                                "tags": m.get("tags") or [],
-                            })
             else:
                 try:
                     members = client.list_policy_group_member_vms(
@@ -362,6 +430,8 @@ def pull_groups_with_members(
     if benign_skips:
         log.info("Cross-site lookups skipped as not-realized-at-site (benign): %d",
                  benign_skips)
+    log.info("Member API calls: %d (groups pruned as not rule-referenced: %d)",
+             api_calls, pruned)
     total_groups = len(groups_by_path)
     for site_id, fails in site_fail_counts.items():
         if fails >= total_groups and total_groups:
@@ -400,6 +470,7 @@ def pull_group_ip_memberships(
     client: NsxPolicyClient,
     groups_by_path: Dict[str, Dict[str, Any]],
     gm_site_eps: Optional[Dict[str, str]] = None,
+    only_paths: Optional[Set[str]] = None,
 ) -> Dict[str, Set[str]]:
     """
     For each group, fetch /members/ip-addresses (returns every IP or CIDR the
@@ -411,7 +482,11 @@ def pull_group_ip_memberships(
     per site) and are unioned; no direct LM connections.
     """
     result: Dict[str, Set[str]] = {}
+    api_calls = 0
     for gpath, meta in groups_by_path.items():
+        if only_paths is not None and gpath not in only_paths:
+            result[gpath] = set()
+            continue
         domain_id = meta["domain_id"]
         gid = meta["id"]
         ips: Set[str] = set()
@@ -421,26 +496,36 @@ def pull_group_ip_memberships(
         if gm_site_eps:
             eps = ({domain_id: gm_site_eps[domain_id]}
                    if domain_id in gm_site_eps else gm_site_eps)
-            param_sets = [(sid, {"enforcement_point_path": ep, "page_size": 1000})
-                          for sid, ep in eps.items()]
+            base_params = [(sid, {"enforcement_point_path": ep}) for sid, ep in eps.items()]
         else:
-            param_sets = [("(single)", {"page_size": 1000})]
-        for label, params in param_sets:
-            try:
-                r = client._get(path, params=params)
-            except Exception as exc:
-                s = str(exc)
-                if "could not be found" in s.lower() or "NOT_FOUND" in s:
-                    log.debug("group=%s/%s (%s): not realized there (skipped)",
-                              domain_id, gid, label)
-                    continue
-                log.warning("group=%s/%s (%s): /members/ip-addresses failed: %s",
-                            domain_id, gid, label, exc)
-                continue
-            for ip in (r.get("results") or []):
-                if isinstance(ip, str) and ip.strip():
-                    ips.add(ip.strip())
+            base_params = [("(single)", {})]
+        for label, base in base_params:
+            cursor = None
+            while True:
+                params = dict(base, page_size=1000)
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    r = client._get(path, params=params)
+                    api_calls += 1
+                except Exception as exc:
+                    s = str(exc)
+                    if "could not be found" in s.lower() or "NOT_FOUND" in s:
+                        log.debug("group=%s/%s (%s): not realized there (skipped)",
+                                  domain_id, gid, label)
+                    else:
+                        log.warning("group=%s/%s (%s): /members/ip-addresses failed: %s",
+                                    domain_id, gid, label, exc)
+                    break
+                page = r.get("results") or []
+                for ip in page:
+                    if isinstance(ip, str) and ip.strip():
+                        ips.add(ip.strip())
+                cursor = r.get("cursor")
+                if not cursor or not page:
+                    break
         result[gpath] = ips
+    log.info("IP-member API calls: %d", api_calls)
     total_ips = sum(len(v) for v in result.values())
     log.info("Group IP memberships fetched: %d total IP/CIDR entries across %d group(s)",
              total_ips, len(result))
@@ -448,10 +533,17 @@ def pull_group_ip_memberships(
 
 
 def _parse_ip_or_cidr(s: str) -> Optional[Tuple[str, Any]]:
-    """Return ('addr', ip_address) or ('net', ip_network) or None if unparseable."""
+    """Return ('addr', ip_address), ('net', ip_network), or ('range', (lo, hi))
+    for a-b range entries; None if unparseable."""
     try:
         if "/" in s:
             return ("net", ipaddress.ip_network(s, strict=False))
+        if "-" in s:
+            lo_s, hi_s = (x.strip() for x in s.split("-", 1))
+            lo, hi = ipaddress.ip_address(lo_s), ipaddress.ip_address(hi_s)
+            if lo.version != hi.version or lo > hi:
+                return None
+            return ("range", (lo, hi))
         return ("addr", ipaddress.ip_address(s))
     except (ValueError, TypeError):
         return None
@@ -491,8 +583,15 @@ def match_vm_ips_to_groups(
                     if any(a == val for a in vm_addrs):
                         hit = True
                         break
+                elif kind == "range":
+                    lo, hi = val
+                    if any(a.version == lo.version and lo <= a <= hi
+                           for a in vm_addrs):
+                        hit = True
+                        break
                 else:  # net
-                    if any(a in val for a in vm_addrs):
+                    if any(a.version == val.version and a in val
+                           for a in vm_addrs):
                         hit = True
                         break
             if hit:
@@ -872,6 +971,20 @@ def main() -> None:
         help="Query the federated /global-infra/ view (use with GM sources).",
     )
     parser.add_argument(
+        "--rate-limit", type=float, default=None, metavar="RPS",
+        help="Cap NSX API requests per second for this run (sets "
+             "NSX_API_MAX_RPS for every client, including site LM clients). "
+             "Default is 5 req/s; pass 0 to disable pacing. 429/503 retry "
+             "with backoff is always on.",
+    )
+    parser.add_argument(
+        "--members-cache-minutes", type=int, default=0,
+        help="GM mode: reuse the on-disk member/IP-member pull for this many "
+             "minutes (stored under <NSX_LOG_DIR>/.cache/). 0 (default) "
+             "disables. A cache is only used when it covers every "
+             "rule-referenced group; otherwise it refetches and rewrites.",
+    )
+    parser.add_argument(
         "--with-vm-inventory", action="store_true",
         help="GM mode only: ALSO connect directly to each site LM for fabric "
              "VM inventory, which adds VM IP addresses to the report. Default "
@@ -880,6 +993,8 @@ def main() -> None:
              "never fatal.",
     )
     args = parser.parse_args()
+    if args.rate_limit is not None:
+        os.environ["NSX_API_MAX_RPS"] = str(args.rate_limit)
 
     init_cli()
     setup_logging("vm_rule_membership")
@@ -909,6 +1024,8 @@ def main() -> None:
     pre_groups: Optional[Tuple[Dict[str, Dict[str, Any]],
                                Dict[str, Set[str]],
                                Dict[str, Dict[str, Any]]]] = None
+    pre_group_ips: Optional[Dict[str, Set[str]]] = None
+    pre_all_rules: Optional[List[Dict[str, Any]]] = None
 
     if is_gm_federation:
         log.info("Detected GM federation mode. Discovering sites.")
@@ -981,9 +1098,36 @@ def main() -> None:
         pre_domain_ids = [d.get("id") for d in domains if d.get("id")]
         if not pre_domain_ids:
             raise SystemExit("No domains returned from NSX.")
-        g_by_path, g_to_members, member_meta = pull_groups_with_members(
-            client, pre_domain_ids, gm_site_eps=gm_site_eps,
-        )
+        # Rules FIRST: membership only matters for groups that rules
+        # reference, so the member fetch is pruned to exactly those.
+        pre_all_rules = pull_all_rules(client, pre_domain_ids)
+        referenced: Set[str] = set()
+        for _r in pre_all_rules:
+            for _f in ("source_groups", "destination_groups", "scope"):
+                referenced.update(_group_paths(_r.get(_f)))
+        log.info("Rule-referenced groups: %d (member fetch limited to these).",
+                 len(referenced))
+
+        cache_path = (Path(nsx_log_dir).expanduser().resolve() / ".cache"
+                      / f"vm_rule_members_{manager_host}.json")
+        cached = _load_members_cache(cache_path, args.members_cache_minutes,
+                                     referenced)
+        if cached is not None:
+            g_by_path, g_to_members, member_meta, pre_group_ips = cached
+            log.info("Member cache HIT (%s): 0 member API calls this run.",
+                     cache_path.name)
+        else:
+            g_by_path, g_to_members, member_meta = pull_groups_with_members(
+                client, pre_domain_ids, gm_site_eps=gm_site_eps,
+                only_paths=referenced,
+            )
+            pre_group_ips = pull_group_ip_memberships(
+                client, g_by_path, gm_site_eps=gm_site_eps,
+                only_paths=referenced,
+            )
+            if args.members_cache_minutes > 0:
+                _save_members_cache(cache_path, g_by_path, g_to_members,
+                                    member_meta, pre_group_ips)
         pre_groups = (g_by_path, g_to_members, member_meta)
         known_ext = {v.get("external_id") or v.get("id") for v in vms}
         synthesized = 0
@@ -1124,11 +1268,14 @@ def main() -> None:
     # so a VM whose IP falls inside a group's IP set is effectively a member
     # for rule-matching purposes. Fetch /members/ip-addresses per group and
     # add matches into vm_to_groups.
-    group_ips = pull_group_ip_memberships(
-        client,
-        groups_by_path,
-        gm_site_eps=gm_site_eps if is_gm_federation else None,
-    )
+    if pre_group_ips is not None:
+        group_ips = pre_group_ips
+    else:
+        group_ips = pull_group_ip_memberships(
+            client,
+            groups_by_path,
+            gm_site_eps=gm_site_eps if is_gm_federation else None,
+        )
     ip_based_matches = match_vm_ips_to_groups(vm_ips, group_ips)
     for ext, gps in ip_based_matches.items():
         vm_to_groups.setdefault(ext, set()).update(gps)
@@ -1140,7 +1287,8 @@ def main() -> None:
         meta["group_count"] = len(vm_to_groups.get(meta["external_id"]) or set())
         meta["rule_hit_count"] = 0  # filled in after rule walk
 
-    all_rules = pull_all_rules(client, domain_ids)
+    all_rules = (pre_all_rules if pre_all_rules is not None
+                 else pull_all_rules(client, domain_ids))
 
     # ---- walk rules, find hits ----
     hits: List[Dict[str, Any]] = []
@@ -1270,6 +1418,8 @@ def main() -> None:
         "not_found": len(not_found),
         "duplicates": len(duplicate_names),
         "groups_indexed": len(groups_by_path),
+        "groups_member_fetched": sum(
+            1 for g in groups_by_path.values() if g.get("members_fetched", True)),
         "rules_scanned": len(all_rules),
         "rules_hitting_targets": len(hits),
         "output_dir": str(out_dir),

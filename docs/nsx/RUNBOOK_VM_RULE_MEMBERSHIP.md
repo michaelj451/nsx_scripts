@@ -58,6 +58,8 @@ python tools/reports/report_vms_in_rules.py --manager nsx-lm1
 Common variations:
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Explicit list file
 python tools/reports/report_vms_in_rules.py --manager nsx-lm1 \
   --vm-list some_other_list.txt
@@ -93,6 +95,13 @@ Location-scoped domains (domain id equal to a site id, e.g.
 responses for a group not realized at a site are benign and logged at debug,
 with one summary count at the end.
 
+Call volume: membership is fetched ONLY for groups that rules reference
+(a group no rule uses cannot produce a hit; NSX rolls nested-group members up
+into the parent, so this loses nothing), with proper pagination for groups
+over 1000 members. `--members-cache-minutes N` reuses the pull from disk for
+repeat runs (different VM lists cost zero member calls). The target-VM list
+never drives API calls at all.
+
 Optional: `--with-vm-inventory` ALSO connects directly to each site LM for
 fabric VM inventory, which enriches the report with VM IP addresses.
 Unreachable LMs are warnings, never fatal (targets with explicit IPs in the
@@ -111,6 +120,8 @@ minus fabric-sourced VM IPs.
 ## Step 3: Read the report
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 LATEST=$(ls -1td nsx_logs/reports/vm_rule_membership/nsx-lm1.lab.local/*/ | head -1)
 echo "Latest run: $LATEST"
 

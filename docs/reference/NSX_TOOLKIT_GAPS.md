@@ -88,6 +88,8 @@ affected rule, but only after the push runs.
 **How to know before the migration whether you're affected:**
 
 ```bash
+setopt interactive_comments 2>/dev/null || true
+
 # Returns every distinct PATH PREFIX used in any rule's applied_to / scope field
 grep -h "^- /infra" nsx_rules_export/<host>/security-policies/*/rules/*.yaml \
   | grep -oE "/infra/(domains/default/groups|tier-[01]s|sites|services|context-profiles|time-ranges)" \
