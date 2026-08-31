@@ -409,12 +409,23 @@ def main() -> int:
                    help="Single domain to query. Ignored if --all-domains is set.")
     p.add_argument("--all-domains", action="store_true",
                    help="Discover and iterate all domains on the target.")
-    p.add_argument("--federation-global", action="store_true")
+    p.add_argument("--federation-global", action="store_true",
+                   help="Refused: VM inventory is a fabric (LM-only) API and a "
+                        "federation-global run never opens a session to a "
+                        "Local Manager. Run this report once per site LM.")
     p.add_argument("--include-system-vms", action="store_true",
                    help="Also include non-REGULAR VMs (Edge, VC_SYSTEM, etc.). "
                         "Default: only REGULAR customer VMs.")
     p.add_argument("--output-base", default=None)
     args = p.parse_args()
+
+    if args.federation_global:
+        raise SystemExit(
+            "report_tag_map: --federation-global is not supported. VM tag "
+            "inventory is a fabric API that lives only on Local Managers, and "
+            "a federation-global run never opens a session to an LM (GM-only "
+            "rule). Run this report once per site LM instead."
+        )
 
     init_cli()
     target_host = resolve_manager(args.target)
@@ -436,39 +447,15 @@ def main() -> int:
     log.info("  output:            %s", out_dir)
     log.info("=" * 60)
 
-    c = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
+    # --federation-global was refused above: this client is always a single
+    # (usually Local) manager, and every call below goes to it alone.
+    c = NsxPolicyClient(nsxmanager=target_host, federation_global=False)
 
-    # Federation: collect VMs from each site's LM (fabric API is LM-scoped)
-    is_gm_fed = args.federation_global and "/global-manager/" in c.POLICY_ROOT
-    site_clients: Dict[str, NsxPolicyClient] = {}
-    if is_gm_fed:
-        try:
-            sr = c._get(c.POLICY_ROOT + "/sites")
-            for s in (sr.get("results") or []):
-                sid = s.get("id")
-                if not sid: continue
-                try:
-                    site_clients[sid] = NsxPolicyClient(nsxmanager=sid,
-                                                        federation_global=False)
-                    log.info("  federation site client ready: %s", sid)
-                except Exception as e:
-                    log.warning("  cannot connect to site %s: %s", sid, str(e)[:80])
-        except Exception as e:
-            log.warning("  site discovery failed: %s", str(e)[:80])
-
-    # Fetch VMs (from GM: aggregate all sites; from LM: local)
+    # Fetch VMs (fabric API, local to this manager)
     vms: List[Dict[str, Any]] = []
-    if is_gm_fed and site_clients:
-        for sid, sc in site_clients.items():
-            log.info("  fetching VMs from site %s ...", sid)
-            for v in (sc.list_virtual_machines() or []):
-                if args.include_system_vms or v.get("type") == "REGULAR":
-                    v["_from_site"] = sid
-                    vms.append(v)
-    else:
-        for v in (c.list_virtual_machines() or []):
-            if args.include_system_vms or v.get("type") == "REGULAR":
-                vms.append(v)
+    for v in (c.list_virtual_machines() or []):
+        if args.include_system_vms or v.get("type") == "REGULAR":
+            vms.append(v)
     log.info("  VMs collected: %d", len(vms))
 
     # Fetch groups (from all requested domains)
@@ -493,40 +480,25 @@ def main() -> int:
             log.warning("  domain %s: group list failed: %s", did, str(e)[:80])
     log.info("  customer groups collected: %d", len(all_groups))
 
-    # For complex groups with Tag conditions, fetch live member list per-site (federation)
+    # For complex groups with Tag conditions, fetch the live member list from
+    # the same target manager.
     complex_group_ids = [g.get("id") for g in all_groups
                         if not _group_is_simple_tag_only(g)
                         and _extract_tag_conditions(g)]
     live_group_members: Dict[str, List[Dict[str, Any]]] = {}
     if complex_group_ids:
-        if is_gm_fed and site_clients:
-            for sid, sc in site_clients.items():
-                log.info("  fetching live members for %d complex group(s) from %s ...",
-                         len(complex_group_ids), sid)
-                for gid in complex_group_ids:
-                    did = group_domain.get(gid, "default")
-                    try:
-                        r = sc._get(sc.POLICY_ROOT + f"/domains/{did}/groups/{gid}/members/virtual-machines")
-                        for v in (r.get("results") or []):
-                            live_group_members.setdefault(gid, []).append({
-                                "external_id": v.get("external_id") or v.get("id") or "",
-                                "display_name": v.get("display_name") or "",
-                            })
-                    except Exception:
-                        pass
-        else:
-            log.info("  fetching live members for %d complex group(s) ...", len(complex_group_ids))
-            for gid in complex_group_ids:
-                did = group_domain.get(gid, "default")
-                try:
-                    r = c._get(c.POLICY_ROOT + f"/domains/{did}/groups/{gid}/members/virtual-machines")
-                    for v in (r.get("results") or []):
-                        live_group_members.setdefault(gid, []).append({
-                            "external_id": v.get("external_id") or v.get("id") or "",
-                            "display_name": v.get("display_name") or "",
-                        })
-                except Exception:
-                    pass
+        log.info("  fetching live members for %d complex group(s) ...", len(complex_group_ids))
+        for gid in complex_group_ids:
+            did = group_domain.get(gid, "default")
+            try:
+                r = c._get(c.POLICY_ROOT + f"/domains/{did}/groups/{gid}/members/virtual-machines")
+                for v in (r.get("results") or []):
+                    live_group_members.setdefault(gid, []).append({
+                        "external_id": v.get("external_id") or v.get("id") or "",
+                        "display_name": v.get("display_name") or "",
+                    })
+            except Exception:
+                pass
 
     # Build the correlation
     log.info("  building 3-way correlation ...")

@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+tests/test_gm_proxy.py
+
+Offline tests for the federation-global rule: a Global Manager run never
+opens a session to a Local Manager. Group member counts
+(report_groups_usage) and rule statistics (report_rules_usage) are proxied
+THROUGH the GM with enforcement_point_path, one call per site, and summed.
+
+    python -m unittest tests/test_gm_proxy.py -v
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import logging
+import sys
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT / "app") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "app"))
+
+logging.disable(logging.CRITICAL)
+
+from nsx.nsx_policy_client import NsxApiError, NsxPolicyClient  # noqa: E402
+
+
+def _load(name: str, rel: str):
+    spec = importlib.util.spec_from_file_location(name, REPO_ROOT / rel)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+groups_usage = _load("report_groups_usage", "tools/reports/report_groups_usage.py")
+rules_usage = _load("report_rules_usage", "tools/reports/report_rules_usage.py")
+
+EPS = {
+    "siteA": "/global-infra/sites/siteA/enforcement-points/default",
+    "siteB": "/global-infra/sites/siteB/enforcement-points/default",
+}
+
+
+def _site_of(ep: str) -> str:
+    return ep.split("/sites/")[1].split("/")[0]
+
+
+class FakeGm:
+    """Stands in for NsxPolicyClient pointed at a GM. Records every call so a
+    test can assert that all of them carried an enforcement point and none
+    went anywhere but the GM policy root."""
+    POLICY_ROOT = "/global-manager/api/v1/global-infra"
+
+    def __init__(self, pages=None, not_found_sites=(), stats=None, fail_sites=()):
+        self.calls = []
+        self.pages = pages or {}
+        self.not_found = set(not_found_sites)
+        self.stats = stats or {}
+        self.fail_sites = set(fail_sites)
+
+    @staticmethod
+    def _q(value):
+        return str(value)
+
+    def _get(self, path, params=None, timeout=30):
+        params = dict(params or {})
+        self.calls.append((path, params))
+        site = _site_of(params["enforcement_point_path"])
+        if site in self.not_found:
+            raise Exception('[HTTP 404] GET failed: {"error_code": 600, "httpStatus": "NOT_FOUND"}')
+        pages = self.pages.get(site, [[]])
+        idx = int(params.get("cursor") or 0)
+        out = {"results": pages[idx]}
+        if idx + 1 < len(pages):
+            out["cursor"] = str(idx + 1)
+        return out
+
+    def get_security_policy_statistics(self, security_policy_id, domain_id="default",
+                                       enforcement_point_path=None, timeout=60):
+        site = _site_of(enforcement_point_path)
+        self.calls.append(("stats", site))
+        if site in self.fail_sites:
+            raise Exception("[HTTP 400] GET failed: 400 java.lang.NullPointerException")
+        return {"results": [{"enforcement_point": enforcement_point_path,
+                             "statistics": {"results": self.stats.get(site, [])}}]}
+
+
+class GroupMembersViaGm(unittest.TestCase):
+    def test_global_domain_fans_out_per_site_and_sums(self):
+        gm = FakeGm(pages={"siteA": [[{"id": 1}, {"id": 2}], [{"id": 3}]],
+                           "siteB": [[{"id": 9}]]})
+        total, per_site = groups_usage._get_group_vm_count_federated(gm, EPS, "default", "g1")
+        self.assertEqual(total, 4)
+        self.assertEqual(per_site, {"siteA": 3, "siteB": 1})
+        self.assertEqual({p["enforcement_point_path"] for _, p in gm.calls}, set(EPS.values()))
+        self.assertTrue(all(path.startswith("/global-manager/") for path, _ in gm.calls))
+        self.assertEqual(len(gm.calls), 3)   # two pages for siteA, one for siteB
+
+    def test_location_scoped_domain_queries_its_own_site_only(self):
+        gm = FakeGm(pages={"siteB": [[{"id": 1}]]})
+        total, per_site = groups_usage._get_group_vm_count_federated(gm, EPS, "siteB", "g1")
+        self.assertEqual(total, 1)
+        self.assertEqual(list(per_site), ["siteB"])
+
+    def test_not_found_at_a_site_is_zero_members_there(self):
+        gm = FakeGm(pages={"siteA": [[{"id": 1}]]}, not_found_sites=("siteB",))
+        total, per_site = groups_usage._get_group_vm_count_federated(gm, EPS, "default", "g1")
+        self.assertEqual(total, 1)
+        self.assertEqual(per_site["siteB"], 0)
+
+
+class StatsViaGm(unittest.TestCase):
+    def test_sums_across_sites(self):
+        gm = FakeGm(stats={"siteA": [{"internal_rule_id": "r1", "hit_count": 5, "popularity_index": 2}],
+                           "siteB": [{"internal_rule_id": "r1", "hit_count": 7, "popularity_index": 9}]})
+        errors = []
+        merged, ok = rules_usage._fetch_stats_via_gm(gm, EPS, "default", "p1", errors)
+        self.assertEqual(ok, 2)
+        self.assertEqual(merged["r1"]["hit_count"], 12)
+        self.assertEqual(merged["r1"]["popularity_index"], 9)
+        self.assertEqual(errors, [])
+
+    def test_npe_on_every_site_is_recorded_with_no_fallback(self):
+        gm = FakeGm(fail_sites=("siteA", "siteB"))
+        errors = []
+        merged, ok = rules_usage._fetch_stats_via_gm(gm, EPS, "default", "p1", errors, "Policy 1")
+        self.assertEqual(merged, {})
+        self.assertEqual(ok, 0)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(e["attempt"].startswith("policy_api_gm:") for e in errors))
+        self.assertTrue(all(c[0] == "stats" for c in gm.calls))
+
+    def test_location_scoped_domain_hits_its_own_site_only(self):
+        gm = FakeGm(stats={"siteA": [{"internal_rule_id": "r1", "hit_count": 1}]})
+        merged, ok = rules_usage._fetch_stats_via_gm(gm, EPS, "siteA", "p1", [])
+        self.assertEqual(ok, 1)
+        self.assertEqual([c[1] for c in gm.calls], ["siteA"])
+
+
+class NoLocalManagerSessionsInGmMode(unittest.TestCase):
+    """Static guard: no report tool may construct a client for a federation site."""
+
+    def test_no_site_client_construction(self):
+        for rel in ("tools/reports/report_groups_usage.py",
+                    "tools/reports/report_rules_usage.py",
+                    "tools/reports/report_vms_in_rules.py",
+                    "tools/reports/report_tag_map.py"):
+            src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotIn("NsxPolicyClient(nsxmanager=sid", src, rel)
+            self.assertNotIn("site_clients", src, rel)
+            self.assertNotIn("site_fabric", src, rel)
+            self.assertNotIn("build_site_clients_for_federation", src, rel)
+
+
+class ClientRefusesLmInFederationGlobal(unittest.TestCase):
+    """federation_global=True with a non-GM host must raise in the
+    constructor, before any HTTP session is opened."""
+
+    def test_constructor_refuses_non_gm_host(self):
+        with self.assertRaises(NsxApiError) as ctx:
+            NsxPolicyClient(nsxmanager="nsx-lm1.lab.local",
+                            federation_global=True)
+        self.assertIn("Global Manager", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

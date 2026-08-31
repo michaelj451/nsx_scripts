@@ -190,17 +190,73 @@ def _flatten_policy_stats(stats_doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]
     return by_irid
 
 
+def _merge_stats_rows(dst: Dict[str, Dict[str, Any]], src: Dict[str, Dict[str, Any]]) -> None:
+    """Sum counters (max for popularity fields) from src into dst, keyed by
+    internal rule id. Used to aggregate per-site statistics."""
+    sum_fields = ("hit_count", "byte_count", "packet_count", "session_count",
+                  "l7_accept_count", "l7_reject_count",
+                  "l7_reject_with_response_count", "total_session_count",
+                  "active_sessions_count")
+    max_fields = ("popularity_index", "max_popularity_index", "max_session_count")
+    for irid, row in src.items():
+        slot = dst.setdefault(irid, {"internal_rule_id": irid})
+        for f in sum_fields:
+            if row.get(f) is not None:
+                slot[f] = slot.get(f, 0) + int(row[f])
+        for f in max_fields:
+            if row.get(f) is not None:
+                slot[f] = max(slot.get(f, 0), int(row[f]))
+
+
+def _fetch_stats_via_gm(client, site_eps: Dict[str, str], domain_id: str, policy_id: str,
+                        errors: List[Dict[str, str]], policy_display: str = ""
+                        ) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    """GM federation mode: query the Policy /statistics endpoint THROUGH THE
+    GM, once per relevant site with `enforcement_point_path`, and sum. Never
+    opens a session to a Local Manager. A location-scoped domain (domain id
+    == a site id) is queried at its own site only.
+
+    Returns (stats_by_irid, sites_answered). On NSX 3.2.x the GM endpoint
+    throws a NullPointerException for every site; the failures are recorded
+    in `errors` and the caller reports the rules as NO_STATS. There is
+    deliberately no Local Manager fallback in this mode.
+    """
+    targets = {domain_id: site_eps[domain_id]} if domain_id in site_eps else site_eps
+    merged: Dict[str, Dict[str, Any]] = {}
+    sites_ok = 0
+    for site_id, ep in targets.items():
+        try:
+            doc = client.get_security_policy_statistics(
+                security_policy_id=policy_id, domain_id=domain_id,
+                enforcement_point_path=ep)
+        except Exception as exc:
+            log.warning("  Policy-API /statistics via GM failed for %s/%s at site %s: %s",
+                        domain_id, policy_id, site_id, str(exc)[:100])
+            errors.append({
+                "domain": domain_id, "policy": policy_id, "display": policy_display,
+                "attempt": f"policy_api_gm:{site_id}",
+                "error": str(exc)[:200],
+            })
+            continue
+        _merge_stats_rows(merged, _flatten_policy_stats(doc))
+        sites_ok += 1
+    return merged, sites_ok
+
+
 # =============================================================================
 # Fallback stats query via the old /api/v1/firewall/sections/<id>/rules/stats
 #
 # The Policy-API /statistics endpoint has an NSX 3.2.x bug when queried against
 # federated policies (/global-infra scope). It returns HTTP 500
-# "General error has occurred. java.lang.NullPointerException" on LMs.
-# GM returns 400 "Enforcement point is mandatory" even when the param is set.
+# "General error has occurred. java.lang.NullPointerException" on LMs, and on
+# the GM it returns 400 "Enforcement point is mandatory" without the param and
+# 400 java.lang.NullPointerException with it (verified on 3.2.2).
 #
 # The pre-Policy API (/api/v1/firewall/sections/<id>/rules/stats) still works
 # on the LM side because federated rules are shadowed there for enforcement.
-# We use it as a fallback when the Policy stats query fails.
+# It is used as a fallback ONLY on direct Local Manager runs, against the same
+# manager. A federation-global run against a GM never contacts a Local
+# Manager: when the GM cannot answer, the rules are reported as NO_STATS.
 # =============================================================================
 
 _SECTION_INDEX_CACHE: Dict[Any, Dict[str, str]] = {}
@@ -315,10 +371,19 @@ def _write_markdown_report(reports_dir: Path,
 
     if errs:
         _add("### Policy-API stats query errors\n")
-        _add("The Policy-API `/statistics` endpoint failed for these policies. "
-             "Where possible the tool fell back to the pre-Policy firewall API "
-             "(`/api/v1/firewall/sections/<id>/rules/stats`). See "
-             "`stats_source (per policy)` above for how many were rescued.\n")
+        if summary.get("gm_proxy_mode"):
+            _add("The Policy-API `/statistics` endpoint, queried through the Global "
+                 "Manager per enforcement point, failed for these policies. A "
+                 "federation-global run never contacts a Local Manager, so there is "
+                 "no fallback: the affected rules are classified `NO_STATS` rather "
+                 "than reported as 0 hits. On NSX 3.2.x this is the known "
+                 "NullPointerException in the GM statistics endpoint; run the report "
+                 "against each site LM for hit counts.\n")
+        else:
+            _add("The Policy-API `/statistics` endpoint failed for these policies. "
+                 "Where possible the tool fell back to the pre-Policy firewall API "
+                 "(`/api/v1/firewall/sections/<id>/rules/stats`) on the same manager. See "
+                 "`stats_source (per policy)` above for how many were rescued.\n")
         _add("| Domain | Policy | Attempt | Error (truncated) |")
         _add("|---|---|---|---|")
         for e in errs[:30]:
@@ -339,6 +404,8 @@ def _write_markdown_report(reports_dir: Path,
     _add(f"| STALE (had hits, none in {args.stale_days}d) | {counters.get('STALE', 0)} |")
     _add(f"| UNUSED (0 hits, <= {args.fresh_days}d old) | {counters.get('UNUSED', 0)} |")
     _add(f"| DORMANT (0 hits, > {args.fresh_days}d old) | {counters.get('DORMANT', 0)} |")
+    if counters.get("NO_STATS"):
+        _add(f"| NO_STATS (this manager could not return statistics; not 0 hits) | {counters['NO_STATS']} |")
     _add(f"| **Total hit_count** | **{counters.get('total_hit_count', 0):,}** |")
     _add(f"| Total byte_count | {counters.get('total_byte_count', 0):,} |")
     _add(f"| Total packet_count | {counters.get('total_packet_count', 0):,} |")
@@ -386,15 +453,20 @@ def _write_markdown_report(reports_dir: Path,
             dsh_s = f"{dsh}d" if dsh is not None else "-"
             pol   = str(r.get("policy_display") or r.get("policy_id") or "")[:32]
             rule  = str(r.get("rule_display") or r.get("rule_id") or "")[:45]
+            if r.get("stats_available", True):
+                cnt = [f"{int(r.get(k) or 0):,}"
+                       for k in ("hit_count", "byte_count", "packet_count", "session_count")]
+            else:
+                cnt = ["-", "-", "-", "-"]
             _add(f"| {r.get('classification','')} "
                  f"| {r.get('domain_id','') or 'default'} "
                  f"| `{pol}` "
                  f"| `{rule}` "
                  f"| {r.get('action','')} "
-                 f"| {int(r.get('hit_count') or 0):,} "
-                 f"| {int(r.get('byte_count') or 0):,} "
-                 f"| {int(r.get('packet_count') or 0):,} "
-                 f"| {int(r.get('session_count') or 0):,} "
+                 f"| {cnt[0]} "
+                 f"| {cnt[1]} "
+                 f"| {cnt[2]} "
+                 f"| {cnt[3]} "
                  f"| {age_s} "
                  f"| {dsh_s} |")
         _add()
@@ -490,8 +562,8 @@ def _write_markdown_report(reports_dir: Path,
     if summary.get("all_domains_mode") and summary.get("per_domain"):
         _add("## Per-domain breakdown")
         _add()
-        _add("| Domain | Rules | HOT | USED | STALE | UNUSED | DORMANT | Total hits | Total bytes |")
-        _add("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        _add("| Domain | Rules | HOT | USED | STALE | UNUSED | DORMANT | NO_STATS | Total hits | Total bytes |")
+        _add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for dname, stats in summary["per_domain"].items():
             _add(f"| `{dname}` "
                  f"| {stats.get('rules', 0)} "
@@ -500,6 +572,7 @@ def _write_markdown_report(reports_dir: Path,
                  f"| {stats.get('STALE', 0)} "
                  f"| {stats.get('UNUSED', 0)} "
                  f"| {stats.get('DORMANT', 0)} "
+                 f"| {stats.get('NO_STATS', 0)} "
                  f"| {int(stats.get('total_hit_count', 0)):,} "
                  f"| {int(stats.get('total_byte_count', 0)):,} |")
         _add()
@@ -559,7 +632,7 @@ def _classify(rec: Dict[str, Any], hot_threshold: int, fresh_days: int,
 # Snapshot history scan — derives "days_since_hit_changed" per rule
 # =============================================================================
 
-def _load_history(history_dir: Path, current_keyset: set) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], int]:
+def _load_history(history_dir: Path) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], int]:
     """Walk all timestamped snapshot dirs under history_dir, collect each
     rule's hit_count progression, and compute the most recent snapshot
     timestamp where hit_count INCREASED (the rule's last-known-active anchor).
@@ -752,34 +825,32 @@ def main() -> int:
     rules_records: List[Dict[str, Any]] = []
 
     # Scan accumulated snapshot history to derive 'days since last hit_count change' per rule.
-    history, snapshot_count = _load_history(history_dir, set())
+    history, snapshot_count = _load_history(history_dir)
     log.info("History scan: %d prior snapshot(s) found; %d rules with hit-anchor data",
              snapshot_count, sum(1 for v in history.values() if v.get("last_change_iso")))
 
-    # Detect GM federation-global target. In that case we should query stats
-    # against each federation site's LM directly (GM's own stats endpoint has
-    # a mandatory-enforcement-point requirement plus an NPE bug on 3.2.x).
-    site_clients: Dict[str, Any] = {}
+    # GM federation-global: statistics are queried THROUGH THE GM, once per
+    # site with enforcement_point_path. This run never opens a session to a
+    # Local Manager, and there is deliberately no LM fallback in this mode:
+    # on NSX 3.2.x the GM endpoint throws a NullPointerException and the
+    # affected rules are reported as NO_STATS. Run the report against each
+    # site LM for hit counts on that version.
+    site_eps: Dict[str, str] = {}
+    managers_contacted = [target_host]
     is_gm_fed = args.federation_global and "/global-manager/" in client.POLICY_ROOT
     if is_gm_fed:
         try:
-            sr = client._get(client.POLICY_ROOT + "/sites")
-            for s in (sr.get("results") or []):
-                sid = s.get("id")
-                if not sid:
-                    continue
-                try:
-                    site_clients[sid] = NsxPolicyClient(nsxmanager=sid,
-                                                        federation_global=False)
-                    log.info("  federation site client ready for stats: %s", sid)
-                except Exception as e:
-                    log.warning("  cannot connect to site %s for stats query: %s",
-                                sid, str(e)[:80])
+            site_eps = client.list_site_enforcement_points()
         except Exception as e:
             log.warning("  site discovery failed: %s", str(e)[:80])
+        for sid, ep in site_eps.items():
+            log.info("  site %s -> enforcement point %s", sid, ep)
+        log.info("GM mode: no direct LM connections. Statistics go through the GM "
+                 "per enforcement point (%d site(s)).", len(site_eps))
 
     stats_query_errors: List[Dict[str, str]] = []
     stats_source_summary: Dict[str, int] = {"policy_api": 0, "old_firewall_api": 0, "empty": 0}
+    policies_without_stats: set = set()
 
     for did, pol in policies_with_domain:
         pol_id = pol.get("id")
@@ -798,54 +869,51 @@ def main() -> int:
         stats_by_irid: Dict[str, Dict[str, Any]] = {}
         stats_source = "empty"
 
-        # Attempt 1: Policy-API /statistics on the primary client
-        try:
-            stats_doc = client.get_security_policy_statistics(
-                security_policy_id=pol_id, domain_id=did,
-            )
-            stats_by_irid = _flatten_policy_stats(stats_doc)
-            if stats_by_irid:
-                stats_source = "policy_api"
-        except Exception as exc:
-            log.warning("  Policy-API /statistics failed for %s/%s: %s",
-                        did, pol_id, str(exc)[:100])
-            stats_query_errors.append({
-                "domain": did, "policy": pol_id, "display": pol_display,
-                "attempt": "policy_api",
-                "error": str(exc)[:200],
-            })
-
-        # Attempt 2 (fallback): old firewall API on each site LM (when GM), or on
-        # the same LM if we're querying an LM directly.
-        if not stats_by_irid:
-            if site_clients:
-                for site_id, site_c in site_clients.items():
-                    site_stats = _fetch_stats_via_old_firewall_api(site_c, pol_display)
-                    for irid, row in site_stats.items():
-                        slot = stats_by_irid.setdefault(irid, {"internal_rule_id": irid})
-                        for f in ("hit_count", "byte_count", "packet_count",
-                                  "session_count", "l7_accept_count",
-                                  "l7_reject_count", "l7_reject_with_response_count",
-                                  "total_session_count", "active_sessions_count"):
-                            if row.get(f) is not None:
-                                slot[f] = slot.get(f, 0) + int(row[f])
-                        for f in ("popularity_index", "max_popularity_index", "max_session_count"):
-                            if row.get(f) is not None:
-                                slot[f] = max(slot.get(f, 0), int(row[f]))
+        if is_gm_fed:
+            # Policy-API /statistics through the GM, per site. No LM fallback.
+            if site_eps:
+                stats_by_irid, sites_ok = _fetch_stats_via_gm(
+                    client, site_eps, did, pol_id, stats_query_errors, pol_display)
                 if stats_by_irid:
-                    stats_source = "old_firewall_api"
-                    log.info("  stats via old-firewall-API fallback (aggregated across %d site(s))",
-                             len(site_clients))
+                    stats_source = "policy_api"
+                    log.info("  stats via GM (%d site(s) answered)", sites_ok)
             else:
+                log.warning("  no enforcement points discovered; cannot query stats through the GM")
+        else:
+            # Attempt 1: Policy-API /statistics on the target itself.
+            try:
+                stats_doc = client.get_security_policy_statistics(
+                    security_policy_id=pol_id, domain_id=did,
+                )
+                stats_by_irid = _flatten_policy_stats(stats_doc)
+                if stats_by_irid:
+                    stats_source = "policy_api"
+            except Exception as exc:
+                log.warning("  Policy-API /statistics failed for %s/%s: %s",
+                            did, pol_id, str(exc)[:100])
+                stats_query_errors.append({
+                    "domain": did, "policy": pol_id, "display": pol_display,
+                    "attempt": "policy_api",
+                    "error": str(exc)[:200],
+                })
+            # Attempt 2 (direct LM runs only): pre-Policy firewall API on the
+            # SAME manager.
+            if not stats_by_irid:
                 stats_by_irid = _fetch_stats_via_old_firewall_api(client, pol_display)
                 if stats_by_irid:
                     stats_source = "old_firewall_api"
-                    log.info("  stats via old-firewall-API fallback")
+                    log.info("  stats via old-firewall-API fallback (same manager)")
 
         stats_source_summary[stats_source] = stats_source_summary.get(stats_source, 0) + 1
         if stats_source == "empty":
-            log.warning("  no stats available for %s/%s (Policy API failed, no fallback match)",
-                        did, pol_id)
+            policies_without_stats.add((did, pol_id))
+            if is_gm_fed:
+                log.warning("  no stats for %s/%s via the GM; rules reported as NO_STATS "
+                            "(no Local Manager fallback in federation-global mode)",
+                            did, pol_id)
+            else:
+                log.warning("  no stats available for %s/%s (Policy API failed, no fallback match)",
+                            did, pol_id)
 
         for rule in rules:
             if rule.get("_system_owned"):
@@ -853,6 +921,9 @@ def main() -> int:
             rid = rule.get("id")
             irid = str(rule.get("rule_id") or "")
             stats = stats_by_irid.get(irid, {})
+            # False when this manager could not answer /statistics for the
+            # policy (GM run on NSX 3.2.x): the rule is NO_STATS, never "0 hits".
+            stats_available = (did, pol_id) not in policies_without_stats
             mod_time_ms = rule.get("_last_modified_time")
             create_time_ms = rule.get("_create_time")
             # Prefer the older of create/modify as the "age" baseline — a rule
@@ -877,7 +948,8 @@ def main() -> int:
                 "source_groups":      rule.get("source_groups") or [],
                 "destination_groups": rule.get("destination_groups") or [],
                 "services":           rule.get("services") or [],
-                # Statistics — aggregated across enforcement points
+                # Statistics, aggregated across enforcement points.
+                "stats_available":              stats_available,
                 "hit_count":                    int(stats.get("hit_count")          or 0),
                 "byte_count":                   int(stats.get("byte_count")         or 0),
                 "packet_count":                 int(stats.get("packet_count")       or 0),
@@ -898,14 +970,16 @@ def main() -> int:
             # History-derived "last hit" anchor (approximate, accurate to snapshot frequency).
             # Keyed on (domain_id, policy_id, rule_id) so that two domains with same rule_id
             # don't collide in the history.
-            hist = history.get((did, pol_id, rid)) or history.get((pol_id, rid)) or {}
+            hist = history.get((did, pol_id, rid)) or {}
             record["history_first_seen_iso"]  = hist.get("first_seen_iso")
             record["history_last_change_iso"] = hist.get("last_change_iso")
             record["history_counter_reset_observed"] = bool(hist.get("counter_reset_observed"))
             record["days_since_hit_changed"]  = _days_between_iso(now_iso, hist.get("last_change_iso"))
             record["history_snapshot_count"]  = snapshot_count
-            record["classification"] = _classify(
-                record, args.hot_threshold, args.fresh_days, args.stale_days,
+            record["classification"] = (
+                "NO_STATS" if not stats_available else _classify(
+                    record, args.hot_threshold, args.fresh_days, args.stale_days,
+                )
             )
             rules_records.append(record)
 
@@ -913,13 +987,14 @@ def main() -> int:
 
     # Classification buckets
     by_class: Dict[str, List[Dict[str, Any]]] = {
-        "HOT": [], "USED": [], "STALE": [], "UNUSED": [], "DORMANT": [],
+        "HOT": [], "USED": [], "STALE": [], "UNUSED": [], "DORMANT": [], "NO_STATS": [],
     }
     for r in rules_records:
         by_class.setdefault(r["classification"], []).append(r)
 
     hot_rules     = sorted(rules_records, key=lambda r: r["hit_count"], reverse=True)[:args.top_n]
-    unused_rules  = [r for r in rules_records if r["hit_count"] == 0]
+    unused_rules  = [r for r in rules_records
+                     if r["hit_count"] == 0 and r.get("stats_available", True)]
     dormant_rules = [r for r in rules_records if r["classification"] == "DORMANT"]
     stale_rules   = [r for r in rules_records if r["classification"] == "STALE"]
 
@@ -932,7 +1007,8 @@ def main() -> int:
             if (r.get("days_since_hit_changed") is not None
                 and r["days_since_hit_changed"] >= args.min_days_since_hit)
             # Include never-hit DORMANT rules too - those are always "no hit in N days"
-            or (r["hit_count"] == 0 and (r.get("rule_age_days") or 0) >= args.min_days_since_hit)
+            or (r["hit_count"] == 0 and r.get("stats_available", True)
+                and (r.get("rule_age_days") or 0) >= args.min_days_since_hit)
         ]
 
     # --hits-in-last-days filter: rules whose hit_count went UP within the last N
@@ -1012,6 +1088,7 @@ def main() -> int:
     for r in rules_records:
         slot = per_domain_counts.setdefault(r["domain_id"], {
             "rules": 0, "HOT": 0, "USED": 0, "STALE": 0, "UNUSED": 0, "DORMANT": 0,
+            "NO_STATS": 0,
             "total_hit_count": 0, "total_byte_count": 0, "total_packet_count": 0,
         })
         slot["rules"] += 1
@@ -1028,6 +1105,9 @@ def main() -> int:
         "domains_queried":  domains_to_query,
         "per_domain":       per_domain_counts,
         "federation_global": args.federation_global,
+        "managers_contacted": managers_contacted,
+        "gm_proxy_mode":     is_gm_fed,
+        "policies_without_stats": sorted(f"{d}/{p}" for d, p in policies_without_stats),
         "read_only":         True,
         "include_defaults": args.include_defaults,
         "hot_threshold":    args.hot_threshold,
@@ -1043,6 +1123,7 @@ def main() -> int:
             "STALE":              len(by_class["STALE"]),
             "UNUSED":             len(by_class["UNUSED"]),
             "DORMANT":            len(by_class["DORMANT"]),
+            "NO_STATS":           len(by_class["NO_STATS"]),
             "total_hit_count":    sum(r["hit_count"]    for r in rules_records),
             "total_byte_count":   sum(r["byte_count"]   for r in rules_records),
             "total_packet_count": sum(r["packet_count"] for r in rules_records),
@@ -1141,6 +1222,9 @@ def main() -> int:
     log.info("  STALE   (had hits, none in %dd) : %d", args.stale_days, len(by_class["STALE"]))
     log.info("  UNUSED  (0 hits, <= %dd old)    : %d", args.fresh_days, len(by_class["UNUSED"]))
     log.info("  DORMANT (0 hits, > %dd old)     : %d", args.fresh_days, len(by_class["DORMANT"]))
+    if by_class["NO_STATS"]:
+        log.info("  NO_STATS (manager could not return statistics) : %d",
+                 len(by_class["NO_STATS"]))
     log.info("  History snapshots scanned     : %d", snapshot_count)
     if args.min_days_since_hit is not None and min_days_filter is not None:
         log.info("  Rules with no hits in >= %dd  : %d (see no_hits_in_n_days.json)",
@@ -1152,6 +1236,7 @@ def main() -> int:
         went_dorm   = sum(1 for d in diff_records if d["transition"] == "went_dormant")
         delta_only  = sum(1 for d in diff_records if d["transition"] == "delta")
         log.info("  Diff: lit_up=%d  went_dormant=%d  delta=%d", lit_up, went_dorm, delta_only)
+    log.info("Managers contacted: %s", ", ".join(managers_contacted))
     log.info("Report: %s", reports_dir)
     log.info("=" * 60)
     print(json.dumps(summary, indent=2))

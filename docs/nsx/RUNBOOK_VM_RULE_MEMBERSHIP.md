@@ -102,20 +102,16 @@ over 1000 members. `--members-cache-minutes N` reuses the pull from disk for
 repeat runs (different VM lists cost zero member calls). The target-VM list
 never drives API calls at all.
 
-Optional: `--with-vm-inventory` ALSO connects directly to each site LM for
-fabric VM inventory, which enriches the report with VM IP addresses.
-Unreachable LMs are warnings, never fatal (targets with explicit IPs in the
-list keep their IPs either way).
+A federation-global run talks to the GM and nothing else: it never opens a
+session to a site LM (the client refuses the combination outright), so
+fabric-sourced VM IPs are not part of the GM report. Targets with explicit
+IPs in the list keep their IPs.
 
 ```bash
 python tools/reports/report_vms_in_rules.py \
   --manager nsx-gm1 \
   --federation-global
 ```
-
-LM reachability is only needed with `--with-vm-inventory` (each site ID must
-then resolve to a reachable LM hostname). Without it, the report is complete
-minus fabric-sourced VM IPs.
 
 ## Step 3: Read the report
 

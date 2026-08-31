@@ -292,6 +292,14 @@ enforcement happens on the LMs. For accurate "is this rule matching traffic"
 data, query the **LM that's enforcing**. Use GM mode for global-policy
 inventory and federation compliance reporting.
 
+A `--federation-global` run against a GM talks to the GM only: statistics
+are requested through the GM per site (`enforcement_point_path`) and the
+tool never opens a session to a Local Manager (the closing log line
+`Managers contacted:` shows exactly one host). On NSX 3.2.x the GM endpoint
+fails with a NullPointerException; affected rules are then classified
+`NO_STATS` rather than shown as 0 hits, and the per-LM runs are the source
+of hit counts on that version.
+
 ---
 
 ## 9. Read-only guarantee — what's enforced

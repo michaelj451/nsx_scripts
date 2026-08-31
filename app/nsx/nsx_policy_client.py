@@ -64,12 +64,22 @@ class NsxPolicyClient:
             if h
         )
 
-        if federation_global:
-            self.POLICY_ROOT = (
-                "/global-manager/api/v1/global-infra"
-                if is_gm
-                else "/policy/api/v1/global-infra"
+        # GM-only rule: a federation-global run talks to a Global Manager and
+        # nothing else. Refusing here, before any HTTP session is opened,
+        # makes it structurally impossible for ANY tool to open a session to
+        # a Local Manager while --federation-global is in effect.
+        if federation_global and not is_gm:
+            raise NsxApiError(
+                400,
+                f"federation_global=True requires a Global Manager target; "
+                f"'{nsxmanager}' is not a configured GM host (NSX_GM1/NSX_GM2). "
+                f"A federation-global run never opens a session to a Local "
+                f"Manager. Point at the GM, or drop federation_global for a "
+                f"direct LM run.",
             )
+
+        if federation_global:
+            self.POLICY_ROOT = "/global-manager/api/v1/global-infra"
         else:
             self.POLICY_ROOT = "/policy/api/v1/infra"
 
@@ -268,6 +278,39 @@ class NsxPolicyClient:
             lambda: self.session.delete(self._url(path), timeout=timeout),
             "DELETE", path)
         return self._json_or_empty(resp) or {"status": "ok"}
+
+    # ---------------------------
+    # Federation helpers
+    # ---------------------------
+
+    def list_site_enforcement_points(self) -> Dict[str, str]:
+        """GM only: {site_id: enforcement_point_path} for every federation site,
+        from GET <POLICY_ROOT>/sites and .../sites/<id>/enforcement-points.
+
+        Tools use this to proxy member and statistics queries THROUGH the GM
+        (`enforcement_point_path=...`) so a federation-global run never opens
+        a session to a Local Manager. When a site's enforcement-point list
+        cannot be read, the conventional .../enforcement-points/default path
+        is assumed for that site.
+        """
+        eps: Dict[str, str] = {}
+        r = self._get(self.POLICY_ROOT + "/sites")
+        for s in (r.get("results") or []):
+            sid = s.get("id")
+            if not sid:
+                continue
+            ep_path = None
+            try:
+                er = self._get(self.POLICY_ROOT + f"/sites/{self._q(sid)}/enforcement-points")
+                found = er.get("results") or []
+                if found:
+                    ep_path = found[0].get("path")
+            except NsxApiError as exc:
+                logging.getLogger(__name__).warning(
+                    "site %s: enforcement-point discovery failed (%s); "
+                    "assuming .../enforcement-points/default", sid, str(exc)[:100])
+            eps[sid] = ep_path or f"/global-infra/sites/{sid}/enforcement-points/default"
+        return eps
 
     # ---------------------------
     # Paging helpers
