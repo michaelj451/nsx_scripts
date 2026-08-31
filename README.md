@@ -55,6 +55,7 @@ Full index of every doc, grouped by area: [docs/README.md](docs/README.md).
 | **Filter-copy** - clone only policies of chosen categories, plus their transitive deps (groups, services, nested groups) | `nsx-lm1` -> any target | filtered subset of services + groups + policies + rules | [docs/nsx/RUNBOOK_FILTER_COPY.md](docs/nsx/RUNBOOK_FILTER_COPY.md) |
 | **BACKUP** - read-only config backup with kept timestamped history; restore = push the bundle back | any manager(s) -> local `nsx_backup/` | definitions only (GET-only; no additive enrichment) | [docs/nsx/RUNBOOK_BACKUP.md](docs/nsx/RUNBOOK_BACKUP.md) |
 | **IP remap audit** - what looks mapped vs gaps, per the CSV; cron-safe exit code | any manager (read-only) | groups' IP entries | [docs/nsx/RUNBOOK_B.md](docs/nsx/RUNBOOK_B.md) section B.4 |
+| **INFO GATHER** - read-only evidence pack: VM rule membership, group membership, 30-day rule hit counts, hostname tag dry run, IP remap dry run, each with LM and GM blocks | any LM and/or GM -> local `nsx_info_<alias>/{lm,gm}/` | GET only, no --apply anywhere | [docs/nsx/RUNBOOK_INFO_GATHER.md](docs/nsx/RUNBOOK_INFO_GATHER.md) / [_PS.md](docs/nsx/RUNBOOK_INFO_GATHER_PS.md) |
 
 Each runbook has a `_PS.md` PowerShell variant where applicable.
 

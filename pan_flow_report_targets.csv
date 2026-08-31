@@ -1,0 +1,32 @@
+# Flow list for tools/pan/report_flow_rules.py.
+#
+# AUTO-DISCOVERED: this file at repo root is picked up automatically.
+# Override with --flows <path> or PAN_FLOW_REPORT_LIST (.env).
+#
+# The header row below is optional and its column names are case-insensitive.
+# Accepted aliases:
+#
+#   source       src, src_ip, source_ip, from          (required)
+#   destination  dst, dest, dst_ip, destination_ip, to (required)
+#   protocol     proto            tcp | udp | blank for any
+#   port         dst_port, destination_port
+#   src_zone     source_zone      omit for a zone-agnostic lookup
+#   dst_zone     destination_zone
+#   name         label, id, flow, ticket   free-text label for the report
+#
+# A headerless file is read positionally as: src,dst[,protocol[,port]]
+#
+# Blank lines and lines starting with # are ignored. Source and destination
+# must be single host IPs. A /32 or /128 suffix is stripped; a wider CIDR is
+# reported as an invalid row rather than silently tested on its network
+# address, so list the individual hosts you care about.
+#
+# Examples (uncomment / edit for your environment):
+#
+# name,source,destination,protocol,port
+# web-to-db,10.6.0.101,10.6.2.102,tcp,3306
+# CHG-12345,10.6.0.101,8.8.8.8,udp,53
+# mgmt-ssh,10.255.1.10,10.6.1.102,tcp,22
+# any-port-check,10.6.0.101,10.6.2.102,,
+
+name,source,destination,protocol,port

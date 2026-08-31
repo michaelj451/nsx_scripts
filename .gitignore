@@ -287,3 +287,6 @@ __marimo__/
 /.idea/modules.xml
 /.idea/inspectionProfiles/profiles_settings.xml
 /.idea/vcs.xml
+nsx_info_*/
+nsx_info_*.tgz
+nsx_info_*.zip
