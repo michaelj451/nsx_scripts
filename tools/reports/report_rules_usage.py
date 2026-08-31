@@ -250,13 +250,17 @@ def _fetch_stats_via_gm(client, site_eps: Dict[str, str], domain_id: str, policy
 # federated policies (/global-infra scope). It returns HTTP 500
 # "General error has occurred. java.lang.NullPointerException" on LMs, and on
 # the GM it returns 400 "Enforcement point is mandatory" without the param and
-# 400 java.lang.NullPointerException with it (verified on 3.2.2).
+# 400 java.lang.NullPointerException with it (verified on 3.2.2; the per-rule
+# .../rules/<rule-id>/statistics variant fails identically, probed 2026-08-31).
 #
 # The pre-Policy API (/api/v1/firewall/sections/<id>/rules/stats) still works
 # on the LM side because federated rules are shadowed there for enforcement.
-# It is used as a fallback ONLY on direct Local Manager runs, against the same
-# manager. A federation-global run against a GM never contacts a Local
-# Manager: when the GM cannot answer, the rules are reported as NO_STATS.
+# It is used two ways:
+#   - direct Local Manager runs: fallback against the same manager;
+#   - federation-global runs: when the GM cannot answer, the tool opens
+#     read-only sessions to each site LM and sums the per-site counters.
+#     The LM addresses are discovered from the GM's own site registry
+#     (site_connection_info), NEVER taken from .env.
 # =============================================================================
 
 _SECTION_INDEX_CACHE: Dict[Any, Dict[str, str]] = {}
@@ -313,6 +317,65 @@ def _fetch_stats_via_old_firewall_api(client, policy_display: str) -> Dict[str, 
             if row.get(f) is not None:
                 slot[f] = max(slot.get(f, 0), int(row[f]))
     return by_irid
+
+
+def _connect_lm_stats_clients(gm_client, managers_contacted: List[str],
+                              errors: List[Dict[str, str]],
+                              client_factory=None) -> Dict[str, Any]:
+    """Statistics fallback for federation-global runs: open a read-only
+    session to each site's LM, with the LM address taken from the GM's own
+    site registry (list_site_lm_fqdns), NEVER from .env aliases. Called
+    lazily, only after the GM statistics endpoint has failed for a policy.
+    Sites that cannot be reached are recorded in `errors` and skipped;
+    every LM actually contacted is appended to `managers_contacted`."""
+    factory = client_factory or (lambda host: NsxPolicyClient(
+        nsxmanager=host, federation_global=False))
+    clients: Dict[str, Any] = {}
+    try:
+        fqdns = gm_client.list_site_lm_fqdns()
+    except Exception as exc:
+        log.warning("  LM fallback: site address discovery via the GM failed: %s",
+                    str(exc)[:120])
+        errors.append({"domain": "", "policy": "", "display": "",
+                       "attempt": "lm_fallback_discovery",
+                       "error": str(exc)[:200]})
+        return clients
+    for sid, fqdn in fqdns.items():
+        try:
+            lm = factory(fqdn)
+        except Exception as exc:
+            log.warning("  LM fallback: cannot connect to site %s (%s): %s",
+                        sid, fqdn, str(exc)[:120])
+            errors.append({"domain": "", "policy": "", "display": "",
+                           "attempt": f"lm_fallback_connect:{sid}",
+                           "error": str(exc)[:200]})
+            continue
+        _lock_client_read_only(lm)
+        clients[sid] = lm
+        managers_contacted.append(fqdn)
+        log.info("  LM fallback: read-only session to site %s LM at %s "
+                 "(address from the GM site registry)", sid, fqdn)
+    return clients
+
+
+def _fetch_stats_via_lm_direct(lm_clients: Dict[str, Any], policy_display: str,
+                               domain_id: str, policy_id: str,
+                               errors: List[Dict[str, str]]
+                               ) -> Dict[str, Dict[str, Any]]:
+    """Sum pre-Policy firewall-API statistics for one policy across every
+    connected site LM (federated sections are shadowed on each LM under the
+    policy's display name). Empty dict when no LM could answer."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for sid, lm in lm_clients.items():
+        rows = _fetch_stats_via_old_firewall_api(lm, policy_display)
+        if rows:
+            _merge_stats_rows(merged, rows)
+        else:
+            errors.append({"domain": domain_id, "policy": policy_id,
+                           "display": policy_display,
+                           "attempt": f"old_firewall_api_lm:{sid}",
+                           "error": "no stats (section missing or query failed)"})
+    return merged
 
 
 # =============================================================================
@@ -373,12 +436,13 @@ def _write_markdown_report(reports_dir: Path,
         _add("### Policy-API stats query errors\n")
         if summary.get("gm_proxy_mode"):
             _add("The Policy-API `/statistics` endpoint, queried through the Global "
-                 "Manager per enforcement point, failed for these policies. A "
-                 "federation-global run never contacts a Local Manager, so there is "
-                 "no fallback: the affected rules are classified `NO_STATS` rather "
-                 "than reported as 0 hits. On NSX 3.2.x this is the known "
-                 "NullPointerException in the GM statistics endpoint; run the report "
-                 "against each site LM for hit counts.\n")
+                 "Manager per enforcement point, failed for these policies (on NSX "
+                 "3.2.x this is the known NullPointerException; the per-rule "
+                 "variant fails identically). Statistics were then fetched "
+                 "directly from each site LM over the pre-Policy firewall API; "
+                 "the LM addresses come from the GM's own site registry, never "
+                 "from local configuration. Rules are classified `NO_STATS` only "
+                 "where no site LM could answer either.\n")
         else:
             _add("The Policy-API `/statistics` endpoint failed for these policies. "
                  "Where possible the tool fell back to the pre-Policy firewall API "
@@ -829,12 +893,12 @@ def main() -> int:
     log.info("History scan: %d prior snapshot(s) found; %d rules with hit-anchor data",
              snapshot_count, sum(1 for v in history.values() if v.get("last_change_iso")))
 
-    # GM federation-global: statistics are queried THROUGH THE GM, once per
-    # site with enforcement_point_path. This run never opens a session to a
-    # Local Manager, and there is deliberately no LM fallback in this mode:
-    # on NSX 3.2.x the GM endpoint throws a NullPointerException and the
-    # affected rules are reported as NO_STATS. Run the report against each
-    # site LM for hit counts on that version.
+    # GM federation-global: statistics are queried THROUGH THE GM first, once
+    # per site with enforcement_point_path. When the GM cannot answer (NSX
+    # 3.2.x NullPointerException), the tool falls back BY DEFAULT to direct
+    # read-only sessions on each site LM, using addresses from the GM's own
+    # site registry, never from .env. Rules are NO_STATS only when no site
+    # LM could answer either.
     site_eps: Dict[str, str] = {}
     managers_contacted = [target_host]
     is_gm_fed = args.federation_global and "/global-manager/" in client.POLICY_ROOT
@@ -845,12 +909,15 @@ def main() -> int:
             log.warning("  site discovery failed: %s", str(e)[:80])
         for sid, ep in site_eps.items():
             log.info("  site %s -> enforcement point %s", sid, ep)
-        log.info("GM mode: no direct LM connections. Statistics go through the GM "
-                 "per enforcement point (%d site(s)).", len(site_eps))
+        log.info("GM mode: statistics go through the GM per enforcement point "
+                 "(%d site(s)); if the GM cannot answer, site LMs are queried "
+                 "directly (read-only) at addresses from the GM site registry, "
+                 "never from .env.", len(site_eps))
 
     stats_query_errors: List[Dict[str, str]] = []
     stats_source_summary: Dict[str, int] = {"policy_api": 0, "old_firewall_api": 0, "empty": 0}
     policies_without_stats: set = set()
+    lm_stats_clients: Optional[Dict[str, Any]] = None  # lazy; only if the GM cannot answer
 
     for did, pol in policies_with_domain:
         pol_id = pol.get("id")
@@ -870,7 +937,7 @@ def main() -> int:
         stats_source = "empty"
 
         if is_gm_fed:
-            # Policy-API /statistics through the GM, per site. No LM fallback.
+            # Attempt 1: Policy-API /statistics through the GM, per site.
             if site_eps:
                 stats_by_irid, sites_ok = _fetch_stats_via_gm(
                     client, site_eps, did, pol_id, stats_query_errors, pol_display)
@@ -879,6 +946,21 @@ def main() -> int:
                     log.info("  stats via GM (%d site(s) answered)", sites_ok)
             else:
                 log.warning("  no enforcement points discovered; cannot query stats through the GM")
+            # Attempt 2 (default in federation-global mode): direct read-only
+            # sessions to each site LM, at addresses discovered FROM THE GM
+            # site registry (never .env). On NSX 3.2.x every GM statistics
+            # endpoint NPEs, so this is where hit counts come from there.
+            if not stats_by_irid:
+                if lm_stats_clients is None:
+                    lm_stats_clients = _connect_lm_stats_clients(
+                        client, managers_contacted, stats_query_errors)
+                stats_by_irid = _fetch_stats_via_lm_direct(
+                    lm_stats_clients, pol_display, did, pol_id,
+                    stats_query_errors)
+                if stats_by_irid:
+                    stats_source = "old_firewall_api"
+                    log.info("  stats via direct site-LM fallback (%d LM(s), "
+                             "addresses from the GM)", len(lm_stats_clients))
         else:
             # Attempt 1: Policy-API /statistics on the target itself.
             try:
@@ -908,9 +990,8 @@ def main() -> int:
         if stats_source == "empty":
             policies_without_stats.add((did, pol_id))
             if is_gm_fed:
-                log.warning("  no stats for %s/%s via the GM; rules reported as NO_STATS "
-                            "(no Local Manager fallback in federation-global mode)",
-                            did, pol_id)
+                log.warning("  no stats for %s/%s from the GM or any site LM; "
+                            "rules reported as NO_STATS", did, pol_id)
             else:
                 log.warning("  no stats available for %s/%s (Policy API failed, no fallback match)",
                             did, pol_id)
@@ -1107,6 +1188,9 @@ def main() -> int:
         "federation_global": args.federation_global,
         "managers_contacted": managers_contacted,
         "gm_proxy_mode":     is_gm_fed,
+        "lm_stats_fallback_used":  lm_stats_clients is not None,
+        "lm_stats_fallback_sites": sorted(lm_stats_clients) if lm_stats_clients else [],
+        "lm_addresses_source":     "gm_site_registry" if lm_stats_clients else None,
         "policies_without_stats": sorted(f"{d}/{p}" for d, p in policies_without_stats),
         "read_only":         True,
         "include_defaults": args.include_defaults,

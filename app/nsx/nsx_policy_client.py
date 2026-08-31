@@ -312,6 +312,28 @@ class NsxPolicyClient:
             eps[sid] = ep_path or f"/global-infra/sites/{sid}/enforcement-points/default"
         return eps
 
+    def list_site_lm_fqdns(self) -> Dict[str, str]:
+        """GM only: {site_id: lm_fqdn} for every federation site, taken from
+        GET <POLICY_ROOT>/sites `site_connection_info`. The LM addresses come
+        from the GM's own site registry, NEVER from local configuration
+        (.env aliases). When a site carries no connection info, the site id
+        itself (which the GM also provided) is used; in most deployments the
+        id already is the LM FQDN.
+        """
+        out: Dict[str, str] = {}
+        r = self._get(self.POLICY_ROOT + "/sites")
+        for s in (r.get("results") or []):
+            sid = s.get("id")
+            if not sid:
+                continue
+            fqdn = None
+            for ci in (s.get("site_connection_info") or []):
+                if ci.get("fqdn"):
+                    fqdn = ci["fqdn"]
+                    break
+            out[sid] = fqdn or sid
+        return out
+
     # ---------------------------
     # Paging helpers
     # ---------------------------

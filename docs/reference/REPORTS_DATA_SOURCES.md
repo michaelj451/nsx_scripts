@@ -20,8 +20,8 @@ Runbook counterparts: [RUNBOOK_REPORTS.md](../nsx/RUNBOOK_REPORTS.md) (bash),
 | Policy list per domain | **NSX API** `GET /policy/api/v1/infra/domains/<d>/security-policies` (or `/global-infra/` on federation) |
 | Rules per policy | **NSX API** `GET .../security-policies/<p>/rules` |
 | Stats - primary | **NSX API** `GET .../security-policies/<p>/statistics`. On a federation-global GM run: through the GM with `?enforcement_point_path=<site EP>`, one call per site, summed |
-| Stats - fallback (direct LM runs only) | **NSX API (old firewall API)** `GET /api/v1/firewall/sections/<id>/rules/stats` on the same manager. Never used on a GM run: a GM run opens no Local Manager session; rules the GM cannot answer for are `NO_STATS` |
-| Federation site + enforcement-point discovery (when target is GM) | **NSX API** `GET /global-manager/api/v1/global-infra/sites` and `.../sites/<id>/enforcement-points` |
+| Stats - fallback | **NSX API (old firewall API)** `GET /api/v1/firewall/sections/<id>/rules/stats`. Direct LM runs: same manager. Federation-global runs: when the GM cannot answer, read-only sessions to each site LM at addresses from the GM site registry (`site_connection_info`, never `.env`), counters summed per site; rules are `NO_STATS` only when no LM answers either |
+| Federation site + enforcement-point + LM-address discovery (when target is GM) | **NSX API** `GET /global-manager/api/v1/global-infra/sites` (also yields each site's LM FQDN via `site_connection_info`) and `.../sites/<id>/enforcement-points` |
 | `days_since_hit_changed`, `--hits-in-last-days`, `--min-days-since-hit` | **Local disk**: prior `rules_usage.json` files under `nsx_logs/reports/rules_usage/<host>/*/` |
 | `--compare-to` diff | **Local disk**: a specific prior report bundle you name |
 
@@ -130,7 +130,7 @@ NSX has three API prefixes; the report tools use all three:
 |---|---|---|
 | `/policy/api/v1/...` | Policy Manager (declarative DFW policies, groups, security rules) | report_rules_usage, report_groups_usage |
 | `/api/v1/fabric/...` | Fabric Manager (VMs, hosts, transport nodes) | dryrun, push, revert |
-| `/api/v1/firewall/sections/...` | Legacy pre-Policy DFW API. Stats fallback on direct LM runs only (never on a GM run) | report_rules_usage (fallback only) |
+| `/api/v1/firewall/sections/...` | Legacy pre-Policy DFW API. Stats fallback: direct LM runs on the same manager; federation-global runs on site LMs discovered via the GM | report_rules_usage (fallback only) |
 
 ### Federation prefix auto-switching
 

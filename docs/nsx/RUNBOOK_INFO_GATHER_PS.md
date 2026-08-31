@@ -5,16 +5,18 @@ or hand over, every one at `$G/<manager-host>/<report>/<ts>/` so LM and GM
 runs sit side by side under their own hostnames. Nothing here writes to
 NSX. Every step has a **Local Manager**
 block and a **Global Manager (federation)** block; run whichever applies, or
-both. A Global Manager block talks to the GM and nothing else: member and
-statistics queries are proxied through the GM per site, and no step opens a
-session to a Local Manager unless you run its Local Manager block. Where DFW policy is GM-owned, the LM blocks show only the default rules
+both. A Global Manager block talks to the GM first: member and statistics
+queries are proxied through the GM per site. The one exception is step 3
+statistics when the GM cannot answer (NSX 3.2.x): the tool then opens
+read-only sessions to each site LM, at addresses taken from the GM's own
+site registry, never from `.env`. Where DFW policy is GM-owned, the LM blocks show only the default rules
 and zero customer groups, and the GM blocks carry the real answer.
 
 | Step | Report | Tool | LM | GM |
 |---|---|---|---|---|
 | 1 | VM rule membership: every DFW rule touching the VMs in your list | `tools/reports/report_vms_in_rules.py` | yes | yes (GM only, no LM access needed) |
 | 2 | Group membership: every customer group, its type, and evaluated VM members | `tools/reports/report_groups_usage.py` | yes | yes (GM only, members proxied per site) |
-| 3 | Rule hit counts, last 30 days: HOT / USED / STALE / UNUSED / DORMANT plus the 30-day window | `tools/reports/report_rules_usage.py` | yes | yes (GM only; on NSX 3.2.x the GM cannot return hit counts, see step 3) |
+| 3 | Rule hit counts, last 30 days: HOT / USED / STALE / UNUSED / DORMANT plus the 30-day window | `tools/reports/report_rules_usage.py` | yes | yes (GM first; on NSX 3.2.x stats come from site LMs discovered via the GM, see step 3) |
 | 4 | Hostname tag dry run: who would be tagged, who is skipped and why | `tools/reports/dryrun_hostname_tags.py` | yes | no (VM inventory is LM-only; run per site LM) |
 | 5 | IP remap dry run: what the CSV remap would add, already-remapped pairs, gaps | `capture_nsx_state.py` + `groups.py push` (dry-run) | yes | yes |
 
@@ -121,7 +123,7 @@ python tools/reports/report_rules_usage.py `
   --output-base $G
 ```
 
-Global Manager (all domains; statistics through the GM per enforcement point, no LM sessions):
+Global Manager (all domains; statistics through the GM per enforcement point, with automatic read-only site-LM fallback, addresses from the GM):
 
 ```powershell
 python tools/reports/report_rules_usage.py `
@@ -144,12 +146,14 @@ baseline and the window fills in as scheduled runs accumulate (daily is
 plenty). Keep `--history-dir` at its default so every run lands in the same
 history.
 
-On NSX 3.2.x the GM statistics endpoint fails with a NullPointerException.
-The GM run then classifies every affected rule as `NO_STATS` instead of
-reporting 0 hits, and it never falls back to a Local Manager; on that
-version the Local Manager block above is the source of hit counts. The log
-line `Managers contacted:` at the end of every run shows where the calls
-went.
+On NSX 3.2.x the GM statistics endpoint fails with a NullPointerException
+(per-policy and per-rule variants alike). The run then falls back by
+default to a direct read-only session on each site LM and sums the
+per-site counters; the LM addresses are discovered from the GM's own site
+registry (`site_connection_info`), never taken from `.env`. Rules are
+`NO_STATS` only when no site LM could answer either. The log line
+`Managers contacted:` at the end of every run shows exactly which managers
+were reached, and `summary.json` records `lm_stats_fallback_sites`.
 
 ---
 
@@ -232,6 +236,6 @@ Everything under `$G` is regenerable: re-run any step to refresh it.
 | Step | Touches NSX? | Rate |
 |---|---|---|
 | 1 to 5, audit | GET only | client default 2 req/s (`NSX_API_MAX_RPS` in `.env` to change) |
-| Global Manager blocks | GET only, one session to the GM; no Local Manager sessions | same |
+| Global Manager blocks | GET only; one session to the GM, plus read-only site-LM sessions in step 3 when the GM cannot return statistics (LM addresses from the GM site registry, never `.env`) | same |
 
 No `--apply` appears anywhere in this runbook.

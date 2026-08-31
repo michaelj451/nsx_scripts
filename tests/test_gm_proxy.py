@@ -53,12 +53,17 @@ class FakeGm:
     went anywhere but the GM policy root."""
     POLICY_ROOT = "/global-manager/api/v1/global-infra"
 
-    def __init__(self, pages=None, not_found_sites=(), stats=None, fail_sites=()):
+    def __init__(self, pages=None, not_found_sites=(), stats=None, fail_sites=(),
+                 lm_fqdns=None):
         self.calls = []
         self.pages = pages or {}
         self.not_found = set(not_found_sites)
         self.stats = stats or {}
         self.fail_sites = set(fail_sites)
+        self.lm_fqdns = dict(lm_fqdns or {})
+
+    def list_site_lm_fqdns(self):
+        return dict(self.lm_fqdns)
 
     @staticmethod
     def _q(value):
@@ -139,8 +144,93 @@ class StatsViaGm(unittest.TestCase):
         self.assertEqual([c[1] for c in gm.calls], ["siteA"])
 
 
+class FakeLm:
+    """Site LM answering the pre-Policy firewall API (sections + rule stats)."""
+
+    def __init__(self, sections=None, stats=None):
+        self.calls = []
+        self.sections = sections or {}   # display_name -> section_id
+        self.stats = stats or {}         # section_id -> [stat rows]
+
+    def _get(self, path, params=None, timeout=30):
+        self.calls.append(path)
+        if path == "/api/v1/firewall/sections":
+            return {"results": [{"display_name": d, "id": i}
+                                for d, i in self.sections.items()]}
+        sid = path.split("/sections/")[1].split("/")[0]
+        return {"results": self.stats.get(sid, [])}
+
+
+class LmStatsFallback(unittest.TestCase):
+    """Federation-global statistics fallback: direct read-only LM sessions,
+    addresses ONLY from the GM's site registry, counters summed per site."""
+
+    def setUp(self):
+        rules_usage._SECTION_INDEX_CACHE.clear()
+
+    def test_clients_built_only_from_gm_discovered_addresses(self):
+        gm = FakeGm(lm_fqdns={"siteA": "lm-a.corp.example",
+                              "siteB": "lm-b.corp.example"})
+        built = []
+
+        def factory(host):
+            built.append(host)
+            return FakeLm()
+
+        contacted, errors = ["gm.lab.local"], []
+        clients = rules_usage._connect_lm_stats_clients(
+            gm, contacted, errors, client_factory=factory)
+        self.assertEqual(sorted(built), ["lm-a.corp.example", "lm-b.corp.example"])
+        self.assertEqual(sorted(contacted),
+                         ["gm.lab.local", "lm-a.corp.example", "lm-b.corp.example"])
+        self.assertEqual(sorted(clients), ["siteA", "siteB"])
+        self.assertEqual(errors, [])
+
+    def test_unreachable_site_is_recorded_and_skipped(self):
+        gm = FakeGm(lm_fqdns={"siteA": "lm-a.corp.example",
+                              "siteB": "lm-b.corp.example"})
+
+        def factory(host):
+            if host == "lm-b.corp.example":
+                raise Exception("connect timeout")
+            return FakeLm()
+
+        contacted, errors = [], []
+        clients = rules_usage._connect_lm_stats_clients(
+            gm, contacted, errors, client_factory=factory)
+        self.assertEqual(sorted(clients), ["siteA"])
+        self.assertEqual(contacted, ["lm-a.corp.example"])
+        self.assertEqual([e["attempt"] for e in errors],
+                         ["lm_fallback_connect:siteB"])
+
+    def test_stats_summed_across_site_lms(self):
+        lm_a = FakeLm(sections={"Policy 1": "s1"},
+                      stats={"s1": [{"rule_id": "r1", "hit_count": 5}]})
+        lm_b = FakeLm(sections={"Policy 1": "s9"},
+                      stats={"s9": [{"rule_id": "r1", "hit_count": 7}]})
+        errors = []
+        merged = rules_usage._fetch_stats_via_lm_direct(
+            {"siteA": lm_a, "siteB": lm_b}, "Policy 1", "default", "p1", errors)
+        self.assertEqual(merged["r1"]["hit_count"], 12)
+        self.assertEqual(errors, [])
+
+    def test_site_without_section_is_recorded(self):
+        lm_a = FakeLm(sections={"Policy 1": "s1"},
+                      stats={"s1": [{"rule_id": "r1", "hit_count": 3}]})
+        lm_b = FakeLm()   # policy not shadowed here
+        errors = []
+        merged = rules_usage._fetch_stats_via_lm_direct(
+            {"siteA": lm_a, "siteB": lm_b}, "Policy 1", "default", "p1", errors)
+        self.assertEqual(merged["r1"]["hit_count"], 3)
+        self.assertEqual([e["attempt"] for e in errors],
+                         ["old_firewall_api_lm:siteB"])
+
+
 class NoLocalManagerSessionsInGmMode(unittest.TestCase):
-    """Static guard: no report tool may construct a client for a federation site."""
+    """Static guard: report tools may not build site clients from local (.env)
+    aliases. report_rules_usage's statistics fallback constructs LM clients
+    ONLY from addresses the GM's site registry returned (see LmStatsFallback);
+    the banned patterns below catch the old .env-alias style."""
 
     def test_no_site_client_construction(self):
         for rel in ("tools/reports/report_groups_usage.py",
