@@ -39,6 +39,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.md_utils import align_markdown_tables
+from nsx.report_paths import report_run_dir, reports_root
 
 # Re-use the classifier from build_hostname_tag_plan.py to avoid duplication.
 # That file still lives under tools/vm_tags/; we're now under tools/reports/.
@@ -160,9 +161,15 @@ def main() -> None:
         help="NSX Local Manager to query.",
     )
     parser.add_argument(
+        "--output-base",
+        default=None,
+        help="Reports root. The run lands at <root>/<manager-host>/hostname_tags_dryrun/<ts>/ "
+             "(default root: $NSX_LOG_DIR/reports).",
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
-        help="Where to write the classification reports (default: <NSX_VM_LOG_DIR>/vm_tags_plan/<manager-host>).",
+        help="Exact directory override (run lands at <dir>/<ts>/). Prefer --output-base.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Delete --output-dir before writing.")
     parser.add_argument("--exclude-file", default=None,
@@ -180,14 +187,12 @@ def main() -> None:
     if not manager_host:
         raise SystemExit(f"Manager not defined for {args.manager}.")
 
-    if args.output_dir:
-        host_dir = Path(args.output_dir).expanduser().resolve()
-    else:
-        host_dir = Path(nsx_log_dir).expanduser().resolve() / "reports" / "vm_tags_plan" / manager_host
-
     # Per-run timestamped subdir so successive runs accumulate instead of
     # overwriting each other.
-    out_dir = host_dir / RUN_TS
+    if args.output_dir:
+        out_dir = Path(args.output_dir).expanduser().resolve() / RUN_TS
+    else:
+        out_dir = report_run_dir("hostname_tags_dryrun", manager_host, args.output_base, RUN_TS, create=False)
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(f"Output dir already exists: {out_dir}. Use --overwrite.")

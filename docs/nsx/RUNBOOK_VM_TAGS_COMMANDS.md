@@ -19,15 +19,15 @@ export PYTHONPATH="$PWD/app"
 ```bash
 python tools/reports/dryrun_hostname_tags.py \
   --manager nsx-lm1 \
-  --output-dir nsx_logs/reports/vm_tags_plan/nsx-lm1.lab.local \
+  --output-base nsx_logs/reports \
   --overwrite
 ```
 
 Discover the latest plan dir (used as `--plan-dir` for the push):
 
 ```bash
-PLAN=$(ls -1t nsx_logs/reports/vm_tags_plan/nsx-lm1.lab.local/ | head -1)
-PLAN_DIR="nsx_logs/reports/vm_tags_plan/nsx-lm1.lab.local/$PLAN"
+PLAN=$(ls -1t nsx_logs/reports/nsx-lm1.lab.local/hostname_tags_dryrun/ | head -1)
+PLAN_DIR="nsx_logs/reports/nsx-lm1.lab.local/hostname_tags_dryrun/$PLAN"
 echo "Plan: $PLAN_DIR"
 ```
 
@@ -44,7 +44,7 @@ python tools/vm_tags/export_vm_tags.py \
 ```bash
 python tools/vm_tags/build_hostname_tag_plan.py \
   --vm-export nsx_vm_files/vm_tags_export/nsx-lm1.lab.local/vms.json \
-  --output-dir nsx_logs/reports/vm_tags_plan/nsx-lm1.lab.local \
+  --output-base nsx_logs/reports \
   --overwrite
 ```
 

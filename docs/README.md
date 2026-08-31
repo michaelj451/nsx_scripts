@@ -61,6 +61,7 @@ a matching revert.
 |---|---|
 | [RUNBOOK_PAN_LAB.md](pan/RUNBOOK_PAN_LAB.md) / [ps](pan/RUNBOOK_PAN_LAB_PS.md) | Lab Panorama over the API: auth (`panorama_auth.py`), config pulls, rule-service tooling |
 | [RUNBOOK_PAN_PROD.md](pan/RUNBOOK_PAN_PROD.md) / [ps](pan/RUNBOOK_PAN_PROD_PS.md) | Production Panorama, manual / file-driven (no API): offline policy lookup flow |
+| [RUNBOOK_PAN_FLOW_RULES.md](pan/RUNBOOK_PAN_FLOW_RULES.md) / [ps](pan/RUNBOOK_PAN_FLOW_RULES_PS.md) | Offline flow/rule report: a CSV of source/destination pairs in, every covering rule out, plus a subnet list that suppresses matches by attribution |
 
 ## Testing
 

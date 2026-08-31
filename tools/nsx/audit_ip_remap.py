@@ -26,7 +26,7 @@ INPUT (one of):
 REQUIRED:
   --csv <path>            The same old_subnet,new_subnet CSV the remap used.
 
-OUTPUT (default: $NSX_LOG_DIR/reports/ip_remap_audit/<label>/<UTC ts>/):
+OUTPUT (default: $NSX_LOG_DIR/reports/<host>/ip_remap_audit/<UTC ts>/; --output-base changes the root):
   ip_remap_audit.md       the report (gaps on top, then mapped, then by-design)
   ip_remap_audit.json     per-group rows, full detail
   gaps.json               sections 1a / 1b / 1c only
@@ -58,6 +58,7 @@ from nsx.cli_bootstrap import init_cli                       # noqa: E402
 from nsx.md_utils import align_markdown_tables                # noqa: E402
 from nsx.nsx_constants import nsx_log_dir, resolve_manager    # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient             # noqa: E402
+from nsx.report_paths import report_run_dir                  # noqa: E402
 from nsx_group_ip_remap_offline import (                      # noqa: E402
     SKIP_INVALID, SKIP_IPV6, SKIP_RANGE, PrefixMappingTable,
     _canonical_ip_token, _load_mapping_csv, _token_kind,
@@ -515,7 +516,8 @@ def main() -> int:
     p.add_argument("--domain-id", default="default")
     p.add_argument("--federation-global", action="store_true", help="Target is a Global Manager.")
     p.add_argument("--output-base", default=None,
-                   help="Report root (default: $NSX_LOG_DIR/reports/ip_remap_audit/<label>/<ts>/).")
+                   help="Reports root. The run lands at <root>/<manager-host>/ip_remap_audit/<ts>/ "
+                        "(default root: $NSX_LOG_DIR/reports).")
     p.add_argument("--label", default=None, help="Override the label used in the report and output path.")
     p.add_argument("--include-generic", action="store_true",
                    help="Treat CSV-covered originals in GENERIC groups as gaps too. Default mirrors "
@@ -544,8 +546,7 @@ def main() -> int:
         source_desc = f"export dir {groups_dir}"
         host = None
 
-    base = Path(args.output_base).expanduser().resolve() if args.output_base else Path(nsx_log_dir).expanduser().resolve() / "reports" / "ip_remap_audit"
-    out_dir = base / label / RUN_TS
+    out_dir = report_run_dir("ip_remap_audit", label, args.output_base, RUN_TS)
     log_file = _setup_logging(out_dir)
 
     log.info("=" * 60)

@@ -64,7 +64,7 @@ setopt interactive_comments 2>/dev/null || true
 python tools/reports/report_vms_in_rules.py --manager nsx-lm1 \
   --vm-list some_other_list.txt
 
-# Custom output root (default: nsx_logs/reports/vm_rule_membership/<host>/<UTC_TS>/)
+# Custom output root (default: nsx_logs/reports/<host>/vm_rule_membership/<UTC_TS>/)
 python tools/reports/report_vms_in_rules.py --manager nsx-lm1 \
   --output-dir /tmp/vm_rule_report
 
@@ -122,7 +122,7 @@ minus fabric-sourced VM IPs.
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-LATEST=$(ls -1td nsx_logs/reports/vm_rule_membership/nsx-lm1.lab.local/*/ | head -1)
+LATEST=$(ls -1td nsx_logs/reports/nsx-lm1.lab.local/vm_rule_membership/*/ | head -1)
 echo "Latest run: $LATEST"
 
 # Open the markdown in your editor:

@@ -31,8 +31,15 @@ PowerShell variant: [RUNBOOK_PAN_PROD_PS.md](RUNBOOK_PAN_PROD_PS.md).
 |---|---|---|---|
 | `tools/pan/check_policy_match.py` | Offline "can A reach B" policy lookup — walks the full Panorama evaluation chain in correct PAN-OS order, reports verdict + matched rule + trace | Panorama XML config file + `(src_ip, dst_ip, [zones], [service/port])` | `verdict.json` + human/JSON stdout |
 | `tools/pan/recommend_dg.py` | "Which DG should a new rule go on?" — checks for existing matches, then if none, scores each DG's affinity to the flow's /24 (or other CIDR) by counting rules referencing the same address space | Same as above + `--subnet-mask` | `recommendation.json` + `recommendation.txt` + human/JSON stdout |
+| `tools/pan/report_flow_rules.py` | Batch "which rules cover these flows" report: takes a CSV of source/destination pairs and reports EVERY rule covering each one, flagging which decides. A second list of subnets suppresses matches by attribution | Panorama XML config file + a flow CSV + an optional subnet list | Report bundle: `report.md`, `flow_rules.json(l)`, `suppressed_matches.jsonl` |
 
-(Future tools — `find_matching_rules.py` for "every rule across the chain that matches", batch CSV mode, NAT-aware analysis — are flagged on the [PAN direction memory](#) and will be added here as they ship.)
+`report_flow_rules.py` has its own runbook:
+[RUNBOOK_PAN_FLOW_RULES.md](RUNBOOK_PAN_FLOW_RULES.md) /
+[ps](RUNBOOK_PAN_FLOW_RULES_PS.md). It covers the flow CSV format, the subnet
+filter's attribution rules and its two comparison modes.
+
+(Future tools: NAT-aware analysis is still on the list and will be added here
+as it ships.)
 
 ---
 
@@ -317,23 +324,28 @@ Add `--src-zone` / `--dst-zone` for zone-aware accuracy. Without them, the tool 
 
 ### Batch-checking N flows
 
-Not yet a single tool, but easy to script:
+Use `report_flow_rules.py`. It takes the CSV directly, and unlike a shell loop
+over `check_policy_match.py` it reports **every** rule covering each flow
+rather than just the first match:
 
 ```bash
 CFG=tools/pan/configs/customer-X-2026-06.xml
-DG=CustomerX-DG
 
-while IFS=, read src dst proto port; do
-  result=$(python tools/pan/check_policy_match.py --config "$CFG" \
-            --device-group "$DG" --src-ip "$src" --dst-ip "$dst" \
-            --protocol "$proto" --dst-port "$port" --json)
-  verdict=$(echo "$result" | jq -r '.verdict')
-  rule=$(echo "$result" | jq -r '.matched_rule')
-  echo "$src,$dst,$proto/$port,$verdict,$rule"
-done < flows.csv
+python tools/pan/report_flow_rules.py \
+  --config "$CFG" \
+  --flows flows.csv \
+  --exclude-subnet 0.0.0.0/0
 ```
 
-A wrapped `batch_check_policy.py` is on the future-tools list — flag if you want it sooner.
+`--exclude-subnet 0.0.0.0/0` strips any/any rules from the report by
+attribution, so the result reflects intentional policy rather than the
+catch-all. Full details, including the flow CSV format and the subnet
+filter's two modes, are in
+[RUNBOOK_PAN_FLOW_RULES.md](RUNBOOK_PAN_FLOW_RULES.md).
+
+The old pattern (a `while read` loop calling `check_policy_match.py --json`
+per row) still works and is the right choice when you specifically want the
+single first-match verdict per flow and nothing else.
 
 ### When you don't know which device-group
 

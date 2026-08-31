@@ -69,6 +69,9 @@ tools/pan/configs/*
 # Operator-specific rule-name filter for offline analysis tools. The
 # .example.txt is tracked as a template; rule_filter.txt is user-local.
 tools/pan/rule_filter.txt
+# Operator-specific subnet filter for report_flow_rules.py. Same arrangement:
+# subnet_filter.example.txt is tracked, subnet_filter.txt is user-local.
+tools/pan/subnet_filter.txt
 # Real configs used as test inputs — kept alongside synthetic fixtures but ignored.
 # Synthetic fixtures (panorama_running_config.xml, etc.) remain tracked.
 tools/pan/tests/fixtures/script-test-*.xml

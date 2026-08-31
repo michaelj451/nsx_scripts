@@ -370,7 +370,7 @@ python tools/nsx/audit_ip_remap.py --target nsx-gm1 --federation-global --csv da
 python tools/nsx/audit_ip_remap.py --groups-dir nsx_groups_export/nsx-lm1.lab.local/groups --csv data/nonprod_map.csv
 ```
 
-Output lands in `$NSX_LOG_DIR/reports/ip_remap_audit/<host>/<UTC ts>/`:
+Output lands in `$NSX_LOG_DIR/reports/<host>/ip_remap_audit/<UTC ts>/`:
 `ip_remap_audit.md` (the report), `ip_remap_audit.json` (per-group detail),
 `gaps.json`, `summary.json`, and a log.
 

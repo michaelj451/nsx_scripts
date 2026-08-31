@@ -43,7 +43,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
-from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
+from nsx.nsx_constants import resolve_manager, nsx_log_dir
+from nsx.report_paths import report_run_dir, reports_root   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
 from nsx.md_utils import align_markdown_tables               # noqa: E402
 
@@ -353,7 +354,9 @@ def main() -> int:
     p.add_argument("--all-domains", action="store_true",
                    help="Discover and iterate all domains on the target.")
     p.add_argument("--federation-global", action="store_true")
-    p.add_argument("--output-base", default=None)
+    p.add_argument("--output-base", default=None,
+                   help="Reports root. The run lands at <root>/<manager-host>/group_membership/<ts>/ "
+                        "(default root: $NSX_LOG_DIR/reports).")
     args = p.parse_args()
 
     init_cli()
@@ -361,8 +364,7 @@ def main() -> int:
     if not target_host:
         raise SystemExit(f"Cannot resolve alias {args.target}")
 
-    base = Path(args.output_base or Path(nsx_log_dir) / "reports" / "groups_usage").expanduser().resolve()
-    out_dir = base / target_host / RUN_TS
+    out_dir = report_run_dir("group_membership", target_host, args.output_base, RUN_TS)
     logs_dir = out_dir / "logs"
     setup_logging(logs_dir)
 

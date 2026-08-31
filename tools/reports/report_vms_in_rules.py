@@ -52,6 +52,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.md_utils import align_markdown_tables
+from nsx.report_paths import report_run_dir, reports_root
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -957,9 +958,13 @@ def main() -> None:
              f"{DEFAULT_LIST_FILENAME} at repo root.",
     )
     parser.add_argument(
+        "--output-base", default=None,
+        help="Reports root. The run lands at <root>/<manager-host>/vm_rule_membership/<ts>/ "
+             "(default root: <NSX_LOG_DIR>/reports).",
+    )
+    parser.add_argument(
         "--output-dir", default=None,
-        help=("Root output dir. Default: "
-              "<NSX_LOG_DIR>/reports/vm_rule_membership/<manager-host>. "
+        help=("Exact directory override (run lands at <dir>/<ts>/). Prefer --output-base. "
               "Each run writes a fresh timestamped subdir inside."),
     )
     parser.add_argument(
@@ -1310,13 +1315,9 @@ def main() -> None:
 
     # ---- output dir ----
     if args.output_dir:
-        base_out = Path(args.output_dir).expanduser().resolve()
+        out_dir = Path(args.output_dir).expanduser().resolve() / RUN_TS
     else:
-        base_out = (
-            Path(nsx_log_dir).expanduser().resolve()
-            / "reports" / "vm_rule_membership" / manager_host
-        )
-    out_dir = base_out / RUN_TS
+        out_dir = report_run_dir("vm_rule_membership", manager_host, args.output_base, RUN_TS, create=False)
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(

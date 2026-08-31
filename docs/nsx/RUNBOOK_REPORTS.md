@@ -83,7 +83,7 @@ Emits `no_hits_in_n_days.jsonl`.
 ### Diff mode (compare two runs)
 
 ```bash
-prior=nsx_logs/reports/rules_usage/nsx-gm1.lab.local/20260807_035735
+prior=nsx_logs/reports/nsx-gm1.lab.local/rules_usage/20260807_035735
 python tools/reports/report_rules_usage.py --target nsx-gm1 \
   --federation-global --all-domains \
   --compare-to "$prior"
@@ -98,7 +98,7 @@ Emits `diff.json` showing per-rule hit_count deltas, transitions
 setopt interactive_comments 2>/dev/null || true
 
 # Latest bundle path
-latest=$(ls -1dt nsx_logs/reports/rules_usage/nsx-gm1.lab.local/*/ | head -1)
+latest=$(ls -1dt nsx_logs/reports/nsx-gm1.lab.local/rules_usage/*/ | head -1)
 latest=${latest%/}
 
 # Human-readable markdown
@@ -178,7 +178,7 @@ added to the table so you can see membership breakdown per LM.
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-latest=$(ls -1dt nsx_logs/reports/groups_usage/nsx-gm1.lab.local/*/ | head -1)
+latest=$(ls -1dt nsx_logs/reports/nsx-gm1.lab.local/group_membership/*/ | head -1)
 latest=${latest%/}
 cat "$latest/report.md"
 

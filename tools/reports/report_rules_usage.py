@@ -55,6 +55,7 @@ from nsx.cli_bootstrap import init_cli            # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
 from nsx.md_utils import align_markdown_tables               # noqa: E402
+from nsx.report_paths import report_run_dir, reports_root               # noqa: E402
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -671,7 +672,8 @@ def main() -> int:
                    help="Path to a prior rules_usage_report/<host>/<ts>/ directory; "
                         "computes a per-rule delta and writes diff.json.")
     p.add_argument("--output-base", default=None,
-                   help="Output root; default: $NSX_LOG_DIR.")
+                   help="Reports root. The run lands at <root>/<manager-host>/rules_usage/<ts>/ "
+                        "(default root: $NSX_LOG_DIR/reports).")
     args = p.parse_args()
 
     init_cli()
@@ -680,9 +682,8 @@ def main() -> int:
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
 
-    output_base = (Path(args.output_base).expanduser().resolve()
-                   if args.output_base else Path(nsx_log_dir) / "reports")
-    reports_dir = output_base / "rules_usage" / target_host / RUN_TS
+    output_base = reports_root(args.output_base)
+    reports_dir = report_run_dir("rules_usage", target_host, args.output_base, RUN_TS)
     log_file = _setup_logging(reports_dir / "logs")
 
     history_dir = (Path(args.history_dir).expanduser().resolve()

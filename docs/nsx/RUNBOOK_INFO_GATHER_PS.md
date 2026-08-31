@@ -1,7 +1,9 @@
 # Runbook INFO GATHER : read-only pre-change evidence : Windows PowerShell
 
 Five read-only reports collected into one session directory you can review
-or hand over. Nothing here writes to NSX. Every step has a **Local Manager**
+or hand over, every one at `$G/<manager-host>/<report>/<ts>/` so LM and GM
+runs sit side by side under their own hostnames. Nothing here writes to
+NSX. Every step has a **Local Manager**
 block and a **Global Manager (federation)** block; run whichever applies, or
 both. Where DFW policy is GM-owned, the LM blocks show only the default rules
 and zero customer groups, and the GM blocks carry the real answer.
@@ -40,7 +42,7 @@ $GH = "nsx-gm1.lab.local"
 $G = "nsx_info_$M"
 $T = "vm_rule_report_targets.txt"
 $CSV = "data/nonprod_map.csv"
-New-Item -ItemType Directory -Force -Path "$G/lm", "$G/gm" | Out-Null
+New-Item -ItemType Directory -Force -Path $G | Out-Null
 ```
 
 The target list is one VM display name per line, optionally `name,ip`
@@ -57,7 +59,7 @@ Local Manager:
 python tools/reports/report_vms_in_rules.py `
   --manager $M `
   --vm-list $T `
-  --output-dir $G/lm/vm_rule_membership `
+  --output-base $G `
   --overwrite
 ```
 
@@ -68,11 +70,11 @@ python tools/reports/report_vms_in_rules.py `
   --manager $GM `
   --federation-global `
   --vm-list $T `
-  --output-dir $G/gm/vm_rule_membership `
+  --output-base $G `
   --overwrite
 ```
 
-Review: `<output-dir>/<ts>/report.md` (matched VMs with Site column on the
+Review: `$G/<host>/vm_rule_membership/<ts>/report.md` (matched VMs with Site column on the
 GM run, then rules per VM with how each hit: Src / Dst / Scope) and
 `report.json`. Add `--members-cache-minutes 30` when iterating on the target
 list; add `--with-vm-inventory` to the GM run to enrich with fabric VM IPs
@@ -87,7 +89,7 @@ Local Manager:
 ```powershell
 python tools/reports/report_groups_usage.py `
   --target $M `
-  --output-base $G/lm/group_membership
+  --output-base $G
 ```
 
 Global Manager (all domains, members aggregated per site):
@@ -97,10 +99,10 @@ python tools/reports/report_groups_usage.py `
   --target $GM `
   --federation-global `
   --all-domains `
-  --output-base $G/gm/group_membership
+  --output-base $G
 ```
 
-Review: `<output-base>/<host>/<ts>/report.md`, plus `groups_usage.jsonl`
+Review: `$G/<host>/group_membership/<ts>/report.md`, plus `groups_usage.jsonl`
 (one row per group: type TAG / IP / SEGMENT / VM_PATH / NESTED, member
 count, members), `tag_based_groups.jsonl`, and `empty_groups.jsonl`.
 
@@ -114,7 +116,7 @@ Local Manager:
 python tools/reports/report_rules_usage.py `
   --target $M `
   --hits-in-last-days 30 `
-  --output-base $G/lm/rules_usage_30d
+  --output-base $G
 ```
 
 Global Manager (all domains, full federation walk):
@@ -125,10 +127,10 @@ python tools/reports/report_rules_usage.py `
   --federation-global `
   --all-domains `
   --hits-in-last-days 30 `
-  --output-base $G/gm/rules_usage_30d
+  --output-base $G
 ```
 
-Review: `<output-base>/rules_usage/<host>/<ts>/report.md` classifies every
+Review: `$G/<host>/rules_usage/<ts>/report.md` classifies every
 rule HOT / USED / STALE / UNUSED / DORMANT with its hit count;
 `hits_in_last_n_days.jsonl` is the 30-day window; `hot_rules.jsonl`,
 `stale_rules.jsonl`, `unused_rules.jsonl`, `dormant_rules.jsonl` are the
@@ -147,11 +149,11 @@ history.
 ```powershell
 python tools/reports/dryrun_hostname_tags.py `
   --manager $M `
-  --output-dir $G/lm/hostname_tags `
+  --output-base $G `
   --overwrite
 ```
 
-Review: `<output-dir>/<ts>/plan.md` plus one JSON per classification
+Review: `$G/<host>/hostname_tags_dryrun/<ts>/plan.md` plus one JSON per classification
 (`eligible`, `skip_has_tag`, `skip_excluded`, `skip_length_out_of_range`,
 `skip_invalid_name`, `skip_edge`, `skip_other_type`). Nothing is tagged. The
 exclusion list is `hostname_tag_exclude.txt` at the repo root unless
@@ -173,7 +175,7 @@ python tools/nsx/groups.py push `
   --target $M `
   --groups-dir nsx_capture/$H/groups_additive/domains/default/groups `
   --csv-remap $CSV `
-  --reports-dir $G/lm/ip_remap_dryrun
+  --reports-dir $G/$H/ip_remap_dryrun
 ```
 
 Global Manager:
@@ -186,10 +188,10 @@ python tools/nsx/groups.py push `
   --federation-global `
   --groups-dir nsx_capture/$GH/groups_additive/domains/default/groups `
   --csv-remap $CSV `
-  --reports-dir $G/gm/ip_remap_dryrun
+  --reports-dir $G/$GH/ip_remap_dryrun
 ```
 
-Review: `<reports-dir>/remap_report.md`: the Result line, section 1 "Would
+Review: `$G/<host>/ip_remap_dryrun/remap_report.md`: the Result line, section 1 "Would
 add" (value, source original, CSV row), section 2 already-remapped pairs,
 then generic-group candidates, never-remapped ranges/IPv6, and CSV coverage
 misses. `summary.json` must show `csv_invalid_rows: []`.
@@ -198,8 +200,8 @@ Optional reconciliation of the live manager against the CSV (read-only, exit
 code 1 when gaps exist):
 
 ```powershell
-python tools/nsx/audit_ip_remap.py --target $M --csv $CSV --output-base $G/lm/ip_remap_audit
-python tools/nsx/audit_ip_remap.py --target $GM --federation-global --csv $CSV --output-base $G/gm/ip_remap_audit
+python tools/nsx/audit_ip_remap.py --target $M --csv $CSV --output-base $G
+python tools/nsx/audit_ip_remap.py --target $GM --federation-global --csv $CSV --output-base $G
 ```
 
 ---
@@ -207,7 +209,7 @@ python tools/nsx/audit_ip_remap.py --target $GM --federation-global --csv $CSV -
 ## 6) Package the evidence
 
 ```powershell
-Get-ChildItem -Recurse $G -Include report.md, remap_report.md, plan.md | Select-Object FullName
+Get-ChildItem -Recurse $G -Include report.md, remap_report.md, plan.md, ip_remap_audit.md | Select-Object FullName
 $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss")
 Compress-Archive -Path $G -DestinationPath "$G-$stamp.zip" -Force
 ```
