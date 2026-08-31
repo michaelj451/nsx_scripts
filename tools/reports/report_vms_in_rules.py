@@ -974,7 +974,7 @@ def main() -> None:
         "--rate-limit", type=float, default=None, metavar="RPS",
         help="Cap NSX API requests per second for this run (sets "
              "NSX_API_MAX_RPS for every client, including site LM clients). "
-             "Default is 5 req/s; pass 0 to disable pacing. 429/503 retry "
+             "Default is 2 req/s; pass 0 to disable pacing. 429/503 retry "
              "with backoff is always on.",
     )
     parser.add_argument(
