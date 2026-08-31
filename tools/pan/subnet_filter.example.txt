@@ -1,0 +1,63 @@
+# Subnet filter for tools/pan/report_flow_rules.py
+#
+# Each non-comment, non-blank line is a subnet. A bare IP is read as /32
+# (or /128 for IPv6). Inline comments after # are stripped.
+#
+# WHAT IT DOES
+#   When a rule matches one of your flows, the report records WHICH address
+#   object, and which network inside it, actually covered the source IP, and
+#   the same for the destination. This file filters on that attribution:
+#
+#     A side's match is filtered when EVERY network that covered the IP on
+#     that side is excluded by this list. If any covering network survives,
+#     the rule matched for a real reason and stays in the report.
+#
+#     If either the source side or the destination side is filtered, the
+#     whole rule/flow match is suppressed.
+#
+#   The "every covering network" rule matters. If a rule's source is a group
+#   holding both 10.0.0.0/8 (listed here) and 10.6.0.101/32 (not listed), a
+#   flow from 10.6.0.101 is a genuine specific match and the rule is KEPT.
+#
+# MODES (--subnet-filter-mode)
+#   broad   (default)  a covering network is excluded when it equals a listed
+#                      subnet or is BROADER than one. Listing 10.0.0.0/8 drops
+#                      matches caused by the 10.0.0.0/8 object and by any /
+#                      0.0.0.0/0, but keeps a match on a specific /32 object.
+#                      This is the "hide catch-all matches" mode.
+#   within             a covering network is excluded when it equals a listed
+#                      subnet or sits INSIDE one. Listing 10.0.0.0/8 drops
+#                      every match anywhere in 10/8. This is the "mute this
+#                      whole address space" mode.
+#
+# HOW TO USE
+#   1. Copy this file to:   tools/pan/subnet_filter.txt
+#   2. Edit to taste. One subnet per line.
+#   3. report_flow_rules.py auto-loads subnet_filter.txt if present. Use
+#      --subnet-filter <path> for a different file, --exclude-subnet <cidr>
+#      to add one inline, or --no-subnet-filter to bypass entirely.
+#
+# CAVEATS
+#   - 'any' on a rule is treated as 0.0.0.0/0 (or ::/0), so listing 0.0.0.0/0
+#     here is how you hide any/any rules from the report.
+#   - A rule with a NEGATED source or destination is never suppressed: a
+#     negated match has no covering network to attribute.
+#   - Suppressed matches are not discarded. They land in
+#     suppressed_matches.jsonl with the attribution that dropped them, and if
+#     a suppressed rule sits earlier in the chain than the rule reported as
+#     deciding, the flow is flagged 'shadowed_by_suppressed'.
+#   - This changes only what THIS TOOL reports. Real enforcement is unaffected.
+
+# ---- Example filters (uncomment in your local subnet_filter.txt) ----
+
+# Hide any/any rules: the catch-all logging rule that covers every flow
+# 0.0.0.0/0
+
+# Hide matches that only happened because a rule carries the whole RFC1918
+# supernet as its source or destination object
+# 10.0.0.0/8
+# 172.16.0.0/12
+# 192.168.0.0/16
+
+# Hide matches caused by a broad management object
+# 10.255.0.0/16

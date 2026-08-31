@@ -52,6 +52,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import nsx_log_dir, resolve_manager
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.md_utils import align_markdown_tables
+from nsx.report_paths import report_run_dir, reports_root
 
 log = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -601,37 +602,6 @@ def match_vm_ips_to_groups(
     return out
 
 
-def build_site_clients_for_federation(
-    sites: List[Dict[str, Any]],
-) -> Tuple[Dict[str, NsxPolicyClient], Dict[str, NsxPolicyClient], Dict[str, str]]:
-    """
-    For each federation site, build:
-      - site_fabric_clients: federation_global=False, for fabric VM inventory
-      - site_fed_clients:    federation_global=True,  for federated group members
-      - site_display:        site_id -> display_name (for reporting)
-    Sites that fail to connect are skipped with a WARN.
-    """
-    site_fabric: Dict[str, NsxPolicyClient] = {}
-    site_fed: Dict[str, NsxPolicyClient] = {}
-    site_display: Dict[str, str] = {}
-    for s in sites:
-        sid = s.get("id")
-        if not sid:
-            continue
-        display = s.get("display_name") or sid
-        site_display[sid] = display
-        try:
-            site_fabric[sid] = NsxPolicyClient(nsxmanager=sid,
-                                                federation_global=False)
-            site_fed[sid] = NsxPolicyClient(nsxmanager=sid,
-                                             federation_global=True)
-            log.info("  federation site ready: %s (%s)", sid, display)
-        except Exception as exc:
-            log.warning("  cannot connect to site %s (%s): %s",
-                        sid, display, str(exc)[:120])
-    return site_fabric, site_fed, site_display
-
-
 def build_vm_to_groups(
     group_to_members: Dict[str, Set[str]],
 ) -> Dict[str, Set[str]]:
@@ -957,9 +927,13 @@ def main() -> None:
              f"{DEFAULT_LIST_FILENAME} at repo root.",
     )
     parser.add_argument(
+        "--output-base", default=None,
+        help="Reports root. The run lands at <root>/<manager-host>/vm_rule_membership/<ts>/ "
+             "(default root: <NSX_LOG_DIR>/reports).",
+    )
+    parser.add_argument(
         "--output-dir", default=None,
-        help=("Root output dir. Default: "
-              "<NSX_LOG_DIR>/reports/vm_rule_membership/<manager-host>. "
+        help=("Exact directory override (run lands at <dir>/<ts>/). Prefer --output-base. "
               "Each run writes a fresh timestamped subdir inside."),
     )
     parser.add_argument(
@@ -973,8 +947,8 @@ def main() -> None:
     parser.add_argument(
         "--rate-limit", type=float, default=None, metavar="RPS",
         help="Cap NSX API requests per second for this run (sets "
-             "NSX_API_MAX_RPS for every client, including site LM clients). "
-             "Default is 5 req/s; pass 0 to disable pacing. 429/503 retry "
+             "NSX_API_MAX_RPS for the client). "
+             "Default is 2 req/s; pass 0 to disable pacing. 429/503 retry "
              "with backoff is always on.",
     )
     parser.add_argument(
@@ -983,14 +957,6 @@ def main() -> None:
              "minutes (stored under <NSX_LOG_DIR>/.cache/). 0 (default) "
              "disables. A cache is only used when it covers every "
              "rule-referenced group; otherwise it refetches and rewrites.",
-    )
-    parser.add_argument(
-        "--with-vm-inventory", action="store_true",
-        help="GM mode only: ALSO connect directly to each site LM for fabric "
-             "VM inventory, which adds VM IP addresses to the report. Default "
-             "is GM-only: membership and VM identity come through the GM's "
-             "enforcement-point proxy, and unreachable LMs are warnings, "
-             "never fatal.",
     )
     args = parser.parse_args()
     if args.rate_limit is not None:
@@ -1018,7 +984,6 @@ def main() -> None:
     )
     vm_ext_to_site: Dict[str, str] = {}
     site_display: Dict[str, str] = {}
-    site_fabric_clients: Dict[str, NsxPolicyClient] = {}
     gm_site_eps: Dict[str, str] = {}
     pre_domain_ids: Optional[List[str]] = None
     pre_groups: Optional[Tuple[Dict[str, Dict[str, Any]],
@@ -1061,33 +1026,9 @@ def main() -> None:
             log.info("  site %s -> enforcement point %s", sid, gm_site_eps[sid])
 
         vms: List[Dict[str, Any]] = []
-        if args.with_vm_inventory:
-            # OPTIONAL enrichment: direct LM fabric inventory adds VM IPs.
-            # Unreachable sites are warnings, never fatal.
-            site_fabric_clients, _unused_fed, _disp = (
-                build_site_clients_for_federation(sites)
-            )
-            if not site_fabric_clients:
-                log.warning("--with-vm-inventory: no site LMs reachable; "
-                            "continuing GM-only (VM IPs unavailable).")
-            for sid, fab_c in site_fabric_clients.items():
-                try:
-                    site_vms = fab_c.list_virtual_machines()
-                except Exception as exc:
-                    log.warning("Site %s (%s): list_virtual_machines failed: %s",
-                                sid, site_display.get(sid, sid), exc)
-                    continue
-                for vm in site_vms:
-                    ext = vm.get("external_id") or vm.get("id")
-                    if ext:
-                        vm_ext_to_site[ext] = sid
-                vms.extend(site_vms)
-                log.info("Site %s (%s): %d VM(s) pulled",
-                         sid, site_display.get(sid, sid), len(site_vms))
-        else:
-            log.info("GM mode: no direct LM connections. VM identity comes from "
-                     "the GM member proxy; add --with-vm-inventory to enrich "
-                     "with fabric VM IPs from the site LMs.")
+        log.info("GM mode: no direct LM connections. VM identity comes from "
+                 "the GM member proxy. Fabric VM inventory is LM-only and is "
+                 "never queried in federation-global mode (GM-only rule).")
 
         # Groups + members THROUGH the GM (enforcement-point proxy). This also
         # yields the VM universe for name matching, so LM access is optional.
@@ -1140,19 +1081,11 @@ def main() -> None:
                             "tags": meta.get("tags") or []})
                 synthesized += 1
         if synthesized:
-            log.info("VM universe from GM member proxy: %d VM(s)%s",
-                     synthesized,
-                     "" if args.with_vm_inventory else " (no fabric IPs)")
-    elif args.federation_global:
-        # Federation on an LM: unusual but not fatal. Fabric API still LM-only.
-        log.info("federation_global=True on an LM (not a GM). "
-                 "Fetching fabric VMs from this LM.")
-        # LM fabric requires federation_global=False on the client; make a
-        # dedicated one just for this call.
-        _fab_client = NsxPolicyClient(nsxmanager=manager_host,
-                                       federation_global=False)
-        vms = _fab_client.list_virtual_machines()
+            log.info("VM universe from GM member proxy: %d VM(s) (no fabric IPs)",
+                     synthesized)
     else:
+        # --federation-global with a non-GM target cannot reach this point:
+        # NsxPolicyClient refuses that combination in its constructor.
         log.info("Fetching virtual machines from %s", manager_host)
         vms = client.list_virtual_machines()
 
@@ -1310,13 +1243,9 @@ def main() -> None:
 
     # ---- output dir ----
     if args.output_dir:
-        base_out = Path(args.output_dir).expanduser().resolve()
+        out_dir = Path(args.output_dir).expanduser().resolve() / RUN_TS
     else:
-        base_out = (
-            Path(nsx_log_dir).expanduser().resolve()
-            / "reports" / "vm_rule_membership" / manager_host
-        )
-    out_dir = base_out / RUN_TS
+        out_dir = report_run_dir("vm_rule_membership", manager_host, args.output_base, RUN_TS, create=False)
     if out_dir.exists():
         if not args.overwrite:
             raise SystemExit(

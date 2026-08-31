@@ -83,7 +83,7 @@ Emits `no_hits_in_n_days.jsonl`.
 ### Diff mode (compare two runs)
 
 ```bash
-prior=nsx_logs/reports/rules_usage/nsx-gm1.lab.local/20260807_035735
+prior=nsx_logs/reports/nsx-gm1.lab.local/rules_usage/20260807_035735
 python tools/reports/report_rules_usage.py --target nsx-gm1 \
   --federation-global --all-domains \
   --compare-to "$prior"
@@ -98,7 +98,7 @@ Emits `diff.json` showing per-rule hit_count deltas, transitions
 setopt interactive_comments 2>/dev/null || true
 
 # Latest bundle path
-latest=$(ls -1dt nsx_logs/reports/rules_usage/nsx-gm1.lab.local/*/ | head -1)
+latest=$(ls -1dt nsx_logs/reports/nsx-gm1.lab.local/rules_usage/*/ | head -1)
 latest=${latest%/}
 
 # Human-readable markdown
@@ -118,7 +118,7 @@ cat "$latest/hot_rules.jsonl" | jq -c '{policy: .policy_display, rule: .rule_dis
 | Section | When shown | Notes |
 |---|---|---|
 | Summary | Always | Counters + stats source provenance |
-| Policy-API stats query errors | When any policy's `/statistics` failed | Fed-GM will always have all 3 here (NSX bug); tool falls back to old firewall API |
+| Policy-API stats query errors | When any policy's `/statistics` failed | Direct LM run: tool falls back to the old firewall API on the same manager. GM run: no fallback, affected rules are `NO_STATS` (NSX 3.2.x GM cannot return stats) |
 | Per-rule breakdown | Always | **Grouped by NSX category** (Ethernet -> Emergency -> Infrastructure -> Environment -> Application), sorted by hit_count DESC within each |
 | Top 20 rules | When any rules present | Flat across categories |
 | Rules with hits in the last Nd | With `--hits-in-last-days` | |
@@ -126,15 +126,22 @@ cat "$latest/hot_rules.jsonl" | jq -c '{policy: .policy_display, rule: .rule_dis
 | Diff vs prior snapshot | With `--compare-to` | |
 | Per-domain breakdown | With `--all-domains` when >1 domain | |
 
-### Federation stats-fallback (important)
+### Federation statistics (important)
 
-NSX 3.2.x has a bug where `/policy/api/v1/global-infra/.../statistics`
-returns HTTP 500 on federated policies (LM side) or HTTP 400 "Enforcement
-point is mandatory" on GM side. When this happens, the tool automatically
-falls back to `/api/v1/firewall/sections/<id>/rules/stats` on each site's
-LM and aggregates. Look for `Stats source (per policy): old_firewall_api=N`
-in the report header; failed Policy-API queries are listed in the
-"Policy-API stats query errors" section for transparency.
+A `--federation-global` run against a GM talks to the GM only. Statistics
+are requested through the GM once per site
+(`/statistics?enforcement_point_path=<site EP>`) and summed; the tool never
+opens a session to a Local Manager, and the closing log line
+`Managers contacted:` proves it.
+
+NSX 3.2.x has a bug where that GM endpoint throws a NullPointerException
+(and the LM-side `/global-infra/.../statistics` returns HTTP 500). On a GM
+run there is no fallback: the affected rules are classified `NO_STATS`
+rather than shown as 0 hits, and the failures are listed in the
+"Policy-API stats query errors" section. Run the report against each site
+LM for hit counts on that version. On a direct LM run the tool falls back
+to `/api/v1/firewall/sections/<id>/rules/stats` on the same manager; look
+for `Stats source (per policy): old_firewall_api=N` in the report header.
 
 ### Building snapshot history
 
@@ -168,17 +175,19 @@ python tools/reports/report_groups_usage.py --target nsx-gm1 \
   --federation-global --all-domains
 ```
 
-The tool auto-discovers federation sites and queries each LM directly
-for VM member counts (GM's own `/members/virtual-machines` endpoint
-returns HTTP 400 without an enforcement point). Per-site columns are
-added to the table so you can see membership breakdown per LM.
+The tool auto-discovers federation sites and their enforcement points,
+then fetches VM member counts through the GM
+(`/members/virtual-machines?enforcement_point_path=<site EP>`, one call
+per site per group). No session is opened to a Local Manager. Per-site
+columns are added to the table so you can see membership breakdown per
+site.
 
 ### View the results
 
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-latest=$(ls -1dt nsx_logs/reports/groups_usage/nsx-gm1.lab.local/*/ | head -1)
+latest=$(ls -1dt nsx_logs/reports/nsx-gm1.lab.local/group_membership/*/ | head -1)
 latest=${latest%/}
 cat "$latest/report.md"
 
@@ -220,15 +229,17 @@ cat "$latest/tag_based_groups.jsonl" | jq -c '{id, display_name, vm_count}'
 python tools/reports/report_tag_map.py --target nsx-lm1
 ```
 
-### Federation view (GM, per-site aggregated)
+### Federation
+
+VM inventory is a fabric API and lives only on Local Managers. A
+federation-global run may never open a session to an LM (GM-only rule),
+so this tool refuses `--federation-global`. In a federated environment
+run it once per site LM:
 
 ```bash
-python tools/reports/report_tag_map.py --target nsx-gm1 \
-  --federation-global --all-domains
+python tools/reports/report_tag_map.py --target nsx-lm1
+python tools/reports/report_tag_map.py --target nsx-lm2
 ```
-
-On GM, auto-discovers federation sites and pulls VM inventory from
-each LM directly (fabric API is LM-scoped). Group data comes from GM.
 
 ### Include system VMs (edges, vCLS)
 
@@ -236,8 +247,8 @@ Default: only `type=REGULAR` customer VMs. Add `--include-system-vms`
 to see everything.
 
 ```bash
-python tools/reports/report_tag_map.py --target nsx-gm1 \
-  --federation-global --all-domains --include-system-vms
+python tools/reports/report_tag_map.py --target nsx-lm1 \
+  --include-system-vms
 ```
 
 ### View the results
@@ -245,7 +256,7 @@ python tools/reports/report_tag_map.py --target nsx-gm1 \
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-latest=$(ls -1dt nsx_logs/reports/tag_map/nsx-gm1.lab.local/*/ | head -1)
+latest=$(ls -1dt nsx_logs/reports/tag_map/nsx-lm1.lab.local/*/ | head -1)
 latest=${latest%/}
 cat "$latest/report.md"
 

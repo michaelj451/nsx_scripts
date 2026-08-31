@@ -292,6 +292,17 @@ enforcement happens on the LMs. For accurate "is this rule matching traffic"
 data, query the **LM that's enforcing**. Use GM mode for global-policy
 inventory and federation compliance reporting.
 
+A `--federation-global` run against a GM talks to the GM first: statistics
+are requested through the GM per site (`enforcement_point_path`). On NSX
+3.2.x that endpoint fails with a NullPointerException (per-policy and
+per-rule variants alike); the tool then falls back by default to a direct
+read-only session on each site LM and sums the per-site counters. The LM
+addresses are discovered from the GM's own site registry
+(`site_connection_info`), never taken from `.env`. Rules are classified
+`NO_STATS` only when no site LM could answer either. The closing log line
+`Managers contacted:` lists every manager reached, and `summary.json`
+records `lm_stats_fallback_sites`.
+
 ---
 
 ## 9. Read-only guarantee — what's enforced
@@ -391,7 +402,7 @@ diff <(jq -S . $NSX_LOG_DIR/rules_usage_report/nsx-lm1.lab.local/<ts>/summary.js
 | `--target <alias>` | required | NSX manager alias (`nsx-lm1`, `nsx-gm1`, etc.) |
 | `--domain-id <id>` | `default` | Single-domain mode. **Ignored under `--all-domains`.** |
 | `--all-domains` | off | Discover every domain on the target and walk all of them in one run. Each rule gets a `domain_id`; summary gets `per_domain` breakdown. |
-| `--federation-global` | off | Required for `nsx-gm1` / `nsx-gm2` (routes to `/policy/api/v1/global-infra/...`) |
+| `--federation-global` | off | GM targets only (`nsx-gm1` / `nsx-gm2`; routes to `/global-manager/api/v1/global-infra/...`). The client refuses the flag on a non-GM host |
 | `--include-defaults` | off | Include `default-layer3-section` + `default-layer2-section` |
 | `--hot-threshold <int>` | 1000 | HOT classification cutoff (hit_count >= N) |
 | `--fresh-days <int>` | 30 | UNUSED vs DORMANT split for never-hit rules |

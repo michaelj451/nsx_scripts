@@ -49,6 +49,7 @@ a matching revert.
 
 | Doc | Purpose |
 |---|---|
+| [RUNBOOK_INFO_GATHER.md](nsx/RUNBOOK_INFO_GATHER.md) / [ps](nsx/RUNBOOK_INFO_GATHER_PS.md) | One-session, read-only evidence pack: VM rule membership, group membership, 30-day rule hit counts, hostname tag dry run, IP remap dry run; LM and GM blocks for every step, variable-driven paths |
 | [RUNBOOK_REPORTS.md](nsx/RUNBOOK_REPORTS.md) / [ps](nsx/RUNBOOK_REPORTS_PS.md) | The report tools under `tools/reports/`, plus the IP remap audit pointer |
 | [RUNBOOK_RULES_USAGE.md](nsx/RUNBOOK_RULES_USAGE.md) / [ps](nsx/RUNBOOK_RULES_USAGE_PS.md) | Rule hit-count / usage report, diff mode, federation notes |
 | [RUNBOOK_VM_RULE_MEMBERSHIP.md](nsx/RUNBOOK_VM_RULE_MEMBERSHIP.md) / [ps](nsx/RUNBOOK_VM_RULE_MEMBERSHIP_PS.md) | Given VM names: every DFW rule they participate in and why |
@@ -60,6 +61,7 @@ a matching revert.
 |---|---|
 | [RUNBOOK_PAN_LAB.md](pan/RUNBOOK_PAN_LAB.md) / [ps](pan/RUNBOOK_PAN_LAB_PS.md) | Lab Panorama over the API: auth (`panorama_auth.py`), config pulls, rule-service tooling |
 | [RUNBOOK_PAN_PROD.md](pan/RUNBOOK_PAN_PROD.md) / [ps](pan/RUNBOOK_PAN_PROD_PS.md) | Production Panorama, manual / file-driven (no API): offline policy lookup flow |
+| [RUNBOOK_PAN_FLOW_RULES.md](pan/RUNBOOK_PAN_FLOW_RULES.md) / [ps](pan/RUNBOOK_PAN_FLOW_RULES_PS.md) | Offline flow/rule report: a CSV of source/destination pairs in, every covering rule out, plus a subnet list that suppresses matches by attribution |
 
 ## Testing
 

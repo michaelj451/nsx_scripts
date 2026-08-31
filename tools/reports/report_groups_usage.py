@@ -18,6 +18,11 @@ VM-member list and classifies the group by expression type:
 Also captures whether the group's Condition set includes ANY tag
 condition (surfaces the "tag-driven" population easily).
 
+A --federation-global run against a Global Manager talks to the GM only:
+evaluated members are proxied THROUGH the GM with enforcement_point_path,
+one call per site per group, and summed. No session is ever opened to a
+Local Manager.
+
 OUTPUT:
     $NSX_LOG_DIR/groups_usage_report/<target-host>/<UTC_TS>/
         summary.json               overall counters + per-domain + per-class
@@ -43,7 +48,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
-from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
+from nsx.nsx_constants import resolve_manager, nsx_log_dir
+from nsx.report_paths import report_run_dir, reports_root   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
 from nsx.md_utils import align_markdown_tables               # noqa: E402
 
@@ -54,6 +60,14 @@ NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 CLASS_ORDER = ["TAG", "IP", "SEGMENT", "VM_PATH", "NESTED", "MIXED", "EMPTY"]
+
+# Per-run counter, reported in summary.json and the closing log lines.
+_STATS = {"member_api_calls": 0}
+
+
+def _is_not_found(exc: Exception) -> bool:
+    s = str(exc)
+    return "could not be found" in s.lower() or "NOT_FOUND" in s or " 600]" in s
 
 
 def setup_logging(bundle_logs_dir: Path) -> Path:
@@ -162,6 +176,7 @@ def _list_customer_groups(c: NsxPolicyClient, domain_id: str) -> List[Dict[str, 
 
 def _get_group_vm_count(c: NsxPolicyClient, domain_id: str, group_id: str) -> Optional[int]:
     try:
+        _STATS["member_api_calls"] += 1
         r = c._get(c.POLICY_ROOT + f"/domains/{domain_id}/groups/{group_id}/members/virtual-machines")
         return len(r.get("results") or [])
     except Exception as e:
@@ -169,20 +184,47 @@ def _get_group_vm_count(c: NsxPolicyClient, domain_id: str, group_id: str) -> Op
         return None
 
 
-def _get_group_vm_count_federated(site_clients: Dict[str, NsxPolicyClient],
+def _get_group_vm_count_federated(c: NsxPolicyClient, site_eps: Dict[str, str],
                                     domain_id: str, group_id: str) -> Tuple[Optional[int], Dict[str, Optional[int]]]:
-    """For GM/federation queries, hit each site LM directly. NSX GM's
-    /members/virtual-machines endpoint returns 400 without an
-    enforcement point, so we iterate sites explicitly and aggregate."""
+    """GM federation mode: evaluated members are fetched THROUGH THE GM, one
+    paginated call per relevant site with `enforcement_point_path`, and
+    summed. No session is ever opened to a Local Manager.
+
+    A location-scoped domain (domain id == a site id) exists only at that
+    site, so only its own enforcement point is queried; global domains fan
+    out to every site. NOT_FOUND from a site means the group is not
+    realized there and counts as 0 members at that site.
+    """
+    targets = {domain_id: site_eps[domain_id]} if domain_id in site_eps else site_eps
+    members_path = (c.POLICY_ROOT + f"/domains/{c._q(domain_id)}/groups/{c._q(group_id)}"
+                    "/members/virtual-machines")
     per_site: Dict[str, Optional[int]] = {}
-    total: Optional[int] = 0
-    for site_id, site_c in site_clients.items():
-        n = _get_group_vm_count(site_c, domain_id, group_id)
+    for site_id, ep in targets.items():
+        n: Optional[int] = 0
+        cursor = None
+        while True:
+            params: Dict[str, Any] = {"enforcement_point_path": ep, "page_size": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                _STATS["member_api_calls"] += 1
+                r = c._get(members_path, params=params)
+            except Exception as e:
+                if _is_not_found(e):
+                    log.debug("  %s/%s not realized at site %s (0 members there)",
+                              domain_id, group_id, site_id)
+                else:
+                    log.warning("  %s/%s: member query via GM for site %s failed: %s",
+                                domain_id, group_id, site_id, str(e)[:80])
+                    n = None
+                break
+            n += len(r.get("results") or [])
+            cursor = r.get("cursor")
+            if not cursor:
+                break
         per_site[site_id] = n
-        if n is not None and total is not None:
-            total += n
-        elif n is None:
-            total = None if not any(v is not None for v in per_site.values()) else total
+    known = [v for v in per_site.values() if v is not None]
+    total: Optional[int] = sum(known) if known else None
     return total, per_site
 
 
@@ -353,7 +395,9 @@ def main() -> int:
     p.add_argument("--all-domains", action="store_true",
                    help="Discover and iterate all domains on the target.")
     p.add_argument("--federation-global", action="store_true")
-    p.add_argument("--output-base", default=None)
+    p.add_argument("--output-base", default=None,
+                   help="Reports root. The run lands at <root>/<manager-host>/group_membership/<ts>/ "
+                        "(default root: $NSX_LOG_DIR/reports).")
     args = p.parse_args()
 
     init_cli()
@@ -361,8 +405,7 @@ def main() -> int:
     if not target_host:
         raise SystemExit(f"Cannot resolve alias {args.target}")
 
-    base = Path(args.output_base or Path(nsx_log_dir) / "reports" / "groups_usage").expanduser().resolve()
-    out_dir = base / target_host / RUN_TS
+    out_dir = report_run_dir("group_membership", target_host, args.output_base, RUN_TS)
     logs_dir = out_dir / "logs"
     setup_logging(logs_dir)
 
@@ -376,29 +419,23 @@ def main() -> int:
     log.info("=" * 60)
 
     c = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
+    managers_contacted = [target_host]
 
-    # For GM/federation-global queries, prepare a per-site client so we can
-    # aggregate VM member counts across LMs (GM's own /members endpoint
-    # returns 400 without an enforcement point).
-    site_clients: Dict[str, NsxPolicyClient] = {}
+    # GM/federation-global: evaluated members are proxied THROUGH THE GM with
+    # enforcement_point_path (one call per site per group). This run never
+    # opens a session to a Local Manager.
+    site_eps: Dict[str, str] = {}
     is_gm_federation = False
     if args.federation_global and "/global-manager/" in c.POLICY_ROOT:
         is_gm_federation = True
         try:
-            sr = c._get(c.POLICY_ROOT + "/sites")
-            for s in (sr.get("results") or []):
-                sid = s.get("id")
-                if not sid:
-                    continue
-                try:
-                    site_clients[sid] = NsxPolicyClient(nsxmanager=sid,
-                                                        federation_global=True)
-                    log.info("  federation site client ready: %s", sid)
-                except Exception as e:
-                    log.warning("  cannot connect to site %s for member queries: %s",
-                                sid, str(e)[:80])
+            site_eps = c.list_site_enforcement_points()
         except Exception as e:
             log.warning("  site discovery failed: %s", str(e)[:80])
+        for sid, ep in site_eps.items():
+            log.info("  site %s -> enforcement point %s", sid, ep)
+        log.info("GM mode: no direct LM connections. Member queries go through the GM "
+                 "per enforcement point (%d site(s)).", len(site_eps))
 
     if args.all_domains:
         domains = discover_domains(c)
@@ -424,9 +461,9 @@ def main() -> int:
             gid = g.get("id")
             cls, cinfo = classify_group(g)
             per_site_counts: Dict[str, Optional[int]] = {}
-            if is_gm_federation and site_clients:
+            if is_gm_federation and site_eps:
                 vm_count, per_site_counts = _get_group_vm_count_federated(
-                    site_clients, dom, gid)
+                    c, site_eps, dom, gid)
             else:
                 vm_count = _get_group_vm_count(c, dom, gid)
             rec = {
@@ -451,6 +488,9 @@ def main() -> int:
         "target":            f"alias:{args.target} ({target_host})",
         "domains_queried":   domains,
         "federation_global": args.federation_global,
+        "managers_contacted": managers_contacted,
+        "gm_proxy_mode":     is_gm_federation,
+        "member_api_calls":  _STATS["member_api_calls"],
         "counters": {
             "customer_groups":     len(records),
             "total_vm_members":    sum((r.get("vm_count") or 0) for r in records),
@@ -475,6 +515,8 @@ def main() -> int:
         v = by_class[k]
         if v["count"]:
             log.info("    %-8s  count=%3d  vm_members=%d", k, v["count"], v["total_vm_members"])
+    log.info("Member API calls: %d", _STATS["member_api_calls"])
+    log.info("Managers contacted: %s", ", ".join(managers_contacted))
     log.info("Report: %s", out_dir)
     log.info("=" * 60)
     print(json.dumps({"output_dir": str(out_dir),

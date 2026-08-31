@@ -32,6 +32,12 @@ Line continuation in PowerShell is the backtick `` ` `` at end of line.
 |---|---|---|---|
 | `tools/pan/check_policy_match.py` | Offline "can A reach B" policy lookup — walks the full Panorama evaluation chain in correct PAN-OS order, reports verdict + matched rule + trace | Panorama XML config file + `(src_ip, dst_ip, [zones], [service/port])` | `verdict.json` + human/JSON stdout |
 | `tools/pan/recommend_dg.py` | "Which DG should a new rule go on?" — checks for existing matches, then if none, scores each DG's affinity to the flow's /24 (or other CIDR) by counting rules referencing the same address space | Same as above + `--subnet-mask` | `recommendation.json` + `recommendation.txt` + human/JSON stdout |
+| `tools/pan/report_flow_rules.py` | Batch "which rules cover these flows" report: takes a CSV of source/destination pairs and reports EVERY rule covering each one, flagging which decides. A second list of subnets suppresses matches by attribution | Panorama XML config file + a flow CSV + an optional subnet list | Report bundle: `report.md`, `flow_rules.json(l)`, `suppressed_matches.jsonl` |
+
+`report_flow_rules.py` has its own runbook:
+[RUNBOOK_PAN_FLOW_RULES_PS.md](RUNBOOK_PAN_FLOW_RULES_PS.md). It covers the
+flow CSV format, the subnet filter's attribution rules and its two comparison
+modes.
 
 ---
 
@@ -262,26 +268,26 @@ python tools/pan/check_policy_match.py `
 
 ### Batch-checking N flows from a CSV
 
-```powershell
-$cfg = "tools/pan/configs/customer-X-2026-06.xml"
-$dg  = "CustomerX-DG"
+Use `report_flow_rules.py`. It takes the CSV directly, and unlike a loop over
+`check_policy_match.py` it reports **every** rule covering each flow rather
+than just the first match:
 
-Import-Csv flows.csv | ForEach-Object {
-  $result = python tools/pan/check_policy_match.py `
-    --config $cfg --device-group $dg `
-    --src-ip $_.src --dst-ip $_.dst `
-    --protocol $_.proto --dst-port $_.port `
-    --json | ConvertFrom-Json
-  [PSCustomObject]@{
-    src     = $_.src
-    dst     = $_.dst
-    proto   = $_.proto
-    port    = $_.port
-    verdict = $result.verdict
-    rule    = $result.matched_rule
-  }
-} | Export-Csv flow_audit.csv -NoTypeInformation
+```powershell
+$cfg = "tools\pan\configs\customer-X-2026-06.xml"
+
+python tools\pan\report_flow_rules.py `
+  --config $cfg `
+  --flows flows.csv `
+  --exclude-subnet 0.0.0.0/0
 ```
+
+`--exclude-subnet 0.0.0.0/0` strips any/any rules from the report by
+attribution. Full details in
+[RUNBOOK_PAN_FLOW_RULES_PS.md](RUNBOOK_PAN_FLOW_RULES_PS.md).
+
+The old `Import-Csv | ForEach-Object` loop calling `check_policy_match.py
+--json` per row still works, and is the right choice when you specifically
+want the single first-match verdict per flow and nothing else.
 
 ### When you don't know which device-group
 

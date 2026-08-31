@@ -64,7 +64,7 @@ setopt interactive_comments 2>/dev/null || true
 python tools/reports/report_vms_in_rules.py --manager nsx-lm1 \
   --vm-list some_other_list.txt
 
-# Custom output root (default: nsx_logs/reports/vm_rule_membership/<host>/<UTC_TS>/)
+# Custom output root (default: nsx_logs/reports/<host>/vm_rule_membership/<UTC_TS>/)
 python tools/reports/report_vms_in_rules.py --manager nsx-lm1 \
   --output-dir /tmp/vm_rule_report
 
@@ -102,10 +102,10 @@ over 1000 members. `--members-cache-minutes N` reuses the pull from disk for
 repeat runs (different VM lists cost zero member calls). The target-VM list
 never drives API calls at all.
 
-Optional: `--with-vm-inventory` ALSO connects directly to each site LM for
-fabric VM inventory, which enriches the report with VM IP addresses.
-Unreachable LMs are warnings, never fatal (targets with explicit IPs in the
-list keep their IPs either way).
+A federation-global run talks to the GM and nothing else: it never opens a
+session to a site LM (the client refuses the combination outright), so
+fabric-sourced VM IPs are not part of the GM report. Targets with explicit
+IPs in the list keep their IPs.
 
 ```bash
 python tools/reports/report_vms_in_rules.py \
@@ -113,16 +113,12 @@ python tools/reports/report_vms_in_rules.py \
   --federation-global
 ```
 
-LM reachability is only needed with `--with-vm-inventory` (each site ID must
-then resolve to a reachable LM hostname). Without it, the report is complete
-minus fabric-sourced VM IPs.
-
 ## Step 3: Read the report
 
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-LATEST=$(ls -1td nsx_logs/reports/vm_rule_membership/nsx-lm1.lab.local/*/ | head -1)
+LATEST=$(ls -1td nsx_logs/reports/nsx-lm1.lab.local/vm_rule_membership/*/ | head -1)
 echo "Latest run: $LATEST"
 
 # Open the markdown in your editor:

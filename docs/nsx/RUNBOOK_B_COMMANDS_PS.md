@@ -101,7 +101,7 @@ python tools/nsx/audit_ip_remap.py --target $M --csv data/nonprod_map.csv
 
 Exit `0` = clean; `1` = gaps in section 1a/1c. Generic-group candidates are
 informational unless you audit with `--include-generic`. Report lands under
-`$env:NSX_LOG_DIR/reports/ip_remap_audit/$H/<ts>/`.
+`$env:NSX_LOG_DIR/reports/$H/ip_remap_audit/<ts>/`.
 
 ---
 
