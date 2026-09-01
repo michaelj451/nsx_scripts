@@ -25,13 +25,18 @@
 #   future-web-01,10.6.0.50
 #   new-app,10.7.5.100,10.7.5.101
 #   probe,10.6.0.99
-d11148-a-00625
-d11148-a-58594
-d11148-a-92825
-d11148-a-96578
-d10677-a-43687
-d10677-a-65183
-q10677-a-00015
-q10677-a-83760
-d00076-a-84181,10.7.25.8
-d1639-a-29018,10.7.0.91
+labdc1-w01-gnsx1
+labdc1-w01-gnsx2
+labdc1-w01-gnsx3
+labdc1-w01-nsxen1
+labdc1-w01-nsxen2
+labdc1-w01-prorec1
+test-vgpu
+test-vgpu-windows-15Xx7
+test-vgpu-windows2-x357b
+labdc2-w01-gnsx1
+labdc2-w01-gnsx2
+labdc2-w01-gnsx3
+labdc2-w01-nsxen1
+labdc2-w01-nsxen2
+labdc2-w01-prorec1

@@ -19,3 +19,5 @@
 
 new
 old
+test
+bad

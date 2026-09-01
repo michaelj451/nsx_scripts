@@ -38,16 +38,39 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
+```
 
-$M = "nsx-lm1"
-$H = "nsx-lm1.lab.local"
-$GM = "nsx-gm1"
-$GH = "nsx-gm1.lab.local"
-$G = "nsx_info_$M"
+NSX_GM1=ral1-w01-gnsx.vcf.fcbint.net
+NSX_LM1=dur1-w01-lnsx.vcf.fcbint.net
+NSX_LM2=ral1-w01-lnsx.vcf.fcbint.net
+NSX_LM3=rch1-w01-lnsx.vcf.fcbint.net
+NSX_LM4=n-ral1-w01-lnsx.vcf.fcbint.net
+
+# NONPROD
+```
+$M = "nsx-lm4"
+$H = "n-ral1-w01-lnsx.vcf.fcbint.net"
+$GM = "nsx-gm1x"
+$GH = "ral1-w01-gnsx.vcf.fcbint.netxx"
+$G = "nsx_info_nonprod"
 $T = "vm_rule_report_targets.txt"
-$CSV = "data/nonprod_map.csv"
+$CSV = "data/remap_master.csv"
 New-Item -ItemType Directory -Force -Path $G | Out-Null
 ```
+
+# PROD
+```
+$M = "nsx-lm4"
+$H = "dur1-w01-lnsx.vcf.fcbint.net"
+$GM = "nsx-gm1"
+$GH = "ral1-w01-gnsx.vcf.fcbint.net"
+$G = "nsx_info_prod"
+$T = "vm_rule_report_targets.txt"
+$CSV = "data/remap_master.csv"
+New-Item -ItemType Directory -Force -Path $G | Out-Null
+```
+
+
 
 The target list is one VM display name per line, optionally `name,ip`
 (explicit IPs are matched against group IP sets too). Blank lines and `#`
