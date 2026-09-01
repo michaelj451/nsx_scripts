@@ -46,6 +46,7 @@ import argparse
 import json
 import logging
 import sys
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,6 +103,25 @@ def _lock_client_read_only(client: NsxPolicyClient) -> None:
     for transport in ("_post", "_put", "_patch", "_delete"):
         if hasattr(client, transport):
             setattr(client, transport, _refuse(transport))
+
+
+# Per-manager tally of every NSX GET this run made, logged at the end and
+# written to summary.json so the evidence pack shows exactly how much load
+# each manager saw (GM and any site LM the fallback reached).
+_API_CALLS: Dict[str, int] = {}
+
+
+def _count_api_calls(client, label: str) -> None:
+    """Wrap the client INSTANCE's GET transport so each call is tallied under
+    `label` (the manager host). Counting only; the read-only lockdown is a
+    separate wrapper and behavior is unchanged."""
+    _API_CALLS.setdefault(label, 0)
+    orig = client._get
+
+    def counted(*a, **kw):
+        _API_CALLS[label] += 1
+        return orig(*a, **kw)
+    client._get = counted
 
 
 # =============================================================================
@@ -351,6 +371,7 @@ def _connect_lm_stats_clients(gm_client, managers_contacted: List[str],
                            "error": str(exc)[:200]})
             continue
         _lock_client_read_only(lm)
+        _count_api_calls(lm, fqdn)
         clients[sid] = lm
         managers_contacted.append(fqdn)
         log.info("  LM fallback: read-only session to site %s LM at %s "
@@ -840,10 +861,13 @@ def main() -> int:
     log.info("  Compare to          : %s", args.compare_to or "(no diff mode)")
     log.info("  Min days since hit  : %s", args.min_days_since_hit or "(disabled)")
     log.info("  Reports             : %s", reports_dir)
+    log.info("  Log file            : %s", log_file)
     log.info("=" * 60)
+    t_start = _time.monotonic()
 
     client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
     _lock_client_read_only(client)
+    _count_api_calls(client, target_host)
     log.info("Read-only lockdown engaged on NsxPolicyClient instance "
              "(_post/_put/_patch/_delete will raise ReadOnlyViolationError)")
 
@@ -918,13 +942,18 @@ def main() -> int:
     stats_source_summary: Dict[str, int] = {"policy_api": 0, "old_firewall_api": 0, "empty": 0}
     policies_without_stats: set = set()
     lm_stats_clients: Optional[Dict[str, Any]] = None  # lazy; only if the GM cannot answer
+    t_stats = _time.monotonic()
+    log.info("Collecting rules + statistics for %d customer policy/-ies ...",
+             len(policies_with_domain))
 
-    for did, pol in policies_with_domain:
+    for p_idx, (did, pol) in enumerate(policies_with_domain, start=1):
         pol_id = pol.get("id")
         pol_display = pol.get("display_name") or pol_id
         if not pol_id:
             continue
-        log.info("Domain: %s | Policy: %s (%s)", did, pol_id, pol_display)
+        t_pol = _time.monotonic()
+        log.info("[%d/%d] Domain: %s | Policy: %s (%s)",
+                 p_idx, len(policies_with_domain), did, pol_id, pol_display)
 
         # Fetch rules + stats in two API calls per policy.
         try:
@@ -996,6 +1025,7 @@ def main() -> int:
                 log.warning("  no stats available for %s/%s (Policy API failed, no fallback match)",
                             did, pol_id)
 
+        pol_start = len(rules_records)
         for rule in rules:
             if rule.get("_system_owned"):
                 continue
@@ -1064,7 +1094,18 @@ def main() -> int:
             )
             rules_records.append(record)
 
-    log.info("Collected %d customer rules total", len(rules_records))
+        pol_recs = rules_records[pol_start:]
+        tally: Dict[str, int] = {}
+        for r in pol_recs:
+            tally[r["classification"]] = tally.get(r["classification"], 0) + 1
+        log.info("  done: %d rule(s), stats=%s, hits=%d, %s  [%.1fs]",
+                 len(pol_recs), stats_source,
+                 sum(r["hit_count"] for r in pol_recs),
+                 " ".join(f"{k}={v}" for k, v in sorted(tally.items())) or "-",
+                 _time.monotonic() - t_pol)
+
+    log.info("Collected %d customer rules total (statistics phase %.1fs)",
+             len(rules_records), _time.monotonic() - t_stats)
 
     # Classification buckets
     by_class: Dict[str, List[Dict[str, Any]]] = {
@@ -1191,6 +1232,8 @@ def main() -> int:
         "lm_stats_fallback_used":  lm_stats_clients is not None,
         "lm_stats_fallback_sites": sorted(lm_stats_clients) if lm_stats_clients else [],
         "lm_addresses_source":     "gm_site_registry" if lm_stats_clients else None,
+        "api_calls":               dict(_API_CALLS),
+        "elapsed_seconds":         round(_time.monotonic() - t_start, 1),
         "policies_without_stats": sorted(f"{d}/{p}" for d, p in policies_without_stats),
         "read_only":         True,
         "include_defaults": args.include_defaults,
@@ -1320,7 +1363,11 @@ def main() -> int:
         went_dorm   = sum(1 for d in diff_records if d["transition"] == "went_dormant")
         delta_only  = sum(1 for d in diff_records if d["transition"] == "delta")
         log.info("  Diff: lit_up=%d  went_dormant=%d  delta=%d", lit_up, went_dorm, delta_only)
+    log.info("NSX API calls (all GETs): %s",
+             ", ".join(f"{k}={v}" for k, v in _API_CALLS.items()) or "0")
     log.info("Managers contacted: %s", ", ".join(managers_contacted))
+    log.info("Elapsed: %.1fs", summary["elapsed_seconds"])
+    log.info("Log file: %s", log_file)
     log.info("Report: %s", reports_dir)
     log.info("=" * 60)
     print(json.dumps(summary, indent=2))

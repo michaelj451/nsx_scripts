@@ -226,6 +226,28 @@ class LmStatsFallback(unittest.TestCase):
                          ["old_firewall_api_lm:siteB"])
 
 
+class ApiCallCounting(unittest.TestCase):
+    """Every GET a report makes is tallied per manager for the evidence pack."""
+
+    def setUp(self):
+        rules_usage._SECTION_INDEX_CACHE.clear()
+        rules_usage._API_CALLS.clear()
+        groups_usage._API_CALLS.clear()
+
+    def test_rules_usage_tallies_per_manager(self):
+        lm = FakeLm(sections={"P": "s1"}, stats={"s1": [{"rule_id": "r1", "hit_count": 1}]})
+        rules_usage._count_api_calls(lm, "lm-a.corp.example")
+        rules_usage._fetch_stats_via_old_firewall_api(lm, "P")
+        self.assertEqual(rules_usage._API_CALLS, {"lm-a.corp.example": 2})  # sections + stats
+        self.assertEqual(len(lm.calls), 2)
+
+    def test_groups_usage_tallies_per_manager(self):
+        gm = FakeGm(pages={"siteA": [[{"id": 1}]], "siteB": [[{"id": 2}]]})
+        groups_usage._count_api_calls(gm, "gm.lab.local")
+        groups_usage._get_group_vm_count_federated(gm, EPS, "default", "g1")
+        self.assertEqual(groups_usage._API_CALLS, {"gm.lab.local": 2})
+
+
 class NoLocalManagerSessionsInGmMode(unittest.TestCase):
     """Static guard: report tools may not build site clients from local (.env)
     aliases. report_rules_usage's statistics fallback constructs LM clients

@@ -64,6 +64,23 @@ CLASS_ORDER = ["TAG", "IP", "SEGMENT", "VM_PATH", "NESTED", "MIXED", "EMPTY"]
 # Per-run counter, reported in summary.json and the closing log lines.
 _STATS = {"member_api_calls": 0}
 
+# Per-manager tally of every NSX GET this run made, logged at the end and
+# written to summary.json so the evidence pack shows exactly how much load
+# each manager saw.
+_API_CALLS: Dict[str, int] = {}
+
+
+def _count_api_calls(client, label: str) -> None:
+    """Wrap the client INSTANCE's GET transport so each call is tallied under
+    `label` (the manager host). Counting only; no behavior change."""
+    _API_CALLS.setdefault(label, 0)
+    orig = client._get
+
+    def counted(*a, **kw):
+        _API_CALLS[label] += 1
+        return orig(*a, **kw)
+    client._get = counted
+
 
 def _is_not_found(exc: Exception) -> bool:
     s = str(exc)
@@ -407,7 +424,8 @@ def main() -> int:
 
     out_dir = report_run_dir("group_membership", target_host, args.output_base, RUN_TS)
     logs_dir = out_dir / "logs"
-    setup_logging(logs_dir)
+    log_file = setup_logging(logs_dir)
+    t_start = _time.monotonic()
 
     log.info("=" * 60)
     log.info("GROUPS USAGE REPORT")
@@ -416,9 +434,11 @@ def main() -> int:
     log.info("  domain_id:         %s", args.domain_id)
     log.info("  all_domains:       %s", args.all_domains)
     log.info("  output:            %s", out_dir)
+    log.info("  log file:          %s", log_file)
     log.info("=" * 60)
 
     c = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
+    _count_api_calls(c, target_host)
     managers_contacted = [target_host]
 
     # GM/federation-global: evaluated members are proxied THROUGH THE GM with
@@ -454,10 +474,12 @@ def main() -> int:
         except Exception as e:
             log.warning("  domain %s: list failed: %s", dom, str(e)[:80])
             continue
-        log.info("  domain %s: %d customer group(s)", dom, len(groups))
+        log.info("  domain %s: %d customer group(s); querying evaluated members ...",
+                 dom, len(groups))
         per_domain.setdefault(dom, {"count": 0, "total_vm_members": 0})
+        t_dom = _time.monotonic()
 
-        for g in groups:
+        for i, g in enumerate(groups, start=1):
             gid = g.get("id")
             cls, cinfo = classify_group(g)
             per_site_counts: Dict[str, Optional[int]] = {}
@@ -466,6 +488,14 @@ def main() -> int:
                     c, site_eps, dom, gid)
             else:
                 vm_count = _get_group_vm_count(c, dom, gid)
+            site_part = ""
+            if per_site_counts:
+                site_part = " (" + ", ".join(
+                    f"{s}={'n/a' if v is None else v}"
+                    for s, v in per_site_counts.items()) + ")"
+            log.info("  [%d/%d] %s/%s (%s) class=%s vms=%s%s",
+                     i, len(groups), dom, gid, g.get("display_name") or "", cls,
+                     "n/a" if vm_count is None else vm_count, site_part)
             rec = {
                 "domain_id":     dom,
                 "id":            gid,
@@ -483,6 +513,11 @@ def main() -> int:
             by_class[cls]["count"] += 1
             by_class[cls]["total_vm_members"] += (vm_count or 0)
 
+        log.info("  domain %s done: %d group(s), %d VM member(s), %.1fs; "
+                 "member API calls so far: %d",
+                 dom, per_domain[dom]["count"], per_domain[dom]["total_vm_members"],
+                 _time.monotonic() - t_dom, _STATS["member_api_calls"])
+
     summary = {
         "ran_at":            datetime.now(timezone.utc).isoformat(),
         "target":            f"alias:{args.target} ({target_host})",
@@ -491,6 +526,9 @@ def main() -> int:
         "managers_contacted": managers_contacted,
         "gm_proxy_mode":     is_gm_federation,
         "member_api_calls":  _STATS["member_api_calls"],
+        "api_calls":         dict(_API_CALLS),
+        "elapsed_seconds":   round(_time.monotonic() - t_start, 1),
+        "log_file":          str(log_file),
         "counters": {
             "customer_groups":     len(records),
             "total_vm_members":    sum((r.get("vm_count") or 0) for r in records),
@@ -516,7 +554,11 @@ def main() -> int:
         if v["count"]:
             log.info("    %-8s  count=%3d  vm_members=%d", k, v["count"], v["total_vm_members"])
     log.info("Member API calls: %d", _STATS["member_api_calls"])
+    log.info("NSX API calls (all GETs): %s",
+             ", ".join(f"{k}={v}" for k, v in _API_CALLS.items()) or "0")
     log.info("Managers contacted: %s", ", ".join(managers_contacted))
+    log.info("Elapsed: %.1fs", summary["elapsed_seconds"])
+    log.info("Log file: %s", log_file)
     log.info("Report: %s", out_dir)
     log.info("=" * 60)
     print(json.dumps({"output_dir": str(out_dir),
