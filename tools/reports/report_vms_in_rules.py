@@ -406,6 +406,10 @@ def pull_groups_with_members(
                     members = client.list_policy_group_member_vms(
                         group_id=gid, domain_id=domain_id
                     )
+                    # One member fetch per group. The GM branch above counts
+                    # each page; here the client pages internally, so this
+                    # undercounts only for groups with >1000 members.
+                    api_calls += 1
                 except Exception as exc:
                     log.warning(
                         "list_policy_group_member_vms(%s/%s) failed: %s",
@@ -484,7 +488,12 @@ def pull_group_ip_memberships(
     """
     result: Dict[str, Set[str]] = {}
     api_calls = 0
-    for gpath, meta in groups_by_path.items():
+    total_groups = len(groups_by_path)
+    to_fetch = (total_groups if only_paths is None
+                else sum(1 for gp in groups_by_path if gp in only_paths))
+    log.info("Fetching group IP memberships for %d of %d group(s) ...",
+             to_fetch, total_groups)
+    for i, (gpath, meta) in enumerate(groups_by_path.items(), start=1):
         if only_paths is not None and gpath not in only_paths:
             result[gpath] = set()
             continue
@@ -526,6 +535,8 @@ def pull_group_ip_memberships(
                 if not cursor or not page:
                     break
         result[gpath] = ips
+        if i % 25 == 0:
+            log.info("  ... %d/%d group IP members fetched", i, total_groups)
     log.info("IP-member API calls: %d", api_calls)
     total_ips = sum(len(v) for v in result.values())
     log.info("Group IP memberships fetched: %d total IP/CIDR entries across %d group(s)",
@@ -907,6 +918,152 @@ def render_markdown(
     return align_markdown_tables("\n".join(lines))
 
 
+# ---------- offline inputs (no NSX contact) ----------
+
+def _collect_ip_entries(expression: Optional[List[Dict[str, Any]]]) -> Set[str]:
+    """Every IP/CIDR/range an expression tree contributes.
+
+    Recurses NestedExpression (child key 'expressions'). A tool that walks
+    expression[] without recursing silently under-reports compound groups,
+    which are exactly the ones API/Terraform-built environments produce.
+    """
+    out: Set[str] = set()
+    for e in (expression or []):
+        if not isinstance(e, dict):
+            continue
+        rt = e.get("resource_type")
+        if rt == "IPAddressExpression":
+            out.update(str(x) for x in (e.get("ip_addresses") or []))
+        elif rt == "NestedExpression":
+            out.update(_collect_ip_entries(e.get("expressions")))
+    return out
+
+
+def _capture_export_root(bundle: Path) -> Path:
+    """nsx_capture/<host>/nsx_export/<host>/ -> the dir holding domains/."""
+    direct = bundle / "domains"
+    if direct.is_dir():
+        return bundle
+    exp = bundle / "nsx_export"
+    if exp.is_dir():
+        for child in sorted(exp.iterdir()):
+            if (child / "domains").is_dir():
+                return child
+    raise SystemExit(f"--from-capture: no domains/ found under {bundle}")
+
+
+def load_capture_groups(export_root: Path,
+                        ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str],
+                                   Dict[str, Set[str]], List[str]]:
+    """Read captured group definitions.
+
+    Returns (groups_by_path, group_id_to_path, group_ips, domain_ids).
+    group_ips comes from the captured IPAddressExpression entries, which is
+    the definition rather than NSX's evaluated /members/ip-addresses answer.
+    """
+    import yaml
+    groups_by_path: Dict[str, Dict[str, Any]] = {}
+    id_to_path: Dict[str, str] = {}
+    group_ips: Dict[str, Set[str]] = {}
+    domain_ids: List[str] = []
+    domains_dir = export_root / "domains"
+    for ddir in sorted(d for d in domains_dir.iterdir() if d.is_dir()):
+        domain_ids.append(ddir.name)
+        gdir = ddir / "groups"
+        if not gdir.is_dir():
+            continue
+        for f in sorted(gdir.glob("*.yaml")):
+            if f.name == "index.yaml":
+                continue
+            try:
+                obj = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+            except Exception as exc:
+                log.warning("capture: unreadable group file %s: %s", f.name, exc)
+                continue
+            gid, gpath = obj.get("id"), obj.get("path")
+            if not gid or not gpath:
+                continue
+            groups_by_path[gpath] = {
+                "id": gid,
+                "display_name": obj.get("display_name") or gid,
+                "domain_id": ddir.name,
+                "path": gpath,
+                "members_fetched": True,
+            }
+            id_to_path[gid] = gpath
+            ips = _collect_ip_entries(obj.get("expression"))
+            if ips:
+                group_ips[gpath] = ips
+    return groups_by_path, id_to_path, group_ips, domain_ids
+
+
+def load_capture_rules(export_root: Path) -> List[Dict[str, Any]]:
+    """Read captured policies + rules, matching pull_all_rules' output shape."""
+    import yaml
+    out: List[Dict[str, Any]] = []
+    domains_dir = export_root / "domains"
+    for ddir in sorted(d for d in domains_dir.iterdir() if d.is_dir()):
+        pdir = ddir / "security-policies"
+        if not pdir.is_dir():
+            continue
+        for poldir in sorted(x for x in pdir.iterdir() if x.is_dir()):
+            pf = poldir / "policy.yaml"
+            if not pf.is_file():
+                continue
+            try:
+                pol = yaml.safe_load(pf.read_text(encoding="utf-8")) or {}
+            except Exception as exc:
+                log.warning("capture: unreadable policy %s: %s", poldir.name, exc)
+                continue
+            rdir = poldir / "rules"
+            if not rdir.is_dir():
+                continue
+            for rf in sorted(rdir.glob("*.yaml")):
+                if rf.name == "rules_order.yaml":
+                    continue
+                try:
+                    r = yaml.safe_load(rf.read_text(encoding="utf-8")) or {}
+                except Exception as exc:
+                    log.warning("capture: unreadable rule %s: %s", rf.name, exc)
+                    continue
+                if not r.get("id"):
+                    continue
+                r["_policy_id"] = pol.get("id")
+                r["_policy_display"] = pol.get("display_name") or pol.get("id")
+                r["_policy_path"] = pol.get("path")
+                r["_domain_id"] = ddir.name
+                r["_category"] = pol.get("category") or ""
+                out.append(r)
+    return out
+
+
+def load_membership_export(mdir: Path,
+                           ) -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+    """Read tools/nsx/membership.py output.
+
+    Returns (vms, vm_ext_to_group_ids). These are NSX's own evaluated answers,
+    so no expression logic is reimplemented here.
+    """
+    f = mdir / "vm_group_membership.json"
+    if not f.is_file():
+        raise SystemExit(f"--from-membership: {f} not found")
+    rows = json.loads(f.read_text(encoding="utf-8"))
+    vms: List[Dict[str, Any]] = []
+    ext_to_gids: Dict[str, List[str]] = {}
+    for r in rows:
+        ext = r.get("external_id") or r.get("vm_id")
+        if not ext:
+            continue
+        vms.append({
+            "external_id": ext,
+            "display_name": r.get("display_name"),
+            "tags": r.get("tags") or [],
+            "ips": r.get("ips") or [],
+        })
+        ext_to_gids[ext] = list(r.get("groups") or [])
+    return vms, ext_to_gids
+
+
 # ---------- main ----------
 
 def main() -> None:
@@ -945,6 +1102,19 @@ def main() -> None:
         help="Query the federated /global-infra/ view (use with GM sources).",
     )
     parser.add_argument(
+        "--from-membership", default=None, metavar="DIR",
+        help="Offline mode: read evaluated membership from a "
+             "tools/nsx/membership.py export dir "
+             "(nsx_membership_export/<host>/). Use with --from-capture. "
+             "No NSX contact is made at all.",
+    )
+    parser.add_argument(
+        "--from-capture", default=None, metavar="DIR",
+        help="Offline mode: read rules and group definitions from an "
+             "nsx_capture bundle (nsx_capture/<host>/). Use with "
+             "--from-membership.",
+    )
+    parser.add_argument(
         "--rate-limit", type=float, default=None, metavar="RPS",
         help="Cap NSX API requests per second for this run (sets "
              "NSX_API_MAX_RPS for the client). "
@@ -973,14 +1143,65 @@ def main() -> None:
     if not names_input:
         raise SystemExit(f"No VM names loaded (file: {list_path})")
 
-    log.info("Target manager: %s (federation_global=%s)",
-             manager_host, args.federation_global)
-    client = NsxPolicyClient(nsxmanager=manager_host,
-                             federation_global=args.federation_global)
+    offline = bool(args.from_membership or args.from_capture)
+    if offline and not (args.from_membership and args.from_capture):
+        raise SystemExit(
+            "--from-membership and --from-capture must be given together: "
+            "membership supplies VM-to-group, the capture supplies the rules.")
+
+    offline_vms: Optional[List[Dict[str, Any]]] = None
+    client = None
+    if offline:
+        if args.federation_global:
+            raise SystemExit(
+                "--federation-global is not supported in offline mode: "
+                "membership.py cannot export from a Global Manager.")
+        mdir = Path(args.from_membership).expanduser().resolve()
+        cdir = Path(args.from_capture).expanduser().resolve()
+        log.info("OFFLINE mode - no NSX contact.")
+        log.info("  membership : %s", mdir)
+        log.info("  capture    : %s", cdir)
+        export_root = _capture_export_root(cdir)
+        offline_vms, ext_to_gids = load_membership_export(mdir)
+        g_by_path, id_to_path, g_ips, dom_ids = load_capture_groups(export_root)
+        # Invert VM->group-ids into the group->members map the report expects.
+        g_to_members: Dict[str, Set[str]] = {gp: set() for gp in g_by_path}
+        unknown_gids: Set[str] = set()
+        for ext, gids in ext_to_gids.items():
+            for gid in gids:
+                gp = id_to_path.get(gid)
+                if gp is None:
+                    unknown_gids.add(gid)
+                    continue
+                g_to_members.setdefault(gp, set()).add(ext)
+        if unknown_gids:
+            log.warning("%d group id(s) in the membership export have no "
+                        "definition in the capture (bundles out of sync?); "
+                        "first few: %s", len(unknown_gids),
+                        sorted(unknown_gids)[:5])
+        offline_rules = load_capture_rules(export_root)
+        offline_data = {
+            "domain_ids": dom_ids,
+            "groups": (g_by_path, g_to_members, {}),
+            "group_ips": g_ips,
+            "rules": offline_rules,
+        }
+        log.info("  loaded: %d VM(s), %d group(s), %d rule(s), %d domain(s)",
+                 len(offline_vms), len(g_by_path), len(offline_rules),
+                 len(dom_ids))
+        log.info("  NOTE: group IP membership is derived from captured "
+                 "IPAddressExpression definitions, not NSX's evaluated "
+                 "/members/ip-addresses.")
+    else:
+        log.info("Target manager: %s (federation_global=%s)",
+                 manager_host, args.federation_global)
+        client = NsxPolicyClient(nsxmanager=manager_host,
+                                 federation_global=args.federation_global)
 
     # ---- pull VMs (and figure out federation topology) ----
     is_gm_federation = (
-        args.federation_global and "/global-manager/" in client.POLICY_ROOT
+        (not offline) and args.federation_global
+        and "/global-manager/" in client.POLICY_ROOT
     )
     vm_ext_to_site: Dict[str, str] = {}
     site_display: Dict[str, str] = {}
@@ -991,6 +1212,13 @@ def main() -> None:
                                Dict[str, Dict[str, Any]]]] = None
     pre_group_ips: Optional[Dict[str, Set[str]]] = None
     pre_all_rules: Optional[List[Dict[str, Any]]] = None
+
+    if offline:
+        # Declared above, so populate here rather than in the offline block.
+        pre_domain_ids = offline_data["domain_ids"]
+        pre_groups = offline_data["groups"]
+        pre_group_ips = offline_data["group_ips"]
+        pre_all_rules = offline_data["rules"]
 
     if is_gm_federation:
         log.info("Detected GM federation mode. Discovering sites.")
@@ -1083,6 +1311,9 @@ def main() -> None:
         if synthesized:
             log.info("VM universe from GM member proxy: %d VM(s) (no fabric IPs)",
                      synthesized)
+    elif offline_vms is not None:
+        vms = offline_vms
+        log.info("VM universe from the membership export: %d VM(s)", len(vms))
     else:
         # --federation-global with a non-GM target cannot reach this point:
         # NsxPolicyClient refuses that combination in its constructor.
