@@ -71,14 +71,11 @@ python tools/reports/dryrun_hostname_tags.py \
 Then pin the newest plan directory rather than typing a timestamp:
 
 ```bash
-PLAN=$(ls -dt "$G/$H"/hostname_tags_dryrun/*/ | head -1); PLAN=${PLAN%/}
+: "${G:?set G first (step 0)}" "${H:?set H first (step 0)}"
+PLAN=$(ls -dt "$G/$H"/hostname_tags_dryrun/*/ 2>/dev/null | head -1); PLAN=${PLAN%/}
+[ -n "$PLAN" ] || { echo "No plan dir under $G/$H/hostname_tags_dryrun - run step 1 first" >&2; }
+[ -f "$PLAN/eligible.json" ] || { echo "$PLAN has no eligible.json - not a valid --plan-dir" >&2; }
 echo "$PLAN"
-```
-
-A directory is a valid `--plan-dir` when it contains `eligible.json`:
-
-```bash
-test -f "$PLAN/eligible.json" && echo "valid plan dir" || echo "NOT a plan dir"
 ```
 
 ---

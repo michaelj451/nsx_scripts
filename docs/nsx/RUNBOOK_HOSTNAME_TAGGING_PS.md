@@ -75,16 +75,30 @@ python tools\reports\dryrun_hostname_tags.py `
 Then pin the newest plan directory rather than typing a timestamp:
 
 ```powershell
-$PLAN = (Get-ChildItem "$G\$H\hostname_tags_dryrun" -Directory |
-         Sort-Object Name -Descending | Select-Object -First 1).FullName
+if (-not $G -or -not $H) {
+    throw "`$G and `$H are not set. Run the step 0 variables block first."
+}
+$base = Join-Path (Join-Path $G $H) 'hostname_tags_dryrun'
+if (-not (Test-Path -LiteralPath $base)) {
+    throw "No dry-run output under '$base'. Run step 1 first."
+}
+$dirs = @(Get-ChildItem -LiteralPath $base -Directory | Sort-Object Name -Descending)
+if ($dirs.Count -eq 0) { throw "No timestamped plan directory under '$base'." }
+$PLAN = $dirs[0].FullName
+if (-not (Test-Path -LiteralPath (Join-Path $PLAN 'eligible.json'))) {
+    throw "'$PLAN' has no eligible.json, so it is not a valid --plan-dir."
+}
 $PLAN
 ```
 
-A directory is a valid `--plan-dir` when it contains `eligible.json`:
-
-```powershell
-if (Test-Path "$PLAN\eligible.json") { "valid plan dir" } else { "NOT a plan dir" }
-```
+> **Why the guards.** The obvious one-liner
+> `$PLAN = (Get-ChildItem ... | Select-Object -First 1).FullName`
+> fails **silently**: when the pipeline matches nothing, `.FullName` on `$null`
+> returns empty rather than erroring, so `$PLAN` ends up blank with no message
+> and the next command runs with no `--plan-dir` value. The usual cause is
+> `$G`/`$H` not being set, since PowerShell variables do not survive a new
+> session. The block above fails loudly instead, and confirms `eligible.json`
+> is present in the same step.
 
 ---
 
