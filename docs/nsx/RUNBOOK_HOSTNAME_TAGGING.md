@@ -71,12 +71,22 @@ python tools/reports/dryrun_hostname_tags.py \
 Then pin the newest plan directory rather than typing a timestamp:
 
 ```bash
-: "${G:?set G first (step 0)}" "${H:?set H first (step 0)}"
-PLAN=$(ls -dt "$G/$H"/hostname_tags_dryrun/*/ 2>/dev/null | head -1); PLAN=${PLAN%/}
-[ -n "$PLAN" ] || { echo "No plan dir under $G/$H/hostname_tags_dryrun - run step 1 first" >&2; }
-[ -f "$PLAN/eligible.json" ] || { echo "$PLAN has no eligible.json - not a valid --plan-dir" >&2; }
+: "${H:?set H first (step 0)}"
+PLAN=$(find . -type f -name eligible.json -path "*/$H/*" 2>/dev/null \
+       | sed 's|/eligible.json$||' \
+       | awk -F/ '{print $NF"\t"$0}' | sort -r | head -1 | cut -f2-)
+[ -n "$PLAN" ] || echo "No plan directory for $H under $PWD - run step 1 first" >&2
 echo "$PLAN"
 ```
+
+> **Why it searches instead of assuming a path.** The plan lands in a different
+> place depending on which flag step 1 used: `--output-base $G` puts it at
+> `$G/<host>/hostname_tags_dryrun/<ts>/`, plain `--output-dir` puts it exactly
+> where you say, and with neither flag the default is
+> `nsx_logs/reports/<host>/hostname_tags_dryrun/<ts>/`. Hard-coding one layout
+> breaks the moment the plan was produced another way. Searching for
+> `eligible.json` sidesteps that: it is the file `--plan-dir` actually
+> requires, so anything found is valid by definition.
 
 ---
 
