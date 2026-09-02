@@ -43,6 +43,7 @@ a matching revert.
 | Doc | Purpose |
 |---|---|
 | [RUNBOOK_VM_TAGS.md](nsx/RUNBOOK_VM_TAGS.md) ([cmds](nsx/RUNBOOK_VM_TAGS_COMMANDS.md) / [ps](nsx/RUNBOOK_VM_TAGS_COMMANDS_PS.md)) | VM hostname tagging: plan / validate / push / revert |
+| [RUNBOOK_HOSTNAME_TAGGING.md](nsx/RUNBOOK_HOSTNAME_TAGGING.md) / [ps](nsx/RUNBOOK_HOSTNAME_TAGGING_PS.md) | Hostname tagging plan-to-apply path: reuse a dry-run plan dir, push, resume after a crash, validate, revert. Variable-driven |
 | [RUNBOOK_GROUP_LABEL_TAGS.md](nsx/RUNBOOK_GROUP_LABEL_TAGS.md) / [ps](nsx/RUNBOOK_GROUP_LABEL_TAGS_PS.md) | Mirror a group's tag-based membership criteria into its own label tags |
 
 ## Reports and audits (all read-only)
