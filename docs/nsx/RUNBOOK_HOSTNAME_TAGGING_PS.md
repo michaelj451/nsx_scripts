@@ -75,30 +75,32 @@ python tools\reports\dryrun_hostname_tags.py `
 Then pin the newest plan directory rather than typing a timestamp:
 
 ```powershell
-if (-not $G -or -not $H) {
-    throw "`$G and `$H are not set. Run the step 0 variables block first."
+if (-not $H) { throw "`$H is not set. Run the step 0 variables block first." }
+$found = @(Get-ChildItem -Path . -Recurse -Filter eligible.json -File -ErrorAction SilentlyContinue |
+           Where-Object { $_.DirectoryName -like "*$H*" } |
+           Sort-Object { $_.Directory.Name } -Descending)
+if ($found.Count -eq 0) {
+    throw "No plan directory for '$H' anywhere under $PWD. Run step 1 first."
 }
-$base = Join-Path (Join-Path $G $H) 'hostname_tags_dryrun'
-if (-not (Test-Path -LiteralPath $base)) {
-    throw "No dry-run output under '$base'. Run step 1 first."
-}
-$dirs = @(Get-ChildItem -LiteralPath $base -Directory | Sort-Object Name -Descending)
-if ($dirs.Count -eq 0) { throw "No timestamped plan directory under '$base'." }
-$PLAN = $dirs[0].FullName
-if (-not (Test-Path -LiteralPath (Join-Path $PLAN 'eligible.json'))) {
-    throw "'$PLAN' has no eligible.json, so it is not a valid --plan-dir."
+$PLAN = $found[0].DirectoryName
+if ($found.Count -gt 1) {
+    Write-Warning "$($found.Count) plan dirs found for ${H}; using the newest:"
+    $found | ForEach-Object { Write-Warning "   $($_.Directory.Name)  $($_.DirectoryName)" }
 }
 $PLAN
 ```
 
-> **Why the guards.** The obvious one-liner
-> `$PLAN = (Get-ChildItem ... | Select-Object -First 1).FullName`
-> fails **silently**: when the pipeline matches nothing, `.FullName` on `$null`
-> returns empty rather than erroring, so `$PLAN` ends up blank with no message
-> and the next command runs with no `--plan-dir` value. The usual cause is
-> `$G`/`$H` not being set, since PowerShell variables do not survive a new
-> session. The block above fails loudly instead, and confirms `eligible.json`
-> is present in the same step.
+> **Why it searches instead of assuming a path.** The plan lands in a different
+> place depending on which flag step 1 used: `--output-base $G` puts it at
+> `$G\<host>\hostname_tags_dryrun\<ts>\`, plain `--output-dir` puts it exactly
+> where you say, and with neither flag the default is
+> `nsx_logs\reports\<host>\hostname_tags_dryrun\<ts>\`. Hard-coding one layout
+> breaks the moment the plan was produced another way.
+>
+> Searching for `eligible.json` sidesteps that: it is the file `--plan-dir`
+> actually requires, so anything found is valid by definition. It also avoids
+> the silent-failure trap, where `.FullName` on a `$null` pipeline result
+> returns empty rather than erroring and `$PLAN` ends up blank with no message.
 
 ---
 
