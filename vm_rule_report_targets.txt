@@ -28,3 +28,4 @@
 ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101
 ubuntu22-speedtest-10.6.2.102-gh0202,10.6.2.102
 ubuntu22-speedtest-10.6.1.102-0102
+mikes-mac2,10.10.2.78
