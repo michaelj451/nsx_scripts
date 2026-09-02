@@ -27,7 +27,9 @@ Assumes `.env` is populated with NSX credentials and manager aliases.
 
 Read-only against NSX. Classifies every VM into eligible / skip_edge /
 skip_other_type / skip_has_tag / skip_invalid_name / skip_too_many_tags.
-Writes plan files under `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\`.
+Writes plan files under the `--output-dir` given below, i.e.
+`nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\`. With no output flag the
+default is `nsx_logs\reports\<host>\hostname_tags_dryrun\<UTC_TS>\`.
 
 ```powershell
 python tools/reports/dryrun_hostname_tags.py `
@@ -241,11 +243,11 @@ exception is the push/revert **manifests**, which land in the top-level
 
 | Tool | Location | Where output lands |
 |---|---|---|
-| `dryrun_hostname_tags.py` | `tools\reports\` | `nsx_logs\reports\vm_tags_plan\<host>\<UTC_TS>\` (contains `plan.md` + `plan.json` + per-bucket `.json`) |
-| `push_hostname_tags.py` | `tools\vm_tags\` | `nsx_vm_tags_manifests\<host>\<UTC_TS>_apply.json` + `.md` (or `_dryrun.*`) |
-| `revert_hostname_tags.py` | `tools\vm_tags\` | `nsx_vm_tags_manifests\<host>\<UTC_TS>_revert_apply.json` (or `_dryrun.json`) |
-| `report_rules_usage.py` | `tools\reports\` | `nsx_logs\reports\rules_usage\<host>\<UTC_TS>\` |
-| `report_groups_usage.py` | `tools\reports\` | `nsx_logs\reports\groups_usage\<host>\<UTC_TS>\` |
+| `dryrun_hostname_tags.py` | `tools\reports\` | default `nsx_logs\reports\<host>\hostname_tags_dryrun\<UTC_TS>\` (contains `plan.md` + `plan.json` + `eligible.json` + per-bucket `.json`); `--output-base` / `--output-dir` override |
+| `push_hostname_tags.py` | `tools\vm_tags\` | `nsx_logs\reports\vm_tags_push\<host>\<UTC_TS>_apply.json` plus `_apply.progress.jsonl` (renamed `.done.jsonl` on clean completion) |
+| `revert_hostname_tags.py` | `tools\vm_tags\` | `nsx_logs\reports\vm_tags_revert\<host>\` |
+| `report_rules_usage.py` | `tools\reports\` | `nsx_logs\reports\<host>\rules_usage\<UTC_TS>\` |
+| `report_groups_usage.py` | `tools\reports\` | `nsx_logs\reports\<host>\group_membership\<UTC_TS>\` |
 | `build_hostname_tag_plan.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_plan\<host>\<UTC_TS>\` (offline planner) |
 | `export_vm_tags.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_export\<host>\vms.json` |
 | `validate_hostname_tags.py` | `tools\vm_tags\` | `nsx_vm_files\vm_tags_validation\<UTC_TS>_<alias>\validation_report.json` |
