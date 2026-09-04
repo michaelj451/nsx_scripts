@@ -3,11 +3,20 @@
 
 Local web UI for the Panorama IP-to-rule search. Serves a single page on
 127.0.0.1 that accepts IP addresses, subnets, AND ranges (one per line,
-same syntax as pan_ip_rule_targets.txt), pulls a FRESH configuration from
-Panorama on every search (fresh keygen, fresh REST pulls; nothing cached),
-runs the same matching engine as tools/pan/report_ips_in_rules.py, and
-renders the results. Every search is also saved locally, and past runs are
-listed in the page for one-click reload.
+same syntax as pan_ip_rule_targets.txt) and runs the same matching engine
+as tools/pan/report_ips_in_rules.py.
+
+Two separate actions, two buttons:
+  - PULL CONFIG: fresh keygen + REST pulls (device groups, addresses,
+    address groups, all pre/post rulebases) into the current SNAPSHOT.
+    The snapshot is kept in memory and persisted to
+    pan_capture/<host>/web_snapshot.json so it survives server restarts.
+  - SEARCH: matches the targets against the current snapshot only; no
+    network traffic. Iterate on target lists as fast as you like, then
+    pull again when you want fresh config.
+
+Every search is saved locally with the snapshot timestamp it ran against,
+and past runs are listed in the page for one-click reload.
 
 Read-only against Panorama, stdlib HTTP server only (no new deps), binds
 loopback only; there is no auth because it never listens beyond 127.0.0.1.
@@ -23,7 +32,8 @@ USAGE:
 Run history: pan_reports/<host>/web_ip_search/<UTC_TS>.json (one file per
 search, inputs + full results).
 
-Endpoints: GET / (page), POST /api/search, GET /api/runs, GET /api/run?id=
+Endpoints: GET / (page), POST /api/pull, POST /api/search, GET /api/runs,
+GET /api/run?id=, GET /api/info
 """
 from __future__ import annotations
 
@@ -55,10 +65,17 @@ CONFIG: Dict[str, Any] = {}   # filled from CLI args at startup
 
 
 # =============================================================================
-# Search execution (fresh client, fresh pulls, per request)
+# Snapshot: PULL CONFIG builds it; SEARCH only reads it
 # =============================================================================
 
-def pull_rules(client: PanRestClient, scope: str, rulebase: str) -> List[Dict[str, Any]]:
+SNAPSHOT: Dict[str, Any] = {}   # {"meta": {...}, "scopes": [{scope, addresses, groups, rules}]}
+
+
+def snapshot_file() -> Path:
+    return REPO_ROOT / "pan_capture" / CONFIG["display_host"].split(".")[0] / "web_snapshot.json"
+
+
+def _pull_scope_rules(client: PanRestClient, scope: str, rulebase: str) -> List[Dict[str, Any]]:
     resource = f"Policies/Security{rulebase.capitalize()}Rules"
     try:
         if scope == "shared":
@@ -71,7 +88,70 @@ def pull_rules(client: PanRestClient, scope: str, rulebase: str) -> List[Dict[st
         raise
 
 
+def pull_snapshot() -> Dict[str, Any]:
+    """Fresh keygen + full REST pull into SNAPSHOT (and onto disk)."""
+    client = PanRestClient.from_env(user_env=CONFIG["user_env"],
+                                    password_env=CONFIG["password_env"],
+                                    host=CONFIG["host"])
+    dgs = client.list_device_groups()
+    shared_addresses = client.list_addresses(location="shared")
+    shared_groups = client.list_address_groups(location="shared")
+
+    scopes: List[Dict[str, Any]] = [{
+        "scope": "shared",
+        "addresses": shared_addresses, "groups": shared_groups,
+        "rules": {rb: _pull_scope_rules(client, "shared", rb) for rb in ("pre", "post")},
+    }]
+    for dg in dgs:
+        scopes.append({
+            "scope": dg,
+            "addresses": client.list_addresses(device_group=dg) + shared_addresses,
+            "groups": client.list_address_groups(device_group=dg) + shared_groups,
+            "rules": {rb: _pull_scope_rules(client, dg, rb) for rb in ("pre", "post")},
+        })
+
+    snap = {
+        "meta": {
+            "pulled_at": datetime.now(timezone.utc).isoformat(),
+            "target": client.env.url,
+            "username": client.username,
+            "device_groups": dgs,
+        },
+        "scopes": scopes,
+    }
+    SNAPSHOT.clear()
+    SNAPSHOT.update(snap)
+    f = snapshot_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
+    log.info("Snapshot pulled: %d device groups, %d rules total (saved %s)",
+             len(dgs), sum(len(s["rules"][rb]) for s in scopes for rb in ("pre", "post")), f)
+    return snapshot_status()
+
+
+def load_persisted_snapshot() -> None:
+    f = snapshot_file()
+    if f.exists():
+        try:
+            SNAPSHOT.update(json.loads(f.read_text(encoding="utf-8")))
+            log.info("Loaded persisted snapshot from %s (pulled_at %s)",
+                     f, SNAPSHOT["meta"]["pulled_at"])
+        except (ValueError, KeyError):
+            log.warning("Ignoring unreadable snapshot file %s", f)
+
+
+def snapshot_status() -> Dict[str, Any]:
+    if not SNAPSHOT:
+        return {"present": False}
+    return {"present": True, **SNAPSHOT["meta"],
+            "rule_counts": {s["scope"]: {rb: len(s["rules"][rb]) for rb in ("pre", "post")}
+                            for s in SNAPSHOT["scopes"]}}
+
+
 def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not SNAPSHOT:
+        raise ValueError("No configuration snapshot yet. Pull the config first.")
+
     targets_text = payload.get("targets", "")
     exclusions_text = payload.get("exclusions", "")
     use_repo_exclusions = bool(payload.get("use_repo_exclusions", True))
@@ -87,42 +167,31 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("No valid targets given (IPs, subnets, or ranges, one per line).")
     targets, excluded = apply_exclusions(raw_targets, exclusions)
 
-    client = PanRestClient.from_env(user_env=CONFIG["user_env"],
-                                    password_env=CONFIG["password_env"],
-                                    host=CONFIG["host"])
-    all_dgs = client.list_device_groups()
+    all_dgs = SNAPSHOT["meta"]["device_groups"]
     wanted = [d.strip() for d in (payload.get("device_groups") or "").split(",") if d.strip()]
     unknown = sorted(set(wanted) - set(all_dgs))
     if unknown:
         raise ValueError(f"Unknown device groups: {unknown} (available: {all_dgs})")
-    dgs = wanted or all_dgs
-
-    shared_addresses = client.list_addresses(location="shared")
-    shared_groups = client.list_address_groups(location="shared")
+    keep = set(wanted or all_dgs) | ({"shared"} if payload.get("include_shared", True) else set())
 
     scope_results: List[Dict[str, Any]] = []
-
-    def run_scope(scope: str, addresses, groups) -> None:
+    for s in SNAPSHOT["scopes"]:
+        if s["scope"] not in keep:
+            continue
         for rulebase in ("pre", "post"):
-            rules = pull_rules(client, scope, rulebase)
-            scope_results.append(match_rules(rules, addresses, groups, targets,
-                                             scope=scope, rulebase=rulebase))
-
-    if payload.get("include_shared", True):
-        run_scope("shared", shared_addresses, shared_groups)
-    for dg in dgs:
-        dg_addresses = client.list_addresses(device_group=dg)
-        dg_groups = client.list_address_groups(device_group=dg)
-        run_scope(dg, dg_addresses + shared_addresses, dg_groups + shared_groups)
+            scope_results.append(match_rules(s["rules"][rulebase], s["addresses"],
+                                             s["groups"], targets,
+                                             scope=s["scope"], rulebase=rulebase))
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     result = {
         "run_id": run_id,
         "meta": {
             "ran_at": datetime.now(timezone.utc).isoformat(),
-            "target": client.env.url,
-            "username": client.username,
-            "device_groups": dgs,
+            "target": SNAPSHOT["meta"]["target"],
+            "username": SNAPSHOT["meta"]["username"],
+            "snapshot_pulled_at": SNAPSHOT["meta"]["pulled_at"],
+            "device_groups": sorted(keep - {"shared"}),
             "read_only": True,
             "firewalls_contacted": False,
         },
@@ -141,12 +210,13 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         "invalid_lines": invalid,
         "scopes": scope_results,
     }
-    run_dir = runs_dir(client.env.hostname)
+    run_dir = runs_dir(CONFIG["display_host"])
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / f"{run_id}.json").write_text(json.dumps(result, indent=2) + "\n",
                                             encoding="utf-8")
-    log.info("Search %s: %d targets, %d matches (saved %s)", run_id,
-             len(targets), result["totals"]["rules_matched"], run_dir / f"{run_id}.json")
+    log.info("Search %s: %d targets, %d matches against snapshot %s", run_id,
+             len(targets), result["totals"]["rules_matched"],
+             SNAPSHOT["meta"]["pulled_at"])
     return result
 
 
@@ -218,7 +288,12 @@ textarea { resize:vertical; }
 button { margin-top:14px; width:100%; padding:9px; border:0; border-radius:6px;
   background:var(--accent); color:var(--accent-ink); font-weight:700;
   font-size:14px; cursor:pointer; }
-button:disabled { opacity:.5; cursor:wait; }
+button:disabled { opacity:.5; cursor:not-allowed; }
+button.secondary { background:transparent; color:var(--accent);
+  border:1.5px solid var(--accent); }
+.snap { margin-top:8px; font-size:12px; color:var(--muted);
+  border-left:3px solid var(--line); padding-left:8px; }
+.snap.ok { border-left-color:var(--accent); }
 .err { color:var(--bad); font-size:13px; margin-top:10px; white-space:pre-wrap; }
 .chips { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
 .chip { background:var(--panel); border:1px solid var(--line); border-radius:8px;
@@ -262,9 +337,12 @@ td code { font:12px ui-monospace, Menlo, monospace; }
       </div>
       <label for="dgs">Device groups (optional)</label>
       <input type="text" id="dgs" placeholder="all (or: dg-4,dg-5)">
-      <button id="go">Search (pulls fresh config)</button>
+      <button id="pull" class="secondary">Pull fresh config</button>
+      <div class="snap" id="snap-status">No config snapshot yet. Pull first.</div>
+      <button id="go" disabled>Search snapshot</button>
       <div class="err" id="error"></div>
-      <div class="readonly">Read-only. Fresh keygen + REST pull every search.
+      <div class="readonly">Read-only. Pull = fresh keygen + REST pull into a
+        local snapshot; Search = matches the snapshot, no network.
         Firewalls are never contacted. Runs saved under pan_reports/.</div>
     </div>
     <div class="panel" style="margin-top:14px">
@@ -321,7 +399,8 @@ function render(r) {
       <div class="chip"><b>${t.targets_excluded}</b><span>excluded</span></div>
     </div>
     <p class="hint">Run ${esc(r.run_id)} at ${esc(r.meta.ran_at)} against
-      ${esc(r.meta.target)} as ${esc(r.meta.username)}</p>
+      ${esc(r.meta.target)} as ${esc(r.meta.username)}
+      (snapshot pulled ${esc(r.meta.snapshot_pulled_at || "n/a")})</p>
     <h2>Rules matching the targets</h2>
     ${table(["Scope","Rulebase","Rule","Action","Flags","Target","Side","Matched through"], matchRows)}
     <h2>Global any/any rules (match every IP)</h2>
@@ -355,10 +434,39 @@ function fillInputs(i) {
   $("dgs").value = i.device_groups || "";
 }
 
+function showSnapshot(s) {
+  const el = $("snap-status");
+  if (!s || !s.present) {
+    el.className = "snap";
+    el.textContent = "No config snapshot yet. Pull first.";
+    $("go").disabled = true;
+    return;
+  }
+  const rules = Object.values(s.rule_counts)
+    .reduce((n, rc) => n + rc.pre + rc.post, 0);
+  el.className = "snap ok";
+  el.textContent = `Snapshot pulled ${s.pulled_at} : ` +
+    `${s.device_groups.length} device groups, ${rules} rules.`;
+  $("go").disabled = false;
+}
+
+$("pull").onclick = async () => {
+  $("error").textContent = "";
+  $("pull").disabled = true;
+  $("pull").textContent = "Pulling from Panorama...";
+  try {
+    const data = await (await fetch("/api/pull", {method: "POST"})).json();
+    if (data.error) $("error").textContent = data.error;
+    else showSnapshot(data);
+  } catch (e) { $("error").textContent = String(e); }
+  $("pull").disabled = false;
+  $("pull").textContent = "Pull fresh config";
+};
+
 $("go").onclick = async () => {
   $("error").textContent = "";
   $("go").disabled = true;
-  $("go").textContent = "Pulling fresh config and searching...";
+  $("go").textContent = "Searching snapshot...";
   try {
     const resp = await fetch("/api/search", {
       method: "POST", headers: {"Content-Type": "application/json"},
@@ -373,12 +481,13 @@ $("go").onclick = async () => {
     else { render(data); refreshRuns(); }
   } catch (e) { $("error").textContent = String(e); }
   $("go").disabled = false;
-  $("go").textContent = "Search (pulls fresh config)";
+  $("go").textContent = "Search snapshot";
 };
 
 fetch("/api/info").then(r => r.json()).then(i => {
   $("server-info").textContent =
-    `${i.target} as ${i.username_source} (read-only)`; });
+    `${i.target} as ${i.username_source} (read-only)`;
+  showSnapshot(i.snapshot); });
 refreshRuns();
 </script>
 </body>
@@ -412,7 +521,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(list_runs())
         elif self.path == "/api/info":
             self._json({"target": CONFIG["display_target"],
-                        "username_source": CONFIG["user_env"] or "PANORAMA_* resolution"})
+                        "username_source": CONFIG["user_env"] or "PANORAMA_* resolution",
+                        "snapshot": snapshot_status()})
         elif self.path.startswith("/api/run?"):
             run_id = (self.path.split("id=", 1) + [""])[1].split("&")[0]
             run = load_run(run_id)
@@ -422,19 +532,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
-        if self.path != "/api/search":
-            self._json({"error": "not found"}, 404)
-            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            self._json(run_search(payload))
+            if self.path == "/api/pull":
+                self._json(pull_snapshot())
+            elif self.path == "/api/search":
+                self._json(run_search(payload))
+            else:
+                self._json({"error": "not found"}, 404)
         except ValueError as exc:
             self._json({"error": str(exc)}, 400)
         except PanRestError as exc:
             self._json({"error": f"Panorama pull failed: {exc}"}, 502)
         except Exception as exc:  # keep the server alive on surprises
-            log.exception("search failed")
+            log.exception("request failed")
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
 
@@ -474,6 +586,7 @@ def main() -> int:
         "host": args.host, "display_host": probe.env.hostname,
         "display_target": probe.env.url,
     })
+    load_persisted_snapshot()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     log.info("Panorama IP Rule Search UI: http://127.0.0.1:%d (target %s, loopback only)",
