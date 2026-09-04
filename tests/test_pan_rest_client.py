@@ -40,6 +40,7 @@ class FakeResponse:
     def __init__(self, status_code=200, text="", body=None):
         self.status_code = status_code
         self.text = text if body is None else json.dumps(body)
+        self.content = self.text.encode("utf-8")
         self._body = body
 
     def json(self):
@@ -132,6 +133,35 @@ class TestAuth(unittest.TestCase):
             text="<response status='error' code='403'><result><msg>Invalid credential</msg></result></response>"))
         with self.assertRaises(PanRestError):
             make_client(s).api_key
+
+
+class TestExport(unittest.TestCase):
+    def _client(self, text, status=200):
+        # The export call hits /api/ with type=export; keygen is answered first
+        # by the fake, so route on the URL and let params decide in get().
+        class ExportSession(FakeSession):
+            def get(self, url, params=None, headers=None, timeout=None):
+                if (params or {}).get("type") == "export":
+                    self.calls.append({"url": url, "params": dict(params), "headers": dict(headers or {})})
+                    return FakeResponse(status_code=status, text=text)
+                return super().get(url, params=params, headers=headers, timeout=timeout)
+        return make_client(ExportSession())
+
+    def test_export_returns_raw_config(self):
+        c = self._client("<config version='11.2.0'><shared/></config>")
+        content = c.export_configuration()
+        self.assertTrue(content.startswith(b"<config"))
+
+    def test_export_refusal_response_raises(self):
+        c = self._client("<response status='error' code='1'><msg><line>denied</line></msg></response>")
+        with self.assertRaises(PanRestError) as ctx:
+            c.export_configuration()
+        self.assertIn("denied", str(ctx.exception))
+
+    def test_export_unexpected_root_raises(self):
+        c = self._client("<html>login</html>")
+        with self.assertRaises(PanRestError):
+            c.export_configuration()
 
 
 class TestGet(unittest.TestCase):

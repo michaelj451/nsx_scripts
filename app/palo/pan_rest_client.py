@@ -314,3 +314,35 @@ class PanRestClient:
 
     def list_device_groups(self) -> List[str]:
         return sorted(e.get("@name", "") for e in self.entries("Panorama/DeviceGroups"))
+
+    # -----------------------------------------------------------------------
+    # Configuration export (XML API type=export; the one XML read besides
+    # keygen that a report/log/export-only role permits)
+    # -----------------------------------------------------------------------
+
+    def export_configuration(self) -> bytes:
+        """The full running configuration as raw XML bytes (root <config>).
+
+        Uses the XML API's type=export, not /restapi/, because no REST
+        equivalent exists; it is still a pure read. NOTE: the export contains
+        the ENTIRE config, including mgt-config with admin password hashes;
+        treat the saved file like a credential store.
+        """
+        r = self.session.get(f"{self.env.url}/api/",
+                             params={"type": "export", "category": "configuration"},
+                             headers={"X-PAN-KEY": self.api_key},
+                             timeout=max(self.timeout, 120))
+        if r.status_code >= 400:
+            raise PanRestError(f"export failed: HTTP {r.status_code} {r.text[:200]}",
+                               status_code=r.status_code)
+        try:
+            root = ET.fromstring(r.content)
+        except ET.ParseError as exc:
+            raise PanRestError("export returned unparseable XML") from exc
+        if root.tag == "response":
+            msg = "; ".join(l.text for l in root.iter("line") if l.text) or r.text[:200]
+            raise PanRestError(f"export refused: {msg}", status_code=r.status_code,
+                               code=root.get("code"))
+        if root.tag != "config":
+            raise PanRestError(f"export returned unexpected root <{root.tag}>")
+        return r.content

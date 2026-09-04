@@ -1,0 +1,14 @@
+# IP-to-rule membership EXCLUSION list.
+# Used by tools/pan/report_ips_in_rules.py.
+#
+# AUTO-DISCOVERED: this file at repo root is picked up automatically.
+# Override with --exclude-file <path> or PAN_IP_RULE_EXCLUDE_LIST (.env).
+# If the file is absent, no exclusions apply.
+#
+# One IP or subnet per line (bare IP = /32). A target FULLY CONTAINED in
+# any entry here is skipped and reported in the "Excluded targets"
+# section. A target that only partially overlaps an entry is still
+# searched, with the overlap noted.
+
+10.3.0.0/16       # sample: drop the 10.3 test networks from searches
+# 10.0.0.0/8      # test entry: excludes ALL 10.x targets; leave commented

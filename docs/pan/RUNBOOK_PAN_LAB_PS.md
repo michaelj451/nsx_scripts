@@ -24,6 +24,7 @@ Line continuation in PowerShell is the backtick `` ` `` at end of line.
 |---|---|---|
 | `tools/pan/pull_panorama_config.py` | Pull a candidate or running config snapshot from Panorama and save to `tools\pan\configs\` | Read-only (GETs) |
 | `tools/pan/add_services_to_rules.py` | Add a fixed set of service objects to every customer security rule; stages changes to candidate; no auto-commit | Write (gated by `--apply`) |
+| `tools/pan/export_panorama_config.py` | Export the full RUNNING config via XML `type=export`; the snapshot path that works for the read-only agent account | Read-only (keygen + export) |
 
 ---
 
@@ -125,6 +126,42 @@ python tools/pan/pull_panorama_config.py --running
 | `running` | ~100 KB | Just Panorama-side rulebase/objects |
 
 For policy/rule analysis, you want **candidate** (it's the pushable surface). For "what's actually deployed right now" forensics, use **running**.
+
+---
+
+## 1b. Export the config as the read-only agent account : `export_panorama_config.py`
+
+`pull_panorama_config.py` uses the XML config API, which the restricted
+`agentuser` role denies. The export path works for it: the role permits XML
+`type=export` (there is no REST equivalent; probed paths return 501), and
+export returns the complete RUNNING configuration.
+
+```powershell
+# As the agent account
+python tools\pan\export_panorama_config.py `
+  --user-env agent_user --password-env agent_password --no-tls-verify
+
+# Chain straight into the offline policy-match engine (stdout is the file path)
+$CFG = python tools\pan\export_panorama_config.py --user-env agent_user `
+  --password-env agent_password --no-tls-verify --quiet
+python tools\pan\check_policy_match.py --config $CFG `
+  --src-ip 10.1.1.5 --dst-ip 10.2.1.5 --protocol tcp --dst-port 443 --device-group dg-4
+```
+
+Output lands in `tools\pan\configs\<host>-export-<UTC_TS>.xml` (gitignored).
+`--host` targets another Panorama; omit the `--user-env` pair to use the
+admin credentials.
+
+Differences from `pull_panorama_config.py`:
+
+| | `pull_panorama_config.py` | `export_panorama_config.py` |
+|---|---|---|
+| API | XML config get/show | XML `type=export` |
+| Account | admin (config rights) | agent account works |
+| Candidate config | yes (default) | no; RUNNING only |
+
+SECURITY: the export contains the FULL config including `mgt-config` with
+admin password hashes. Treat the file like a credential store.
 
 ---
 
