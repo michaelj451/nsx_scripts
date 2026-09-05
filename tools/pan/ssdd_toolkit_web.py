@@ -9,6 +9,9 @@ SSDD Toolkit: local web hub for the Panorama tools. Serves on 127.0.0.1:
     /group-remap  CSV group remap dry run: pick a CSV from data/, run the
                   same analysis as tools/pan/pan_group_remap_report.py,
                   browse past reports
+    /remap-pivot  Same CSV remap dry-run data, pivoted: one row per
+                  group/rule with Source (adds) and Destination (adds) as
+                  parallel columns. Shares run history with /group-remap.
 
 Read-only against Panorama, stdlib HTTP server only, binds loopback only
 (no auth; it never listens beyond 127.0.0.1). Managed firewalls are never
@@ -16,9 +19,13 @@ contacted. All runs land in the same pan_reports/ and pan_capture/ trees
 the CLI tools use, so web and CLI runs share one history.
 
 USAGE:
-    python tools/pan/ssdd_toolkit_web.py \
-        --user-env agent_user --password-env agent_password --no-tls-verify
+    # Simplest: reads agent_user / agent_password from .env by default.
+    python tools/pan/ssdd_toolkit_web.py --no-tls-verify
     # then open http://127.0.0.1:8765
+
+    # Override the .env var names if your account uses different keys:
+    python tools/pan/ssdd_toolkit_web.py \
+        --user-env some_other_user --password-env some_other_pw --no-tls-verify
 
 (tools/pan/ip_rule_search_web.py now delegates here.)
 """
@@ -758,6 +765,7 @@ def shell(title: str, here: str, body: str, script: str) -> str:
         f'<a href="{path}"{" class=here" if here == path else ""}>{name}</a>'
         for path, name in (("/", "SSDD Toolkit"), ("/ip-search", "IP Rule Search"),
                            ("/group-remap", "Group Remap"),
+                           ("/remap-pivot", "Remap Pivot"),
                            ("/flow-search", "Flow Match"),
                            ("/rule-placement", "Rule Placement")))
     return f"""<!DOCTYPE html>
@@ -790,6 +798,12 @@ HUB_BODY = """
     <p class="hint">Run a subnet-remap CSV against address groups and rules;
       see the deduplicated object actions and exactly what gets added where.
       Report-only: nothing is ever pushed.</p>
+  </a>
+  <a class="panel" href="/remap-pivot" style="text-decoration:none;color:inherit">
+    <h2 style="margin-top:0">Remap Pivot (Source vs Destination)</h2>
+    <p class="hint">Same CSV remap dry run, presented one row per group/rule
+      with Source (adds) and Destination (adds) as parallel columns. Easier
+      to scan when a single rule gets adds on both sides.</p>
   </a>
   <a class="panel" href="/flow-search" style="text-decoration:none;color:inherit">
     <h2 style="margin-top:0">Flow Match</h2>
@@ -1033,6 +1047,124 @@ function render(r) {
           (c.values.length > 6 ? " ..." : "")]))}
     <p class="hint">Full report (already remapped, ranges, never remapped,
       unresolved) is in pan_reports/.../group_remap_dryrun/report.md</p>`;
+}
+
+async function refreshRuns() {
+  const runs = await (await fetch("/api/remap/runs")).json();
+  $("runs").innerHTML = runs.length ? runs.map(r =>
+    `<li data-id="${esc(r.run_ts)}">
+       <div><b>${r.totals.object_actions}</b> object actions,
+         ${r.totals.targets_updated} targets <code>${esc(r.csv)}</code></div>
+       <div class="when">${esc(r.ran_at)}</div>
+       <span class="del" data-del="${esc(r.run_ts)}" title="delete this report">&#215;</span></li>`).join("")
+    : '<li class="none" style="cursor:default">none yet</li>';
+  for (const li of $("runs").querySelectorAll("li[data-id]"))
+    li.onclick = async () => {
+      const run = await (await fetch("/api/remap/run?id=" + li.dataset.id)).json();
+      if (!run.error) render(run);
+    };
+  wireHistory("remap", refreshRuns);
+}
+
+fetch("/api/remap/csvs").then(r => r.json()).then(csvs => {
+  $("csv").innerHTML = csvs.map(c =>
+    `<option value="${esc(c.name)}">${esc(c.name)}${c.rows != null ? ` (${c.rows} rows)` : ""}</option>`
+  ).join("") || "<option value=''>no CSVs in data/</option>"; });
+
+$("run").onclick = async () => {
+  $("error").textContent = "";
+  $("run").disabled = true;
+  $("run").textContent = "Pulling and analyzing...";
+  try {
+    const resp = await fetch("/api/remap/run", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({csv: $("csv").value, device_groups: $("dgs").value})});
+    const data = await resp.json();
+    if (data.error) $("error").textContent = data.error;
+    else { render(data); refreshRuns(); }
+  } catch (e) { $("error").textContent = String(e); }
+  $("run").disabled = false;
+  $("run").textContent = "Run dry-run report (pulls fresh)";
+};
+refreshRuns();
+"""
+
+
+REMAP_PIVOT_BODY = """
+<div class="layout">
+  <div>
+    <div class="panel">
+      <label for="csv">Remap CSV (from data/)</label>
+      <select id="csv"></select>
+      <p class="hint">Same input, same analysis as /group-remap. Pivoted view.</p>
+      <label for="dgs">Device groups (optional)</label>
+      <input type="text" id="dgs" placeholder="all (or: dg-4,dg-5)">
+      <button id="run">Run dry-run report (pulls fresh)</button>
+      <div class="err" id="error"></div>
+      <div class="readonly">Report-only. Rows share history with /group-remap;
+        a run started here is browsable there and vice versa.</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <label style="margin-top:0">Previous reports
+        <a href="#" id="clear-runs" class="clearlink">clear all</a></label>
+      <ul id="runs" class="runs"></ul>
+    </div>
+  </div>
+  <div id="results"><p class="none">No report yet.</p></div>
+</div>
+"""
+
+REMAP_PIVOT_JS = """
+function render(r) {
+  // Pivot the updates by (scope, type, name). Each rule/group becomes one
+  // row with Source and Destination columns; blank if nothing is added on
+  // that side.
+  const map = new Map();
+  for (const u of r.updates) {
+    const key = `${u.scope}||${u.type}||${u.name}`;
+    if (!map.has(key)) {
+      map.set(key, {scope: u.scope, type: u.type, name: u.name,
+                    source: "", destination: ""});
+    }
+    const row = map.get(key);
+    const side = String(u.side || "").toLowerCase();
+    if (side === "source" || side === "src") row.source = u.adds || "";
+    else if (side === "destination" || side === "dst") row.destination = u.adds || "";
+  }
+  // Sort: scope, type, name for stable output
+  const pivoted = Array.from(map.values()).sort((a, b) =>
+    (a.scope + a.type + a.name).localeCompare(b.scope + b.type + b.name));
+
+  const t = r.totals;
+  $("results").innerHTML = `
+    <div class="chips">
+      <div class="chip"><b>${t.object_actions}</b><span>object actions</span></div>
+      <div class="chip"><b>${pivoted.length}</b><span>groups/rules updated</span></div>
+      <div class="chip"><b>${t.ranges}</b><span>ranges (report-only)</span></div>
+      <div class="chip"><b>${t.csv_rows_unmatched}</b><span>CSV rows unmatched</span></div>
+    </div>
+    <p class="hint">Run ${esc(r.run_ts)} at ${esc(r.meta.ran_at)} against
+      ${esc(r.meta.target)} as ${esc(r.meta.username)},
+      CSV ${esc(r.meta.csv)} (${esc(r.meta.csv_rows)} rows)</p>
+    <h2>Additive changes per group/rule (Source vs Destination pivot)</h2>
+    <div class="tblwrap"><table style="table-layout:fixed;width:100%;">
+      <colgroup>
+        <col style="width:11%"><col style="width:10%"><col style="width:22%">
+        <col style="width:28.5%"><col style="width:28.5%">
+      </colgroup>
+      <tr><th>Scope</th><th>Type</th><th>Group / Rule</th>
+          <th>Source (adds)</th><th>Destination (adds)</th></tr>
+      ${pivoted.map(p => `<tr>
+        <td>${esc(p.scope)}</td>
+        <td>${esc(p.type)}</td>
+        <td style="word-break:break-word">${esc(p.name)}</td>
+        <td style="word-break:break-word">${esc(p.source)}</td>
+        <td style="word-break:break-word">${esc(p.destination)}</td>
+      </tr>`).join("")}
+    </table></div>
+    <p class="hint">Empty cell = no adds on that side. Full detail is in
+      pan_reports/.../group_remap_dryrun/report.md; also see the un-pivoted
+      view under <a href="/group-remap">Group Remap</a>.</p>`;
 }
 
 async function refreshRuns() {
@@ -1349,6 +1481,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/ip-search"):
             self._page("SSDD Toolkit : IP Rule Search", "/ip-search",
                        IP_SEARCH_BODY, IP_SEARCH_JS)
+        elif self.path.startswith("/remap-pivot"):
+            self._page("SSDD Toolkit : Remap Pivot", "/remap-pivot",
+                       REMAP_PIVOT_BODY, REMAP_PIVOT_JS)
         elif self.path.startswith("/group-remap"):
             self._page("SSDD Toolkit : Group Remap", "/group-remap",
                        REMAP_BODY, REMAP_JS)
@@ -1430,10 +1565,10 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog=__doc__.split("USAGE:", 1)[1] if "USAGE:" in __doc__ else None)
     parser.add_argument("--host", default=None, help="Target Panorama hostname (overrides .env).")
-    parser.add_argument("--user-env", default=None,
-                        help="Env var holding the username (e.g. agent_user).")
-    parser.add_argument("--password-env", default=None,
-                        help="Env var holding the password (e.g. agent_password).")
+    parser.add_argument("--user-env", default="agent_user",
+                        help="Env var (in .env) holding the username (default: agent_user).")
+    parser.add_argument("--password-env", default="agent_password",
+                        help="Env var (in .env) holding the password (default: agent_password).")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Listen port on 127.0.0.1 (default {DEFAULT_PORT}).")
     parser.add_argument("--no-tls-verify", action="store_true",
