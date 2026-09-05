@@ -277,112 +277,125 @@ def main() -> int:
         log.info("DRY RUN: no network calls, nothing written.")
         return 0
 
-    # ------------------------------------------------------------------ pull
     try:
-        all_dgs = client.list_device_groups()
-        dgs = ([d.strip() for d in args.device_groups.split(",") if d.strip()]
-               if args.device_groups else all_dgs)
-        unknown = sorted(set(dgs) - set(all_dgs))
-        if unknown:
-            log.error("Unknown device groups: %s (available: %s)", unknown, all_dgs)
-            return 2
-
-        shared_addresses = client.list_addresses(location="shared")
-        shared_groups = client.list_address_groups(location="shared")
-        _write_json(capture_dir / "shared" / "addresses.json", shared_addresses)
-        _write_json(capture_dir / "shared" / "address_groups.json", shared_groups)
-
-        scopes: List[Dict[str, Any]] = []
-        rule_scopes: List[Dict[str, Any]] = []
-        values_seen: List[str] = []
-        name_locations: Dict[str, str] = {}
-
-        def note_locations(entries: List[Dict[str, Any]], fallback: str) -> None:
-            for e in entries:
-                if e.get("@name"):
-                    name_locations.setdefault(e["@name"], e.get("@location") or fallback)
-
-        note_locations(shared_addresses, "shared")
-        note_locations(shared_groups, "shared")
-
-        def analyze_scope_rules(scope: str, addresses, groups) -> None:
-            for rulebase in ("pre", "post"):
-                rules = pull_rules(client, scope, rulebase)
-                _write_json(capture_dir / scope / f"security_{rulebase}_rules.json", rules)
-                res = analyze_rules(rules, addresses, groups, maps,
-                                    scope=scope, rulebase=rulebase)
-                rule_scopes.append(res)
-                values_seen.extend(res["values_seen"])
-                log.info("%s: %d %s-rules", scope, len(rules), rulebase)
-
-        if not args.no_shared:
-            res = analyze_groups(shared_groups, shared_addresses, maps, scope="shared")
-            scopes.append(res)
-            values_seen += res["values_seen"]
-            log.info("shared: %d groups, %d addresses", len(shared_groups), len(shared_addresses))
-            analyze_scope_rules("shared", shared_addresses, shared_groups)
-
-        for dg in dgs:
-            dg_addresses = client.list_addresses(device_group=dg)
-            dg_groups = client.list_address_groups(device_group=dg)
-            _write_json(capture_dir / dg / "addresses.json", dg_addresses)
-            _write_json(capture_dir / dg / "address_groups.json", dg_groups)
-            note_locations(dg_addresses, dg)
-            note_locations(dg_groups, dg)
-            # A DG resolves members against its own objects plus shared
-            # (flat DG hierarchy; ancestors other than shared not walked).
-            vis_addresses = dg_addresses + shared_addresses
-            vis_groups = dg_groups + shared_groups
-            res = analyze_groups(dg_groups, vis_addresses, maps, scope=dg)
-            scopes.append(res)
-            values_seen += res["values_seen"]
-            log.info("%s: %d groups, %d addresses", dg, len(dg_groups), len(dg_addresses))
-            analyze_scope_rules(dg, vis_addresses, vis_groups)
+        report = run_report(client, maps, csv_path=csv_path, capture_dir=capture_dir,
+                            reports_dir=reports_dir, device_groups=args.device_groups,
+                            include_shared=not args.no_shared)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
     except PanRestError as exc:
         log.error("Pull failed: %s", exc)
         return 1
 
-    # --------------------------------------------------------------- analyze
+    log.info("Totals  : %s", report["totals"])
+    log.info("Report  : %s", reports_dir / "report.md")
+    log.info("          %s", reports_dir / "report.json")
+    return 0
+
+
+def run_report(client: PanRestClient, maps, *, csv_path: Path, capture_dir: Path,
+               reports_dir: Path, device_groups: str | None = None,
+               include_shared: bool = True) -> Dict[str, Any]:
+    """Pull, analyze, and write the dry-run report (report.md + report.json
+    under reports_dir, raw pulls under capture_dir). Returns the report dict.
+    Raises ValueError for unknown device groups, PanRestError on pull
+    failures. Shared by main() and the SSDD Toolkit web UI."""
+    all_dgs = client.list_device_groups()
+    dgs = ([d.strip() for d in device_groups.split(",") if d.strip()]
+           if device_groups else all_dgs)
+    unknown = sorted(set(dgs) - set(all_dgs))
+    if unknown:
+        raise ValueError(f"Unknown device groups: {unknown} (available: {all_dgs})")
+
+    shared_addresses = client.list_addresses(location="shared")
+    shared_groups = client.list_address_groups(location="shared")
+    _write_json(capture_dir / "shared" / "addresses.json", shared_addresses)
+    _write_json(capture_dir / "shared" / "address_groups.json", shared_groups)
+
+    scopes: List[Dict[str, Any]] = []
+    rule_scopes: List[Dict[str, Any]] = []
+    values_seen: List[str] = []
+    name_locations: Dict[str, str] = {}
+
+    def note_locations(entries: List[Dict[str, Any]], fallback: str) -> None:
+        for e in entries:
+            if e.get("@name"):
+                name_locations.setdefault(e["@name"], e.get("@location") or fallback)
+
+    note_locations(shared_addresses, "shared")
+    note_locations(shared_groups, "shared")
+
+    def analyze_scope_rules(scope: str, addresses, groups) -> None:
+        for rulebase in ("pre", "post"):
+            rules = pull_rules(client, scope, rulebase)
+            _write_json(capture_dir / scope / f"security_{rulebase}_rules.json", rules)
+            res = analyze_rules(rules, addresses, groups, maps,
+                                scope=scope, rulebase=rulebase)
+            rule_scopes.append(res)
+            values_seen.extend(res["values_seen"])
+            log.info("%s: %d %s-rules", scope, len(rules), rulebase)
+
+    if include_shared:
+        res = analyze_groups(shared_groups, shared_addresses, maps, scope="shared")
+        scopes.append(res)
+        values_seen += res["values_seen"]
+        log.info("shared: %d groups, %d addresses", len(shared_groups), len(shared_addresses))
+        analyze_scope_rules("shared", shared_addresses, shared_groups)
+
+    for dg in dgs:
+        dg_addresses = client.list_addresses(device_group=dg)
+        dg_groups = client.list_address_groups(device_group=dg)
+        _write_json(capture_dir / dg / "addresses.json", dg_addresses)
+        _write_json(capture_dir / dg / "address_groups.json", dg_groups)
+        note_locations(dg_addresses, dg)
+        note_locations(dg_groups, dg)
+        # A DG resolves members against its own objects plus shared
+        # (flat DG hierarchy; ancestors other than shared not walked).
+        vis_addresses = dg_addresses + shared_addresses
+        vis_groups = dg_groups + shared_groups
+        res = analyze_groups(dg_groups, vis_addresses, maps, scope=dg)
+        scopes.append(res)
+        values_seen += res["values_seen"]
+        log.info("%s: %d groups, %d addresses", dg, len(dg_groups), len(dg_addresses))
+        analyze_scope_rules(dg, vis_addresses, vis_groups)
+
     coverage = csv_coverage(maps, values_seen)
     agg = aggregate_report_items(scopes, rule_scopes, name_locations)
     updates = flatten_updates(agg)
     meta = {
-        "ran_at": datetime.now(timezone.utc).isoformat(),
-        "target": client.env.url,
-        "username": client.username,
-        "csv": str(csv_path),
-        "csv_rows": len(maps),
-        "capture_dir": str(capture_dir),
-        "read_only": True,
+    "ran_at": datetime.now(timezone.utc).isoformat(),
+    "target": client.env.url,
+    "username": client.username,
+    "csv": str(csv_path),
+    "csv_rows": len(maps),
+    "capture_dir": str(capture_dir),
+    "read_only": True,
     }
 
     totals = {
-        "object_actions": len(agg["object_actions"]),
-        "targets_updated": len(updates),
-        "literal_adds": len(agg["literal_adds"]),
-        "group_would_add_refs": sum(len(g["would_add"]) for s in scopes for g in s["groups"]),
-        "rule_would_add_refs": sum(len(r["would_add"]) for s in rule_scopes for r in s["rules"]),
-        "already_remapped": (sum(len(g["already_remapped"]) for s in scopes for g in s["groups"])
-                             + sum(len(r["already_remapped"]) for s in rule_scopes for r in s["rules"])),
-        "ranges": (sum(len(g["ranges"]) for s in scopes for g in s["groups"])
-                   + sum(len(r["ranges"]) for s in rule_scopes for r in s["rules"])),
-        "never_remapped": (sum(len(g["never_remapped"]) for s in scopes for g in s["groups"])
-                           + sum(len(r["never_remapped"]) for s in rule_scopes for r in s["rules"])),
-        "unresolved": (sum(len(g["unresolved"]) for s in scopes for g in s["groups"])
-                       + sum(len(r["unresolved"]) for s in rule_scopes for r in s["rules"])),
-        "csv_rows_unmatched": sum(1 for c in coverage if c["matches"] == 0),
+    "object_actions": len(agg["object_actions"]),
+    "targets_updated": len(updates),
+    "literal_adds": len(agg["literal_adds"]),
+    "group_would_add_refs": sum(len(g["would_add"]) for s in scopes for g in s["groups"]),
+    "rule_would_add_refs": sum(len(r["would_add"]) for s in rule_scopes for r in s["rules"]),
+    "already_remapped": (sum(len(g["already_remapped"]) for s in scopes for g in s["groups"])
+                         + sum(len(r["already_remapped"]) for s in rule_scopes for r in s["rules"])),
+    "ranges": (sum(len(g["ranges"]) for s in scopes for g in s["groups"])
+               + sum(len(r["ranges"]) for s in rule_scopes for r in s["rules"])),
+    "never_remapped": (sum(len(g["never_remapped"]) for s in scopes for g in s["groups"])
+                       + sum(len(r["never_remapped"]) for s in rule_scopes for r in s["rules"])),
+    "unresolved": (sum(len(g["unresolved"]) for s in scopes for g in s["groups"])
+                   + sum(len(r["unresolved"]) for s in rule_scopes for r in s["rules"])),
+    "csv_rows_unmatched": sum(1 for c in coverage if c["matches"] == 0),
     }
 
     report = {"meta": meta, "totals": totals, "actions": agg, "updates": updates,
-              "scopes": scopes, "rule_scopes": rule_scopes, "csv_coverage": coverage}
+          "scopes": scopes, "rule_scopes": rule_scopes, "csv_coverage": coverage}
     _write_json(reports_dir / "report.json", report)
     (reports_dir / "report.md").write_text(
-        build_report_md(meta, scopes, rule_scopes, agg, coverage), encoding="utf-8")
-
-    log.info("Totals  : %s", totals)
-    log.info("Report  : %s", reports_dir / "report.md")
-    log.info("          %s", reports_dir / "report.json")
-    return 0
+    build_report_md(meta, scopes, rule_scopes, agg, coverage), encoding="utf-8")
+    return report
 
 
 if __name__ == "__main__":

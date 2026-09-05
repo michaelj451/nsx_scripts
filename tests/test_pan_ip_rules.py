@@ -187,5 +187,121 @@ class TestMatchRules(unittest.TestCase):
         self.assertTrue(res["matched_rules"][0]["disabled"])
 
 
+class TestMatchExclusions(unittest.TestCase):
+    def setUp(self):
+        self.addresses = [
+            addr("h-10.1.1.5", **{"ip-netmask": "10.1.1.5"}),
+            addr("n-10.1.1.0-24", **{"ip-netmask": "10.1.1.0/24"}),
+            addr("agg-10.0.0.0-8", **{"ip-netmask": "10.0.0.0/8"}),
+        ]
+        self.targets, _ = pir.parse_ip_lines("10.1.1.5\n")
+        self.exclusions, _ = pir.parse_ip_lines("10.0.0.0/8\n")
+
+    def match(self, rules):
+        return pir.match_rules(rules, self.addresses, [], self.targets,
+                               scope="dg-4", rulebase="pre",
+                               match_exclusions=self.exclusions)
+
+    def test_equal_value_suppressed_with_reason(self):
+        res = self.match([rule("r1", ["agg-10.0.0.0-8"], ["any"])])
+        self.assertEqual(res["matched_rules"], [])
+        s = res["suppressed"][0]
+        self.assertEqual((s["rule"], s["member"], s["excluded_by"]),
+                         ("r1", "agg-10.0.0.0-8", "10.0.0.0/8"))
+
+    def test_broader_value_suppressed(self):
+        addresses = self.addresses + [addr("half-internet", **{"ip-netmask": "0.0.0.0/1"})]
+        res = pir.match_rules([rule("r1", ["half-internet"], ["any"])],
+                              addresses, [], self.targets, scope="s", rulebase="pre",
+                              match_exclusions=self.exclusions)
+        self.assertEqual(len(res["suppressed"]), 1)
+
+    def test_narrower_value_still_matches(self):
+        res = self.match([rule("r1", ["n-10.1.1.0-24", "agg-10.0.0.0-8"], ["any"])])
+        self.assertEqual(len(res["matched_rules"]), 1)
+        self.assertEqual(res["matched_rules"][0]["matches"][0]["member"], "n-10.1.1.0-24")
+        self.assertEqual(len(res["suppressed"]), 1)
+
+    def test_targets_never_dropped(self):
+        # A /8-excluded world still searches a 10.x target: h-10.1.1.5 matches.
+        res = self.match([rule("r1", ["h-10.1.1.5"], ["any"])])
+        self.assertEqual(len(res["matched_rules"]), 1)
+        self.assertEqual(res["suppressed"], [])
+
+
+class TestMatchFlow(unittest.TestCase):
+    def setUp(self):
+        self.addresses = [
+            addr("h-src", **{"ip-netmask": "10.1.1.5"}),
+            addr("n-dst", **{"ip-netmask": "10.2.1.0/24"}),
+        ]
+        self.groups = [group("grp-src", ["h-src"])]
+        self.services = [{"@name": "svc-443", "protocol": {"tcp": {"port": "443"}}},
+                         {"@name": "svc-53u", "protocol": {"udp": {"port": "53"}}},
+                         {"@name": "svc-hi", "protocol": {"tcp": {"port": "8000-9000"}}}]
+        self.svc_groups = [{"@name": "web", "members": {"member": ["svc-443"]}}]
+
+    def chain(self, *rules):
+        return [{"scope": "dg-4", "rulebase": "pre", "rule": r} for r in rules]
+
+    def flow(self, chain, **kw):
+        return pir.match_flow(chain, self.addresses, self.groups,
+                              self.services, self.svc_groups, **kw)
+
+    def test_requires_at_least_one_ip(self):
+        with self.assertRaises(ValueError):
+            self.flow(self.chain(), port_spec=pir.parse_port_spec("443"))
+
+    def test_full_flow_match_order_and_vias(self):
+        c = self.chain(rule("r-no", ["n-dst"], ["any"]),
+                       rule("r-yes", ["grp-src"], ["n-dst"], service={"member": ["svc-443"]}),
+                       rule("r-any", ["any"], ["any"]))
+        out = self.flow(c, src="10.1.1.5", dst="10.2.1.9",
+                        port_spec=pir.parse_port_spec("tcp/443"))
+        self.assertEqual([o["rule"] for o in out], ["r-yes", "r-any"])
+        first = out[0]
+        self.assertIn("via group grp-src", first["src_via"])
+        self.assertEqual(first["dst_via"], "n-dst = 10.2.1.0/24")
+        self.assertEqual(first["service_via"], "svc-443")
+
+    def test_src_only_lookup(self):
+        c = self.chain(rule("r1", ["h-src"], ["n-dst"]))
+        out = self.flow(c, src="10.1.1.5")
+        self.assertEqual(out[0]["dst_via"], "(not specified)")
+
+    def test_port_filters_rules(self):
+        c = self.chain(rule("r1", ["any"], ["any"], service={"member": ["svc-53u"]}))
+        self.assertEqual(self.flow(c, src="10.1.1.5",
+                                   port_spec=pir.parse_port_spec("tcp/53")), [])
+        self.assertEqual(len(self.flow(c, src="10.1.1.5",
+                                       port_spec=pir.parse_port_spec("udp/53"))), 1)
+        self.assertEqual(len(self.flow(c, src="10.1.1.5",
+                                       port_spec=pir.parse_port_spec("53"))), 1)
+
+    def test_port_range_group_predefined_and_appdefault(self):
+        c = self.chain(rule("r-range", ["any"], ["any"], service={"member": ["svc-hi"]}),
+                       rule("r-grp", ["any"], ["any"], service={"member": ["web"]}),
+                       rule("r-pre", ["any"], ["any"], service={"member": ["service-https"]}),
+                       rule("r-appdef", ["any"], ["any"],
+                            service={"member": ["application-default"]}))
+        out = self.flow(c, src="10.1.1.5", port_spec=pir.parse_port_spec("tcp/8443"))
+        self.assertEqual([o["rule"] for o in out], ["r-range", "r-appdef"])
+        out = self.flow(c, src="10.1.1.5", port_spec=pir.parse_port_spec("443"))
+        self.assertEqual([o["rule"] for o in out], ["r-grp", "r-pre", "r-appdef"])
+        self.assertEqual(out[0]["service_via"], "svc-443 (in group web)")
+
+    def test_port_spec_parsing(self):
+        self.assertIsNone(pir.parse_port_spec(""))
+        self.assertEqual(pir.parse_port_spec("tcp/443"), {"proto": "tcp", "port": 443})
+        self.assertEqual(pir.parse_port_spec("53"), {"proto": None, "port": 53})
+        for bad in ("abc", "tcp/", "icmp/8", "70000", "tcp/0"):
+            with self.assertRaises(ValueError):
+                pir.parse_port_spec(bad)
+
+    def test_bad_ip_raises(self):
+        with self.assertRaises(ValueError):
+            self.flow(self.chain(), src="not-an-ip")
+
+
 if __name__ == "__main__":
     unittest.main()

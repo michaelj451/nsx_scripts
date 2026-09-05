@@ -1,14 +1,16 @@
-# IP-to-rule membership EXCLUSION list.
-# Used by tools/pan/report_ips_in_rules.py.
+# IP-to-rule membership MATCH EXCLUSION list.
+# Used by tools/pan/report_ips_in_rules.py and the SSDD Toolkit IP search.
 #
 # AUTO-DISCOVERED: this file at repo root is picked up automatically.
 # Override with --exclude-file <path> or PAN_IP_RULE_EXCLUDE_LIST (.env).
 # If the file is absent, no exclusions apply.
 #
-# One IP or subnet per line (bare IP = /32). A target FULLY CONTAINED in
-# any entry here is skipped and reported in the "Excluded targets"
-# section. A target that only partially overlaps an entry is still
-# searched, with the overlap noted.
+# Applies to MATCH RESULTS, not to search targets: a match is suppressed
+# when the value it matched THROUGH is equal to or broader than an entry
+# here. Example: with 10.0.0.0/8 listed, a rule that matches the target
+# only via an object valued 10.0.0.0/8 (or anything even broader) is
+# suppressed and reported in the "Suppressed matches" section; a match via
+# 10.1.1.0/24 still counts. Narrower values are never suppressed, and
+# targets themselves are never dropped.
 
-10.3.0.0/16       # sample: drop the 10.3 test networks from searches
-# 10.0.0.0/8      # test entry: excludes ALL 10.x targets; leave commented
+10.0.0.0/8      # suppress matches that ride whole-10-space aggregates

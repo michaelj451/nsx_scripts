@@ -14,11 +14,13 @@ Target list: one IP or subnet per line (bare IP = /32), # comments ignored.
 Precedence: --ip-list > PAN_IP_RULE_REPORT_LIST (.env) > auto-discovered
 pan_ip_rule_targets.txt at repo root.
 
-Exclusion list: same format. A target FULLY CONTAINED in any exclusion
-entry is skipped (reported in its own section); a partial overlap keeps
-the target and notes the entry. Precedence: --exclude-file >
-PAN_IP_RULE_EXCLUDE_LIST (.env) > auto-discovered pan_ip_rule_exclude.txt
-at repo root. Missing exclusion file = no exclusions.
+Exclusion list: same format, applied to MATCH RESULTS (not targets): a
+match whose matching value is equal to or broader than an exclusion entry
+is suppressed and reported in its own section. Example: with 10.0.0.0/8
+excluded, a match through an object valued 10.0.0.0/8 (or 0.0.0.0/1) is
+suppressed, while a match through 10.1.1.0/24 still counts. Precedence:
+--exclude-file > PAN_IP_RULE_EXCLUDE_LIST (.env) > auto-discovered
+pan_ip_rule_exclude.txt at repo root. Missing exclusion file = none.
 
 Rules with any on BOTH sides match everything, so they are listed once in
 their own section instead of per target. A rule with any on one side is a
@@ -52,7 +54,7 @@ from typing import Any, Dict, List
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
-from palo.pan_ip_rules import apply_exclusions, match_rules, parse_ip_lines  # noqa: E402
+from palo.pan_ip_rules import match_rules, parse_ip_lines  # noqa: E402
 from palo.pan_rest_client import PanRestClient, PanRestError  # noqa: E402
 
 log = logging.getLogger("report_ips_in_rules")
@@ -106,13 +108,15 @@ def _md_table(headers: List[str], rows: List[List[str]]) -> List[str]:
     return out
 
 
-def build_report_md(meta: Dict[str, Any], targets, excluded, invalid,
+def build_report_md(meta: Dict[str, Any], targets, invalid,
                     scope_results: List[Dict[str, Any]]) -> str:
+    suppressed_count = sum(len(sr["suppressed"]) for sr in scope_results)
     L: List[str] = ["# Panorama IP-to-rule membership report", ""]
     L += _md_table(["", ""], [
         ["Target", f"`{meta['target']}`"],
         ["Account", f"`{meta['username']}`"],
-        ["IP list", f"`{meta['ip_list']}` ({len(targets)} searched, {len(excluded)} excluded)"],
+        ["IP list", f"`{meta['ip_list']}` ({len(targets)} searched)"],
+        ["Match exclusions", f"{suppressed_count} matches suppressed"],
         ["Exclusions", f"`{meta['exclude_list'] or '(none)'}`"],
         ["Firewalls", "not contacted (Panorama config only)"],
         ["Ran at", meta["ran_at"]],
@@ -146,14 +150,18 @@ def build_report_md(meta: Dict[str, Any], targets, excluded, invalid,
     L.append("## 3. Targets with no rule matches")
     matched_targets = {m["target"] for sr in scope_results
                        for r in sr["matched_rules"] for m in r["matches"]}
-    rows = [[t["raw"], ", ".join(t.get("partial_exclusions", [])) or ""]
-            for t in targets if t["raw"] not in matched_targets]
-    L += _md_table(["Target", "Partial exclusion overlap"], rows) if rows else ["(none)"]
+    rows = [[t["raw"]] for t in targets if t["raw"] not in matched_targets]
+    L += _md_table(["Target"], rows) if rows else ["(none)"]
     L.append("")
 
-    L.append("## 4. Excluded targets")
-    rows = [[t["raw"], t["excluded_by"]] for t in excluded]
-    L += _md_table(["Target", "Excluded by"], rows) if rows else ["(none)"]
+    L.append("## 4. Suppressed matches (matching value equal to or broader "
+             "than an exclusion entry)")
+    rows = [[sr["scope"], sr["rulebase"], s["rule"], s["target"], s["side"],
+             f"{s['member']} = `{s['value']}`" + (f" via group {s['via']}" if s["via"] else ""),
+             f"`{s['excluded_by']}`"]
+            for sr in scope_results for s in sr["suppressed"]]
+    L += _md_table(["Scope", "Rulebase", "Rule", "Target", "Side",
+                    "Matched through", "Excluded by"], rows) if rows else ["(none)"]
     L.append("")
 
     if invalid:
@@ -212,25 +220,25 @@ def main() -> int:
         log.error("List file not found: %s", exc)
         return 2
 
-    raw_targets, invalid = parse_ip_lines(ip_path.read_text(encoding="utf-8"))
+    targets, invalid = parse_ip_lines(ip_path.read_text(encoding="utf-8"))
     exclusions, invalid_excl = parse_ip_lines(
         exclude_path.read_text(encoding="utf-8")) if exclude_path else ([], [])
     invalid += [f"(exclusions) {x}" for x in invalid_excl]
-    if not raw_targets:
+    if not targets:
         log.error("No valid targets in %s", ip_path)
         return 2
-    targets, excluded = apply_exclusions(raw_targets, exclusions)
 
     log.info("Target    : %s (account via %s)", client.env.url,
              args.user_env or "PANORAMA_* resolution")
-    log.info("IP list   : %s (%d targets, %d excluded, %d invalid lines)",
-             ip_path, len(targets), len(excluded), len(invalid))
-    log.info("Exclusions: %s (%d entries)", exclude_path or "(none)", len(exclusions))
+    log.info("IP list   : %s (%d targets, %d invalid lines)",
+             ip_path, len(targets), len(invalid))
+    log.info("Exclusions: %s (%d entries; applied to MATCH VALUES, not targets)",
+             exclude_path or "(none)", len(exclusions))
     if args.dry_run:
         for t in targets:
             log.info("  search  %s", t["raw"])
-        for t in excluded:
-            log.info("  exclude %s (by %s)", t["raw"], t["excluded_by"])
+        for e in exclusions:
+            log.info("  suppress matches via values covering %s", e["raw"])
         log.info("DRY RUN: no network calls, nothing written.")
         return 0
 
@@ -252,10 +260,12 @@ def main() -> int:
             for rulebase in ("pre", "post"):
                 rules = pull_rules(client, scope, rulebase)
                 res = match_rules(rules, addresses, groups, targets,
-                                  scope=scope, rulebase=rulebase)
+                                  scope=scope, rulebase=rulebase,
+                                  match_exclusions=exclusions)
                 scope_results.append(res)
-                log.info("%s/%s: %d rules, %d matched, %d any/any", scope, rulebase,
-                         len(rules), len(res["matched_rules"]), len(res["any_any_rules"]))
+                log.info("%s/%s: %d rules, %d matched, %d any/any, %d suppressed",
+                         scope, rulebase, len(rules), len(res["matched_rules"]),
+                         len(res["any_any_rules"]), len(res["suppressed"]))
 
         if not args.no_shared:
             run_scope("shared", shared_addresses, shared_groups)
@@ -283,17 +293,16 @@ def main() -> int:
 
     totals = {
         "targets_searched": len(targets),
-        "targets_excluded": len(excluded),
         "rules_matched": sum(len(sr["matched_rules"]) for sr in scope_results),
         "any_any_rules": sum(len(sr["any_any_rules"]) for sr in scope_results),
+        "matches_suppressed": sum(len(sr["suppressed"]) for sr in scope_results),
     }
     report = {"meta": meta, "totals": totals, "targets": [t["raw"] for t in targets],
-              "excluded": excluded, "invalid_lines": invalid,
-              "scopes": scope_results}
+              "invalid_lines": invalid, "scopes": scope_results}
     (reports_dir / "report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     (reports_dir / "report.md").write_text(
-        build_report_md(meta, targets, excluded, invalid, scope_results), encoding="utf-8")
+        build_report_md(meta, targets, invalid, scope_results), encoding="utf-8")
 
     log.info("Totals  : %s", totals)
     log.info("Report  : %s", reports_dir / "report.md")

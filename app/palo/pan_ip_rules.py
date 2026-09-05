@@ -175,6 +175,188 @@ def expand_group(
 # Rule matching
 # =============================================================================
 
+# =============================================================================
+# Flow matching (src -> dst [port] against a rule evaluation chain)
+# =============================================================================
+
+# PAN-OS built-in service objects, present even when not in the pulled config.
+PREDEFINED_SERVICES = {
+    "service-http": {"protocol": {"tcp": {"port": "80,8080"}}},
+    "service-https": {"protocol": {"tcp": {"port": "443"}}},
+}
+
+
+def parse_port_spec(text: str) -> Optional[Dict[str, Any]]:
+    """'443' or 'tcp/443' or 'udp/53' -> {"proto": None|'tcp'|'udp',
+    "port": int}. Empty -> None. Raises ValueError on garbage."""
+    text = (text or "").strip().lower()
+    if not text:
+        return None
+    proto = None
+    if "/" in text:
+        proto, _, text = text.partition("/")
+        if proto not in ("tcp", "udp"):
+            raise ValueError(f"Protocol must be tcp or udp, got {proto!r}")
+    if not text.isdigit() or not (0 < int(text) < 65536):
+        raise ValueError(f"Port must be 1-65535, got {text!r}")
+    return {"proto": proto, "port": int(text)}
+
+
+def _service_port_ranges(entry: Dict[str, Any]):
+    for proto in ("tcp", "udp"):
+        spec = (entry.get("protocol") or {}).get(proto) or {}
+        for token in str(spec.get("port") or "").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            lo, _, hi = token.partition("-")
+            try:
+                yield proto, int(lo), int(hi or lo)
+            except ValueError:
+                continue
+
+
+def service_covers(port_spec: Dict[str, Any], entry: Dict[str, Any]) -> bool:
+    for proto, lo, hi in _service_port_ranges(entry):
+        if (port_spec["proto"] is None or port_spec["proto"] == proto) \
+                and lo <= port_spec["port"] <= hi:
+            return True
+    return False
+
+
+def _rule_service_coverage(
+    members: List[str],
+    port_spec: Optional[Dict[str, Any]],
+    svc_by_name: Dict[str, Dict[str, Any]],
+    svcgrp_by_name: Dict[str, List[str]],
+) -> Optional[str]:
+    """How the rule's service list covers the port (a description), or None
+    when it does not. No port given -> always covered."""
+    if port_spec is None:
+        return "(no port given)"
+    def walk(names: List[str], seen: frozenset) -> Optional[str]:
+        for m in names:
+            if m in ("any", "application-default"):
+                return m
+            entry = svc_by_name.get(m) or (
+                {"@name": m, **PREDEFINED_SERVICES[m]} if m in PREDEFINED_SERVICES else None)
+            if entry and service_covers(port_spec, entry):
+                return m
+            if m in svcgrp_by_name and m not in seen:
+                hit = walk(svcgrp_by_name[m], seen | frozenset([m]))
+                if hit:
+                    return f"{hit} (in group {m})"
+        return None
+    return walk(members or ["any"], frozenset())
+
+
+def _side_coverage(
+    members: List[str],
+    target: Optional[Dict[str, Any]],
+    addr_by_name: Dict[str, Dict[str, str]],
+    groups_by_name: Dict[str, Dict[str, Any]],
+    expansion_cache: Dict[str, List[Dict[str, str]]],
+) -> Optional[str]:
+    """How a rule side covers the target entry (description), or None. A
+    side is covered by 'any', by an object/literal whose value covers the
+    target, or by a group member that does. No target -> pass."""
+    if target is None:
+        return "(not specified)"
+    if members == ["any"]:
+        return "any"
+    for m in members:
+        if m in addr_by_name:
+            if token_covers(target, addr_by_name[m]["value"]):
+                return f"{m} = {addr_by_name[m]['value']}"
+        elif m in groups_by_name:
+            if m not in expansion_cache:
+                expansion_cache[m] = expand_group(m, groups_by_name, addr_by_name)
+            for c in expansion_cache[m]:
+                if c["kind"] != "fqdn" and token_covers(target, c["value"]):
+                    return f"{c['member']} = {c['value']} via group {c['via']}"
+        elif token_covers(target, m):
+            return f"literal {m}"
+    return None
+
+
+def match_flow(
+    chain: List[Dict[str, Any]],
+    addresses: List[Dict[str, Any]],
+    groups: List[Dict[str, Any]],
+    services: List[Dict[str, Any]],
+    service_groups: List[Dict[str, Any]],
+    *,
+    src: Optional[str] = None,
+    dst: Optional[str] = None,
+    port_spec: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Evaluate a flow against an ordered rule chain.
+
+    chain: [{"scope", "rulebase", "rule": <rule entry>}] in evaluation order
+    (shared pre, DG pre, DG post, shared post). src/dst are IP/subnet/range
+    strings, both optional but the caller enforces at least one. Returns the
+    matching rules in order, each with how every given criterion was covered.
+    The first entry is what the firewall would actually apply.
+    """
+    if src is None and dst is None:
+        raise ValueError("At least one of source and destination is required.")
+    src_t = parse_ip_entry(src) if src else None
+    dst_t = parse_ip_entry(dst) if dst else None
+    if src and src_t is None:
+        raise ValueError(f"Source is not an IP/subnet/range: {src!r}")
+    if dst and dst_t is None:
+        raise ValueError(f"Destination is not an IP/subnet/range: {dst!r}")
+
+    addr_by_name = {a["@name"]: address_value(a) for a in addresses
+                    if a.get("@name") and address_value(a)}
+    groups_by_name = {g["@name"]: g for g in groups if g.get("@name")}
+    svc_by_name = {s["@name"]: s for s in services if s.get("@name")}
+    svcgrp_by_name = {}
+    for g in service_groups:
+        members = (g.get("members") or g.get("static") or {}).get("member") or []
+        svcgrp_by_name[g.get("@name")] = [members] if isinstance(members, str) else members
+    cache: Dict[str, List[Dict[str, str]]] = {}
+
+    out: List[Dict[str, Any]] = []
+    for item in chain:
+        rule = item["rule"]
+        def side(name):
+            m = (rule.get(name) or {}).get("member") or []
+            return [m] if isinstance(m, str) else m
+        src_via = _side_coverage(side("source"), src_t, addr_by_name, groups_by_name, cache)
+        if src_via is None:
+            continue
+        dst_via = _side_coverage(side("destination"), dst_t, addr_by_name, groups_by_name, cache)
+        if dst_via is None:
+            continue
+        svc_via = _rule_service_coverage(side("service"), port_spec,
+                                         svc_by_name, svcgrp_by_name)
+        if svc_via is None:
+            continue
+        out.append({
+            "scope": item["scope"], "rulebase": item["rulebase"],
+            "rule": rule.get("@name", "?"), "action": rule.get("action"),
+            "disabled": rule.get("disabled") == "yes",
+            "src_via": src_via, "dst_via": dst_via, "service_via": svc_via,
+        })
+    return out
+
+
+def _suppressed_by(cand: Optional[Dict[str, Any]],
+                   exclusions: List[Dict[str, Any]]) -> Optional[str]:
+    """The exclusion entry (raw text) that suppresses a match through this
+    candidate value: suppression applies when the candidate's coverage is
+    EQUAL TO OR BROADER THAN the entry (an aggregate at least that big).
+    Narrower, more specific values are never suppressed."""
+    if cand is None:
+        return None
+    for e in exclusions:
+        if (e["version"] == cand["version"]
+                and cand["lo"] <= e["lo"] and cand["hi"] >= e["hi"]):
+            return e["raw"]
+    return None
+
+
 def match_rules(
     rules: List[Dict[str, Any]],
     addresses: List[Dict[str, Any]],
@@ -183,18 +365,24 @@ def match_rules(
     *,
     scope: str,
     rulebase: str,
+    match_exclusions: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Match every rule's source/destination against the targets.
 
     Returns {"scope", "rulebase", "matched_rules": [...], "any_any_rules":
-    [names]}. Each matched rule dict:
+    [names], "suppressed": [...]}. Each matched rule dict:
       {"rule", "action", "disabled", "matches": [
         {"target", "side", "member", "value", "via"}  # via "" = direct member
       ], "any_sides": ["source"...]}
     A rule with any on BOTH sides goes to any_any_rules (it matches every
     IP; listing per-target adds noise). A rule with any on ONE side is
     reported when the other side matches, with the any side noted.
+
+    match_exclusions (parse_ip_lines entries) filter MATCH RESULTS: a match
+    whose matching value is equal to or broader than an exclusion entry is
+    moved to "suppressed" (with the entry that did it) instead of counting.
     """
+    match_exclusions = match_exclusions or []
     addr_by_name: Dict[str, Dict[str, str]] = {}
     for a in addresses:
         av = address_value(a)
@@ -205,6 +393,7 @@ def match_rules(
 
     matched_rules: List[Dict[str, Any]] = []
     any_any: List[str] = []
+    suppressed: List[Dict[str, Any]] = []
 
     for rule in rules:
         rname = rule.get("@name", "?")
@@ -240,11 +429,18 @@ def match_rules(
                 for c in candidates:
                     if c["kind"] == "fqdn":
                         continue
+                    cand_entry = parse_ip_entry(c["value"])
+                    excl = _suppressed_by(cand_entry, match_exclusions)
                     for t in targets:
                         if token_covers(t, c["value"]):
-                            matches.append({"target": t["raw"], "side": side,
-                                            "member": c["member"], "value": c["value"],
-                                            "via": c["via"]})
+                            hit = {"target": t["raw"], "side": side,
+                                   "member": c["member"], "value": c["value"],
+                                   "via": c["via"]}
+                            if excl:
+                                suppressed.append({**hit, "rule": rname,
+                                                   "excluded_by": excl})
+                            else:
+                                matches.append(hit)
         if matches:
             matched_rules.append({
                 "rule": rname, "scope": scope, "rulebase": rulebase,
@@ -255,4 +451,5 @@ def match_rules(
             })
 
     return {"scope": scope, "rulebase": rulebase,
-            "matched_rules": matched_rules, "any_any_rules": any_any}
+            "matched_rules": matched_rules, "any_any_rules": any_any,
+            "suppressed": suppressed}
