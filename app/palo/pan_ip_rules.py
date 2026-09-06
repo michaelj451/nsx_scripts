@@ -366,6 +366,9 @@ def match_rules(
     scope: str,
     rulebase: str,
     match_exclusions: Optional[List[Dict[str, Any]]] = None,
+    service_filter: Optional[Dict[str, Any]] = None,
+    services: Optional[List[Dict[str, Any]]] = None,
+    service_groups: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Match every rule's source/destination against the targets.
 
@@ -373,7 +376,9 @@ def match_rules(
     [names], "suppressed": [...]}. Each matched rule dict:
       {"rule", "action", "disabled", "matches": [
         {"target", "side", "member", "value", "via"}  # via "" = direct member
-      ], "any_sides": ["source"...]}
+      ], "any_sides": ["source"...],
+       "source_members", "destination_members", "service_members",  # as configured
+       "service_matched"}  # how the service filter was satisfied, or None
     A rule with any on BOTH sides goes to any_any_rules (it matches every
     IP; listing per-target adds noise). A rule with any on ONE side is
     reported when the other side matches, with the any side noted.
@@ -381,8 +386,33 @@ def match_rules(
     match_exclusions (parse_ip_lines entries) filter MATCH RESULTS: a match
     whose matching value is equal to or broader than an exclusion entry is
     moved to "suppressed" (with the entry that did it) instead of counting.
+
+    service_filter {"proto": None|'tcp'|'udp', "ports": [int, ...]} keeps
+    only rules whose service list covers at least ONE of the ports (needs
+    `services` / `service_groups` entries for resolution); it applies to
+    any/any rules too.
     """
     match_exclusions = match_exclusions or []
+    svc_by_name = {s["@name"]: s for s in (services or []) if s.get("@name")}
+    svcgrp_by_name: Dict[str, List[str]] = {}
+    for g in (service_groups or []):
+        gm = (g.get("members") or g.get("static") or {}).get("member") or []
+        svcgrp_by_name[g.get("@name")] = [gm] if isinstance(gm, str) else gm
+
+    def service_check(rule: Dict[str, Any]) -> Optional[str]:
+        """Description of how the filter is satisfied, or None to drop the
+        rule. No filter -> always passes (with None description)."""
+        if not service_filter or not service_filter.get("ports"):
+            return "(no filter)"
+        members = (rule.get("service") or {}).get("member") or []
+        members = [members] if isinstance(members, str) else members
+        for port in service_filter["ports"]:
+            spec = {"proto": service_filter.get("proto"), "port": port}
+            via = _rule_service_coverage(members, spec, svc_by_name, svcgrp_by_name)
+            if via:
+                proto = service_filter.get("proto") or "tcp|udp"
+                return f"{proto}/{port} via {via}"
+        return None
     addr_by_name: Dict[str, Dict[str, str]] = {}
     for a in addresses:
         av = address_value(a)
@@ -403,6 +433,10 @@ def match_rules(
             if isinstance(members, str):
                 members = [members]
             sides[side] = members
+
+        service_matched = service_check(rule)
+        if service_matched is None:
+            continue
 
         if all(ms == ["any"] for ms in sides.values()):
             any_any.append(rname)
@@ -442,12 +476,17 @@ def match_rules(
                             else:
                                 matches.append(hit)
         if matches:
+            smembers = (rule.get("service") or {}).get("member") or []
             matched_rules.append({
                 "rule": rname, "scope": scope, "rulebase": rulebase,
                 "action": rule.get("action"),
                 "disabled": rule.get("disabled") == "yes",
                 "matches": matches,
                 "any_sides": any_sides,
+                "source_members": sides["source"],
+                "destination_members": sides["destination"],
+                "service_members": [smembers] if isinstance(smembers, str) else smembers,
+                "service_matched": None if service_matched == "(no filter)" else service_matched,
             })
 
     return {"scope": scope, "rulebase": rulebase,

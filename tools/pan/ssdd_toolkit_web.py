@@ -42,7 +42,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
@@ -178,9 +178,35 @@ def snapshot_status() -> Dict[str, Any]:
                             for s in SNAPSHOT["scopes"]}}
 
 
-def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_service_filter(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    proto = (payload.get("service_proto") or "").strip().lower() or None
+    ports_text = (payload.get("service_ports") or "").strip()
+    if proto and proto not in ("tcp", "udp"):
+        raise ValueError(f"Service protocol must be tcp or udp, got {proto!r}")
+    if not ports_text:
+        if proto:
+            raise ValueError("A protocol was chosen but no ports were given.")
+        return None
+    ports = []
+    for token in ports_text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit() or not (0 < int(token) < 65536):
+            raise ValueError(f"Ports must be 1-65535, comma separated; got {token!r}")
+        ports.append(int(token))
+    if not ports:
+        return None
+    return {"proto": proto, "ports": ports}
+
+
+def run_search(payload: Dict[str, Any], plus: bool = False) -> Dict[str, Any]:
     if not SNAPSHOT:
         raise ValueError("No configuration snapshot yet. Pull the config first.")
+    service_filter = _parse_service_filter(payload)
+    if service_filter and SNAPSHOT["scopes"] and "services" not in SNAPSHOT["scopes"][0]:
+        raise ValueError("This snapshot predates service filtering (no services); "
+                         "pull the config again.")
 
     targets_text = payload.get("targets", "")
     exclusions_text = payload.get("exclusions", "")
@@ -211,7 +237,10 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             scope_results.append(match_rules(s["rules"][rulebase], s["addresses"],
                                              s["groups"], targets,
                                              scope=s["scope"], rulebase=rulebase,
-                                             match_exclusions=exclusions))
+                                             match_exclusions=exclusions,
+                                             service_filter=service_filter,
+                                             services=s.get("services", []),
+                                             service_groups=s.get("service_groups", [])))
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     result = {
@@ -228,7 +257,10 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         "inputs": {"targets": targets_text, "exclusions": exclusions_text,
                    "use_repo_exclusions": use_repo_exclusions,
                    "repo_exclude_file": str(REPO_EXCLUDE_FILE) if use_repo_exclusions else None,
-                   "device_groups": payload.get("device_groups") or ""},
+                   "device_groups": payload.get("device_groups") or "",
+                   "service_proto": payload.get("service_proto") or "",
+                   "service_ports": payload.get("service_ports") or ""},
+        "service_filter": service_filter,
         "totals": {
             "targets_searched": len(targets),
             "rules_matched": sum(len(sr["matched_rules"]) for sr in scope_results),
@@ -239,22 +271,23 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         "invalid_lines": invalid,
         "scopes": scope_results,
     }
-    run_dir = search_runs_dir()
+    run_dir = search_runs_dir(plus)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / f"{run_id}.json").write_text(json.dumps(result, indent=2) + "\n",
                                             encoding="utf-8")
-    log.info("Search %s: %d targets, %d matches against snapshot %s", run_id,
-             len(targets), result["totals"]["rules_matched"],
-             SNAPSHOT["meta"]["pulled_at"])
+    log.info("Search%s %s: %d targets, %d matches against snapshot %s",
+             "+" if plus else "", run_id, len(targets),
+             result["totals"]["rules_matched"], SNAPSHOT["meta"]["pulled_at"])
     return result
 
 
-def search_runs_dir() -> Path:
-    return REPO_ROOT / "pan_reports" / CONFIG["display_host"].split(".")[0] / "web_ip_search"
+def search_runs_dir(plus: bool = False) -> Path:
+    name = "web_rule_search_plus" if plus else "web_ip_search"
+    return REPO_ROOT / "pan_reports" / CONFIG["display_host"].split(".")[0] / name
 
 
-def list_search_runs() -> List[Dict[str, Any]]:
-    d = search_runs_dir()
+def list_search_runs(plus: bool = False) -> List[Dict[str, Any]]:
+    d = search_runs_dir(plus)
     if not d.exists():
         return []
     out = []
@@ -262,16 +295,18 @@ def list_search_runs() -> List[Dict[str, Any]]:
         try:
             r = json.loads(f.read_text(encoding="utf-8"))
             out.append({"run_id": r["run_id"], "ran_at": r["meta"]["ran_at"],
-                        "totals": r["totals"], "targets": r["targets"][:8]})
+                        "totals": r["totals"], "targets": r["targets"][:8],
+                        "service": ((r.get("inputs", {}).get("service_proto") or "")
+                                    + " " + (r.get("inputs", {}).get("service_ports") or "")).strip()})
         except (ValueError, KeyError):
             continue
     return out
 
 
-def load_search_run(run_id: str) -> Dict[str, Any] | None:
+def load_search_run(run_id: str, plus: bool = False) -> Dict[str, Any] | None:
     if not RUN_ID_RE.match(run_id):
         return None
-    f = search_runs_dir() / f"{run_id}.json"
+    f = search_runs_dir(plus) / f"{run_id}.json"
     return json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
 
 
@@ -681,8 +716,10 @@ def delete_runs(kind: str, run_id: str | None) -> Dict[str, Any]:
     import shutil
     host = CONFIG["display_host"].split(".")[0]
     deleted = 0
-    if kind in ("search", "placement", "flow"):
-        d = {"search": search_runs_dir, "placement": placement_runs_dir,
+    if kind in ("search", "searchplus", "placement", "flow"):
+        d = {"search": search_runs_dir,
+             "searchplus": lambda: search_runs_dir(True),
+             "placement": placement_runs_dir,
              "flow": flow_runs_dir}[kind]()
         files = ([d / f"{run_id}.json"] if run_id else list(d.glob("*.json"))) if d.exists() else []
         for f in files:
@@ -820,6 +857,7 @@ def shell(title: str, here: str, body: str, script: str) -> str:
     nav = "".join(
         f'<a href="{path}"{" class=here" if here == path else ""}>{name}</a>'
         for path, name in (("/", "SSDD Toolkit"), ("/ip-search", "IP Rule Search"),
+                           ("/rule-search", "Rule Search+"),
                            ("/group-remap", "Group Remap"),
                            ("/remap-pivot", "Remap Pivot"),
                            ("/flow-search", "Flow Match"),
@@ -860,6 +898,13 @@ HUB_BODY = """
     <p class="hint">Same CSV remap dry run, presented one row per group/rule
       with Source (adds) and Destination (adds) as parallel columns. Easier
       to scan when a single rule gets adds on both sides.</p>
+  </a>
+  <a class="panel" href="/rule-search" style="text-decoration:none;color:inherit">
+    <h2 style="margin-top:0">Rule Search+</h2>
+    <p class="hint">IP Rule Search with full rule context: every match also
+      shows the rule's configured source, destination, and service, and an
+      optional service filter (tcp/udp + comma-delimited ports) narrows
+      results to rules covering those ports.</p>
   </a>
   <a class="panel" href="/flow-search" style="text-decoration:none;color:inherit">
     <h2 style="margin-top:0">Flow Match</h2>
@@ -1412,6 +1457,188 @@ refreshRuns();
 """
 
 
+RULE_SEARCH_BODY = """
+<div class="layout">
+  <div>
+    <div class="panel">
+      <label for="targets">Search targets</label>
+      <textarea id="targets" rows="6" placeholder="10.1.1.5&#10;10.2.1.0/24&#10;10.1.1.5-10.1.1.20"></textarea>
+      <p class="hint">IPs, subnets (CIDR), or ranges. One per line, # comments OK.</p>
+      <label for="svc-proto">Service protocol (optional)</label>
+      <select id="svc-proto">
+        <option value="">any protocol</option>
+        <option value="tcp">tcp</option>
+        <option value="udp">udp</option>
+      </select>
+      <label for="svc-ports">Service ports (optional, comma delimited)</label>
+      <input type="text" id="svc-ports" placeholder="443,8080">
+      <p class="hint">Keeps only rules whose service covers at least one of
+        these ports.</p>
+      <label for="exclusions">Match exclusions (optional)</label>
+      <textarea id="exclusions" rows="2" placeholder="10.0.0.0/8">10.0.0.0/8</textarea>
+      <div class="row">
+        <input type="checkbox" id="repo-excl" checked>
+        <label for="repo-excl" style="margin:0;font-weight:400">also apply pan_ip_rule_exclude.txt</label>
+      </div>
+      <label for="dgs">Device groups (optional)</label>
+      <input type="text" id="dgs" placeholder="all (or: dg-4,dg-5)">
+      <button id="pull" class="secondary">Pull fresh config</button>
+      <div class="snap" id="snap-status">No config snapshot yet. Pull first.</div>
+      <button id="go" disabled>Search snapshot</button>
+      <div class="err" id="error"></div>
+      <div class="readonly">Like IP Rule Search, plus each matched rule's full
+        configured source / destination / service, and an optional service
+        filter. Read-only, snapshot-based.</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <label style="margin-top:0">Previous runs
+        <a href="#" id="clear-runs" class="clearlink">clear all</a></label>
+      <ul id="runs" class="runs"></ul>
+    </div>
+  </div>
+  <div id="results"><p class="none">No search yet.</p></div>
+</div>
+"""
+
+RULE_SEARCH_JS = """
+const members = list => (list || []).map(m => `<code>${esc(m)}</code>`).join("<br>");
+
+function render(r) {
+  const t = r.totals;
+  const matchRows = [], anyRows = [];
+  for (const sr of r.scopes) {
+    for (const rule of sr.matched_rules) {
+      const flags = [rule.disabled ? "DISABLED" : "",
+                     rule.any_sides.length ? "any on " + rule.any_sides.join("/") : ""]
+                    .filter(Boolean).join(", ");
+      const hits = rule.matches.map(m =>
+        `<code>${esc(m.target)}</code> (${esc(m.side)}) via ${esc(m.member)}` +
+        (m.via ? ` <span class="none">in group ${esc(m.via)}</span>` : "")).join("<br>");
+      matchRows.push([esc(sr.scope), esc(sr.rulebase), esc(rule.rule),
+        rule.action === "allow" ? esc(rule.action)
+          : `<span class="flag">${esc(rule.action || "")}</span>`,
+        `<span class="flag">${esc(flags)}</span>`, hits,
+        members(rule.source_members), members(rule.destination_members),
+        members(rule.service_members) +
+          (rule.service_matched ? `<br><span class="none">filter: ${esc(rule.service_matched)}</span>` : "")]);
+    }
+    for (const name of sr.any_any_rules)
+      anyRows.push([esc(sr.scope), esc(sr.rulebase), esc(name)]);
+  }
+  const matched = new Set();
+  for (const sr of r.scopes) for (const rule of sr.matched_rules)
+    for (const m of rule.matches) matched.add(m.target);
+  const noMatch = r.targets.filter(x => !matched.has(x)).map(x => [`<code>${esc(x)}</code>`]);
+  const suppRows = [];
+  for (const sr of r.scopes)
+    for (const s of (sr.suppressed || []))
+      suppRows.push([esc(sr.scope), esc(sr.rulebase), esc(s.rule), `<code>${esc(s.target)}</code>`,
+        `${esc(s.member)} = <code>${esc(s.value)}</code>`, `<code>${esc(s.excluded_by)}</code>`]);
+
+  const filt = r.service_filter
+    ? `, service ${r.service_filter.proto || "tcp|udp"}/${r.service_filter.ports.join(",")}` : "";
+  $("results").innerHTML = `
+    <div class="chips">
+      <div class="chip"><b>${t.targets_searched}</b><span>targets searched</span></div>
+      <div class="chip"><b>${t.rules_matched}</b><span>rule matches</span></div>
+      <div class="chip"><b>${t.any_any_rules}</b><span>any/any rules</span></div>
+      <div class="chip"><b>${t.matches_suppressed ?? 0}</b><span>matches suppressed</span></div>
+    </div>
+    <p class="hint">Run ${esc(r.run_id)} at ${esc(r.meta.ran_at)}${esc(filt)}
+      (snapshot pulled ${esc(r.meta.snapshot_pulled_at || "n/a")})</p>
+    <h2>Rules matching the targets (with configured source / destination / service)</h2>
+    ${table(["Scope","Rulebase","Rule","Action","Flags","Target hits",
+             "Source (configured)","Destination (configured)","Service (configured)"], matchRows)}
+    <h2>Global any/any rules${r.service_filter ? " (passing the service filter)" : ""}</h2>
+    ${table(["Scope","Rulebase","Rule"], anyRows)}
+    <h2>Targets with no matches</h2>${table(["Target"], noMatch)}
+    <h2>Suppressed matches</h2>
+    ${table(["Scope","Rulebase","Rule","Target","Matched through","Excluded by"], suppRows)}`;
+}
+
+function showSnapshot(s) {
+  const el = $("snap-status");
+  if (!s || !s.present) {
+    el.className = "snap";
+    el.textContent = "No config snapshot yet. Pull first.";
+    $("go").disabled = true;
+    return;
+  }
+  const rules = Object.values(s.rule_counts)
+    .reduce((n, rc) => n + rc.pre + rc.post, 0);
+  el.className = "snap ok";
+  el.textContent = `Snapshot pulled ${s.pulled_at} : ` +
+    `${s.device_groups.length} device groups, ${rules} rules.`;
+  $("go").disabled = false;
+}
+window.onInfo = i => showSnapshot(i.snapshot);
+
+async function refreshRuns() {
+  const runs = await (await fetch("/api/runs2")).json();
+  $("runs").innerHTML = runs.length ? runs.map(r =>
+    `<li data-id="${esc(r.run_id)}">
+       <div><b>${r.totals.rules_matched}</b> matches, ${r.totals.targets_searched} targets
+         ${r.service ? `svc ${esc(r.service)}` : ""}</div>
+       <div><code>${esc(r.targets.join(", "))}</code></div>
+       <div class="when">${esc(r.ran_at)}</div>
+       <span class="del" data-del="${esc(r.run_id)}" title="delete this run">&#215;</span></li>`).join("")
+    : '<li class="none" style="cursor:default">none yet</li>';
+  for (const li of $("runs").querySelectorAll("li[data-id]"))
+    li.onclick = async () => {
+      const run = await (await fetch("/api/run2?id=" + li.dataset.id)).json();
+      if (!run.error) { render(run); fillInputs(run.inputs); }
+    };
+  wireHistory("searchplus", refreshRuns);
+}
+
+function fillInputs(i) {
+  if (!i) return;
+  $("targets").value = i.targets || "";
+  $("exclusions").value = i.exclusions || "";
+  $("repo-excl").checked = !!i.use_repo_exclusions;
+  $("dgs").value = i.device_groups || "";
+  $("svc-proto").value = i.service_proto || "";
+  $("svc-ports").value = i.service_ports || "";
+}
+
+$("pull").onclick = async () => {
+  $("error").textContent = "";
+  $("pull").disabled = true;
+  $("pull").textContent = "Pulling from Panorama...";
+  try {
+    const data = await (await fetch("/api/pull", {method: "POST"})).json();
+    if (data.error) $("error").textContent = data.error;
+    else showSnapshot(data);
+  } catch (e) { $("error").textContent = String(e); }
+  $("pull").disabled = false;
+  $("pull").textContent = "Pull fresh config";
+};
+
+$("go").onclick = async () => {
+  $("error").textContent = "";
+  $("go").disabled = true;
+  $("go").textContent = "Searching snapshot...";
+  try {
+    const resp = await fetch("/api/search2", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        targets: $("targets").value,
+        exclusions: $("exclusions").value,
+        use_repo_exclusions: $("repo-excl").checked,
+        device_groups: $("dgs").value,
+        service_proto: $("svc-proto").value,
+        service_ports: $("svc-ports").value,
+      })});
+    const data = await resp.json();
+    if (data.error) $("error").textContent = data.error;
+    else { render(data); refreshRuns(); }
+  } catch (e) { $("error").textContent = String(e); }
+  $("go").disabled = false;
+  $("go").textContent = "Search snapshot";
+};
+refreshRuns();
+"""
+
 FLOW_BODY = """
 <div class="layout">
   <div>
@@ -1691,6 +1918,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/group-remap"):
             self._page("SSDD Toolkit : Group Remap", "/group-remap",
                        REMAP_BODY, REMAP_JS)
+        elif self.path.startswith("/rule-search"):
+            self._page("SSDD Toolkit : Rule Search+", "/rule-search",
+                       RULE_SEARCH_BODY, RULE_SEARCH_JS)
         elif self.path.startswith("/flow-search"):
             self._page("SSDD Toolkit : Flow Match", "/flow-search",
                        FLOW_BODY, FLOW_JS)
@@ -1707,6 +1937,13 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/run?"):
             run_id = (self.path.split("id=", 1) + [""])[1].split("&")[0]
             run = load_search_run(run_id)
+            self._json(run if run else {"error": f"run {run_id!r} not found"},
+                       200 if run else 404)
+        elif self.path == "/api/runs2":
+            self._json(list_search_runs(plus=True))
+        elif self.path.startswith("/api/run2?"):
+            run_id = (self.path.split("id=", 1) + [""])[1].split("&")[0]
+            run = load_search_run(run_id, plus=True)
             self._json(run if run else {"error": f"run {run_id!r} not found"},
                        200 if run else 404)
         elif self.path == "/api/flow/runs":
@@ -1745,6 +1982,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(run_search(payload))
             elif self.path == "/api/remap/run":
                 self._json(run_remap(payload))
+            elif self.path == "/api/search2":
+                self._json(run_search(payload, plus=True))
             elif self.path == "/api/flow/run":
                 self._json(run_flow(payload))
             elif self.path == "/api/placement/pull":

@@ -229,6 +229,48 @@ class TestMatchExclusions(unittest.TestCase):
         self.assertEqual(res["suppressed"], [])
 
 
+class TestServiceFilterAndMembers(unittest.TestCase):
+    def setUp(self):
+        self.addresses = [addr("h-10.1.1.5", **{"ip-netmask": "10.1.1.5"})]
+        self.services = [{"@name": "svc-443", "protocol": {"tcp": {"port": "443"}}},
+                         {"@name": "svc-53u", "protocol": {"udp": {"port": "53"}}}]
+        self.svc_groups = [{"@name": "web", "members": {"member": ["svc-443"]}}]
+        self.targets, _ = pir.parse_ip_lines("10.1.1.5\n")
+
+    def match(self, rules, service_filter=None):
+        return pir.match_rules(rules, self.addresses, [], self.targets,
+                               scope="dg-4", rulebase="pre",
+                               service_filter=service_filter,
+                               services=self.services, service_groups=self.svc_groups)
+
+    def test_members_included_in_output(self):
+        res = self.match([rule("r1", ["h-10.1.1.5"], ["any"],
+                               service={"member": ["svc-443", "web"]})])
+        r = res["matched_rules"][0]
+        self.assertEqual(r["source_members"], ["h-10.1.1.5"])
+        self.assertEqual(r["destination_members"], ["any"])
+        self.assertEqual(r["service_members"], ["svc-443", "web"])
+        self.assertIsNone(r["service_matched"])
+
+    def test_service_filter_keeps_and_drops(self):
+        rules = [rule("r-web", ["h-10.1.1.5"], ["any"], service={"member": ["web"]}),
+                 rule("r-dns", ["h-10.1.1.5"], ["any"], service={"member": ["svc-53u"]}),
+                 rule("r-any", ["h-10.1.1.5"], ["any"], service={"member": ["any"]})]
+        res = self.match(rules, service_filter={"proto": "tcp", "ports": [443, 8080]})
+        names = [r["rule"] for r in res["matched_rules"]]
+        self.assertEqual(names, ["r-web", "r-any"])
+        self.assertEqual(res["matched_rules"][0]["service_matched"],
+                         "tcp/443 via svc-443 (in group web)")
+
+    def test_service_filter_applies_to_any_any(self):
+        rules = [rule("g1", ["any"], ["any"], service={"member": ["svc-53u"]}),
+                 rule("g2", ["any"], ["any"], service={"member": ["any"]})]
+        res = self.match(rules, service_filter={"proto": None, "ports": [53]})
+        self.assertEqual(res["any_any_rules"], ["g1", "g2"])
+        res = self.match(rules, service_filter={"proto": "tcp", "ports": [53]})
+        self.assertEqual(res["any_any_rules"], ["g2"])
+
+
 class TestMatchFlow(unittest.TestCase):
     def setUp(self):
         self.addresses = [
