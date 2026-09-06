@@ -290,6 +290,49 @@ def list_csvs() -> List[Dict[str, Any]]:
     return out
 
 
+def _flatten_already_remapped(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Walk scopes + rule_scopes in report.json and pull the already_remapped
+    entries into the same shape as `updates` (one row per group/rule side).
+    Returns [{scope, type, name, side, items}]. `items` is a printable
+    'member -> mapped_member (for value)' summary."""
+    out: List[Dict[str, Any]] = []
+    # Groups: per-scope, per-group. No `side` on group already_remapped.
+    for s in report.get("scopes") or []:
+        scope = s.get("scope") or ""
+        for g in s.get("groups") or []:
+            items = g.get("already_remapped") or []
+            if not items:
+                continue
+            summary = "; ".join(
+                f"{i.get('mapped_member')} (for {i.get('value')})" for i in items
+            )
+            out.append({
+                "scope": scope, "type": "group",
+                "name": g.get("name") or "", "side": "",
+                "items": summary,
+            })
+    # Rules: per-scope+rulebase, per-rule, split by side.
+    for rs in report.get("rule_scopes") or []:
+        scope = rs.get("scope") or ""
+        rulebase = rs.get("rulebase") or ""
+        for r in rs.get("rules") or []:
+            by_side: Dict[str, List[str]] = {}
+            for i in r.get("already_remapped") or []:
+                side = (i.get("side") or "").lower()
+                if side not in ("source", "destination"):
+                    continue
+                by_side.setdefault(side, []).append(
+                    f"{i.get('mapped_member')} (for {i.get('value')})"
+                )
+            for side, entries in by_side.items():
+                out.append({
+                    "scope": scope, "type": f"{rulebase}-rule",
+                    "name": r.get("name") or "", "side": side,
+                    "items": "; ".join(entries),
+                })
+    return out
+
+
 def condense_remap(report: Dict[str, Any], run_ts: str) -> Dict[str, Any]:
     """report.json -> the view the page renders."""
     agg = report["actions"]
@@ -303,13 +346,26 @@ def condense_remap(report: Dict[str, Any], run_ts: str) -> Dict[str, Any]:
             "action": (f"reuse {a['existing_object']}" if a["existing_object"]
                        else f"create {a['suggested_name']}"),
             "refs": summarize_refs(a["refs"]),
+            "refs_count": len(a["refs"]),
+            "refs_groups": sum(1 for r in a["refs"] if r.get("kind") == "group"),
+            "refs_rules": sum(1 for r in a["refs"] if r.get("kind") == "rule"),
         } for a in agg["object_actions"]],
         "updates": [{
             "scope": u["scope"],
             "type": "group" if u["kind"] == "group" else f"{u['rulebase']}-rule",
             "name": u["name"], "side": u["side"] or "",
             "adds": "; ".join(f"{a['add']} (for {a['for']})" for a in u["adds"]),
+            # Distinct add-item kinds present in this update row. "literal"
+            # means the rule has a bare IP/CIDR/range that maps; "object"
+            # means the rule/group directly references a named address object
+            # whose value maps. Group updates are always "object" (groups can
+            # only hold members, never literals).
+            "kinds": sorted({
+                "literal" if str(a.get("for", "")).startswith("literal ") else "object"
+                for a in u["adds"]
+            }),
         } for u in report["updates"]],
+        "already": _flatten_already_remapped(report),
         "coverage": report["csv_coverage"],
     }
 
@@ -1116,53 +1172,201 @@ REMAP_PIVOT_BODY = """
 
 REMAP_PIVOT_JS = """
 function render(r) {
-  // Pivot the updates by (scope, type, name). Each rule/group becomes one
-  // row with Source and Destination columns; blank if nothing is added on
-  // that side.
+  // Pivot both r.updates and r.already by (scope, type, name). Each
+  // rule/group becomes one row with four side-columns; blank if empty.
   const map = new Map();
-  for (const u of r.updates) {
-    const key = `${u.scope}||${u.type}||${u.name}`;
+  function ensure(key, u) {
     if (!map.has(key)) {
       map.set(key, {scope: u.scope, type: u.type, name: u.name,
-                    source: "", destination: ""});
+                    src_add: "", dst_add: "",
+                    src_already: "", dst_already: "",
+                    _kinds: new Set()});
     }
-    const row = map.get(key);
+    return map.get(key);
+  }
+  for (const u of r.updates || []) {
+    const key = `${u.scope}||${u.type}||${u.name}`;
+    const row = ensure(key, u);
     const side = String(u.side || "").toLowerCase();
-    if (side === "source" || side === "src") row.source = u.adds || "";
-    else if (side === "destination" || side === "dst") row.destination = u.adds || "";
+    if (side === "source" || side === "src") row.src_add = u.adds || "";
+    else if (side === "destination" || side === "dst") row.dst_add = u.adds || "";
+    // group-scope updates carry side="" (no source/dest split for groups):
+    // put those into src_add so they don't disappear.
+    else if (u.type === "group") row.src_add = u.adds || row.src_add;
+    for (const k of (u.kinds || [])) row._kinds.add(k);
+  }
+  for (const u of r.already || []) {
+    const key = `${u.scope}||${u.type}||${u.name}`;
+    const row = ensure(key, u);
+    const side = String(u.side || "").toLowerCase();
+    if (side === "source" || side === "src") row.src_already = u.items || "";
+    else if (side === "destination" || side === "dst") row.dst_already = u.items || "";
+    else if (u.type === "group") row.src_already = u.items || row.src_already;
   }
   // Sort: scope, type, name for stable output
   const pivoted = Array.from(map.values()).sort((a, b) =>
     (a.scope + a.type + a.name).localeCompare(b.scope + b.type + b.name));
 
+  // Partition: one Groups bucket (all scopes together), and one bucket per
+  // scope for rules. Keep insertion order determined by sort below.
+  const groupRows = pivoted.filter(p => p.type === "group");
+  const ruleRows  = pivoted.filter(p => p.type !== "group");
+  const scopeOrder = (s) => (s === "shared" ? 0 : 1);
+  const rulesByScope = new Map();
+  for (const r of ruleRows) {
+    if (!rulesByScope.has(r.scope)) rulesByScope.set(r.scope, []);
+    rulesByScope.get(r.scope).push(r);
+  }
+  const scopes = Array.from(rulesByScope.keys()).sort((a, b) =>
+    (scopeOrder(a) - scopeOrder(b)) || a.localeCompare(b));
+
+  function whyOf(p) {
+    // Groups are always by-object; skip the "object" label there and only
+    // annotate rule rows (where literal vs object is meaningful).
+    if (p.type === "group") return "";
+    return Array.from(p._kinds || []).sort().join(", ");
+  }
+
+  function renderGroupsTable(rows) {
+    if (!rows.length) return '<p class="none">(no group updates)</p>';
+    return `
+      <div class="tblwrap"><table style="table-layout:fixed;width:100%;">
+        <colgroup>
+          <col style="width:12%"><col style="width:26%">
+          <col style="width:15.5%"><col style="width:15.5%">
+          <col style="width:15.5%"><col style="width:15.5%">
+        </colgroup>
+        <tr>
+          <th rowspan="2">Scope</th>
+          <th rowspan="2">Group</th>
+          <th colspan="2" style="text-align:center">Adds</th>
+          <th colspan="2" style="text-align:center">Already mapped</th>
+        </tr>
+        <tr>
+          <th>Source</th><th>Destination</th>
+          <th>Source</th><th>Destination</th>
+        </tr>
+        ${rows.map(p => `<tr>
+          <td>${esc(p.scope)}</td>
+          <td style="word-break:break-word">${esc(p.name)}</td>
+          <td style="word-break:break-word">${esc(p.src_add)}</td>
+          <td style="word-break:break-word">${esc(p.dst_add)}</td>
+          <td style="word-break:break-word;color:var(--muted)">${esc(p.src_already)}</td>
+          <td style="word-break:break-word;color:var(--muted)">${esc(p.dst_already)}</td>
+        </tr>`).join("")}
+      </table></div>`;
+  }
+
+  function renderRulesTable(rows) {
+    if (!rows.length) return '<p class="none">(no rule updates)</p>';
+    return `
+      <div class="tblwrap"><table style="table-layout:fixed;width:100%;">
+        <colgroup>
+          <col style="width:9%"><col style="width:23%"><col style="width:9%">
+          <col style="width:14.75%"><col style="width:14.75%">
+          <col style="width:14.75%"><col style="width:14.75%">
+        </colgroup>
+        <tr>
+          <th rowspan="2">Rulebase</th>
+          <th rowspan="2">Rule</th>
+          <th rowspan="2" title="literal = rule has a bare IP/CIDR that maps; object = rule references an address object that maps">Why</th>
+          <th colspan="2" style="text-align:center">Adds</th>
+          <th colspan="2" style="text-align:center">Already mapped</th>
+        </tr>
+        <tr>
+          <th>Source</th><th>Destination</th>
+          <th>Source</th><th>Destination</th>
+        </tr>
+        ${rows.map(p => `<tr>
+          <td>${esc(p.type.replace(/-rule$/, ""))}</td>
+          <td style="word-break:break-word">${esc(p.name)}</td>
+          <td>${esc(whyOf(p))}</td>
+          <td style="word-break:break-word">${esc(p.src_add)}</td>
+          <td style="word-break:break-word">${esc(p.dst_add)}</td>
+          <td style="word-break:break-word;color:var(--muted)">${esc(p.src_already)}</td>
+          <td style="word-break:break-word;color:var(--muted)">${esc(p.dst_already)}</td>
+        </tr>`).join("")}
+      </table></div>`;
+  }
+
+  const rulesSections = scopes.map(sc =>
+    `<h3 style="margin-top:22px">Device group: ${esc(sc)} (${rulesByScope.get(sc).length} rule${rulesByScope.get(sc).length === 1 ? "" : "s"})</h3>
+     ${renderRulesTable(rulesByScope.get(sc))}`).join("");
+
+  // Root-cause view: which object actions drive the most downstream rows.
+  // One "action" resolved usually knocks out many groups/rules at once, so
+  // sorting by downstream ref count surfaces the biggest levers first.
+  const rootActions = (r.object_actions || []).slice().sort(
+    (a, b) => (b.refs_count || 0) - (a.refs_count || 0));
+  const totalDownstream = rootActions.reduce((s, a) => s + (a.refs_count || 0), 0);
+
+  function renderRootTable(rows) {
+    if (!rows.length) return '<p class="none">(no object actions)</p>';
+    return `
+      <div class="tblwrap"><table style="table-layout:fixed;width:100%;">
+        <colgroup>
+          <col style="width:5%"><col style="width:18%"><col style="width:11%">
+          <col style="width:11%"><col style="width:11%"><col style="width:20%">
+          <col style="width:24%">
+        </colgroup>
+        <tr>
+          <th>#</th>
+          <th>Object</th>
+          <th>Defined in</th>
+          <th>Current value</th>
+          <th>Mapped value</th>
+          <th>Action</th>
+          <th title="how many groups / rules downstream would be resolved by this single action">Downstream targets</th>
+        </tr>
+        ${rows.map((a, i) => `<tr>
+          <td>${i + 1}</td>
+          <td style="word-break:break-word"><code>${esc(a.member)}</code></td>
+          <td>${esc(a.location)}</td>
+          <td><code>${esc(a.value)}</code></td>
+          <td><code>${esc(a.mapped_value)}</code></td>
+          <td>${esc(a.action)}</td>
+          <td style="word-break:break-word"><b>${a.refs_count}</b>
+            (${a.refs_groups} group${a.refs_groups === 1 ? "" : "s"},
+             ${a.refs_rules} rule${a.refs_rules === 1 ? "" : "s"}):
+            <span style="color:var(--muted);font-size:12px">${esc(a.refs)}</span></td>
+        </tr>`).join("")}
+      </table></div>`;
+  }
+
+  const alreadyCount = (r.already || []).length;
   const t = r.totals;
   $("results").innerHTML = `
     <div class="chips">
       <div class="chip"><b>${t.object_actions}</b><span>object actions</span></div>
-      <div class="chip"><b>${pivoted.length}</b><span>groups/rules updated</span></div>
+      <div class="chip"><b>${totalDownstream}</b><span>downstream group/rule refs</span></div>
+      <div class="chip"><b>${groupRows.length}</b><span>groups touched</span></div>
+      <div class="chip"><b>${ruleRows.length}</b><span>rule sides touched</span></div>
+      <div class="chip"><b>${alreadyCount}</b><span>already-mapped rows</span></div>
       <div class="chip"><b>${t.ranges}</b><span>ranges (report-only)</span></div>
       <div class="chip"><b>${t.csv_rows_unmatched}</b><span>CSV rows unmatched</span></div>
     </div>
     <p class="hint">Run ${esc(r.run_ts)} at ${esc(r.meta.ran_at)} against
       ${esc(r.meta.target)} as ${esc(r.meta.username)},
       CSV ${esc(r.meta.csv)} (${esc(r.meta.csv_rows)} rows)</p>
-    <h2>Additive changes per group/rule (Source vs Destination pivot)</h2>
-    <div class="tblwrap"><table style="table-layout:fixed;width:100%;">
-      <colgroup>
-        <col style="width:11%"><col style="width:10%"><col style="width:22%">
-        <col style="width:28.5%"><col style="width:28.5%">
-      </colgroup>
-      <tr><th>Scope</th><th>Type</th><th>Group / Rule</th>
-          <th>Source (adds)</th><th>Destination (adds)</th></tr>
-      ${pivoted.map(p => `<tr>
-        <td>${esc(p.scope)}</td>
-        <td>${esc(p.type)}</td>
-        <td style="word-break:break-word">${esc(p.name)}</td>
-        <td style="word-break:break-word">${esc(p.source)}</td>
-        <td style="word-break:break-word">${esc(p.destination)}</td>
-      </tr>`).join("")}
-    </table></div>
-    <p class="hint">Empty cell = no adds on that side. Full detail is in
+
+    <h2 style="margin-top:14px">Root causes (${rootActions.length}
+      object action${rootActions.length === 1 ? "" : "s"} would resolve
+      ${totalDownstream} downstream ref${totalDownstream === 1 ? "" : "s"})</h2>
+    <p class="hint">One "object action" is the single canonical change (create
+      or reuse a partner object) that then propagates to every group/rule
+      listed in Downstream targets. Sorted by downstream ref count so the
+      biggest levers are on top.</p>
+    ${renderRootTable(rootActions)}
+
+    <h2 style="margin-top:22px">Groups (${groupRows.length})</h2>
+    ${renderGroupsTable(groupRows)}
+
+    <h2 style="margin-top:22px">Rules (${ruleRows.length}), grouped by device group</h2>
+    ${rulesSections || '<p class="none">(no rule updates)</p>'}
+
+    <p class="hint">Empty cell = nothing on that side. The two "Already mapped"
+      columns show entries where a partner object with the mapped value already
+      exists on this group/rule, so no add is needed. Full detail is in
       pan_reports/.../group_remap_dryrun/report.md; also see the un-pivoted
       view under <a href="/group-remap">Group Remap</a>.</p>`;
 }

@@ -23,7 +23,7 @@ Serves `http://127.0.0.1:8765` by default. Pages:
 | `/` | Hub: link cards to every tool page below |
 | `/ip-search` | IP-to-rule search: pull a config snapshot, then search IPs / subnets / ranges against it |
 | `/group-remap` | CSV group remap dry run (same analysis as `tools/pan/pan_group_remap_report.py`); pick a CSV from `data/`, run, browse past reports |
-| `/remap-pivot` | Same CSV remap dry-run data as `/group-remap`, pivoted: one row per group/rule with Source (adds) and Destination (adds) as parallel columns. Shares run history with `/group-remap` |
+| `/remap-pivot` | Same CSV remap dry-run data as `/group-remap`, pivoted: one row per group/rule with four side-columns: `Adds Source`, `Adds Destination`, `Already-mapped Source`, `Already-mapped Destination`. Empty cell = nothing on that side. Shares run history with `/group-remap` |
 | `/flow-search` | Flow match: which rules a specific 5-tuple would hit |
 | `/rule-placement` | Rule placement recommender |
 
