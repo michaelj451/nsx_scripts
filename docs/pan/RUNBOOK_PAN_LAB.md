@@ -20,6 +20,8 @@ PowerShell variant: [RUNBOOK_PAN_LAB_PS.md](RUNBOOK_PAN_LAB_PS.md).
 
 | Tool | Purpose | Read/Write |
 |---|---|---|
+| `tools/pan/panorama_auth.py` | Prove the `.env` credentials work over the **XML** API; optionally mint and persist `PANORAMA_API_KEY` | Read-only (keygen + `show system info`) |
+| `tools/pan/panorama_rest_auth.py` | Prove the credentials work over the **REST** API and report which resources the role may actually read | Read-only (keygen + GETs) |
 | `tools/pan/pull_panorama_config.py` | Pull a candidate or running config snapshot from Panorama and save to `tools/pan/configs/` | Read-only (GETs) |
 | `tools/pan/add_services_to_rules.py` | Add a fixed set of service objects to every customer security rule (across shared + all DGs); stages changes to candidate; no auto-commit | Write (gated by `--apply`) |
 | `tools/pan/export_panorama_config.py` | Export the full RUNNING config via XML `type=export`; the snapshot path that works for the read-only agent account | Read-only (keygen + export) |
@@ -82,6 +84,48 @@ Both Panorama clients read the same variables (see `app/palo/pan_env.py`):
 | `app/palo/panos_client.py` | pan-os-python object model (device groups, address objects, rules); `PanosClient.from_env()` |
 | `app/palo/pan_rest_client.py` | REST API GETs only (read-only by design) plus config export; works under the restricted agent account (`agent_user`/`agent_password` in `.env`); `PanRestClient.from_env(user_env=..., password_env=...)` |
 
+### Testing REST API auth (restricted / read-only accounts)
+
+`panorama_auth.py` proves the **XML** API works, so it needs a role with XML
+op + config rights. When an account is denied the XML API but granted
+read-only REST access, use the REST twin instead. Same keygen, then
+`/restapi/<version>/` GETs only:
+
+```bash
+# Canonical PANORAMA_* credentials from .env
+python tools/pan/panorama_rest_auth.py
+
+# The restricted agent account (agent_user / agent_password in .env)
+python tools/pan/panorama_rest_auth.py --agent
+
+# Any other credential pair, named by .env variable
+python tools/pan/panorama_rest_auth.py --user-env svc_user --password-env svc_password
+
+# Ignore a stored PANORAMA_API_KEY and force a fresh keygen
+python tools/pan/panorama_rest_auth.py --keygen
+
+# Different host / REST version; probe policy reads inside one device group
+python tools/pan/panorama_rest_auth.py --host pano2.lab.local --rest-version v11.1
+python tools/pan/panorama_rest_auth.py --agent --device-group DG-Prod
+```
+
+It prints the target, the REST version being spoken, and the key fingerprint
+(never the key), then probes `Panorama/DeviceGroups`, `Panorama/Templates`,
+and shared `Addresses` / `AddressGroups` / `Services` / `Tags`, plus DG-scoped
+`Addresses` and pre/post security rules once a device group is known
+(`--device-group`, else the first one discovered; `--no-dg-probe` skips them).
+Every probe is reported readable or denied, so a `403` tells you exactly which
+resource the role is missing instead of aborting the run. A JSON report lands
+in `$PANO_REPORTS_DIR` (or `.pano_reports/`) as
+`panorama_rest_auth_<UTC_TS>.json`.
+
+Exit code `0` = authenticated and at least one resource readable, `1` = keygen
+failed, `2` = `.env` incomplete, `4` = authenticated but every probe denied
+(the role has no REST read access at all).
+
+There is deliberately no `--write-env` here: keygen is shared between the two
+APIs, so `panorama_auth.py --keygen --write-env` already persists the same key.
+
 The raw XML equivalent, if you ever need it by hand:
 
 ```bash
@@ -106,8 +150,10 @@ curl -ks "https://pano4.lab.local/api/?type=keygen&user=USERNAME&password=PASSWO
 ## 0b. Authenticate with .env credentials (get a token)
 
 ```bash
-python tools/pan/panorama_auth.py                      # check creds, masked token
+python tools/pan/panorama_auth.py                      # XML API: check creds, masked token
 python tools/pan/panorama_auth.py --keygen --write-env # mint + persist PANORAMA_API_KEY
+python tools/pan/panorama_rest_auth.py                 # REST API: keygen + read probes
+python tools/pan/panorama_rest_auth.py --agent         # REST API as the restricted account
 ```
 
 With `PANORAMA_API_KEY` persisted, every pan tool skips per-run keygen.
