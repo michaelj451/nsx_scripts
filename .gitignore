@@ -60,6 +60,8 @@ nsx_health_backup/
 # The .gitkeep is preserved so the dir exists on fresh clones.
 .pano_reports/*
 !.pano_reports/.gitkeep
+pan_capture/
+pan_reports/
 
 # Palo Alto / Panorama configuration exports — drop them here, they're auto-ignored
 # (the .gitkeep is kept so the directory exists for new clones)

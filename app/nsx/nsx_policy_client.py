@@ -93,7 +93,7 @@ class NsxPolicyClient:
         # NSX_API_MAX_RPS=0 (or max_rps=0) to disable pacing entirely.
         # Independently, 429/503 responses are retried with backoff honoring
         # Retry-After (NSX_API_RETRY_MAX attempts, default 5).
-        DEFAULT_MAX_RPS = 2.0
+        DEFAULT_MAX_RPS = 5.0
         if max_rps is None:
             env_val = (os.getenv("NSX_API_MAX_RPS") or "").strip()
             if env_val == "":
