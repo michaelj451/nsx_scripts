@@ -12,6 +12,11 @@ SSDD Toolkit: local web hub for the Panorama tools. Serves on 127.0.0.1:
     /remap-pivot  Same CSV remap dry-run data, pivoted: one row per
                   group/rule with Source (adds) and Destination (adds) as
                   parallel columns. Shares run history with /group-remap.
+    /rule-placement  Where a new rule belongs, from two independent
+                  signals: the firewalls' routing tables (authoritative,
+                  needs the admin-credential topology pull) and rule
+                  history (which DGs already write rules about that /24,
+                  from the plain config snapshot). Either alone answers.
 
 Read-only against Panorama, stdlib HTTP server only, binds loopback only
 (no auth; it never listens beyond 127.0.0.1). Managed firewalls are never
@@ -52,10 +57,16 @@ import xml.etree.ElementTree as ET  # noqa: E402
 import requests  # noqa: E402
 import urllib3  # noqa: E402
 
+from palo.pan_dg_subnets import (  # noqa: E402
+    DGProfile, SideResolution, SubnetProfiler, interval_from_text,
+    lookup_ip, profile_to_dict,
+)
 from palo.pan_env import resolve_panorama_env  # noqa: E402
-from palo.pan_group_remap import read_csv_mappings, summarize_refs  # noqa: E402
+from palo.pan_group_remap import (  # noqa: E402
+    address_value, read_csv_mappings, summarize_refs,
+)
 from palo.pan_ip_rules import (  # noqa: E402
-    match_flow, match_rules, parse_ip_lines, parse_port_spec,
+    expand_group, match_flow, match_rules, parse_ip_lines, parse_port_spec,
 )
 from palo.pan_rest_client import PanRestClient, PanRestError  # noqa: E402
 from palo.pan_rule_placement import (  # noqa: E402
@@ -655,21 +666,194 @@ def topology_status() -> Dict[str, Any]:
                        for dg, t in TOPOLOGY.get("tables", {}).items()}}
 
 
+# =============================================================================
+# DG subnet profile (second evidence source on /rule-placement): which
+# address space each device group's OWN rulebase already talks about,
+# bucketed to /24. Built from the REST snapshot the toolkit already holds,
+# so it needs no admin credentials and no XML export. Bucketing itself is
+# app/palo/pan_dg_subnets.py, shared with tools/pan/dg_subnet_profile.py.
+# =============================================================================
+
+DG_SUBNETS: Dict[str, Any] = {}     # {"key": <cache key>, "profiles": {...}}
+
+DG_SUBNET_V4_PREFIX = 24
+DG_SUBNET_EXPAND_LIMIT = 16
+
+
+def _resolve_snapshot_side(members: List[str],
+                           addr_by_name: Dict[str, Dict[str, str]],
+                           groups_by_name: Dict[str, Dict[str, Any]],
+                           cache: Dict[str, List[Dict[str, str]]],
+                           ) -> SideResolution:
+    """One REST rule side's members -> the subnet engine's SideResolution.
+
+    Mirrors _side_coverage()'s member handling (object, static group,
+    literal), but keeps every interval instead of stopping at the first
+    match against a target.
+    """
+    if "any" in members:
+        return SideResolution(is_any=True)
+    res = SideResolution()
+    for m in members:
+        if m in addr_by_name:
+            av = addr_by_name[m]
+            if av["kind"] == "fqdn":
+                res.caveats.append(f"address {m!r} is an FQDN ({av['value']!r})")
+                continue
+            iv = interval_from_text(av["value"])
+            if iv:
+                res.items.append((m, iv))
+        elif m in groups_by_name:
+            g = groups_by_name[m]
+            if not (g.get("static") or {}).get("member"):
+                res.caveats.append(f"group {m!r} has no static members "
+                                   f"(dynamic group; membership is runtime)")
+                continue
+            if m not in cache:
+                cache[m] = expand_group(m, groups_by_name, addr_by_name)
+            for c in cache[m]:
+                if c["kind"] == "fqdn":
+                    res.caveats.append(f"address {c['member']!r} is an FQDN "
+                                       f"(via group {m})")
+                    continue
+                iv = interval_from_text(c["value"])
+                if iv:
+                    res.items.append((c["member"], iv))
+        else:
+            iv = interval_from_text(m)
+            if iv:
+                res.items.append((m, iv))
+            else:
+                res.caveats.append(f"unresolved address reference: {m!r}")
+    return res
+
+
+def build_dg_subnet_profiles() -> Dict[str, DGProfile]:
+    """Profile every scope in the snapshot. DG-LOCAL rulebases only (each
+    scope's own pre + post), which is what tells you where a NEW rule
+    belongs; 'shared' is profiled as a pseudo-DG because "this already
+    lives in shared policy" is a real answer."""
+    profiler = SubnetProfiler(v4_prefix=DG_SUBNET_V4_PREFIX,
+                              expand_limit=DG_SUBNET_EXPAND_LIMIT)
+    profiles: Dict[str, DGProfile] = {}
+    for s in SNAPSHOT["scopes"]:
+        scope = s["scope"]
+        prof = DGProfile(dg=scope)
+        addr_by_name = {a["@name"]: address_value(a) for a in s["addresses"]
+                        if a.get("@name") and address_value(a)}
+        groups_by_name = {g["@name"]: g for g in s["groups"] if g.get("@name")}
+        cache: Dict[str, List[Dict[str, str]]] = {}
+        for rb in ("pre", "post"):
+            prof.rulebases.append(f"{scope}/{rb}-rulebase")
+            for rule in s["rules"][rb]:
+                if rule.get("disabled") == "yes":
+                    prof.rules_skipped += 1
+                    continue
+
+                def side(field: str) -> List[str]:
+                    m = (rule.get(field) or {}).get("member") or []
+                    return [m] if isinstance(m, str) else m
+
+                rid = f"{scope}/{rb}:{rule.get('@name', '?')}"
+                profiler.fold_rule(
+                    prof, rid,
+                    _resolve_snapshot_side(side("source"), addr_by_name,
+                                           groups_by_name, cache),
+                    _resolve_snapshot_side(side("destination"), addr_by_name,
+                                           groups_by_name, cache))
+        profiles[scope] = prof
+    return profiles
+
+
+def dg_subnet_profiles() -> Optional[Dict[str, DGProfile]]:
+    """Cached profiles for the current snapshot, or None with no snapshot.
+
+    Keyed on the snapshot's pulled_at, so a re-pull rebuilds and an
+    unchanged snapshot answers lookups from memory.
+    """
+    if not SNAPSHOT:
+        return None
+    key = SNAPSHOT["meta"]["pulled_at"]
+    if DG_SUBNETS.get("key") != key:
+        profiles = build_dg_subnet_profiles()
+        DG_SUBNETS.clear()
+        DG_SUBNETS.update({"key": key, "profiles": profiles})
+        log.info("DG subnet profile built for snapshot %s: %s",
+                 key, {dg: len(p.buckets) for dg, p in profiles.items()})
+    return DG_SUBNETS["profiles"]
+
+
+def dg_subnet_map(top: int = 10) -> Dict[str, Any]:
+    """Standing view: the top N /24s per device group."""
+    profiles = dg_subnet_profiles()
+    if profiles is None:
+        return {"available": False,
+                "reason": "No configuration snapshot yet. Pull the config "
+                          "on IP Rule Search first."}
+    return {"available": True,
+            "snapshot_pulled_at": SNAPSHOT["meta"]["pulled_at"],
+            "mask": DG_SUBNET_V4_PREFIX,
+            "device_groups": {dg: profile_to_dict(p, top=top, include_all=False)
+                              for dg, p in sorted(profiles.items())}}
+
+
+def _rule_history(src: str, dst: str) -> Dict[str, Any]:
+    """Which DGs already write rules about this address space, merged into
+    one row per DG (its best src bucket and best dst bucket)."""
+    profiles = dg_subnet_profiles()
+    if profiles is None:
+        return {"available": False,
+                "reason": "No configuration snapshot yet. Pull the config on "
+                          "IP Rule Search to add rule-history evidence."}
+    src_hits = lookup_ip(src, profiles)["matches"]
+    dst_hits = lookup_ip(dst, profiles)["matches"]
+    best: Dict[str, Dict[str, Any]] = {}
+    for hits, side in ((src_hits, "src"), (dst_hits, "dst")):
+        for h in hits:
+            row = best.setdefault(h["dg"], {"dg": h["dg"]})
+            if side in row:
+                continue        # hits are pre-sorted; first is the best
+            row[side] = h
+    rows = sorted(best.values(),
+                  key=lambda r: -((r.get("src") or {}).get("rules", 0)
+                                  + (r.get("dst") or {}).get("rules", 0)))
+    return {"available": True,
+            "snapshot_pulled_at": SNAPSHOT["meta"]["pulled_at"],
+            "mask": DG_SUBNET_V4_PREFIX,
+            "by_dg": rows}
+
+
 def run_placement(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not TOPOLOGY or not TOPOLOGY.get("tables"):
-        raise ValueError("No routing topology yet. Pull routing tables first.")
     src = (payload.get("src") or "").strip()
     dst = (payload.get("dst") or "").strip()
-    try:
-        result = recommend_placement(src, dst, TOPOLOGY["tables"])
-    except PanPlacementError as exc:
-        raise ValueError(str(exc)) from exc
+    if not src or not dst:
+        raise ValueError("Both a source and a destination IP are required.")
+
+    # Routing is the authoritative signal, but it needs the admin-credential
+    # topology pull. Rule history works off the plain snapshot, so the page
+    # still answers with one source when the other is missing.
+    routing: Dict[str, Any] = {"recommended": [], "considered": [], "note": None}
+    routing_available = bool(TOPOLOGY and TOPOLOGY.get("tables"))
+    if routing_available:
+        try:
+            routing = recommend_placement(src, dst, TOPOLOGY["tables"])
+        except PanPlacementError as exc:
+            raise ValueError(str(exc)) from exc
+
+    history = _rule_history(src, dst)
+    if not routing_available and not history["available"]:
+        raise ValueError("Nothing to go on yet: pull routing tables here, or "
+                         "pull a config snapshot on IP Rule Search.")
+
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out = {"run_id": run_id, "src": src, "dst": dst,
            "meta": {"ran_at": datetime.now(timezone.utc).isoformat(),
-                    "topology_pulled_at": TOPOLOGY["meta"]["pulled_at"],
-                    "target": TOPOLOGY["meta"]["target"]},
-           **result}
+                    "topology_pulled_at": (TOPOLOGY["meta"]["pulled_at"]
+                                           if routing_available else None),
+                    "target": CONFIG["display_target"]},
+           "routing_available": routing_available,
+           "rule_history": history,
+           **routing}
     d = placement_runs_dir()
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{run_id}.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
@@ -918,7 +1102,8 @@ HUB_BODY = """
     <p class="hint">Source IP + destination IP in, the most likely device
       group(s) for a new rule out. Anchored on the firewalls' routing tables:
       the boxes that most specifically own each endpoint, not every possible
-      location.</p>
+      location. Corroborated by rule history: which device groups already
+      write rules about that /24, plus a standing subnet map per group.</p>
   </a>
 </div>
 <p class="hint" style="padding:0 22px">Read-only against Panorama; firewalls
@@ -1783,13 +1968,23 @@ PLACEMENT_BODY = """
       <input type="text" id="dst" placeholder="10.4.1.9">
       <button id="pull" class="secondary">Pull routing tables</button>
       <div class="snap" id="topo-status">No routing topology yet. Pull first.</div>
+      <div class="snap" id="snap-status">No config snapshot yet.</div>
       <button id="go" disabled>Recommend placement</button>
       <div class="err" id="error"></div>
-      <div class="readonly">Routing tables come from each connected firewall
-        via Panorama's proxy (read-only op, admin credentials; the one place
-        the toolkit touches firewall state). Recommendation = the device
-        group(s) whose firewall most specifically routes each endpoint;
-        default-route-only boxes are never recommended.</div>
+      <div class="readonly">Two independent signals. ROUTING is
+        authoritative: tables come from each connected firewall via
+        Panorama's proxy (read-only op, admin credentials; the one place the
+        toolkit touches firewall state), and the recommendation is the device
+        group(s) whose firewall most specifically routes each endpoint, with
+        default-route-only boxes never recommended. RULE HISTORY is a proxy:
+        which device groups already write rules about this /24, from the
+        config snapshot. Either one alone still answers.</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <label style="margin-top:0">Device group subnet map</label>
+      <p class="hint" style="margin-top:0">The top /24s in each device group's
+        own rulebase. No inputs; this is the standing ownership picture.</p>
+      <button id="map" class="secondary" disabled>Show subnet map</button>
     </div>
     <div class="panel" style="margin-top:14px">
       <label style="margin-top:0">Previous lookups
@@ -1802,39 +1997,109 @@ PLACEMENT_BODY = """
 """
 
 PLACEMENT_JS = """
+let hasTopo = false, hasSnap = false;
+
+function bucketCell(h) {
+  if (!h) return '<span class="none">no rule history</span>';
+  const agg = h.aggregate ? ' <span class="none">(aggregate)</span>' : "";
+  return `<code>${esc(h.subnet)}</code>${agg}<br>
+    <span class="when">${h.rules} rules (src ${h.src_rules}, dst ${h.dst_rules}),
+    rank ${h.rank_in_dg} of ${h.dg_bucket_count}</span>`;
+}
+
+function historySection(r) {
+  // Runs saved before rule history existed have no such field.
+  const h = r.rule_history ||
+    {available: false, reason: "This saved lookup predates rule history. Re-run it."};
+  if (!h.available)
+    return `<h2>Rule history</h2><p class="none">${esc(h.reason)}</p>`;
+  const rows = h.by_dg.map(d => [
+    esc(d.dg), bucketCell(d.src), bucketCell(d.dst),
+    esc(((d.src || {}).sample_objects || [])
+      .concat(((d.dst || {}).sample_objects || [])).slice(0, 4).join(", "))]);
+  return `<h2>Rule history (/${h.mask} buckets, snapshot ${esc(h.snapshot_pulled_at)})</h2>
+    <p class="hint">Which device groups already write rules about this address
+      space. A proxy for placement, not a verdict: confirm against routing.</p>
+    ${table(["Device group","Source /"+h.mask,"Destination /"+h.mask,"Objects"], rows)}`;
+}
+
 function render(r) {
   const recos = r.recommended.map(x => `
     <div class="reco"><b>${esc(x.dg)}</b>
       <span class="none">(${esc(x.device)})</span>
       <ul>${x.reasons.map(y => `<li>${esc(y)}</li>`).join("")}</ul></div>`).join("");
-  $("results").innerHTML = `
-    <p class="hint">Lookup ${esc(r.run_id)}: <code>${esc(r.src)}</code> to
-      <code>${esc(r.dst)}</code> (topology pulled ${esc(r.meta.topology_pulled_at)})</p>
-    <h2>Recommended placement</h2>
+  // Older saved runs have no routing_available flag but always carried routing.
+  const hasRouting = r.routing_available !== undefined
+    ? r.routing_available : !!(r.considered && r.considered.length);
+  const routing = hasRouting ? `
+    <h2>Recommended placement (routing)</h2>
     ${recos || '<p class="none">(none)</p>'}
     ${r.note ? `<p class="err">${esc(r.note)}</p>` : ""}
     <h2>Every device group considered</h2>
     ${table(["Device group","Firewall","Route to source","Route to destination","Verdict"],
       r.considered.map(c => [esc(c.dg), esc(c.device), esc(c.src), esc(c.dst),
-        c.verdict === "recommended" ? `<b>${esc(c.verdict)}</b>` : esc(c.verdict)]))}`;
+        c.verdict === "recommended" ? `<b>${esc(c.verdict)}</b>` : esc(c.verdict)]))}`
+    : `<h2>Recommended placement (routing)</h2>
+       <p class="none">No routing topology pulled. Rule history only, below:
+       this is a shortlist, not a verdict.</p>`;
+  $("results").innerHTML = `
+    <p class="hint">Lookup ${esc(r.run_id)}: <code>${esc(r.src)}</code> to
+      <code>${esc(r.dst)}</code>${r.meta.topology_pulled_at
+        ? ` (topology pulled ${esc(r.meta.topology_pulled_at)})` : ""}</p>
+    ${routing}
+    ${historySection(r)}`;
 }
+
+function renderMap(m) {
+  if (!m.available) { $("results").innerHTML =
+    `<p class="none">${esc(m.reason)}</p>`; return; }
+  const blocks = Object.entries(m.device_groups).map(([dg, p]) => {
+    const rows = p.top.map(b => [
+      b.rank, `<code>${esc(b.subnet)}</code>${b.aggregate ? " *" : ""}`,
+      b.rules, b.src_rules, b.dst_rules, b.share_pct + "%",
+      esc((b.sample_objects || []).slice(0, 3).join(", "))]);
+    return `<h2>${esc(dg)}</h2>
+      <p class="hint">${p.rules_scanned} enabled rules
+        (${p.any_src_rules} any-source, ${p.any_dst_rules} any-dest),
+        ${p.distinct_subnets} distinct /${m.mask}s,
+        ${p.address_bearing_rules} carrying a specific address.</p>
+      ${table(["#","Subnet","Rules","Src","Dst","Share","Objects"], rows)}`;
+  }).join("");
+  $("results").innerHTML = `
+    <p class="hint">Device group subnet map, /${m.mask} buckets
+      (snapshot ${esc(m.snapshot_pulled_at)}). * = aggregate, a prefix too wide
+      to expand.</p>${blocks}`;
+}
+
+function setGo() { $("go").disabled = !(hasTopo || hasSnap); }
 
 function showTopo(s) {
   const el = $("topo-status");
-  if (!s || !s.present) {
+  hasTopo = !!(s && s.present);
+  if (!hasTopo) {
     el.className = "snap";
-    el.textContent = "No routing topology yet. Pull first.";
-    $("go").disabled = true;
-    return;
+    el.textContent = "No routing topology. Pull for the authoritative answer.";
+  } else {
+    const parts = Object.entries(s.tables)
+      .map(([dg, t]) => `${dg}/${t.device} ${t.routes} routes`).join(", ");
+    el.className = "snap ok";
+    el.textContent = `Topology pulled ${s.pulled_at} : ${parts}.` +
+      (s.warnings.length ? ` Warnings: ${s.warnings.join("; ")}` : "");
   }
-  const parts = Object.entries(s.tables)
-    .map(([dg, t]) => `${dg}/${t.device} ${t.routes} routes`).join(", ");
-  el.className = "snap ok";
-  el.textContent = `Topology pulled ${s.pulled_at} : ${parts}.` +
-    (s.warnings.length ? ` Warnings: ${s.warnings.join("; ")}` : "");
-  $("go").disabled = false;
+  setGo();
 }
-window.onInfo = i => showTopo(i.topology);
+
+function showSnap(s) {
+  const el = $("snap-status");
+  hasSnap = !!(s && s.present);
+  el.className = hasSnap ? "snap ok" : "snap";
+  el.textContent = hasSnap
+    ? `Config snapshot pulled ${s.pulled_at} : rule history available.`
+    : "No config snapshot. Pull one on IP Rule Search for rule history.";
+  $("map").disabled = !hasSnap;
+  setGo();
+}
+window.onInfo = i => { showTopo(i.topology); showSnap(i.snapshot); };
 
 async function refreshRuns() {
   const runs = await (await fetch("/api/placement/runs")).json();
@@ -1864,6 +2129,19 @@ $("pull").onclick = async () => {
   } catch (e) { $("error").textContent = String(e); }
   $("pull").disabled = false;
   $("pull").textContent = "Pull routing tables";
+};
+
+$("map").onclick = async () => {
+  $("error").textContent = "";
+  $("map").disabled = true;
+  $("map").textContent = "Building subnet map...";
+  try {
+    const data = await (await fetch("/api/dgsubnets/map?top=10")).json();
+    if (data.error) $("error").textContent = data.error;
+    else renderMap(data);
+  } catch (e) { $("error").textContent = String(e); }
+  $("map").disabled = !hasSnap;
+  $("map").textContent = "Show subnet map";
 };
 
 $("go").onclick = async () => {
@@ -1953,6 +2231,10 @@ class Handler(BaseHTTPRequestHandler):
             run = load_flow_run(run_id)
             self._json(run if run else {"error": f"run {run_id!r} not found"},
                        200 if run else 404)
+        elif self.path.startswith("/api/dgsubnets/map"):
+            raw = (self.path.split("top=", 1) + [""])[1].split("&")[0]
+            top = int(raw) if raw.isdigit() else 10
+            self._json(dg_subnet_map(top))
         elif self.path == "/api/placement/runs":
             self._json(list_placement_runs())
         elif self.path.startswith("/api/placement/run?"):

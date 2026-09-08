@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/nsx/wipe_target_manager.py
+"""tools/test/wipe_target_manager.py
 
 Surgical wipe of all CUSTOMER security objects on an NSX Local Manager.
 Deletes customer rules, customer policies, customer groups, customer
@@ -16,12 +16,22 @@ What it protects:
 Every run captures a pre-wipe state snapshot on disk before writing.
 Default mode is DRY-RUN. Use --apply to actually delete.
 
+Scoping with --id-prefix turns the full wipe into a surgical one: only
+objects whose NSX id starts with a given prefix are deleted, and the
+default sections are then left completely alone (their NDP/DHCP rules are
+NOT is_default, so an unscoped run treats them as customer rules and
+removes them).
+
 USAGE:
     # See what would happen
-    python tools/nsx/wipe_target_manager.py --target nsx-lm3
+    python tools/test/wipe_target_manager.py --target nsx-lm3
 
     # Apply
-    python tools/nsx/wipe_target_manager.py --target nsx-lm3 --apply
+    python tools/test/wipe_target_manager.py --target nsx-lm3 --apply
+
+    # Only one family of test objects (dry-run, then apply)
+    python tools/test/wipe_target_manager.py --target nsx-lm2 --id-prefix tagload-
+    python tools/test/wipe_target_manager.py --target nsx-lm2 --id-prefix tagload- --apply
 
 OUTPUT:
     nsx_wipe_bundle/<UTC_TS>/<host>/
@@ -73,29 +83,49 @@ def _setup_logging(out_dir: Path) -> Path:
 # Snapshot capture (pre-wipe state)
 # =============================================================================
 
-def _snapshot(client: NsxPolicyClient, domain_id: str) -> Dict[str, Any]:
+def _snapshot(client: NsxPolicyClient, domain_id: str,
+              id_prefixes: Optional[List[str]] = None) -> Dict[str, Any]:
     """Return a JSON-serializable snapshot of every customer DFW object on
     the target. Used both to produce the delete plan and as an audit
-    record (written to pre_wipe_state.json)."""
-    services = [s for s in client.list_services() if not s.get("_system_owned")]
+    record (written to pre_wipe_state.json).
+
+    With `id_prefixes`, only objects whose id starts with one of them are
+    in scope. That turns the full wipe into a surgical one: unmatched
+    services, groups and policies are left alone entirely, and the default
+    sections are not touched at all (a prefix scope means "delete these
+    objects", never "reach into a section I am keeping"). A prefix that
+    matches no services simply makes phase 4 a no-op.
+    """
+    def _match(obj: Dict[str, Any]) -> bool:
+        if not id_prefixes:
+            return True
+        oid = str(obj.get("id") or "")
+        return any(oid.startswith(pref) for pref in id_prefixes)
+
+    services = [s for s in client.list_services()
+                if not s.get("_system_owned") and _match(s)]
     groups   = [g for g in client.list_groups(domain_id=domain_id)
-                if not g.get("_system_owned")]
+                if not g.get("_system_owned") and _match(g)]
     policies_raw = client.list_security_policies(domain_id=domain_id)
 
     # Customer policies (deletable): not system-owned, not default sections
     customer_policies = [p for p in policies_raw
                          if not p.get("_system_owned")
-                         and p.get("id") not in DEFAULT_SECTION_IDS]
+                         and p.get("id") not in DEFAULT_SECTION_IDS
+                         and _match(p)]
 
     # Default sections (kept, but their customer-added rules are deletable)
     default_sections = [p for p in policies_raw
                         if p.get("id") in DEFAULT_SECTION_IDS
                         or (p.get("is_default") and not p.get("_system_owned"))]
 
-    # For every policy that has customer rules (customer policies OR default
-    # sections), collect the customer rules so we can delete them.
+    # For every policy that has customer rules, collect the customer rules
+    # so we can delete them. Under a prefix scope the default sections are
+    # off limits: their rules (NDP/DHCP, for instance) are not is_default,
+    # so they would otherwise be swept up as "customer rules".
+    rule_parents = customer_policies + ([] if id_prefixes else default_sections)
     rules_to_delete: List[Dict[str, Any]] = []
-    for p in customer_policies + default_sections:
+    for p in rule_parents:
         try:
             rules = client.list_security_rules(security_policy_id=p["id"],
                                                domain_id=domain_id)
@@ -118,6 +148,7 @@ def _snapshot(client: NsxPolicyClient, domain_id: str) -> Dict[str, Any]:
 
     return {
         "domain_id":         domain_id,
+        "id_prefixes":       list(id_prefixes or []),
         "customer_services": services,
         "customer_groups":   groups,
         "customer_policies": customer_policies,
@@ -247,6 +278,14 @@ def main() -> int:
                    help="Actually delete. Default is dry-run.")
     p.add_argument("--output-base", default="nsx_wipe_bundle",
                    help="Output root. Default: ./nsx_wipe_bundle/")
+    p.add_argument("--id-prefix", action="append", default=[], metavar="PREFIX",
+                   help="Only delete objects whose NSX id starts with PREFIX "
+                        "(repeatable). Scopes the wipe to one family of test "
+                        "objects, e.g. --id-prefix tagload-. With any prefix "
+                        "set, the default sections and their rules are left "
+                        "completely alone, and unmatched services/groups/"
+                        "policies are never touched. Default: full customer "
+                        "wipe.")
     args = p.parse_args()
 
     host = resolve_manager(args.target)
@@ -262,6 +301,9 @@ def main() -> int:
     log.info("  Target        : %s (%s)", args.target, host)
     log.info("  Domain        : %s", args.domain_id)
     log.info("  Mode          : %s", "APPLY" if args.apply else "DRY-RUN")
+    log.info("  Scope         : %s",
+             ("id prefix " + ", ".join(repr(x) for x in args.id_prefix))
+             if args.id_prefix else "ALL customer objects")
     log.info("  Output bundle : %s", out_dir)
     log.info("=" * 70)
 
@@ -269,7 +311,7 @@ def main() -> int:
 
     # Snapshot
     log.info("Capturing pre-wipe state on %s ...", host)
-    snap = _snapshot(client, args.domain_id)
+    snap = _snapshot(client, args.domain_id, args.id_prefix or None)
     (out_dir / "pre_wipe_state.json").write_text(
         json.dumps(snap, indent=2, sort_keys=True, default=str),
         encoding="utf-8")
@@ -277,10 +319,12 @@ def main() -> int:
     log.info("  customer_groups  : %d", len(snap["customer_groups"]))
     log.info("  customer_policies: %d (excludes default sections)",
              len(snap["customer_policies"]))
-    log.info("  default_sections : %d (kept, only their customer rules deleted)",
-             len(snap["default_sections"]))
-    log.info("  rules to delete  : %d (across customer policies + default sections)",
-             len(snap["rules_to_delete"]))
+    log.info("  default_sections : %d (%s)", len(snap["default_sections"]),
+             "kept untouched under a prefix scope" if args.id_prefix
+             else "kept, only their customer rules deleted")
+    log.info("  rules to delete  : %d (%s)", len(snap["rules_to_delete"]),
+             "inside in-scope policies only" if args.id_prefix
+             else "across customer policies + default sections")
 
     # Delete in dependency order
     log.info("")
@@ -304,6 +348,7 @@ def main() -> int:
         "target":  f"alias:{args.target} ({host})",
         "domain_id": args.domain_id,
         "mode":    "APPLY" if args.apply else "DRY-RUN",
+        "id_prefixes": args.id_prefix,
         "counts_before_wipe": {
             "customer_services": len(snap["customer_services"]),
             "customer_groups":   len(snap["customer_groups"]),

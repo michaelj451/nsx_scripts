@@ -64,11 +64,15 @@ a matching revert.
 | [RUNBOOK_PAN_PROD.md](pan/RUNBOOK_PAN_PROD.md) / [ps](pan/RUNBOOK_PAN_PROD_PS.md) | Production Panorama, manual / file-driven (no API): offline policy lookup flow |
 | [RUNBOOK_PAN_FLOW_RULES.md](pan/RUNBOOK_PAN_FLOW_RULES.md) / [ps](pan/RUNBOOK_PAN_FLOW_RULES_PS.md) | Offline flow/rule report: a CSV of source/destination pairs in, every covering rule out, plus a subnet list that suppresses matches by attribution |
 
-## Testing
+## Testing and cleanup (`tools/test/`)
+
+Lab-only scaffolding and the destructive cleanup tools. Documentation for
+everything under `tools/test/` lives in [`docs/tools/test/`](tools/test/).
 
 | Doc | Purpose |
 |---|---|
-| [README-TEST.md](reference/README-TEST.md) | Load-test scaffolding under `tools/test/` for exercising the NSX tools at scale |
+| [README-TEST.md](tools/test/README-TEST.md) | Load-test scaffolding under `tools/test/` for exercising the NSX tools at scale |
+| [RUNBOOK_WIPE.md](tools/test/RUNBOOK_WIPE.md) | `wipe_target_manager.py`: delete customer DFW objects in dependency order. Full wipe, or `--id-prefix` to clear one family of test objects while leaving the Default sections (and their NDP/DHCP rules) alone. Back up first: there is no paired revert |
 
 Unit tests for the remap / audit / backup / Panorama code live in
 [`tests/`](../tests/): `python -m unittest discover tests`.
