@@ -1,0 +1,16 @@
+# IP-to-rule membership target list.
+# Used by tools/pan/report_ips_in_rules.py.
+#
+# AUTO-DISCOVERED: this file at repo root is picked up automatically.
+# Override with --ip-list <path> or PAN_IP_RULE_REPORT_LIST (.env).
+#
+# One IP or subnet per line. A bare IP is read as /32 (or /128 for IPv6).
+# Inline comments after # are stripped. A subnet matches any rule whose
+# coverage overlaps it.
+
+10.1.1.5          # inside r-10.1.1.5-10.1.1.20 and n-10.1.1.0-24
+# 10.2.1.30         # inside r-10.2.1.20-10.2.1.50
+# 10.6.0.25         # inside test-address-10.6.0.0-24
+# 10.3.1.150        # inside r-10.3.1.101-10.3.2.5 (excluded by sample exclusion)
+# 10.9.9.9          # matches nothing (expected in the no-match section)
+10.1.1.1

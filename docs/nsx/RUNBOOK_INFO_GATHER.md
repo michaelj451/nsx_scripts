@@ -41,8 +41,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
 
-M=nsx-lm3
-H=nsx-lm3.lab.local
+M=nsx-lm2
+H=nsx-lm2.lab.local
 GM=nsx-gm1
 GH=nsx-gm1.lab.local
 G=nsx_info_$M

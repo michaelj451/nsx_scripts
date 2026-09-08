@@ -295,7 +295,11 @@ def main() -> int:
     p.add_argument("--policies", type=int, default=0,
                    help="Number of security policies to create")
     p.add_argument("--rules-per-policy", type=int, default=0,
-                   help="Rules per policy")
+                   help="Rules per policy (uniform). Ignored when --rules-total is set.")
+    p.add_argument("--rules-total", type=int, default=0, metavar="N",
+                   help="Exact total rules to spread across --policies. Use when the "
+                        "total does not divide evenly: the first (N %% policies) "
+                        "policies get one extra rule each, so the total is exact.")
     p.add_argument("--groups-per-side", type=int, default=4,
                    help="Groups in each rule's source and destination list (default 4)")
 
@@ -311,12 +315,13 @@ def main() -> int:
     p.add_argument("--throttle-rps", type=float, default=5.0,
                    help="Requests per second across the whole run; "
                         "0 disables throttling (default 5)")
-    p.add_argument("--workers", type=int, default=1, metavar="N",
-                   help="Concurrent PUT workers (default 1). NSX write latency "
+    p.add_argument("--workers", type=int, default=5, metavar="N",
+                   help="Concurrent PUT workers (default 5). NSX write latency "
                         "is ~400ms per object, so a serial run tops out near "
                         "2.5 objects/s regardless of --throttle-rps; raising "
-                        "this is the only way to go faster. 8 to 16 is a "
-                        "reasonable range on a lab manager.")
+                        "this is the only way to go faster. 5 stays under the "
+                        "HTTP session pool of 10, so no connections are "
+                        "discarded. Use 1 for strictly one-at-a-time.")
     p.add_argument("--skip-groups", action="store_true",
                    help="Do not create groups (reuse existing ones with this prefix for rules)")
     p.add_argument("--skip-rules", action="store_true",
@@ -378,8 +383,14 @@ def main() -> int:
     print(f"  Tag pairs     : {len(pairs)} from {source}  (~{per_pair} groups each)")
     print(f"  Groups        : {args.groups}")
     if not args.skip_rules:
-        print(f"  Policies      : {args.policies} x {args.rules_per_policy} rules "
-              f"= {args.policies * args.rules_per_policy} rules")
+        if args.rules_total > 0:
+            b, e = divmod(args.rules_total, max(args.policies, 1))
+            shape = (f"{args.policies} policies, {args.rules_total} rules total "
+                     f"({e} with {b+1}, {args.policies - e} with {b})")
+        else:
+            shape = (f"{args.policies} x {args.rules_per_policy} rules "
+                     f"= {args.policies * args.rules_per_policy} rules")
+        print(f"  Policies      : {shape}")
         print(f"  Groups/side   : {args.groups_per_side}")
     print(f"  Prefix        : {args.prefix}")
     print(f"  Throttle      : "
@@ -387,7 +398,9 @@ def main() -> int:
     print(f"  Workers       : {args.workers}")
     total_writes = (0 if args.skip_groups else args.groups)
     if not args.skip_rules:
-        total_writes += args.policies + args.policies * args.rules_per_policy
+        _b, _e = divmod(args.rules_total, max(args.policies, 1))
+        _rules = args.rules_total if args.rules_total > 0 else args.policies * args.rules_per_policy
+        total_writes += args.policies + _rules
     eta = (total_writes / args.throttle_rps) if args.throttle_rps > 0 else 0
     print(f"  Total PUTs    : {total_writes}"
           + (f"   (~{eta/60:.1f} min at {args.throttle_rps} req/s)" if eta else ""))
@@ -419,7 +432,16 @@ def main() -> int:
         print(f"Groups done: {len(group_jobs)}", flush=True)
 
     # ---- policies + rules ----
-    if args.skip_rules or args.policies <= 0 or args.rules_per_policy <= 0:
+    # Per-policy rule counts. --rules-total spreads a remainder so the total
+    # is exact; otherwise every policy gets --rules-per-policy.
+    if args.rules_total > 0 and args.policies > 0:
+        base, extra = divmod(args.rules_total, args.policies)
+        per_policy = [base + (1 if y < extra else 0) for y in range(args.policies)]
+    else:
+        per_policy = [args.rules_per_policy] * max(args.policies, 0)
+    planned_rules = sum(per_policy)
+
+    if args.skip_rules or args.policies <= 0 or planned_rules <= 0:
         print("Skipping policies/rules.")
     else:
         if args.groups_per_side > len(group_paths):
@@ -438,7 +460,7 @@ def main() -> int:
             else:
                 policy_jobs.append(
                     lambda pa=ppath, pl=pol: put_with_retry(cfg, throttler, pa, pl))
-            for z in range(args.rules_per_policy):
+            for z in range(per_policy[y]):
                 rid = f"{args.prefix}-rule-{y:04d}-{z:04d}"
                 src = rng.sample(group_paths, args.groups_per_side)
                 dst = rng.sample(group_paths, args.groups_per_side)
