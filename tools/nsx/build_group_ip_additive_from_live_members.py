@@ -280,6 +280,23 @@ def main() -> None:
         action="store_true",
         help="Deprecated: this is now the default. Kept for compatibility; overrides --live-query.",
     )
+    parser.add_argument(
+        "--ip-source",
+        choices=["effective", "vm-vif"],
+        default="effective",
+        help=(
+            "Where a group's IPs come from, with --live-query. "
+            "'effective' (DEFAULT) asks NSX directly via "
+            ".../groups/<id>/members/ip-addresses, the same list the UI's "
+            "Effective Members tab shows: static IPAddressExpression entries, "
+            "IP ranges, segment-derived subnets, nested-group contributions "
+            "and stopped VMs' last-known bindings are all included. "
+            "'vm-vif' is the legacy path (evaluated VM members looked up in "
+            "the fabric VIF index); it sees ONLY running VMs' VIF IPs and on "
+            "nsx-lm1 under-reported 10 of 12 groups. Use it solely to "
+            "reproduce a pre-2026-09-08 bundle."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -436,13 +453,27 @@ def main() -> None:
             try:
                 log.info("Processing group %s (%s)", group_name, group_id)
 
+                # vm_to_ips is kept for the audit trail in every mode: it shows
+                # WHICH VMs contributed, which the effective-IP endpoint does
+                # not tell you. It is only the source of `ips` in vm-vif mode.
                 vm_to_ips = client.get_group_member_vm_ips(
                     group_id=group_id,
                     domain_id=args.domain_id,
                     vm_ip_index=vm_ip_index,
                 )
 
-                if not vm_to_ips:
+                ips: Set[str] = set()
+                if args.ip_source == "effective":
+                    # Ask NSX what the group actually resolves to. See
+                    # NsxPolicyClient.get_group_effective_ips for why the
+                    # vm-vif path is not equivalent.
+                    ips.update(client.get_group_effective_ips(
+                        group_id=group_id, domain_id=args.domain_id))
+                else:
+                    for ip_list in vm_to_ips.values():
+                        ips.update(ip_list)
+
+                if not ips and not vm_to_ips:
                     groups_no_members += 1
                     no_members_rows.append({
                         "group_id": group_id,
@@ -450,12 +481,8 @@ def main() -> None:
                         "group_file": str(group_file),
                         "status": "no_members",
                     })
-                    log.info("Group %s has no evaluated VM members", group_name)
+                    log.info("Group %s resolves to no members and no IPs", group_name)
                     continue
-
-                ips: Set[str] = set()
-                for ip_list in vm_to_ips.values():
-                    ips.update(ip_list)
 
                 if not ips:
                     groups_no_ips += 1
@@ -543,6 +570,7 @@ def main() -> None:
         "output_format": args.output_format,
         "copy_first": args.copy_first,
         "continue_on_group_error": args.continue_on_group_error,
+        "ip_source": ("n/a (offline copy)" if args.no_live_query else args.ip_source),
         "vm_ip_index_count": len(vm_ip_index),
         "group_files_found": len(group_files),
         "groups_seen": groups_seen,

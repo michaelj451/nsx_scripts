@@ -31,6 +31,7 @@ a matching revert.
 | Selective category copy | [RUNBOOK_FILTER_COPY.md](nsx/RUNBOOK_FILTER_COPY.md) | included | [ps](nsx/RUNBOOK_FILTER_COPY_PS.md) | Copy chosen DFW policies plus only their transitive dependencies |
 | Services only | [RUNBOOK_SERVICES.md](nsx/RUNBOOK_SERVICES.md) | included | included | Export / push / revert customer services alone |
 | GM to LM copy | `tools/nsx/transform_gm_export_to_lm.py` | tool docstring | n/a | Rewrite a Global Manager export's `/global-infra/` refs (and optionally the domain) so the standard Workflow A pushes land it on a Local Manager |
+| **AVS** Federation teardown | [RUNBOOK_AVS.md](nsx/RUNBOOK_AVS.md) | included | n/a | End-to-end GM to LM to target with tag groups decomposed to IP-only siblings, for a destination with no matching VM inventory or tag scheme. Read the two failure modes first: a capture without `--live-query` and any powered-off VM both silently drop IPs |
 
 ## Backup (separate from capture on purpose)
 

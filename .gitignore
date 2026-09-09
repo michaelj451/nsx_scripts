@@ -42,6 +42,8 @@ nsx_segments*/
 nsx_membership*/
 nsx_pure_ip_remap*/
 nsx_remap*/
+nsx_gm_to_lm/
+nsx_avs_runs/
 
 # VM Tag Logs
 nsx_vm_files/

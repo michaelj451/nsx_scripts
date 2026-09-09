@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """tools/test/wipe_target_manager.py
 
-Surgical wipe of all CUSTOMER security objects on an NSX Local Manager.
+Surgical wipe of all CUSTOMER security objects on an NSX manager (Local
+Manager, or a Global Manager via the auto-detected /global-infra surface).
 Deletes customer rules, customer policies, customer groups, customer
 services in the correct order (rules -> policies -> groups -> services)
 so referential integrity is never violated.
@@ -32,6 +33,10 @@ USAGE:
     # Only one family of test objects (dry-run, then apply)
     python tools/test/wipe_target_manager.py --target nsx-lm2 --id-prefix tagload-
     python tools/test/wipe_target_manager.py --target nsx-lm2 --id-prefix tagload- --apply
+
+    # Global Manager: nsx-gm* aliases auto-select the /global-infra surface
+    python tools/test/wipe_target_manager.py --target nsx-gm1
+    python tools/test/wipe_target_manager.py --target nsx-gm1 --apply
 
 OUTPUT:
     nsx_wipe_bundle/<UTC_TS>/<host>/
@@ -286,11 +291,28 @@ def main() -> int:
                         "completely alone, and unmatched services/groups/"
                         "policies are never touched. Default: full customer "
                         "wipe.")
+    p.add_argument("--federation-global", dest="federation_global",
+                   action="store_true", default=None,
+                   help="Force the Global Manager API surface "
+                        "(/global-manager/api/v1/global-infra). Auto-enabled "
+                        "for nsx-gm* aliases; this flag only overrides the "
+                        "auto-detection.")
+    p.add_argument("--no-federation-global", dest="federation_global",
+                   action="store_false",
+                   help="Force the Local Manager API surface even for an "
+                        "nsx-gm* alias.")
     args = p.parse_args()
 
     host = resolve_manager(args.target)
     if not host:
         raise SystemExit(f"cannot resolve target alias: {args.target}")
+
+    # GM aliases speak /global-infra. Same auto-detect as backup_nsx_state.py:
+    # without it, a wipe aimed at a GM queries the LM surface, finds none of
+    # the /global-infra/ objects, and reports a clean no-op while the GM stays
+    # fully populated. Silent success is the worst failure mode for this tool.
+    fed = args.target.startswith("nsx-gm") if args.federation_global is None \
+        else args.federation_global
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_base).expanduser().resolve() / ts / host
@@ -299,6 +321,8 @@ def main() -> int:
     log.info("=" * 70)
     log.info("WIPE TARGET MANAGER")
     log.info("  Target        : %s (%s)", args.target, host)
+    log.info("  API surface   : %s", "GLOBAL MANAGER (/global-infra)" if fed
+             else "local manager (/infra)")
     log.info("  Domain        : %s", args.domain_id)
     log.info("  Mode          : %s", "APPLY" if args.apply else "DRY-RUN")
     log.info("  Scope         : %s",
@@ -307,7 +331,7 @@ def main() -> int:
     log.info("  Output bundle : %s", out_dir)
     log.info("=" * 70)
 
-    client = NsxPolicyClient(nsxmanager=host, federation_global=False)
+    client = NsxPolicyClient(nsxmanager=host, federation_global=fed)
 
     # Snapshot
     log.info("Capturing pre-wipe state on %s ...", host)
@@ -347,6 +371,7 @@ def main() -> int:
         "ran_at":  datetime.now(timezone.utc).isoformat(),
         "target":  f"alias:{args.target} ({host})",
         "domain_id": args.domain_id,
+        "federation_global": fed,
         "mode":    "APPLY" if args.apply else "DRY-RUN",
         "id_prefixes": args.id_prefix,
         "counts_before_wipe": {

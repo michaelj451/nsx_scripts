@@ -110,20 +110,35 @@ print("services:", len(c.list_services()))
 PY
 ```
 
-## 6. Restore
+## 6. Getting the objects back
 
-The backup bundle from step 2 is push-ready. The push tools discover files with
-`rglob`, so the backup's flat per-object YAML layout is consumable directly.
-Restore in creation order (services -> groups -> policies -> rules), dry-run
-first, then `--apply`:
+For load-test objects, **regenerate, do not restore**. They were created by a
+generator, so re-running it is faster, has no 4500-file bundle to babysit, and
+is deterministic with the same `--seed`:
 
 ```bash
-B=nsx_backup/nsx-lm2.lab.local/<UTC_TS>/nsx_export/nsx-lm2.lab.local/domains/default
+python tools/test/create_tag_load_objects.py --mode lm --host nsx-lm2.lab.local \
+    --prefix tagload- --seed <same seed> [--groups N --policies N --rules-per-policy N]
+```
+
+This is why there is no paired revert for the wipe, and why one should not be
+built: a revert that replays a backup would be strictly worse than the generator
+that already produces the same objects.
+
+Restoring from the step-2 backup is only for objects that were **not**
+generated (real customer config that landed on the manager). The push tools
+discover files with `rglob`, so the backup's flat per-object YAML layout is
+consumable directly. Push in creation order, dry-run first, then `--apply`:
+
+```bash
+B=nsx_backup/<host>/<UTC_TS>/nsx_export/<host>/domains/default
 python tools/nsx/services.py push --target nsx-lm2 --services-dir $B/services
 python tools/nsx/groups.py   push --target nsx-lm2 --groups-dir   $B/groups
 python tools/nsx/policies.py push --target nsx-lm2 --policies-dir $B/security-policies
 python tools/nsx/rules.py    push --target nsx-lm2 --rules-dir    $B/security-policies
 ```
+
+That push-back path has not been exercised round-trip on real gear.
 
 ## 7. Safety properties
 
@@ -141,8 +156,14 @@ python tools/nsx/rules.py    push --target nsx-lm2 --rules-dir    $B/security-po
 
 ## 8. Known gaps
 
-* There is no paired revert tool. Restore is the manual push sequence in step 6,
-  which has not been exercised round-trip on real gear. Treat step 2's backup as
-  mandatory, not optional.
+* No paired revert, by design: load-test objects are regenerated (section 6),
+  not restored. Step 2's backup is the safety net for anything on the manager
+  that was NOT generated, and that push-back path is untested.
 * The prefix match is on the NSX **id**, not the display name. Objects whose id
   and display name diverge will not match on what you see in the UI.
+* Overlaps with `tools/test/wipe_by_prefix.py`, which also deletes by id prefix
+  and is faster for pure load-test cleanup: it deletes policies first and lets
+  the rules go with them (no separate per-rule phase) and runs concurrent
+  workers. Use that one for routine `create_*_load_objects.py` cleanup. Use
+  this one when you want the `pre_wipe_state.json` audit snapshot, service
+  handling, or the Default-section rule protection described in section 1.

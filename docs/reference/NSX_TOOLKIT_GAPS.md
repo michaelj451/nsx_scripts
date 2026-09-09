@@ -43,6 +43,78 @@ For reference — these scenarios used to bite migrations and no longer do:
 
 ## 2. HIGH-severity gaps — common in customer envs, will silently break or land wrong
 
+### 2.0 Group IP resolution: ask NSX, do not reconstruct it (FIXED 2026-09-08)
+
+**The most expensive mistake we have made in this toolkit.** Recorded here in
+full because the failure is silent, the output looks plausible, and nothing in
+any report flags it.
+
+NSX answers "what IPs does this group resolve to?" directly:
+
+```
+GET /policy/api/v1/infra/domains/<domain>/groups/<group>/members/ip-addresses
+```
+
+That is exactly what the UI's **Effective Members > IP Addresses** tab renders.
+The toolkit used to reconstruct the answer instead, from evaluated VM member
+IDs looked up in a fabric VIF index. The reconstruction sees only **running
+VMs' VIF IPs**, and therefore silently drops:
+
+| Dropped by the reconstruction | Example on nsx-lm1 |
+|---|---|
+| Static `IPAddressExpression` entries | `hardware-subnet` to `10.2.1.0/24` |
+| IP ranges | `ip-address-group` to `10.6.0.52-10.6.0.60` |
+| Segment-derived subnets | `segment-group-1` to 4 subnets |
+| Nested-group contributions | `super-nested-group` to 5 IPs, not 2 |
+| Stopped VMs' last-known bindings | `network-2` to 2 IPs, not 0 |
+
+**Measured 2026-09-08 on nsx-lm1: 10 of 12 groups resolved to MORE IPs via the
+endpoint than the reconstruction found.** Only `network-6-1` and `vm2` agreed.
+
+Real-world impact, same day: a Workflow C run against lm3 produced **1 sibling
+group holding 2 IPs**. After the fix it produced **6 siblings holding 17 IPs**,
+every one matching NSX exactly. `network-2` had been dropped entirely and was
+miscounted as `skipped_empty_ips`, which reads like "this group has no IPs"
+rather than "we failed to find them".
+
+**The fix.** `NsxPolicyClient.get_group_effective_ips()` wraps the endpoint.
+`build_group_ip_additive_from_live_members.py --ip-source effective` is now the
+DEFAULT, and `capture_nsx_state.py --live-query` forwards it. The summary JSON
+records `"ip_source"` so any bundle can be audited after the fact.
+
+**Rules to keep:**
+
+1. **Never reconstruct what the manager will tell you.** If the UI shows a
+   number, find the endpoint behind it before deriving your own.
+2. `--ip-source vm-vif` reproduces the old behaviour. It exists only to
+   regenerate a pre-2026-09-08 bundle. Do not use it for a migration.
+3. A stopped VM's binding is NSX's **last known** value and can be stale. On
+   lm1, `network-2`'s members are the VMs named `10.6.2.101/102` while NSX
+   reports `10.6.1.101/102`, consistent with a clone that was never powered on
+   afterwards. Reconcile stopped-VM addresses against vCenter before cutover.
+4. Bundles captured before 2026-09-08, or with `"ip_source"` absent from the
+   summary, are a **lower bound**. Re-capture rather than trusting them.
+
+Verify any bundle against the manager:
+
+```bash
+python - <<'PY'
+import sys, logging; sys.path.insert(0, "app"); logging.disable(logging.INFO)
+from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.nsx_constants import resolve_manager
+c = NsxPolicyClient(nsxmanager=resolve_manager("nsx-lm1"), federation_global=False)
+idx = c.build_vm_ip_index()
+for g in c.list_groups(domain_id="default"):
+    if g.get("_system_owned"): continue
+    old = sorted(c.get_group_member_ips(group_id=g["id"], vm_ip_index=idx))
+    new = sorted(c.get_group_effective_ips(g["id"]))
+    if old != new:
+        print(f"{g['id']}\n   reconstructed: {old}\n   NSX says     : {new}")
+PY
+```
+
+See [RUNBOOK_AVS.md](../nsx/RUNBOOK_AVS.md) for the workflow this was found in.
+
 ### 2.1 `applied_to` (a.k.a. `scope`) in rules — ONLY the gateway-targeted case
 
 **Important:** This is **not** a gap when `applied_to` references **groups**.

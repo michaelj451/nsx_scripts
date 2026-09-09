@@ -251,6 +251,12 @@ def main() -> int:
                         "source and freeze their VM IPs into groups_additive/ (LM sources only; "
                         "ignored for GM). Default off: groups_additive/ is a faithful copy of the "
                         "export. Required when Workflow A Part 3 will push captured VM IPs.")
+    p.add_argument("--ip-source", choices=["effective", "vm-vif"], default="effective",
+                   help="With --live-query: where group IPs come from. 'effective' (default) "
+                        "asks NSX via .../groups/<id>/members/ip-addresses (what the UI's "
+                        "Effective Members tab shows: static IPs, ranges, segment subnets, "
+                        "nested groups, stopped VMs). 'vm-vif' is the legacy running-VM-only "
+                        "path that under-reported 10 of 12 groups on nsx-lm1.")
     p.add_argument("--with-vm-tags", action="store_true", default=True,
                    help="Capture VM tag state (LM only). Default ON; ignored for GM.")
     p.add_argument("--no-vm-tags", action="store_false", dest="with_vm_tags",
@@ -362,7 +368,7 @@ def main() -> int:
         "--continue-on-group-error",
     ]
     if args.live_query and not args.federation_global:
-        cmd.append("--live-query")
+        cmd.extend(["--live-query", "--ip-source", args.ip_source])
     steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
     # 3. Segment inventory WITH live details so transform can run offline. MANDATORY:

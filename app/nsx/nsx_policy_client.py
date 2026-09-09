@@ -813,6 +813,75 @@ class NsxPolicyClient:
 
         return sorted(ips)
 
+    def get_group_effective_ips(
+        self,
+        group_id: str,
+        domain_id: str = "default",
+        *,
+        page_size: int = 1000,
+        timeout: int = 60,
+        realize_attempts: int = 4,
+        realize_backoff: float = 15.0,
+    ) -> List[str]:
+        """
+        Every IP NSX itself resolves this group to, straight from the manager.
+
+        GET .../domains/<domain>/groups/<group>/members/ip-addresses
+
+        This is the list rendered by the UI's Effective Members > IP Addresses
+        tab, and it is authoritative. Prefer it over get_group_member_ips(),
+        which reconstructs IPs from evaluated VM members plus the fabric VIF
+        index and therefore silently omits:
+
+          - static IPAddressExpression entries   (10.2.1.0/24)
+          - IP ranges                            (10.6.0.52-10.6.0.60)
+          - segment-derived subnets              (from PathExpression members)
+          - IPs contributed by nested groups
+          - stopped VMs, whose last-known bindings NSX still reports
+
+        Measured on nsx-lm1 2026-09-08: 10 of 12 groups resolved to more IPs
+        here than the VIF-index path found.
+
+        Entries may be single addresses, CIDR blocks, or ranges: this returns
+        them verbatim as NSX expresses them, sorted and deduped. NOTE that for
+        a stopped VM the binding can be stale, so reconcile against vCenter
+        before treating one as authoritative.
+        """
+        path = self._policy_path(
+            f"/domains/{self._q(domain_id)}/groups/{self._q(group_id)}/members/ip-addresses"
+        )
+
+        # A group created moments ago has no realized membership yet, and this
+        # endpoint answers HTTP 400 (error_code 500141, "Error while getting
+        # membership ... INVALID_ARGUMENT") until the enforcement point catches
+        # up. That window is exactly when a migration re-run touches a source
+        # that just gained new groups, so retry rather than let the caller
+        # record an empty result. Verified on nsx-lm1 2026-09-09: a new group
+        # 400'd immediately after creation and resolved on the next attempt.
+        last: Optional[Exception] = None
+        for attempt in range(realize_attempts):
+            try:
+                results = self._get_all_results(path, page_size=page_size, timeout=timeout)
+                return sorted({str(ip) for ip in results if ip})
+            except NsxApiError as exc:
+                if exc.status_code != 400:
+                    raise
+                last = exc
+                if attempt < realize_attempts - 1:
+                    logging.warning(
+                        "Group %s membership not realized yet (attempt %d/%d); retrying in %.0fs",
+                        group_id, attempt + 1, realize_attempts, realize_backoff,
+                    )
+                    time.sleep(realize_backoff)
+
+        raise NsxApiError(
+            400,
+            f"group {group_id!r} membership never became readable after "
+            f"{realize_attempts} attempts. NSX has not realized this group yet. "
+            f"Re-run once realization completes rather than accepting an empty "
+            f"IP list for it. Underlying error: {last}",
+        )
+
     # ---------------------------
     # Update / Upsert helpers
     # ---------------------------
