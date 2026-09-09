@@ -994,7 +994,13 @@ def cmd_push(args: argparse.Namespace) -> int:
     files = _iter_group_files(groups_dir)
     log.info("Found %d group file(s).", len(files))
 
-    client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
+    # A plain dry run is fully offline. --diff-target opts into ONE read-only
+    # pass over the target so each dry-run row can report the IPs it would add
+    # or remove; without it a dry run cannot answer the question an operator
+    # actually needs answered before approving a destructive strip.
+    needs_client = args.apply or args.diff_target
+    client = NsxPolicyClient(nsxmanager=target_host,
+                             federation_global=args.federation_global) if needs_client else None
     baseline_path = None
     baseline_dict: Dict[str, Dict[str, Any]] = {}
     # Ids of every group this run actually writes. Persisted next to the
@@ -1007,6 +1013,13 @@ def cmd_push(args: argparse.Namespace) -> int:
         baseline_path = _append_baseline(reports_dir, baseline_dict)
         _write_pushed_ids(baseline_path, pushed_ids)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
+    elif args.diff_target:
+        # Read-only. No baseline file: a baseline is a revert artifact, and
+        # only an apply is allowed to create one.
+        log.info("Reading current groups on %s for the dry-run diff "
+                 "(read-only, no baseline written) ...", target_host)
+        baseline_dict = _capture_target_groups(client, args.domain_id)
+        log.info("  Target has %d customer group(s)", len(baseline_dict))
 
     # Interactive batch state.
     # Default behaviour:
@@ -1176,6 +1189,26 @@ def cmd_push(args: argparse.Namespace) -> int:
                         "as EMPTY (no remaining membership)" if not obj["expression"] else "with reduced membership",
                     )
 
+            # Per-row IP diff against the target's current state. Computed for
+            # BOTH modes so a dry run can preview the delta, feeding interactive
+            # batch mode's per-row preview and the row JSON/JSONL for forensic
+            # auditability. Skipped only for a plain offline dry run, where the
+            # fields are OMITTED rather than guessed: with no baseline every IP
+            # would look newly added, which is worse than saying nothing.
+            have_baseline = args.apply or args.diff_target
+            ips_added: List[str] = []
+            ips_removed: List[str] = []
+            if have_baseline:
+                before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
+                after_ips  = _extract_ip_entries(obj)
+                ips_added, ips_removed = _ip_diff(before_ips, after_ips)
+                row["ips_before"]      = before_ips    # full list, for audit replayability
+                row["ips_after"]       = after_ips     # full list, for audit replayability
+                row["before_ip_count"] = len(before_ips)
+                row["after_ip_count"]  = len(after_ips)
+                row["ips_added"]       = ips_added
+                row["ips_removed"]     = ips_removed
+
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -1183,8 +1216,18 @@ def cmd_push(args: argparse.Namespace) -> int:
                 if paths_seen:
                     seg_note = (f" (segments_seen={paths_seen} converted={converted_here}"
                                 f" unresolved={unresolved_here})")
-                log.info("[%d/%d  DRY  ok=%d fail=%d skip=%d] %s%s",
-                         i, len(files), ok, failed, skipped, gid, seg_note)
+                ip_note = ""
+                if have_baseline and (ips_added or ips_removed):
+                    ip_note = f" (ips +{len(ips_added)}/-{len(ips_removed)})"
+                log.info("[%d/%d  DRY  ok=%d fail=%d skip=%d] %s%s%s",
+                         i, len(files), ok, failed, skipped, gid, seg_note, ip_note)
+                # Surface a would-be contract violation now rather than at apply
+                # time. The row is not failed: a dry run reports, it does not
+                # decide.
+                if ips_removed and not args.intentional_ip_removal:
+                    log.warning("[%d/%d] %s WOULD REMOVE %d IP(s) on apply: %s. "
+                                "Re-run with --intentional-ip-removal if that is the intent.",
+                                i, len(files), gid, len(ips_removed), ips_removed)
                 rows.append(row)
                 continue
 
@@ -1192,19 +1235,6 @@ def cmd_push(args: argparse.Namespace) -> int:
             # without re-doing CSV/segment transforms (they're deterministic
             # but extra work). Stripped before JSON serialization below.
             row["_payload"] = obj
-
-            # Per-row IP diff against the captured baseline (used by interactive
-            # batch mode for human-readable per-row preview, and recorded in
-            # full in the row's JSON/JSONL for forensic auditability).
-            before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
-            after_ips  = _extract_ip_entries(obj)
-            ips_added, ips_removed = _ip_diff(before_ips, after_ips)
-            row["ips_before"]      = before_ips    # full list, for audit replayability
-            row["ips_after"]       = after_ips     # full list, for audit replayability
-            row["before_ip_count"] = len(before_ips)
-            row["after_ip_count"]  = len(after_ips)
-            row["ips_added"]       = ips_added
-            row["ips_removed"]     = ips_removed
 
             # --- ADDITIVE-ONLY CONTRACT ENFORCEMENT --------------------------
             # When CSV remap is in play, the run must never remove an IP from
@@ -1833,6 +1863,14 @@ def main() -> int:
                          "removed). Without this flag, any per-row diff showing removed IPs is "
                          "refused and marked as a contract failure. Cannot be combined with "
                          "--csv-remap (those workflows have opposite intents).")
+    pp.add_argument("--diff-target", action="store_true",
+                    help="DRY RUN ONLY: make one read-only pass over the target so every "
+                         "dry-run row reports ips_before/ips_after/ips_added/ips_removed, and "
+                         "the summary's total_ips_removed is truthful. A plain dry run is fully "
+                         "offline and therefore cannot know the delta, which is why it reports "
+                         "0 IPs removed even when the apply removes some. Use this before "
+                         "approving a destructive push. Ignored with --apply, which always "
+                         "captures a baseline and diffs against it.")
     pp.set_defaults(func=cmd_push)
 
     pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")

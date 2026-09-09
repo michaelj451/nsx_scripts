@@ -20,7 +20,7 @@ Phase 5  Revert             per-phase unwind, reverse order
 
 Every phase is dry-run first. Nothing writes without `--apply`.
 
-> ## THE FOUR THINGS THAT SILENTLY GO WRONG
+> ## THE FIVE THINGS THAT SILENTLY GO WRONG
 >
 > 1. **`--live-query` missing on the capture.** `groups_additive/` becomes a
 >    copy of the plain export, every tag group looks empty, and WF-C produces
@@ -36,6 +36,10 @@ Every phase is dry-run first. Nothing writes without `--apply`.
 >    for its effective IPs. The client now retries; if it still fails the run
 >    errors rather than recording an empty IP list.
 >    [Details](#failure-mode-unrealized-groups)
+> 5. **A dry run without `--diff-target` is blind.** It never contacts the
+>    target, so it reports 0 IPs added and 0 removed no matter what the apply
+>    would do. Always pass `--diff-target` on the group pushes before approving.
+>    [Details](#the-dry-run-pass)
 
 ---
 
@@ -257,11 +261,11 @@ Run the whole sequence with `--apply` removed, capturing each report:
 
 ```bash
 python tools/nsx/services.py push --target "$TGT" --services-dir "$EXP_SVC"  > $DRY/1_services.json 2>$DRY/1_services.log
-python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$EXP_GRP" --segments-mode strip > $DRY/2_groups.json 2>$DRY/2_groups.log
+python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$EXP_GRP" --segments-mode strip --diff-target > $DRY/2_groups.json 2>$DRY/2_groups.log
 python tools/nsx/policies.py push --target "$TGT" --policies-dir "$EXP_POL" > $DRY/3_policies.json 2>$DRY/3_policies.log
 python tools/nsx/rules.py    push --target "$TGT" --rules-dir    "$EXP_RUL" > $DRY/4_rules.json 2>$DRY/4_rules.log
-python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$SIB/groups"   > $DRY/5_siblings.json 2>$DRY/5_siblings.log
-python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$STRIP/groups" --intentional-ip-removal > $DRY/6_stripped.json 2>$DRY/6_stripped.log
+python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$SIB/groups" --diff-target > $DRY/5_siblings.json 2>$DRY/5_siblings.log
+python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$STRIP/groups" --intentional-ip-removal --diff-target > $DRY/6_stripped.json 2>$DRY/6_stripped.log
 python tools/nsx/rules.py    amend-refs --target "$TGT" --sibling-map "$SIB/sibling_map.json" > $DRY/7_amend.json 2>$DRY/7_amend.log
 
 for f in $DRY/*.json; do
@@ -270,12 +274,49 @@ for f in $DRY/*.json; do
 done
 ```
 
-**Known dry-run gap:** step 6's `total_ips_removed` reports `0` even when the
-apply removes IPs, because the count is computed from the write. Read
-`ips_before` / `ips_after` per row in the push report instead of trusting the
-dry-run total for the one destructive step.
+**`--diff-target` is what makes a dry run worth reading.** A plain dry run is
+fully offline: it never contacts the target, so it cannot know which IPs it
+would add or remove and reports `total_ips_removed: 0` even when the apply
+removes some. `--diff-target` adds one read-only pass over the target and fills
+in `ips_before` / `ips_after` / `ips_added` / `ips_removed` on every row, makes
+the summary total truthful, and logs a warning for any group that would lose
+IPs without `--intentional-ip-removal`.
+
+Measured on the reference run, same bundle and same target:
+
+| Dry run | `total_ips_removed` | Apply actually removed |
+|---|---|---|
+| offline (default) | 0 | 2 |
+| `--diff-target` | **2** | 2 |
+
+> **The dry run overwrites the apply's report, and vice versa.** Both write to
+> the same `<bundle>/push_report/<class>.json`. Run
+> `report_avs_run.py` immediately after each pass, into separate
+> `--out-dir`s (`$REPORT/dryrun` and `$REPORT/apply`); the aggregated report is
+> the only durable record. Baselines under `push_report/baselines/` are
+> unaffected, so revert still works either way.
 
 ### Consolidated change report
+
+Run this **twice**: once on the dry-run pass to review before approving, and
+again after the apply to record what happened. Only `--out-dir` and `--label`
+change.
+
+```bash
+# Pre-apply review (after the dry-run pass above)
+python tools/nsx/report_avs_run.py \
+  --report-root nsx_services_export/$SRC_HOST \
+  --report-root nsx_groups_export/$SRC_HOST \
+  --report-root nsx_policies_export/$SRC_HOST \
+  --report-root nsx_rules_export/$SRC_HOST \
+  --report-root nsx_rules_export/$TGT_HOST \
+  --report-root "$SIB" --report-root "$STRIP" \
+  --out-dir "$REPORT/dryrun" --since "$RUN_START" \
+  --label "PRE-APPLY dry run: $SRC to $TGT"
+```
+
+Everything lands in the `planned` column. Review `IPs added` / `IPs removed`
+and the per-object table, then apply. Afterwards:
 
 ```bash
 python tools/nsx/report_avs_run.py \
@@ -285,8 +326,8 @@ python tools/nsx/report_avs_run.py \
   --report-root nsx_rules_export/$SRC_HOST \
   --report-root nsx_rules_export/$TGT_HOST \
   --report-root "$SIB" --report-root "$STRIP" \
-  --out-dir "$REPORT" --since "$RUN_START" \
-  --label "AVS run: $SRC to $TGT"
+  --out-dir "$REPORT/apply" --since "$RUN_START" \
+  --label "APPLIED: $SRC to $TGT"
 ```
 
 Offline; reads the push reports only. Writes `avs_run_report.md` (operator
@@ -442,6 +483,67 @@ A stopped VM's binding is NSX's **last known** value and can be stale. On lm1,
 `network-2`'s members are the VMs named `10.6.2.101/102` while NSX reports
 `10.6.1.101/102`. Reconcile stopped-VM addresses against vCenter before
 cutover.
+
+---
+
+## Nested groups: what is and is not handled
+
+Tested 2026-09-09 on lm1 against NSX ground truth. Every NestedExpression shape
+decomposed correctly; group-to-group references did not.
+
+| Shape | Example | Sibling built | Matches NSX |
+|---|---|---|---|
+| Nested AND | `Nested(Tag a AND Tag b)` | yes | yes |
+| Nested ORs of ANDs | `Nested(a AND b) OR Nested(c AND d)` | yes | yes |
+| Nested AND + static IPs | `Nested(a AND b) OR IPAddressExpression` | yes | yes |
+| Three conditions in one nested block | `Nested(a AND b AND c)` | yes | yes |
+| Nested + group-ref + static IPs | all three at once | yes | yes (9 IPs) |
+| **Group reference only** | `PathExpression -> /groups/vm1` | **NO** | n/a |
+| **Group reference chain** | `A -> B -> vm1` (3 levels) | **NO** | n/a |
+
+`build_sibling_groups.py` recurses properly (`_has_condition_anywhere`,
+`_collect_ips`), and because siblings are built from NSX's effective IP list
+rather than by re-evaluating criteria, even the mixed shape lands exactly right.
+
+**The gap is group-to-group references.** A group whose only expression is a
+`PathExpression` at another group has no `Condition`, so it gets no sibling,
+and no `IPAddressExpression`, so it misses the `pure_ip_remap` bundle too. It
+lands in **no output bundle at all**. On the source it resolves fine and
+transitively (a 3-level chain returned exactly the leaf group's IPs), but on a
+target with no VM inventory the chain evaluates to nothing and rules using it
+silently stop matching. Detection script and remediation:
+[NSX_TOOLKIT_GAPS.md](../reference/NSX_TOOLKIT_GAPS.md) section 2.0c.
+
+A group-ref **alongside** a Condition is safe: the Condition makes it eligible
+and the effective-IP list already includes the referenced group's contribution.
+
+### NSX schema limits worth knowing
+
+| Attempted | NSX response |
+|---|---|
+| `NestedExpression` inside a `NestedExpression` | **rejected**: "NestedExpression is not allowed in nested expression. Allowed are Condition and ConjunctionOperator." Nesting is capped at one level |
+| Tag `NOTEQUALS` on a VirtualMachine | **rejected**: "The property Tag.notequals is not supported for the member type VirtualMachine" |
+
+So the recursive walkers can never see depth greater than one. The recursion is
+correct defensive coding, not a live requirement.
+
+---
+
+## Failure mode: stale realized port bindings
+
+NSX group membership counts a segment port's **realized** address bindings, not
+only its **discovered** ones, so a leftover manual binding attaches an address
+to every group that port's VM belongs to.
+
+Measured on lm1 2026-09-09: **5 of 6 VM ports had realized-only bindings**, and
+one stray address appeared in **14 groups**. A group whose only member VM is
+`10.6.0.101` resolved to `['10.6.0.101', '10.6.1.102']`.
+
+This is environment data, not a tool defect, and the effective-IP endpoint
+remains the right source since it is what the firewall enforces. But each stale
+binding is copied verbatim into a sibling and becomes a permanent literal IP on
+the target. **Audit ports before Phase 3**; script in
+[NSX_TOOLKIT_GAPS.md](../reference/NSX_TOOLKIT_GAPS.md) section 2.0d.
 
 ---
 

@@ -74,6 +74,46 @@ def bucket_for(status: Optional[str]) -> str:
     return STATUS_BUCKETS.get((status or "").lower(), "other")
 
 
+# Which workflow step a bundle belongs to. Without this the same object id shows
+# up twice with no way to tell the WF-A push from the WF-C stripped push, which
+# reads like a duplicate-row bug.
+def phase_for(bundle: str, report: str) -> str:
+    b = bundle.replace("\\", "/")
+    if report == "amend_refs.json":
+        return "C5 amend-refs"
+    if "nsx_sibling_groups" in b:
+        return "C3 siblings"
+    if "nsx_stripped_groups" in b:
+        return "C4 stripped"
+    if "nsx_pure_ip_remap" in b:
+        return "C  pure-ip"
+    if "nsx_services_export" in b:
+        return "A1 services"
+    if "nsx_groups_export" in b:
+        return "A2 groups"
+    if "nsx_policies_export" in b:
+        return "A3 policies"
+    if "nsx_rules_export" in b:
+        return "A4 rules"
+    return "?"
+
+
+# IP deltas only exist for group pushes. Everything else has no IP concept, so
+# saying "not measured" there would imply a gap that is not there.
+IP_BEARING = {"group"}
+
+
+def ip_cell(row: Dict[str, Any]) -> str:
+    if row["kind"] not in IP_BEARING:
+        return "n/a"
+    added, removed = row.get("ips_added"), row.get("ips_removed")
+    if added is None and removed is None:
+        return "not measured"
+    if not added and not removed:
+        return "0"
+    return f"+{len(added or [])}/-{len(removed or [])}"
+
+
 def load_rows(root: Path, since: Optional[datetime]) -> List[Dict[str, Any]]:
     """Every row from every recognised report file under <root>/push_report."""
     rows: List[Dict[str, Any]] = []
@@ -109,6 +149,7 @@ def load_rows(root: Path, since: Optional[datetime]) -> List[Dict[str, Any]]:
                 "kind": kind,
                 "bundle": str(root),
                 "report": name,
+                "phase": phase_for(str(root), name),
                 "id": r.get("id") or r.get("group_id") or r.get("rule_id")
                       or r.get("policy_id") or r.get("service_id"),
                 "display_name": r.get("display_name") or r.get("group_name"),
@@ -198,16 +239,30 @@ def main() -> int:
            f"- Rule refs added: **{refs_added}**",
            f"- Failures: **{len(failed)}**", ""]
 
+    # Detail table covers applied AND planned rows: on a dry-run pass every row
+    # is 'planned', and a pre-apply report that lists no objects is useless for
+    # the review it exists to support.
     applied = [r for r in rows if r["bucket"] == "applied"]
-    if applied:
-        md += ["## Objects changed", "",
-               "| Class | Id | Status | IPs +/- | Refs + |", "|---|---|---|---|---|"]
-        for r in sorted(applied, key=lambda x: (x["kind"], str(x["id"]))):
-            delta = ""
-            if r["ips_added"] or r["ips_removed"]:
-                delta = f"+{len(r['ips_added'] or [])}/-{len(r['ips_removed'] or [])}"
-            md.append(f"| {r['kind']} | `{r['id']}` | {r['status']} | {delta} | "
-                      f"{r['refs_added_total'] or ''} |")
+    detail = [r for r in rows if r["bucket"] in ("applied", "planned")]
+    if detail:
+        planned_only = not applied
+        md += ["## Objects " + ("that WOULD change (dry run)" if planned_only
+                                else "changed"), ""]
+        if planned_only:
+            md.append("Nothing has been written.")
+        unmeasured = [r for r in detail
+                      if r["kind"] in IP_BEARING
+                      and r.get("ips_added") is None and r.get("ips_removed") is None]
+        if unmeasured:
+            md.append(f"{len(unmeasured)} group row(s) show `not measured`: that pass ran "
+                      "without `--diff-target`, so its IP delta is unknown (not zero).")
+        md += ["", "An object appears once per phase that touches it, so a group in both "
+               "the WF-A push and the WF-C stripped push is listed twice.", "",
+               "| Phase | Class | Id | Status | IPs +/- | Refs + |",
+               "|---|---|---|---|---|---|"]
+        for r in sorted(detail, key=lambda x: (x["phase"], x["kind"], str(x["id"]))):
+            md.append(f"| {r['phase']} | {r['kind']} | `{r['id']}` | {r['status']} | "
+                      f"{ip_cell(r)} | {r['refs_added_total'] or ''} |")
         md.append("")
 
     if failed:

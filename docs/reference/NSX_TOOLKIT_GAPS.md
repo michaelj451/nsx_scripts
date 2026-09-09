@@ -115,6 +115,156 @@ PY
 
 See [RUNBOOK_AVS.md](../nsx/RUNBOOK_AVS.md) for the workflow this was found in.
 
+### 2.0b A dry run is offline, so it cannot tell you the IP delta (FIXED 2026-09-09)
+
+`groups.py push` without `--apply` never opens a session to the target. That
+makes a dry run fast and safe, and it also makes it **blind**: with no target
+state to diff against, every row is reported with no `ips_added` /
+`ips_removed` at all, and the summary's `total_ips_removed` is `0` no matter
+what the apply would do.
+
+That is worst exactly where it matters most. The decomposition workflow's
+destructive step (`--intentional-ip-removal`, pushing the stripped originals)
+is gated on an operator approving a removal count, and the preview showed zero.
+
+Measured on the same bundle and target, 2026-09-09:
+
+| Dry run mode | `total_ips_removed` | Apply actually removed |
+|---|---|---|
+| offline (default) | 0 | 2 |
+| `--diff-target` | **2** | 2 |
+
+**The fix.** `groups.py push --diff-target` makes one read-only pass over the
+target, populates `ips_before` / `ips_after` / `ips_added` / `ips_removed` on
+every dry-run row, makes the summary total truthful, and logs
+`WOULD REMOVE n IP(s) on apply` for any group that would lose IPs without
+`--intentional-ip-removal`. It is opt-in, so a plain dry run stays fully
+offline and no existing behaviour changes. Ignored with `--apply`, which
+always captures a baseline and diffs against it.
+
+**Rules to keep:**
+
+1. Pass `--diff-target` on every group dry run you intend to approve from.
+   Without it the preview is structural only: which objects get touched, not
+   what changes inside them.
+2. When the baseline is absent the IP fields are **omitted, not zeroed**. An
+   empty baseline would make every IP look newly added, which is worse than
+   silence. Absent fields mean "not measured", not "no change".
+3. A dry run reports, it does not decide: `--diff-target` warns about a
+   would-be contract violation but does not fail the row.
+
+**Related trap: the dry run and the apply overwrite each other's report.**
+Both write `<bundle>/push_report/<class>.json`. Run `report_avs_run.py` after
+each pass into separate `--out-dir`s; the aggregated report is the only durable
+record. Baselines under `push_report/baselines/` are unaffected, so revert is
+never at risk.
+
+See [RUNBOOK_AVS.md](../nsx/RUNBOOK_AVS.md) Phase 4.
+
+### 2.0c Group-to-group references produce NO sibling and vanish on the target
+
+A group whose membership comes only from a `PathExpression` pointing at another
+**group** (not a segment) is dropped by `build_sibling_groups.py`. It has no
+`Condition`, so it is counted in `skipped_no_condition`; it has no
+`IPAddressExpression`, so it does not reach the `pure_ip_remap` bundle either.
+It appears in no output bundle at all.
+
+On the source that group resolves correctly, and transitively:
+
+| Test group (lm1, 2026-09-09) | Expression | NSX resolves to | Sibling built |
+|---|---|---|---|
+| `nestvar-grp-ref-tag` | PathExpression -> group `vm1` | 3 IPs | **none** |
+| `nestvar-grp-ref-ip` | PathExpression -> group `ip-address-group` | 6 IPs (incl. a range and 2 CIDRs) | **none** |
+| `nestvar-grp-ref-chain` | PathExpression -> `grp-ref-tag` -> `vm1` | 3 IPs | **none** |
+
+Group nesting is transitive: the 3-level chain returned exactly `vm1`'s IPs.
+
+**Why it matters for AVS.** The parent inherits its IPs from the child's *tag*
+evaluation. On a target with no matching VM inventory or tags, the child
+resolves to nothing, so the parent resolves to nothing, and every rule using
+the parent silently stops matching. Nothing errors, and no report flags it,
+because from the tool's point of view there was never anything to decompose.
+
+**A group-ref alongside a Condition is fine.** `nestvar-nest-mixed-all`
+(NestedExpression + PathExpression to a group + static IPs) got a sibling with
+all 9 IPs, because the Condition made it eligible and the sibling is built from
+NSX's effective IP list, which already includes the referenced group's
+contribution.
+
+**How to apply:** before Phase 3, list any group whose expression is
+PathExpression-only and whose paths point at `/groups/`. Either give it a
+sibling by hand from `get_group_effective_ips()`, or flatten it into the
+referencing rules. Detect them with:
+
+```bash
+python - <<'PY'
+import sys, os, logging; sys.path.insert(0, "app"); logging.disable(logging.INFO)
+from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.nsx_constants import resolve_manager
+c = NsxPolicyClient(nsxmanager=resolve_manager(os.environ.get("SRC","nsx-lm1")),
+                    federation_global=False)
+for g in c.list_groups(domain_id="default"):
+    if g.get("_system_owned"): continue
+    ex = g.get("expression") or []
+    kinds = {e.get("resource_type") for e in ex}
+    paths = [p for e in ex for p in (e.get("paths") or []) if "/groups/" in p]
+    if paths and "Condition" not in kinds and "NestedExpression" not in kinds:
+        print(f"{g['id']}: group-ref only -> {paths}")
+        print(f"   resolves to {len(c.get_group_effective_ips(g['id']))} IPs, sibling will NOT be built")
+PY
+```
+
+### 2.0d Stale realized port bindings contaminate every effective IP list
+
+NSX group membership counts a segment port's **realized** address bindings, not
+only its **discovered** ones. A manual or leftover `address_bindings` entry
+therefore attaches an address to every group that port's VM belongs to, and
+`get_group_effective_ips()` faithfully reports it.
+
+Measured on nsx-lm1 2026-09-09: **5 of 6 VM ports carried realized-only
+bindings**, and one stray address, `10.6.1.102`, appeared in **14 groups**.
+
+```
+port ubuntu22-speedtest-10.6.0.101-ax2001
+  discovered: 10.6.0.101   <- real, matches the VIF
+  realized:   10.6.1.102   <- stale, wrong address on the same MAC
+  realized:   10.6.0.101
+```
+
+That single stale binding made a group whose only member VM is `10.6.0.101`
+resolve to `['10.6.0.101', '10.6.1.102']`. It also explains why `network-2`,
+whose members are the stopped `10.6.2.x` VMs, reports `10.6.1.101/102`: those
+ports have realized-only bindings and no discovered ones at all.
+
+**This is environment data, not a tool defect**, and the effective-IP endpoint
+is still the right source (it is what the firewall enforces). But every stale
+binding is copied verbatim into a sibling and shipped to the target, where it
+becomes a permanent literal IP rather than something that self-corrects when
+the VM is fixed.
+
+**How to apply:** audit ports before Phase 3 and clear stale bindings, or
+accept them knowingly. Any port whose realized set exceeds its discovered set
+is suspect:
+
+```bash
+python - <<'PY'
+import sys, os, logging; sys.path.insert(0, "app"); logging.disable(logging.INFO)
+from nsx.nsx_policy_client import NsxPolicyClient
+from nsx.nsx_constants import resolve_manager
+c = NsxPolicyClient(nsxmanager=resolve_manager(os.environ.get("SRC","nsx-lm1")),
+                    federation_global=False)
+for seg in c._get_all_results("/policy/api/v1/infra/segments"):
+    for p in c._get_all_results(f"/policy/api/v1/infra/segments/{seg['id']}/ports"):
+        st = c._get(f"/policy/api/v1/infra/segments/{seg['id']}/ports/{p['id']}/state")
+        d = {b.get("binding",{}).get("ip_address") for b in (st.get("discovered_bindings") or [])}
+        r = {b.get("binding",{}).get("ip_address") for b in (st.get("realized_bindings") or [])}
+        stale = {x for x in r - d if x}
+        if stale:
+            print(f"STALE {p.get('display_name')}: discovered={sorted(x for x in d if x)} "
+                  f"realized-only={sorted(stale)}")
+PY
+```
+
 ### 2.1 `applied_to` (a.k.a. `scope`) in rules — ONLY the gateway-targeted case
 
 **Important:** This is **not** a gap when `applied_to` references **groups**.
