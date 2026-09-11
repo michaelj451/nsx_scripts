@@ -32,6 +32,7 @@ Exit code is 1 when any row failed, so it is safe as a pipeline gate.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import sys
@@ -101,6 +102,40 @@ def phase_for(bundle: str, report: str) -> str:
 # IP deltas only exist for group pushes. Everything else has no IP concept, so
 # saying "not measured" there would imply a gap that is not there.
 IP_BEARING = {"group"}
+
+# Object classes get their own section, in push dependency order, so a reviewer
+# can answer "which rules changed?" without filtering a mixed table by eye.
+KIND_ORDER = ["service", "group", "policy", "rule", "rule-amend"]
+KIND_LABEL = {"service": "Services", "group": "Groups", "policy": "Policies",
+              "rule": "Rules", "rule-amend": "Rule reference amendments"}
+
+
+def table(headers: List[str], body: List[List[str]]) -> List[str]:
+    """Render a markdown table with every column padded to a fixed width.
+
+    Markdown renders either way, but these reports are read as plain text in a
+    terminal and pasted into change records, where a ragged table is hard to
+    scan. Padding costs nothing and makes the columns line up.
+    """
+    if not body:
+        return []
+    cols = len(headers)
+    grid = [[("" if c is None else str(c)) for c in (r + [""] * (cols - len(r)))[:cols]]
+            for r in body]
+    width = [max(len(headers[i]), max((len(r[i]) for r in grid), default=0))
+             for i in range(cols)]
+    out = ["| " + " | ".join(h.ljust(width[i]) for i, h in enumerate(headers)) + " |",
+           "|" + "|".join("-" * (width[i] + 2) for i in range(cols)) + "|"]
+    for r in grid:
+        out.append("| " + " | ".join(c.ljust(width[i]) for i, c in enumerate(r)) + " |")
+    return out
+
+
+def name_of(row: Dict[str, Any]) -> str:
+    """What a reviewer recognises. NSX ids are frequently UUIDs or truncated
+    slugs, so the display name is what appears in the UI and in a change
+    request. Falls back to the id only when a name is genuinely absent."""
+    return str(row.get("display_name") or row.get("id") or "?")
 
 
 def ip_cell(row: Dict[str, Any]) -> str:
@@ -218,6 +253,20 @@ def main() -> int:
     for root in args.report_root:
         rows.extend(load_rows(Path(root).expanduser(), since))
 
+    # One report describes ONE pass. groups.py archives every pass, so a window
+    # containing both a dry run and the apply that followed would otherwise list
+    # each object twice (once planned, once applied) and double every total.
+    # When any row was actually written, this is an apply report: drop the
+    # planned rows. A report with no applied rows is a dry-run report and keeps
+    # them.
+    applied_any = any(r["bucket"] in ("applied", "failed") for r in rows)
+    if applied_any:
+        dropped = [r for r in rows if r["bucket"] == "planned"]
+        rows = [r for r in rows if r["bucket"] != "planned"]
+        if dropped:
+            log.info("Apply report: dropped %d dry-run row(s) from the same window.",
+                     len(dropped))
+
     totals: Dict[str, Dict[str, int]] = {}
     for r in rows:
         totals.setdefault(r["kind"], {}).setdefault(r["bucket"], 0)
@@ -246,54 +295,111 @@ def main() -> int:
     (out_dir / "avs_run_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    buckets = ["applied", "planned", "no_change", "skipped", "failed", "other"]
-    md = [f"# {args.label}", "",
-          f"Generated {report['generated_at']}", ""]
-    if args.since:
-        md.append(f"Rows since `{args.since}`.\n")
-    md += ["## Changes by object class", "",
-           "| Class | " + " | ".join(b.replace("_", " ") for b in buckets) + " |",
-           "|---|" + "---|" * len(buckets)]
-    for kind in sorted(totals):
-        md.append(f"| {kind} | " + " | ".join(
-            str(totals[kind].get(b, 0)) for b in buckets) + " |")
-    md += ["",
-           f"- IPs added: **{ips_added}**",
-           f"- IPs removed: **{ips_removed}**",
-           f"- Rule refs added: **{refs_added}**",
-           f"- Failures: **{len(failed)}**", ""]
-
-    # Detail table covers applied AND planned rows: on a dry-run pass every row
-    # is 'planned', and a pre-apply report that lists no objects is useless for
-    # the review it exists to support.
     applied = [r for r in rows if r["bucket"] == "applied"]
     detail = [r for r in rows if r["bucket"] in ("applied", "planned")]
-    if detail:
-        planned_only = not applied
-        md += ["## Objects " + ("that WOULD change (dry run)" if planned_only
-                                else "changed"), ""]
-        if planned_only:
-            md.append("Nothing has been written.")
-        unmeasured = [r for r in detail
-                      if r["kind"] in IP_BEARING
-                      and r.get("ips_added") is None and r.get("ips_removed") is None]
-        if unmeasured:
-            md.append(f"{len(unmeasured)} group row(s) show `not measured`: that pass ran "
-                      "without `--diff-target`, so its IP delta is unknown (not zero).")
-        md += ["", "An object appears once per phase that touches it, so a group in both "
-               "the WF-A push and the WF-C stripped push is listed twice.", "",
-               "| Phase | Class | Id | Status | IPs +/- | Refs + |",
-               "|---|---|---|---|---|---|"]
-        for r in sorted(detail, key=lambda x: (x["phase"], x["kind"], str(x["id"]))):
-            md.append(f"| {r['phase']} | {r['kind']} | `{r['id']}` | {r['status']} | "
-                      f"{ip_cell(r)} | {r['refs_added_total'] or ''} |")
-        md.append("")
+    mode = "APPLY" if applied_any else "DRY RUN"
+
+    # Classify what each row actually DID, not merely that it was pushed.
+    #   created   - the object did not exist (PUT succeeded outright)
+    #   changed   - a measurable delta: IPs moved, or rule refs added
+    #   rewritten - pushed over an object that already existed, with no
+    #               measurable delta. For groups that means the IPs are
+    #               identical; for other classes we cannot see inside the
+    #               payload, so this is NOT a promise that nothing changed.
+    def verdict(r: Dict[str, Any]) -> str:
+        if r["bucket"] == "failed":
+            return "failed"
+        if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")):
+            return "changed"
+        if str(r.get("status", "")).endswith("_put"):
+            return "created"
+        return "rewritten"
+
+    for r in detail:
+        r["verdict"] = verdict(r)
+    created   = [r for r in detail if r["verdict"] == "created"]
+    changed   = [r for r in detail if r["verdict"] == "changed"]
+    rewritten = [r for r in detail if r["verdict"] == "rewritten"]
+    opaque    = [r for r in rewritten if r["kind"] not in IP_BEARING]
+
+    md = [f"# {args.label}", "",
+          f"**{mode}** | generated {report['generated_at']}"
+          + (f" | rows since `{args.since}`" if args.since else ""), ""]
+
+    # ---- the answer, first -------------------------------------------------
+    verb = "would be" if not applied_any else ""
+    past = "were" if applied_any else "would be"
+    md += ["## What changed", ""]
+    if not (created or changed or failed):
+        md += [f"**Nothing{' would be' if not applied_any else ''} changed.** "
+               f"{len(rewritten)} object(s) {past} pushed over existing, identical content.", ""]
+    else:
+        md += table(["Outcome", "Count"], [
+            [f"Created {verb}".strip(),  f"**{len(created)}**"],
+            [f"Changed {verb}".strip(),  f"**{len(changed)}**"],
+            ["Failed",                   f"**{len(failed)}**"],
+            ["Pushed, no measurable change", str(len(rewritten))],
+        ]) + [""]
+        # Broken out per object class: a reviewer signing off a change window
+        # cares about "which RULES changed" as a separate question from
+        # "which GROUPS changed", and a single mixed table forces them to
+        # filter it by eye.
+        for kind in KIND_ORDER:
+            hits = [r for r in (created + changed) if r["kind"] == kind]
+            if not hits:
+                continue
+            md += [f"### {KIND_LABEL[kind]} ({len(hits)})", ""]
+            md += table(["Phase", "Name", "Verdict", "IPs +/-", "Refs +"],
+                        [[r["phase"], name_of(r), r["verdict"], ip_cell(r),
+                          str(r["refs_added_total"] or "")]
+                         for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
+                                                             name_of(x)))]) + [""]
+
+    md += [f"- IPs added: **{ips_added}**   removed: **{ips_removed}**   "
+           f"rule refs added: **{refs_added}**", ""]
 
     if failed:
-        md += ["## FAILURES", "", "| Class | Id | Reason |", "|---|---|---|"]
-        for r in failed:
-            md.append(f"| {r['kind']} | `{r['id']}` | {str(r['reason'])[:120]} |")
-        md.append("")
+        md += ["## Failures", ""]
+        md += table(["Class", "Name", "Reason"],
+                    [[r["kind"], name_of(r), str(r["reason"])[:120]] for r in failed]) + [""]
+
+    # ---- caveats that change how the numbers should be read ----------------
+    caveats = []
+    unmeasured = [r for r in detail if r["kind"] in IP_BEARING
+                  and r.get("ips_added") is None and r.get("ips_removed") is None]
+    if unmeasured:
+        caveats.append(f"{len(unmeasured)} group row(s) have an unmeasured IP delta: that "
+                       "pass ran without `--diff-target`, so the delta is unknown, not zero.")
+    if opaque:
+        caveats.append(f"{len(opaque)} non-group object(s) are listed as no measurable change. "
+                       "Only groups expose an IP diff, so a policy, rule or service whose "
+                       "payload differs would look identical here.")
+    if caveats:
+        md += ["## Read this before trusting the counts", ""] + [f"- {c}" for c in caveats] + [""]
+
+    # ---- full detail, demoted and split per class --------------------------
+    if detail:
+        md += ["## Appendix: every object touched", "",
+               f"{len(detail)} row(s). An object appears once per phase that touches it, so a "
+               "group in both the WF-A push and the WF-C stripped push is listed twice.", ""]
+        for kind in KIND_ORDER:
+            hits = [r for r in detail if r["kind"] == kind]
+            if not hits:
+                continue
+            v = collections.Counter(r["verdict"] for r in hits)
+            tally = ", ".join(f"{n} {k}" for k, n in sorted(v.items()))
+            md += [f"### {KIND_LABEL[kind]} ({len(hits)}: {tally})", ""]
+            md += table(["Phase", "Name", "Verdict", "Status", "IPs +/-", "Refs +"],
+                        [[r["phase"], name_of(r), r["verdict"], str(r["status"]),
+                          ip_cell(r), str(r["refs_added_total"] or "")]
+                         for r in sorted(hits, key=lambda x: (x["phase"], name_of(x)))]) + [""]
+        # Anything whose class is not in KIND_ORDER still has to appear.
+        rest = [r for r in detail if r["kind"] not in KIND_ORDER]
+        if rest:
+            md += [f"### Other ({len(rest)})", ""]
+            md += table(["Phase", "Class", "Name", "Verdict", "Status"],
+                        [[r["phase"], r["kind"], name_of(r), r["verdict"], str(r["status"])]
+                         for r in sorted(rest, key=lambda x: (x["phase"], name_of(x)))]) + [""]
 
     (out_dir / "avs_run_report.md").write_text("\n".join(md), encoding="utf-8")
 
