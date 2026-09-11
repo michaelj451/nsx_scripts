@@ -122,8 +122,32 @@ def load_rows(root: Path, since: Optional[datetime]) -> List[Dict[str, Any]]:
         log.warning("no push_report/ under %s (nothing pushed from this bundle?)", root)
         return rows
 
+    # Fixed-name reports are the latest pass only. push_report/runs/ holds a
+    # timestamped copy of EVERY pass, which is what makes a pre-apply dry-run
+    # report reconstructable after the apply has overwritten the fixed names.
+    runs = pr / "runs"
+    archived: Dict[str, List[Path]] = {}
+    if runs.is_dir():
+        for f in sorted(runs.glob("*.json")):
+            if f.name.endswith("_summary.json"):
+                continue
+            for n, k in REPORT_FILES.items():
+                if f.name.startswith(n.removesuffix(".json")):
+                    archived.setdefault(k, []).append(f)
+                    break
+
+    sources: List[tuple] = []
     for name, kind in REPORT_FILES.items():
-        f = pr / name
+        if kind in archived:
+            # The archive is a superset: it contains this pass AND every
+            # earlier one. Reading the fixed-name file too would double-count
+            # the most recent pass.
+            sources.extend((f, kind) for f in archived[kind])
+        else:
+            sources.append((pr / name, kind))
+
+    for f, kind in sources:
+        name = f.name
         if not f.is_file():
             continue
         try:

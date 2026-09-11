@@ -1505,11 +1505,27 @@ def cmd_push(args: argparse.Namespace) -> int:
         "errors_log": str(errors_log),
     }
 
+    # Every pass ALSO writes a timestamped copy. The fixed-name files are the
+    # "latest" pointer that existing tooling reads, but they are overwritten by
+    # the next invocation: without the archive, running a dry run and then the
+    # apply destroys the dry run's machine-readable rows, and the pre-apply
+    # report can never be rebuilt. Timestamped logs already worked this way;
+    # the JSON did not, which made report_avs_run.py unable to see any pass but
+    # the most recent one.
+    mode_tag = "apply" if args.apply else "dryrun"
+    archive = reports_dir / "runs"
+    archive.mkdir(parents=True, exist_ok=True)
+    stem = f"groups_{RUN_TS}_{mode_tag}"
+
     (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    (reports_dir / "groups.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+    (archive / f"{stem}_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    rows_json = json.dumps(rows, indent=2, sort_keys=True)
+    (reports_dir / "groups.json").write_text(rows_json, encoding="utf-8")
+    (archive / f"{stem}.json").write_text(rows_json, encoding="utf-8")
     with (reports_dir / "groups.jsonl").open("w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, sort_keys=True) + "\n")
+    log.info("Report archive: %s", archive / f"{stem}.json")
     if failed:
         failures = [r for r in rows if r.get("status") == "failed"]
         (reports_dir / "failures.json").write_text(json.dumps(failures, indent=2, sort_keys=True), encoding="utf-8")
