@@ -295,6 +295,16 @@ def audit_lines(r: Dict[str, Any]) -> List[str]:
     if csv_added:
         out.append(f"- CSV-mapped values added ({len(csv_added)}): {_vals(csv_added)}")
 
+    # Build-time outcomes. `copied` reached the sibling verbatim; `dropped` did
+    # not reach it at all, and is the number that matters: an address the CSV
+    # could not map is a workload that stops matching after cutover.
+    copied = r.get("ips_manual_copied") or []
+    if copied:
+        out.append(f"- Manually entered IPs copied verbatim ({len(copied)}): {_vals(copied)}")
+    dropped = [ip for ip in (r.get("ips_uncovered") or []) if ip not in copied]
+    if dropped:
+        out.append(f"- **IPs DROPPED, no CSV mapping ({len(dropped)}): {_vals(dropped)}**")
+
     # A created object has nothing to diff against, so its payload IS the
     # change record. Show it rather than reporting an empty delta.
     if r["verdict"] == "created":
@@ -357,10 +367,32 @@ def load_modes(root: Path, since: Optional[datetime]) -> set:
     return modes
 
 
+def load_sibling_map(root: Path) -> Dict[str, Dict[str, Any]]:
+    """Per-sibling build audit, keyed by sibling id, or {} if there is none.
+
+    The push reports say which addresses reached the target. Only the BUILD
+    knows which ones never made it into the payload: an address with no CSV
+    mapping is absent from the sibling, so no push row can mention it. That
+    detail lives in sibling_map.json beside the bundle, and without reading it
+    the report cannot show what a WF-D run dropped.
+    """
+    f = root / "sibling_map.json"
+    if not f.is_file():
+        return {}
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        log.warning("unreadable sibling map %s: %s", f, exc)
+        return {}
+    return {e["sibling_id"]: e for e in (data.get("map") or [])
+            if isinstance(e, dict) and e.get("sibling_id")}
+
+
 def load_rows(root: Path, since: Optional[datetime],
               workflow: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every row from every recognised report file under <root>/push_report."""
     rows: List[Dict[str, Any]] = []
+    smap = load_sibling_map(root)
     pr = root / "push_report"
     if not pr.is_dir():
         log.warning("no push_report/ under %s (nothing pushed from this bundle?)", root)
@@ -449,6 +481,10 @@ def load_rows(root: Path, since: Optional[datetime],
                 # the only record of what it actually is: no diff exists,
                 # because there was nothing to diff against.
                 "file": r.get("file"),
+                # Build-time audit for a sibling: which source addresses had no
+                # CSV mapping, and which hand-entered ones were copied verbatim.
+                "ips_uncovered": (smap.get(str(r.get("id"))) or {}).get("ips_uncovered"),
+                "ips_manual_copied": (smap.get(str(r.get("id"))) or {}).get("ips_manual_copied"),
                 "timestamp": ts,
             })
     return rows
@@ -642,6 +678,28 @@ def main() -> int:
                           str(r["refs_added_total"] or "")]
                          for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
                                                              name_of(x)))]) + [""]
+
+    # An address with no CSV mapping never reaches the sibling, so no push row
+    # can report it. Surfaced above the fold because a dropped address is a
+    # workload that silently stops matching after cutover.
+    dropped_by_row = [(r, [ip for ip in (r.get("ips_uncovered") or [])
+                           if ip not in (r.get("ips_manual_copied") or [])])
+                      for r in detail]
+    dropped_by_row = [(r, d) for r, d in dropped_by_row if d]
+    copied_total = sum(len(r.get("ips_manual_copied") or []) for r in detail)
+    if dropped_by_row:
+        n = sum(len(d) for _, d in dropped_by_row)
+        md += [f"> **{n} source address(es) had no CSV mapping and are NOT in the "
+               f"sibling groups.** They reach no rule through the sibling, so any "
+               "workload on them stops matching once enforcement moves. Extend the CSV, "
+               "or re-run the build with `--skip-uncovered` to skip those groups "
+               "entirely rather than emit a partial sibling.", ""]
+        md += table(["Sibling", "Dropped addresses"],
+                    [[name_of(r), ", ".join(d)] for r, d in
+                     sorted(dropped_by_row, key=lambda x: name_of(x[0]))]) + [""]
+    if copied_total:
+        md += [f"- {copied_total} manually entered address(es) were copied into siblings "
+               "verbatim (no mapping applied). Listed per group below.", ""]
 
     refs_kept = sum(r.get("refs_preserved_total") or 0 for r in rows)
     refs_lost = sum(r.get("refs_removed_total") or 0 for r in rows)

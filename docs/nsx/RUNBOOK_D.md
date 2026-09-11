@@ -177,6 +177,48 @@ window.
 | Operator credentials | NSX manager creds with policy/write permissions on lm1. |
 | Change window | Off-peak preferred. The push is strict-additive (only CREATE operations), but each create triggers an effective-member recompute. |
 | Rollback rehearsed | Step 3 revert tested against a lab-equivalent state first. |
+| `OBJECT_APPENDIX_AVS` set in `.env` | WF-D siblings must not share WF-C's suffix. See below. |
+
+---
+
+## Sibling suffix: WF-D must not share WF-C's
+
+WF-C and WF-D both create sibling groups named `<original_id><suffix>`, but
+their contents are **different**:
+
+| Workflow | Sibling holds | Suffix | `.env` variable |
+|---|---|---|---|
+| C | the SOURCE addresses, copied | `_np_ips` | `OBJECT_APPENDIX` |
+| D | the CSV-REMAPPED addresses | `_avs_ips` | `OBJECT_APPENDIX_AVS` |
+
+Sharing one suffix is the failure this split exists to prevent. The ids would
+collide, and the push is strict-additive, so a WF-D push would **merge** mapped
+`10.7.x` addresses into a WF-C sibling already holding source `10.6.x`
+addresses. Both sets end up wrong, the push reports success, and every rule
+referencing that sibling then permits both ranges.
+
+```bash
+OBJECT_APPENDIX=_np_ips
+OBJECT_APPENDIX_AVS=_avs_ips
+```
+
+`run_workflow.py` picks the right one per phase, so the WF-D phases need no
+`--appendix` argument. It refuses to run when `OBJECT_APPENDIX_AVS` is unset,
+and refuses again if you force the WF-C suffix onto a WF-D phase.
+
+Running `build_sibling_groups.py` by hand does **not** get that protection: it
+defaults to `OBJECT_APPENDIX`, so a WF-D build has to pass `--appendix` itself.
+
+```bash
+python tools/nsx/build_sibling_groups.py --source nsx-lm1 \
+  --appendix "$OBJECT_APPENDIX_AVS" \
+  --csv-remap data/nonprod_map.csv \
+  --skip-segment-groups --no-stripped-originals
+```
+
+**Do not change either suffix between runs against the same target.** A changed
+suffix renames nothing, because NSX ids are immutable: it creates a second,
+parallel sibling set and leaves the first in place, still rule-referenced.
 
 ---
 
@@ -565,7 +607,7 @@ want different.
 | **Any group with a PathExpression** | **Skipped via `--skip-segment-groups`** (recommended for prod) | Omit the flag to allow tag+segment+IP hybrids to decompose (NOT recommended for prod) |
 | **Pure-IP groups** | **Emitted to `nsx_pure_ip_remap/` for in-place additive CSV-remap push (step 2b)** | Skip step 2b entirely if no mapped IPs are wanted on pure-IP groups |
 | CSV-uncovered IPs | Sibling emitted with only mapped IPs; uncovered noted in audit | `--skip-uncovered` to skip the whole group |
-| Appendix | `_sibling` (from `.env` `OBJECT_APPENDIX`) | Override with `--appendix` per run |
+| Appendix | `OBJECT_APPENDIX_AVS` from `.env` (`_avs_ips`), NOT `OBJECT_APPENDIX`. See [Sibling suffix](#sibling-suffix-wf-d-must-not-share-wf-cs) | Override with `--appendix` per run |
 | `group_type` on siblings | `[IPAddress]` (consistent with WF-C) | — |
 | Rule amendment (step 3) | **Optional, separate change window** — strict-additive | Skip; rules continue to reference originals only |
 | Empty-groups handling | Reported in `empty_groups.json`; no sibling, no remap entry | — |

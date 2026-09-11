@@ -13,7 +13,20 @@ or [RUNBOOK_D_COMMANDS_PS.md](RUNBOOK_D_COMMANDS_PS.md) for PowerShell.
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
+export OBJECT_APPENDIX_AVS=$(grep -E '^OBJECT_APPENDIX_AVS=' .env | cut -d= -f2-)
+echo "WF-D sibling suffix: $OBJECT_APPENDIX_AVS"
 ```
+
+The Python tools read `.env` themselves, but your **shell** does not, so the
+suffix has to be exported before any command below can interpolate it. Confirm
+the echo prints `_avs_ips` and not an empty string: `build_sibling_groups.py`
+treats an empty `--appendix` as unset and silently falls back to
+`OBJECT_APPENDIX` (`_np_ips`), which is WF-C's suffix and would merge remapped
+addresses into WF-C's source-IP siblings. See
+[RUNBOOK_D.md](RUNBOOK_D.md#sibling-suffix-wf-d-must-not-share-wf-cs).
+
+Or skip all of this and let the driver pick the suffix per phase:
+[RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md).
 
 ---
 
@@ -58,6 +71,7 @@ python tools/nsx/compare_group_ips.py \
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
+  --appendix "$OBJECT_APPENDIX_AVS" \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups \
@@ -73,6 +87,7 @@ Outputs:
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
+  --appendix "$OBJECT_APPENDIX_AVS" \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups \
@@ -161,6 +176,7 @@ Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit code: `0` = all pass, `1` = at le
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
+  --appendix "$OBJECT_APPENDIX_AVS" \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups

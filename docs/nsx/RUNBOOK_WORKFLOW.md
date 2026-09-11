@@ -267,7 +267,7 @@ up an older run's baseline.
 | `--rollback` | Undo the phase. Combine with `--apply` to write |
 | `--csv-remap` | Required for `d2a` / `d2b`. Not needed for verify or rollback |
 | `--run-dir` | Default `nsx_avs_runs/<source>_to_<target>` |
-| `--appendix` | Sibling suffix. Default `OBJECT_APPENDIX` from `.env`. **Do not change between runs**: a different suffix creates a second, parallel sibling set |
+| `--appendix` | Sibling suffix. Default: `OBJECT_APPENDIX` (`_np_ips`) for phase `c`, `OBJECT_APPENDIX_AVS` (`_avs_ips`) for the `d*` phases. The driver picks per phase and refuses if WF-D would share WF-C's suffix. **Do not change either between runs**: a different suffix creates a second, parallel sibling set rather than renaming anything |
 | `--domain-id` | Default `default` |
 | `--continue-on-error` | Keep going after a failed step. Default is to stop, so a broken push does not cascade into the next dependency level |
 

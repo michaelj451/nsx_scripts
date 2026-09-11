@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -326,7 +327,11 @@ def main() -> int:
                    help="Where bundles and reports land (default: nsx_avs_runs/<src>_to_<tgt>).")
     p.add_argument("--domain-id", default="default")
     p.add_argument("--appendix", default=None,
-                   help="Phase C sibling suffix; default OBJECT_APPENDIX from .env.")
+                   help="Sibling suffix. Default: OBJECT_APPENDIX from .env for phase C, "
+                        "OBJECT_APPENDIX_AVS for the WF-D phases. The two must differ: "
+                        "WF-C siblings hold the SOURCE addresses and WF-D siblings hold "
+                        "the CSV-REMAPPED ones, so a shared suffix would merge mapped "
+                        "addresses into the source-IP siblings.")
     p.add_argument("--capture", action=argparse.BooleanOptionalAction, default=True,
                    help="Re-capture the source before a DRY RUN so it reflects the "
                         "source as it is now, and gate on the capture summary. On by "
@@ -359,6 +364,26 @@ def main() -> int:
     if args.source == args.target:
         log.warning("source and target are the same manager (%s): this is the "
                     "supported in-place mode, but confirm that is intended.", args.source)
+
+    # WF-D siblings carry CSV-REMAPPED addresses; WF-C siblings carry the source
+    # addresses. They must land in different groups, so WF-D defaults to its own
+    # suffix. Sharing one would make a WF-D push merge mapped IPs into WF-C's
+    # siblings, which reads as success and quietly corrupts both sets.
+    wf_c_appendix = os.environ.get("OBJECT_APPENDIX")
+    if args.appendix is None and args.phase.startswith("d"):
+        args.appendix = os.environ.get("OBJECT_APPENDIX_AVS")
+        if not args.appendix:
+            log.error("OBJECT_APPENDIX_AVS is not set. WF-D needs a suffix distinct "
+                      "from OBJECT_APPENDIX (%r), because its siblings hold remapped "
+                      "addresses. Set it in .env or pass --appendix.", wf_c_appendix)
+            return 2
+        log.info("  appendix : %s (OBJECT_APPENDIX_AVS, WF-D remapped siblings)",
+                 args.appendix)
+    if args.appendix and wf_c_appendix and args.appendix == wf_c_appendix \
+            and args.phase.startswith("d"):
+        log.error("WF-D suffix %r is the same as OBJECT_APPENDIX. The remapped "
+                  "siblings would merge into the WF-C source-IP siblings.", args.appendix)
+        return 2
 
     src_host = resolve_manager(args.source)
     tgt_host = resolve_manager(args.target)
