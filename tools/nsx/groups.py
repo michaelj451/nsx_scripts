@@ -1884,14 +1884,15 @@ def main() -> int:
                          "removed). Without this flag, any per-row diff showing removed IPs is "
                          "refused and marked as a contract failure. Cannot be combined with "
                          "--csv-remap (those workflows have opposite intents).")
-    pp.add_argument("--diff-target", action="store_true",
-                    help="DRY RUN ONLY: make one read-only pass over the target so every "
-                         "dry-run row reports ips_before/ips_after/ips_added/ips_removed, and "
-                         "the summary's total_ips_removed is truthful. A plain dry run is fully "
-                         "offline and therefore cannot know the delta, which is why it reports "
-                         "0 IPs removed even when the apply removes some. Use this before "
-                         "approving a destructive push. Ignored with --apply, which always "
-                         "captures a baseline and diffs against it.")
+    pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
+                    help="DRY RUN: make one read-only pass over the target so every row "
+                         "reports ips_before/ips_after/ips_added/ips_removed and whether the "
+                         "group already exists, and the summary's total_ips_removed is "
+                         "truthful. ON BY DEFAULT: a fully offline dry run cannot know the "
+                         "delta and reports 0 IPs removed even when the apply removes some, "
+                         "which is exactly the preview you must not approve from. "
+                         "--no-diff-target restores the offline behaviour. Ignored with "
+                         "--apply, which always captures a baseline and diffs against it.")
     pp.set_defaults(func=cmd_push)
 
     pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")

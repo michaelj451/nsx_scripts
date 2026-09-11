@@ -581,6 +581,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             # Preserve group refs that exist only on the target (sibling groups
             # from WF-C / WF-D). Computed for BOTH modes so a dry run with
             # --diff-target previews exactly what the apply will do.
+            if need_target:
+                row["exists_on_target"] = f"{policy_id}::{rid}" in baseline
             tgt_payload = (baseline.get(f"{policy_id}::{rid}") or {}).get("payload") or {}
             if tgt_payload:
                 rule, mrep = _merge_group_refs(rule, tgt_payload, replace=args.replace_refs)
@@ -1232,10 +1234,12 @@ def main() -> int:
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <rules-dir>/../push_report/.")
-    pp.add_argument("--diff-target", action="store_true",
-                    help="On a dry run, make one read-only pass over the target so the "
-                         "preview shows which target-only group refs the push would keep "
-                         "or drop. Ignored with --apply, which always reads the target.")
+    pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
+                    help="Read the target on a dry run so the preview shows which rules "
+                         "already exist and which target-only group refs the push would "
+                         "keep. On by default: a report that guesses is worse than one "
+                         "that says it does not know. --no-diff-target makes the dry run "
+                         "fully offline. Ignored with --apply, which always reads.")
     pp.add_argument("--replace-refs", action="store_true",
                     help="Overwrite source_groups / destination_groups / scope with the "
                          "source payload exactly, DROPPING any group ref that exists only "

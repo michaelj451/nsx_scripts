@@ -3,32 +3,24 @@
 
 Run a whole workflow phase as ONE command, and always produce its report.
 
-Four verbs, same shape for every phase:
+Four verbs, same shape for every phase. Define a shell function once, then the
+only thing that changes per command is the verb:
 
-    W="python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm2"
-    $W --phase a                        # dry run
-    $W --phase a --apply                # apply
-    $W --phase a --verify               # read-only check
-    $W --phase a --rollback             # rollback preview
-    $W --phase a --rollback --apply     # rollback
+    wf() { python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm2 "$@"; }
+
+    wf --phase a                        # dry run
+    wf --phase a --apply                # apply
+    wf --phase a --verify               # read-only check
+    wf --phase a --rollback             # rollback preview
+    wf --phase a --rollback --apply     # rollback
+
+Use a function, not a variable: W="python ..." followed by $W --phase a works
+in bash but fails in zsh, which does not word-split an unquoted parameter.
 
 Phases: a (WF-A Part 1 clone), c (WF-C decomposition), and d2a / d2b / d3 / d5
-(one WF-D change window each). Reports land under
+(one WF-D change window each; d2a and d2b need --csv-remap). Reports land under
 <run-dir>/report/<phase>/<mode>, so no two invocations overwrite each other.
-
-    # Phase A Part 1 (clone). Dry run, then apply.
-    python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm2 --phase a
-    python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm2 --phase a --apply
-
-    # Phase C (sibling decomposition).
-    python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm2 --phase c
-    python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm2 --phase c --apply
-
-    # WF-D, one change window per invocation (2a is the only mandatory one).
-    python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm1 \
-        --phase d2a --csv-remap data/nonprod_map.csv
-    python tools/nsx/run_workflow.py --source nsx-lm1 --target nsx-lm1 \
-        --phase d2a --csv-remap data/nonprod_map.csv --apply
+See docs/nsx/RUNBOOK_WORKFLOW.md.
 
 WHY THIS EXISTS
 
@@ -44,15 +36,21 @@ run produces the dry-run report; an apply produces the apply report. Neither
 can be forgotten, and the two can never be conflated, because one invocation
 runs exactly one mode.
 
+FRESH ON DRY RUN, FROZEN ON APPLY
+
+A dry run re-captures the source first (--live-query, then a gate check on the
+capture's own summary) and rebuilds the sibling bundle, so it always reflects
+the source as it is right now. An apply does NEITHER: it pushes exactly the
+bundle its dry run previewed. That asymmetry is the point. If the source
+changed after you reviewed the preview, you want the apply to push what you
+approved, not something you have never seen. Re-run the dry run to pick up the
+change. --no-capture skips the re-capture when you deliberately want to push an
+older bundle.
+
 WHAT IT DOES NOT DO
 
-  - It does not capture or export. Run capture_nsx_state.py --live-query and
-    the per-class exports first; phase A reads those bundles.
   - It does not decide anything. Every step is the same command you would run
     by hand, with --apply passed through.
-  - Phase C never rebuilds the sibling bundle during an --apply run, so the
-    apply pushes exactly what the dry run previewed. It will build the bundle
-    on a dry run if it is missing.
 
 Exit code is 0 only when every step succeeded. The report is written even when
 a step fails, so a failed run is still auditable.
@@ -66,13 +64,13 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
 from nsx.cli_bootstrap import init_cli          # noqa: E402
-from nsx.nsx_constants import resolve_manager    # noqa: E402
+from nsx.nsx_constants import resolve_manager, nsx_log_dir  # noqa: E402
 
 log = logging.getLogger("run_workflow")
 
@@ -106,13 +104,49 @@ def run_step(label: str, cmd: List[str], log_dir: Path) -> Dict[str, Any]:
             "log": str(step_log)}
 
 
+def check_capture_gate() -> Optional[str]:
+    """Read the capture's own summary and say why it is not usable, or None.
+
+    These four numbers are the difference between a real capture and a silent
+    no-op. A capture without --live-query produces a groups_additive/ tree that
+    is a plain copy of the export: every tag group looks empty, the sibling
+    build yields almost nothing, and every step still reports success. Checking
+    the summary is the only thing standing between that and a wrong push.
+    """
+    # nsx_constants resolves NSX_LOG_DIR properly: the .env value is
+    # "$ROOT_DIR/nsx_logs", so reading os.environ directly yields a literal
+    # unexpanded path that matches nothing.
+    base = Path(nsx_log_dir) if nsx_log_dir else (REPO_ROOT / "nsx_logs")
+    dirs = sorted(d for d in (base / "build_group_ip_additive_from_live_members").glob("*")
+                  if d.is_dir())
+    if not dirs:
+        return "no additive report directory: did the capture run?"
+    f = dirs[-1] / "summary.json"
+    if not f.is_file():
+        return f"no summary.json under {dirs[-1]}"
+    try:
+        s = json.loads(f.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        return f"unreadable {f}: {exc}"
+    if s.get("ip_source") != "effective":
+        return (f"ip_source is {s.get('ip_source')!r}, not 'effective': this bundle "
+                "under-reports group IPs and must not be pushed")
+    if s.get("groups_errors"):
+        return (f"groups_errors={s['groups_errors']}: some groups did not resolve, "
+                "usually because they were created moments ago and have not realized. "
+                "Wait, then re-run")
+    if not s.get("vm_ip_index_count"):
+        return "vm_ip_index_count is 0: the capture ran without --live-query"
+    return None
+
+
 def phase_a_steps(src_host: str, target: str, apply: bool) -> List[Dict[str, Any]]:
     """WF-A Part 1: services, groups (segments stripped), policies, rules."""
     a = ["--apply"] if apply else []
-    # --diff-target only matters on a dry run: an apply always captures a
-    # baseline and diffs against it. Without it a dry run cannot report which
-    # IPs it would add or remove.
-    d = [] if apply else ["--diff-target"]
+    # Every push tool reads the target on a dry run by default now, so there is
+    # nothing to pass here. Kept as an empty list so the step definitions below
+    # stay identical in shape to the other phases.
+    d: List[str] = []
     return [
         {"label": "a1_services", "roots": [f"nsx_services_export/{src_host}"],
          "cmd": [PY, "tools/nsx/services.py", "push", "--target", target,
@@ -124,8 +158,6 @@ def phase_a_steps(src_host: str, target: str, apply: bool) -> List[Dict[str, Any
         {"label": "a3_policies", "roots": [f"nsx_policies_export/{src_host}"],
          "cmd": [PY, "tools/nsx/policies.py", "push", "--target", target,
                  "--policies-dir", f"nsx_policies_export/{src_host}/security-policies"] + a},
-        # --diff-target on the rules dry run too: without it the preview cannot
-        # show which target-only group refs (WF-C/WF-D siblings) the push keeps.
         {"label": "a4_rules", "roots": [f"nsx_rules_export/{src_host}"],
          "cmd": [PY, "tools/nsx/rules.py", "push", "--target", target,
                  "--rules-dir", f"nsx_rules_export/{src_host}/security-policies"] + d + a},
@@ -136,7 +168,7 @@ def phase_c_steps(src_host: str, target: str, apply: bool,
                   sib: Path, strip: Path, tgt_host: str) -> List[Dict[str, Any]]:
     """WF-C: push siblings, strip the originals, amend the rules."""
     a = ["--apply"] if apply else []
-    d = [] if apply else ["--diff-target"]
+    d: List[str] = []
     return [
         {"label": "c3_siblings", "roots": [str(sib)],
          "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
@@ -161,7 +193,7 @@ def phase_d_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
     its own --phase and the driver refuses to run more than the one asked for.
     """
     a = ["--apply"] if apply else []
-    d = [] if apply else ["--diff-target"]
+    d: List[str] = []
     if phase == "d2a":
         return [{"label": "d2a_siblings", "roots": [str(sib)],
                  "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
@@ -295,6 +327,11 @@ def main() -> int:
     p.add_argument("--domain-id", default="default")
     p.add_argument("--appendix", default=None,
                    help="Phase C sibling suffix; default OBJECT_APPENDIX from .env.")
+    p.add_argument("--capture", action=argparse.BooleanOptionalAction, default=True,
+                   help="Re-capture the source before a DRY RUN so it reflects the "
+                        "source as it is now, and gate on the capture summary. On by "
+                        "default. Never runs on an apply, which must push exactly what "
+                        "its dry run previewed.")
     p.add_argument("--continue-on-error", action="store_true",
                    help="Keep going after a failed step (default: stop, so a broken "
                         "push does not cascade into the next dependency level).")
@@ -352,6 +389,22 @@ def main() -> int:
     wf = "d" if args.phase.startswith("d") else args.phase
     out_dir = run_dir / "report" / args.phase / mode
 
+    # Re-capture FIRST, on a dry run only. The source moves between runs, and a
+    # preview built from a stale bundle is a preview of the wrong change.
+    if action == "push" and not args.apply and args.capture:
+        rec = run_step("a0_capture", [PY, "tools/nsx/capture_nsx_state.py",
+                                      "--source", args.source, "--live-query",
+                                      "--domain-id", args.domain_id, "--quiet"], log_dir)
+        if not rec["ok"]:
+            log.error("Capture failed; nothing pushed.")
+            return 1
+        why = check_capture_gate()
+        if why:
+            log.error("Capture gate FAILED: %s", why)
+            log.error("Refusing to continue: the bundle would push wrong data.")
+            return 2
+        log.info("Capture gate passed (ip_source=effective, groups_errors=0).")
+
     if args.verify:
         steps = verify_steps(args.phase, args.source, args.target, sib, out_dir, run_dir)
         if not steps:
@@ -366,13 +419,18 @@ def main() -> int:
     elif args.phase == "a":
         steps = phase_a_steps(src_host, args.target, args.apply)
     elif args.phase in ("c", "d2a"):
-        # Build the bundle only on a dry run, and only when missing. An apply
-        # must push exactly what its dry run previewed, so it never rebuilds.
-        if not (sib / "sibling_map.json").exists():
-            if args.apply:
+        # Rebuild on EVERY dry run, not just when missing: the source changes
+        # between runs, and a stale sibling bundle silently previews the wrong
+        # IPs. build_sibling_groups rmtrees its own output dirs, so this leaves
+        # nothing behind from a previous build. An apply never rebuilds, so it
+        # pushes exactly what its dry run previewed.
+        if args.apply:
+            if not (sib / "sibling_map.json").exists():
                 log.error("No sibling bundle at %s. Run the dry run first so the "
                           "apply pushes exactly what was previewed.", sib)
                 return 2
+            log.info("Using the bundle the dry run previewed: %s", sib)
+        else:
             build = [PY, "tools/nsx/build_sibling_groups.py", "--source", args.source,
                      "--output-base", str(run_dir), "--domain-id", args.domain_id]
             if args.appendix:
@@ -389,8 +447,6 @@ def main() -> int:
             if not rec["ok"]:
                 log.error("Sibling build failed; nothing pushed.")
                 return 1
-        else:
-            log.info("Using existing sibling bundle: %s", sib)
         steps = phase_c_steps(src_host, args.target, args.apply, sib, strip, tgt_host) \
             if args.phase == "c" else \
             phase_d_steps(args.phase, args.target, args.apply, sib, strip, pure_ip,

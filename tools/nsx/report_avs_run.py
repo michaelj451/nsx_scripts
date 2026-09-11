@@ -43,6 +43,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import yaml
+except ImportError:                                   # pragma: no cover
+    # Only the created-object payload detail needs it; the rest of the report
+    # is pure JSON and still works without it.
+    yaml = None                                       # type: ignore[assignment]
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
@@ -153,6 +160,148 @@ def name_of(row: Dict[str, Any]) -> str:
     slugs, so the display name is what appears in the UI and in a change
     request. Falls back to the id only when a name is genuinely absent."""
     return str(row.get("display_name") or row.get("id") or "?")
+
+
+# How many values to print per list in the audit section. The JSON report keeps
+# the full set regardless; this only stops one 4000-entry group from burying the
+# rest of the change record.
+AUDIT_CAP = 50
+
+
+def _vals(items: Optional[List[Any]]) -> str:
+    """Render a value list as inline code, truncated, with the true count."""
+    items = [str(x) for x in (items or [])]
+    shown = ", ".join(f"`{x}`" for x in items[:AUDIT_CAP])
+    if len(items) > AUDIT_CAP:
+        shown += f", ... and {len(items) - AUDIT_CAP} more"
+    return shown
+
+
+def _short(path: str) -> str:
+    """Group paths are long and repetitive; the id is what a reviewer reads."""
+    s = str(path)
+    return s.rsplit("/", 1)[-1] if s.startswith("/") else s
+
+
+def payload_lines(r: Dict[str, Any]) -> List[str]:
+    """What a created object actually IS, read from the YAML being pushed.
+
+    A create has no before/after to diff, so without this the audit record can
+    only say the name. For a firewall rule the name is the least interesting
+    part: what matters is what it permits, between what, over which services.
+    """
+    path = r.get("file")
+    if not path or yaml is None:
+        return []
+    p = Path(path)
+    if not p.is_file():
+        return []
+    try:
+        d = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError, yaml.YAMLError) as exc:
+        log.warning("unreadable payload %s: %s", p, exc)
+        return []
+    if not isinstance(d, dict):
+        return []
+
+    out: List[str] = []
+    k = r["kind"]
+    if k == "rule":
+        out.append(f"- action: **{d.get('action')}**, direction: {d.get('direction')}, "
+                   f"protocol: {d.get('ip_protocol')}, disabled: {d.get('disabled')}, "
+                   f"logged: {d.get('logged')}")
+        for label, field in (("sources", "source_groups"),
+                             ("destinations", "destination_groups"),
+                             ("services", "services"),
+                             ("applied to (scope)", "scope")):
+            vals = d.get(field) or []
+            if vals:
+                out.append(f"- {label} ({len(vals)}): {_vals([_short(x) for x in vals])}")
+    elif k == "service":
+        entries = d.get("service_entries") or []
+        out.append(f"- type: {d.get('service_type')}, entries: {len(entries)}")
+        for e in entries[:AUDIT_CAP]:
+            if not isinstance(e, dict):
+                continue
+            proto = e.get("l4_protocol") or e.get("protocol") or e.get("resource_type")
+            dports = ", ".join(str(x) for x in (e.get("destination_ports") or [])) or "any"
+            sports = ", ".join(str(x) for x in (e.get("source_ports") or [])) or "any"
+            out.append(f"  - {proto}  dst ports: `{dports}`  src ports: `{sports}`")
+    elif k == "policy":
+        out.append(f"- category: {d.get('category')}, sequence: {d.get('sequence_number')}, "
+                   f"stateful: {d.get('stateful')}")
+        vals = d.get("scope") or []
+        if vals:
+            out.append(f"- applied to (scope) ({len(vals)}): "
+                       f"{_vals([_short(x) for x in vals])}")
+    elif k == "group":
+        crit, ipc = [], 0
+        def walk(ex):
+            nonlocal ipc
+            for e in ex or []:
+                if not isinstance(e, dict):
+                    continue
+                rt = e.get("resource_type")
+                if rt == "Condition":
+                    crit.append(str(e.get("value")))
+                elif rt == "IPAddressExpression":
+                    ipc += len(e.get("ip_addresses") or [])
+                elif rt == "NestedExpression":
+                    walk(e.get("expressions"))
+        walk(d.get("expression"))
+        if crit:
+            out.append(f"- tag criteria ({len(crit)}): {_vals(crit)}")
+        if ipc:
+            out.append(f"- static IP entries: {ipc}")
+    out.append(f"- payload: `{path}`")
+    return out
+
+
+def audit_lines(r: Dict[str, Any]) -> List[str]:
+    """The concrete before/after for one row: what actually moved.
+
+    Deliberately shows removals first. A removal is the direction that breaks
+    traffic, so it should never be something a reader has to scroll for.
+    """
+    out: List[str] = []
+    removed, added = r.get("ips_removed") or [], r.get("ips_added") or []
+    if removed:
+        out.append(f"- IPs REMOVED ({len(removed)}): {_vals(removed)}")
+    if added:
+        out.append(f"- IPs added ({len(added)}): {_vals(added)}")
+    before, after = r.get("ips_before"), r.get("ips_after")
+    if (removed or added) and before is not None and after is not None:
+        out.append(f"- IPs before ({len(before)}) -> after ({len(after)})")
+
+    refs_removed = r.get("refs_removed") or []
+    if refs_removed:
+        out.append(f"- Group refs REMOVED ({len(refs_removed)}): "
+                   f"{_vals([_short(x) for x in refs_removed])}")
+    kept = r.get("refs_preserved") or []
+    if kept:
+        out.append(f"- Target-only group refs kept ({len(kept)}): "
+                   f"{_vals([_short(x) for x in kept])}")
+
+    # amend-refs records a per-field before/after/added structure.
+    pfd = r.get("per_field_diff") or {}
+    for field, d in (pfd.items() if isinstance(pfd, dict) else []):
+        if not isinstance(d, dict):
+            continue
+        gained = d.get("added") or []
+        if gained:
+            out.append(f"- `{field}` gained ({len(gained)}): "
+                       f"{_vals([_short(x) for x in gained])}")
+    csv_added = r.get("csv_added_values") or []
+    if csv_added:
+        out.append(f"- CSV-mapped values added ({len(csv_added)}): {_vals(csv_added)}")
+
+    # A created object has nothing to diff against, so its payload IS the
+    # change record. Show it rather than reporting an empty delta.
+    if r["verdict"] == "created":
+        out += payload_lines(r)
+    if not out:
+        out.append("- No value-level detail recorded for this row.")
+    return out
 
 
 def ip_cell(row: Dict[str, Any]) -> str:
@@ -288,6 +437,18 @@ def load_rows(root: Path, since: Optional[datetime],
                 # it did not. Absent is not False: a plain offline dry run knows
                 # nothing about the target.
                 "exists_on_target": r.get("exists_on_target"),
+                # Concrete before/after values, for the audit section. Counts
+                # answer "how much", these answer "what", which is what a change
+                # record has to show.
+                "ips_before": r.get("ips_before"),
+                "ips_after": r.get("ips_after"),
+                "refs_preserved": r.get("refs_preserved"),
+                "per_field_diff": r.get("per_field_diff"),
+                "csv_added_values": r.get("csv_added_values"),
+                # The exact YAML the push sends. For a CREATED object this is
+                # the only record of what it actually is: no diff exists,
+                # because there was nothing to diff against.
+                "file": r.get("file"),
                 "timestamp": ts,
             })
     return rows
@@ -399,6 +560,12 @@ def main() -> int:
         if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")
                 or r.get("refs_removed_total")):
             return "changed"
+        # Nothing observed, and nothing was checked: say so. Calling this
+        # "rewritten" asserts the object already existed, which is a claim the
+        # run never made. A new service pushed with --no-diff-target read as
+        # "rewritten" on 2026-09-11 while it was in fact about to be created.
+        if r.get("exists_on_target") is None and r["bucket"] == "planned":
+            return "unknown"
         return "rewritten"
 
     for r in detail:
@@ -427,6 +594,7 @@ def main() -> int:
     created   = [r for r in detail if r["verdict"] == "created"]
     changed   = [r for r in detail if r["verdict"] == "changed"]
     rewritten = [r for r in detail if r["verdict"] == "rewritten"]
+    unknown   = [r for r in detail if r["verdict"] == "unknown"]
     opaque    = [r for r in rewritten if r["kind"] not in IP_BEARING]
 
     md = [f"# {args.label}", "",
@@ -438,17 +606,28 @@ def main() -> int:
     # happened, so a dry run never reads as a statement of fact.
     past = "were" if is_apply else "would be"
     md += ["## What changed", ""]
-    if not (created or changed or failed):
+    if not (created or changed or failed or unknown):
         md += [f"**Nothing{' would be' if not is_apply else ''} changed.** "
                f"{len(rewritten)} object(s) {past} pushed over existing, identical content.", ""]
     else:
-        md += table(["Outcome", "Count"], [
+        rows_out = [
             ["Created" if is_apply else "Would create", f"**{len(created)}**"],
             ["Changed" if is_apply else "Would change", f"**{len(changed)}**"],
             ["Failed",                                  f"**{len(failed)}**"],
             ["Pushed, no measurable change" if is_apply
              else "Would be pushed, no measurable change", str(len(rewritten))],
-        ]) + [""]
+        ]
+        # Only ever shown when it is non-zero, so the normal report stays four
+        # lines. A non-zero count here means the run was told not to read the
+        # target, and those rows could be creates.
+        if unknown:
+            rows_out.append(["**Unknown (target not read)**", f"**{len(unknown)}**"])
+        md += table(["Outcome", "Count"], rows_out) + [""]
+        if unknown:
+            md += [f"> **{len(unknown)} row(s) are UNKNOWN.** That pass ran with "
+                   "`--no-diff-target`, so it never contacted the target and cannot say "
+                   "whether these objects exist there. Any of them may be a create. "
+                   "Re-run without `--no-diff-target` for an exact answer.", ""]
         # Broken out per object class: a reviewer signing off a change window
         # cares about "which RULES changed" as a separate question from
         # "which GROUPS changed", and a single mixed table forces them to
@@ -498,18 +677,30 @@ def main() -> int:
         caveats.append(f"{len(opaque)} non-group object(s) are listed as no measurable change. "
                        "Only groups expose an IP diff, so a policy, rule or service whose "
                        "payload differs would look identical here.")
-    if not is_apply:
-        # Group rows pushed with --diff-target carry exists_on_target and are
-        # exact. Everything else never read the target, so its create-ness is
-        # genuinely unknown and the count can only be a floor.
-        blind = [r for r in detail if r.get("exists_on_target") is None]
-        if blind:
-            caveats.append(f"`Would create` is a lower bound: {len(blind)} row(s) had no target "
-                           "baseline to compare against. Group rows pushed with `--diff-target` "
-                           "are exact; services, policies and rules never read the target on a "
-                           "dry run, so a new one counts as no measurable change.")
+    # Rows whose create-ness was never checked are reported as `unknown` and
+    # called out above the fold, so no caveat is needed for them here.
     if caveats:
         md += ["## Read this before trusting the counts", ""] + [f"- {c}" for c in caveats] + [""]
+
+    # ---- what actually changed, value by value -----------------------------
+    # The tables above answer "how many". A change record has to answer "what",
+    # and a reviewer signing one cannot do that from "+2/-0". Only objects that
+    # were created or changed appear here; the untouched majority would bury it.
+    audit = [r for r in detail if r["verdict"] in ("created", "changed")]
+    if audit:
+        md += ["## Change detail (audit)", "",
+               f"Every value that {'moved' if is_apply else 'would move'}, for the "
+               f"{len(audit)} object(s) above. Lists longer than {AUDIT_CAP} entries are "
+               "truncated here; `avs_run_report.json` always holds the full set.", ""]
+        for kind in KIND_ORDER:
+            hits = [r for r in audit if r["kind"] == kind]
+            if not hits:
+                continue
+            md += [f"### {KIND_LABEL[kind]}", ""]
+            for r in sorted(hits, key=lambda x: (x["phase"], name_of(x))):
+                md += [f"**{name_of(r)}** ({r['verdict']}, {r['phase']}, `{r['status']}`)", ""]
+                md += audit_lines(r)
+                md += [""]
 
     # ---- full detail, demoted and split per class --------------------------
     if detail:
