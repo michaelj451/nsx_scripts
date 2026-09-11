@@ -38,8 +38,13 @@ Every phase is dry-run first. Nothing writes without `--apply`.
 >    [Details](#failure-mode-unrealized-groups)
 > 5. **A dry run without `--diff-target` is blind.** It never contacts the
 >    target, so it reports 0 IPs added and 0 removed no matter what the apply
->    would do. Always pass `--diff-target` on the group pushes before approving.
->    [Details](#the-dry-run-pass)
+>    would do. Always pass `--diff-target` on the group **and rule** pushes
+>    before approving. [Details](#the-dry-run-pass)
+>
+> Or skip all five by driving the phases with
+> [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md), which passes `--live-query`'s
+> gate, `--diff-target` and `--allow-delete` for you and writes the report in
+> the same invocation.
 
 ---
 
@@ -331,9 +336,19 @@ python tools/nsx/report_avs_run.py \
 ```
 
 Offline; reads the push reports only. Writes `avs_run_report.md` (operator
-table) and `avs_run_report.json` (every row). `--since "$RUN_START"` keeps
-older rows in the same bundle out. Exit code 1 if any row failed, so it gates
-a pipeline.
+table) and `avs_run_report.json` (every row, with verdicts). `--since
+"$RUN_START"` keeps older rows in the same bundle out. Exit code 1 if any row
+failed, so it gates a pipeline.
+
+Add `--workflow d` on a WF-D run. WF-C and WF-D push from the same bundle
+directories, so the path alone cannot say which ran, and the flag is what picks
+the phase labels (`D2a siblings` / `D2b pure-ip` / `D3 amend-refs` /
+`D5 stripped` instead of WF-C's). It defaults to the WF-C labels.
+`run_workflow.py` passes it for you.
+
+The report's mode banner comes from each push tool's own `summary.json`
+(`"mode": "APPLY" | "DRY-RUN"`), not from row statuses. A dry run that hits one
+failed row is still a dry-run report.
 
 ### Live verification
 
@@ -416,7 +431,8 @@ IP source, possibly with new objects added since.
 | **Same `OBJECT_APPENDIX`** | Sibling ids match, so the push PATCHes them. IP sets **merge additively**, filling in what a v1 bug missed. This is the wanted path |
 | **Changed `OBJECT_APPENDIX`** | Creates a second, parallel sibling set. The v1 groups stay and stay rule-referenced. **Do not change the suffix between runs** |
 | New groups / services / policies / rules on `$SRC` | Created on `$TGT` by Phase 2c |
-| Originals already stripped on `$TGT` | Phase 3e is a no-op for them; harmless |
+| Originals already stripped on `$TGT` | Phase 2c **re-adds** the static IPs it stripped (it pushes the raw export), then Phase 3e strips them again. Visible in the report as a positive IP delta on those groups |
+| Rules already amended on `$TGT` | Phase 2c **preserves** the sibling refs. `rules.py push` merges group refs that exist only on the target rather than overwriting them, because the source's rules can never reference the target's siblings. Before this was fixed (2026-09-11) a re-run silently deleted every sibling ref, and no report showed it. `--replace-refs` opts back into the old behaviour |
 | **Source itself previously stripped** | If WF-C was ever run in place against `$SRC`, its groups no longer resolve to the moved IPs, so 3a returns an incomplete truth. Union with the existing sibling's contents before rebuilding |
 | Revert after an upgrade run | Lands on the **v1 state**, not on empty: restores prior siblings to their v1 IPs and deletes only what this run created |
 

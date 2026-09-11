@@ -185,13 +185,25 @@ window.
 ### 0a. Fresh capture of lm1
 
 ```bash
-python tools/nsx/capture_nsx_state.py --source nsx-lm1 \
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query \
   --ip-report-csv data/nonprod_map.csv
 ```
 
 This GETs lm1's current state, runs the IP-additive enrichment (so
 sub-step 6's IP report sees the spliced VM IPs), and writes the report
 with CSV coverage to `$NSX_LOG_DIR/groups_ip_report/nsx-lm1.lab.local/`.
+
+> **`--live-query` is mandatory and its absence is silent.** The enrichment is
+> what splices each group's effective IPs into `groups_additive/`. Without the
+> flag that tree is a plain copy of the export, every tag-only group appears to
+> have no IPs, and step 1 emits siblings only for groups that already carried
+> static IPs. No error, no warning in the summary, a success report. Measured
+> on lm1 2026-09-11: **1 sibling without it, 7 with it.**
+>
+> Gate on the additive step's summary before building: `ip_source: 'effective'`,
+> non-zero `vm_ip_index_count` / `groups_changed` / `ips_added_total`, and
+> `groups_errors: 0`. A non-zero error count means groups that have not
+> realized yet: wait and re-run rather than proceeding.
 
 ### 0b. Review IP-report counters before designing the push
 

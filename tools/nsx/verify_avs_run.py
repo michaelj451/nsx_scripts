@@ -75,11 +75,15 @@ def main() -> int:
         epilog=__doc__.split("USAGE:", 1)[1] if "USAGE:" in __doc__ else None)
     p.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
     p.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
-    p.add_argument("--sibling-map", required=True,
-                   help="sibling_map.json from build_sibling_groups.py")
+    p.add_argument("--sibling-map", default=None,
+                   help="sibling_map.json from build_sibling_groups.py. Omit after a "
+                        "plain clone (WF-A Part 1) with no decomposition yet: V1 object "
+                        "parity and V6 membership still run, V2-V5 are skipped because "
+                        "there are no siblings to check.")
     p.add_argument("--domain-id", default="default")
     p.add_argument("--report-dir", default=None,
-                   help="Write verify_avs_run.json here (default: alongside the sibling map).")
+                   help="Write verify_avs_run.json here (default: alongside the sibling "
+                        "map, or the working directory when there is none).")
     p.add_argument("--skip-object-parity", action="store_true",
                    help="Skip V1. Use when the target intentionally holds a subset.")
     args = p.parse_args()
@@ -90,9 +94,18 @@ def main() -> int:
     logging.Formatter.converter = __import__("time").gmtime
     init_cli()
 
-    smap_path = Path(args.sibling_map).expanduser()
-    smap = json.loads(smap_path.read_text(encoding="utf-8"))
-    entries = smap.get("map", [])
+    # No sibling map means nothing has been decomposed yet: V1 and V6 are still
+    # meaningful (did the clone land, does everything resolve), V2-V5 have no
+    # subjects. Reporting zero sibling checks is honest; refusing to run at all
+    # would leave a plain WF-A clone with no verification path.
+    smap_path = Path(args.sibling_map).expanduser() if args.sibling_map else None
+    if smap_path:
+        smap = json.loads(smap_path.read_text(encoding="utf-8"))
+        entries = smap.get("map", [])
+    else:
+        entries = []
+        log.info("No --sibling-map given: running V1 object parity and V6 membership "
+                 "only (no siblings to check).")
 
     src = NsxPolicyClient(nsxmanager=resolve_manager(args.source), federation_global=False)
     tgt = NsxPolicyClient(nsxmanager=resolve_manager(args.target), federation_global=False)
@@ -199,12 +212,17 @@ def main() -> int:
            "every group resolves")
 
     failed = [c for c in checks if not c["ok"]]
-    out_dir = Path(args.report_dir).expanduser() if args.report_dir else smap_path.parent
+    if args.report_dir:
+        out_dir = Path(args.report_dir).expanduser()
+    elif smap_path:
+        out_dir = smap_path.parent
+    else:
+        out_dir = Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "verify_avs_run.json").write_text(json.dumps({
         "verified_at": datetime.now(timezone.utc).isoformat(),
         "source": args.source, "target": args.target,
-        "sibling_map": str(smap_path),
+        "sibling_map": str(smap_path) if smap_path else None,
         "checks_total": len(checks), "checks_failed": len(failed),
         "ok": not failed, "checks": checks,
     }, indent=2, sort_keys=True) + "\n", encoding="utf-8")

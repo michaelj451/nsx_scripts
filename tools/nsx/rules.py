@@ -84,6 +84,69 @@ STRIP_KEYS = {
 # Parent policies that are NSX defaults — rules under them can't be pushed.
 SKIP_POLICIES = {"default-layer2-section", "default-layer3-section"}
 
+# Rule fields that hold group references, and that amend-refs can add sibling
+# references to. A push must not silently drop what it finds in these.
+MERGEABLE_REF_FIELDS = ("source_groups", "destination_groups", "scope")
+
+# NSX's "match everything" sentinel. It cannot be mixed with concrete paths in
+# the same field, so a field holding it can never be merged.
+ANY_SENTINEL = "ANY"
+
+
+def _merge_group_refs(rule: Dict[str, Any], target_payload: Dict[str, Any],
+                      replace: bool = False) -> tuple:
+    """Keep group references that exist on the TARGET but not in the bundle.
+
+    The source manager's rules can never reference the target's sibling groups:
+    siblings are created ON the target by WF-C / WF-D, and the source has no
+    idea they exist. So pushing the source payload verbatim deletes every
+    sibling reference amend-refs added, and the rule silently stops matching the
+    literal IPs that exist precisely to keep it matching while VMs are split
+    across two managers. That is the failure the siblings were built to prevent,
+    reintroduced by the clone step.
+
+    Merging is therefore the default. `replace=True` restores the old
+    clobbering behaviour, for the case where the target genuinely must end up
+    byte-identical to the source.
+
+    Returns (rule, report). `rule` is a new dict when anything changed.
+    `report` holds three lists of "<field>:<path>" strings:
+        preserved: target-only refs carried through (the safe outcome)
+        removed:   target-only refs dropped, because replace=True or because
+                   the field could not be merged
+        conflicts: fields holding ANY on one side and concrete paths on the
+                   other, which NSX will not accept as a mixed list
+    """
+    report = {"preserved": [], "removed": [], "conflicts": []}
+    merged = dict(rule)
+    changed = False
+
+    for field in MERGEABLE_REF_FIELDS:
+        src_vals = list(rule.get(field) or [])
+        tgt_vals = list(target_payload.get(field) or [])
+        extra = [v for v in tgt_vals if v not in src_vals]
+        if not extra:
+            continue
+
+        if replace:
+            report["removed"] += [f"{field}:{v}" for v in extra]
+            continue
+
+        # ANY on either side means the lists cannot be unioned: ANY already
+        # matches everything, and NSX rejects it alongside concrete paths.
+        # Keep the source value and surface it rather than guessing.
+        if ANY_SENTINEL in src_vals or ANY_SENTINEL in tgt_vals:
+            report["conflicts"].append(f"{field}: source={src_vals} target={tgt_vals}")
+            report["removed"] += [f"{field}:{v}" for v in extra if v != ANY_SENTINEL]
+            continue
+
+        merged[field] = src_vals + extra   # source order first, target-only appended
+        report["preserved"] += [f"{field}:{v}" for v in extra]
+        changed = True
+
+    return (merged if changed else rule), report
+
+
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
@@ -459,16 +522,29 @@ def cmd_push(args: argparse.Namespace) -> int:
     total = len(all_rule_files)
     log.info("Found %d rule file(s) across %d policy folder(s).", total, len(policy_dirs))
 
-    client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
+    # --diff-target gives a DRY RUN the one read-only pass it needs to preview
+    # the group-ref merge. Without it a dry run stays fully offline and cannot
+    # know which target-only refs the push would preserve.
+    need_target = args.apply or args.diff_target
+    client = NsxPolicyClient(nsxmanager=target_host,
+                             federation_global=args.federation_global) if need_target else None
     baseline_path = None
-    if args.apply:
+    baseline: Dict[str, Dict[str, Any]] = {}
+    if need_target:
         log.info("Capturing target baseline (current customer rules on %s) ...", target_host)
         baseline = _capture_target_rules(client, args.domain_id)
-        baseline_path = _append_baseline(reports_dir, baseline)
-        log.info("  Baseline: %d rule(s) across customer policies → %s", len(baseline), baseline_path)
+        if args.apply:
+            baseline_path = _append_baseline(reports_dir, baseline)
+            log.info("  Baseline: %d rule(s) across customer policies → %s", len(baseline), baseline_path)
+        else:
+            # Read-only: a baseline file is a revert artifact, and a dry run has
+            # nothing to revert.
+            log.info("  Target has %d customer rule(s) (read-only, no baseline written)",
+                     len(baseline))
 
     rows: List[Dict[str, Any]] = []
     ok = failed = skipped = dry_run_count = 0
+    total_refs_preserved = total_refs_removed = 0
 
     for i, (rule_file, folder_slug) in enumerate(all_rule_files, start=1):
         row = {
@@ -501,6 +577,33 @@ def cmd_push(args: argparse.Namespace) -> int:
                 log.info("[%d/%d skip] %s — parent %s is default", i, total, rid, policy_id)
                 rows.append(row)
                 continue
+
+            # Preserve group refs that exist only on the target (sibling groups
+            # from WF-C / WF-D). Computed for BOTH modes so a dry run with
+            # --diff-target previews exactly what the apply will do.
+            tgt_payload = (baseline.get(f"{policy_id}::{rid}") or {}).get("payload") or {}
+            if tgt_payload:
+                rule, mrep = _merge_group_refs(rule, tgt_payload, replace=args.replace_refs)
+                if mrep["preserved"]:
+                    row["refs_preserved"] = mrep["preserved"]
+                    row["refs_preserved_total"] = len(mrep["preserved"])
+                    total_refs_preserved += len(mrep["preserved"])
+                    log.info("[%d/%d] %s/%s: keeping %d target-only group ref(s): %s",
+                             i, total, policy_id, rid, len(mrep["preserved"]),
+                             ", ".join(mrep["preserved"]))
+                if mrep["removed"]:
+                    row["refs_removed"] = mrep["removed"]
+                    row["refs_removed_total"] = len(mrep["removed"])
+                    total_refs_removed += len(mrep["removed"])
+                    log.warning("[%d/%d] %s/%s: %s %d target-only group ref(s): %s",
+                                i, total, policy_id, rid,
+                                "WOULD REMOVE" if not args.apply else "REMOVING",
+                                len(mrep["removed"]), ", ".join(mrep["removed"]))
+                if mrep["conflicts"]:
+                    row["ref_merge_conflicts"] = mrep["conflicts"]
+                    log.warning("[%d/%d] %s/%s: cannot merge, ANY cannot mix with "
+                                "concrete paths: %s", i, total, policy_id, rid,
+                                "; ".join(mrep["conflicts"]))
 
             if not args.apply:
                 row["status"] = "dry_run"
@@ -650,6 +753,12 @@ def cmd_push(args: argparse.Namespace) -> int:
             "dry_run": dry_run_count,
             "retry_rounds": retry_round,
             "retry_attempts": retry_attempts,
+            # Group refs that exist only on the target. Preserved is the safe
+            # path; removed should be 0 unless --replace-refs was passed.
+            "refs_preserved_total": total_refs_preserved,
+            "refs_removed_total": total_refs_removed,
+            "ref_merge": "replace" if args.replace_refs else "merge",
+            "target_read": bool(need_target),
         },
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
@@ -1123,6 +1232,15 @@ def main() -> int:
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <rules-dir>/../push_report/.")
+    pp.add_argument("--diff-target", action="store_true",
+                    help="On a dry run, make one read-only pass over the target so the "
+                         "preview shows which target-only group refs the push would keep "
+                         "or drop. Ignored with --apply, which always reads the target.")
+    pp.add_argument("--replace-refs", action="store_true",
+                    help="Overwrite source_groups / destination_groups / scope with the "
+                         "source payload exactly, DROPPING any group ref that exists only "
+                         "on the target. Default is to merge them, which is what keeps "
+                         "WF-C / WF-D sibling refs alive across a re-clone.")
     pp.set_defaults(func=cmd_push)
 
     pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")

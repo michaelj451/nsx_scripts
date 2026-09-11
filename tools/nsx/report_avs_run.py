@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """tools/nsx/report_avs_run.py
 
-One consolidated "what did this run change?" report for an AVS / WF-A / WF-C
-sequence, built entirely from the per-tool push reports already on disk.
+One consolidated "what did this run change?" report for an AVS / WF-A / WF-C /
+WF-D sequence, built entirely from the per-tool push reports already on disk.
+
+WF-C and WF-D push from the same bundle directories, so pass --workflow d on a
+WF-D run to get its phase labels (D2a / D2b / D3 / D5) instead of WF-C's.
 
 Offline: reads JSON, contacts no NSX manager. Pair it with
 verify_avs_run.py, which is the live check.
@@ -78,16 +81,30 @@ def bucket_for(status: Optional[str]) -> str:
 # Which workflow step a bundle belongs to. Without this the same object id shows
 # up twice with no way to tell the WF-A push from the WF-C stripped push, which
 # reads like a duplicate-row bug.
-def phase_for(bundle: str, report: str) -> str:
+#
+# WF-C and WF-D push from the SAME bundle directories (nsx_sibling_groups,
+# nsx_stripped_groups), so the path alone cannot say which one ran. --workflow
+# supplies what the path cannot. Without it the labels stay on WF-C, which is
+# what every report before this flag existed already said.
+WF_STEP_LABELS = {
+    "c": {"siblings": "C3 siblings", "stripped": "C4 stripped",
+          "pure_ip": "C pure-ip", "amend": "C5 amend-refs"},
+    "d": {"siblings": "D2a siblings", "stripped": "D5 stripped",
+          "pure_ip": "D2b pure-ip", "amend": "D3 amend-refs"},
+}
+
+
+def phase_for(bundle: str, report: str, workflow: Optional[str] = None) -> str:
     b = bundle.replace("\\", "/")
+    steps = WF_STEP_LABELS["d" if workflow == "d" else "c"]
     if report == "amend_refs.json":
-        return "C5 amend-refs"
+        return steps["amend"]
     if "nsx_sibling_groups" in b:
-        return "C3 siblings"
+        return steps["siblings"]
     if "nsx_stripped_groups" in b:
-        return "C4 stripped"
+        return steps["stripped"]
     if "nsx_pure_ip_remap" in b:
-        return "C  pure-ip"
+        return steps["pure_ip"]
     if "nsx_services_export" in b:
         return "A1 services"
     if "nsx_groups_export" in b:
@@ -149,7 +166,50 @@ def ip_cell(row: Dict[str, Any]) -> str:
     return f"+{len(added or [])}/-{len(removed or [])}"
 
 
-def load_rows(root: Path, since: Optional[datetime]) -> List[Dict[str, Any]]:
+# Every push tool records its own mode in its summary. That is the authority on
+# whether a pass wrote anything; row statuses are not.
+SUMMARY_FILES = ("summary.json", "amend_refs_summary.json")
+
+
+def load_modes(root: Path, since: Optional[datetime]) -> set:
+    """Modes ("APPLY" / "DRY-RUN") recorded under <root>/push_report in window.
+
+    Inferring the mode from row statuses is not safe: a dry run that raises on
+    one file (an unparseable YAML in the bundle, say) writes a `failed` row, and
+    a failed row is not evidence that anything was written. Reading the mode the
+    push tool itself recorded removes the guess.
+    """
+    modes: set = set()
+    pr = root / "push_report"
+    if not pr.is_dir():
+        return modes
+    files = [pr / n for n in SUMMARY_FILES]
+    runs = pr / "runs"
+    if runs.is_dir():
+        files.extend(sorted(runs.glob("*_summary.json")))
+    for f in files:
+        if not f.is_file():
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            log.warning("unreadable summary %s: %s", f, exc)
+            continue
+        ran_at = data.get("ran_at")
+        if since and ran_at:
+            try:
+                if datetime.fromisoformat(str(ran_at).replace("Z", "+00:00")) < since:
+                    continue
+            except ValueError:
+                pass
+        mode = str(data.get("mode") or "").strip().upper()
+        if mode:
+            modes.add(mode)
+    return modes
+
+
+def load_rows(root: Path, since: Optional[datetime],
+              workflow: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every row from every recognised report file under <root>/push_report."""
     rows: List[Dict[str, Any]] = []
     pr = root / "push_report"
@@ -208,7 +268,7 @@ def load_rows(root: Path, since: Optional[datetime]) -> List[Dict[str, Any]]:
                 "kind": kind,
                 "bundle": str(root),
                 "report": name,
-                "phase": phase_for(str(root), name),
+                "phase": phase_for(str(root), name, workflow),
                 "id": r.get("id") or r.get("group_id") or r.get("rule_id")
                       or r.get("policy_id") or r.get("service_id"),
                 "display_name": r.get("display_name") or r.get("group_name"),
@@ -218,6 +278,16 @@ def load_rows(root: Path, since: Optional[datetime]) -> List[Dict[str, Any]]:
                 "ips_added": r.get("ips_added"),
                 "ips_removed": r.get("ips_removed"),
                 "refs_added_total": r.get("refs_added_total"),
+                # Group refs that existed only on the target. Preserved means a
+                # push kept WF-C/WF-D sibling refs instead of clobbering them;
+                # removed means it dropped them, which needs to be loud.
+                "refs_preserved_total": r.get("refs_preserved_total"),
+                "refs_removed_total": r.get("refs_removed_total"),
+                "refs_removed": r.get("refs_removed"),
+                # True/False when the push held a target baseline, absent when
+                # it did not. Absent is not False: a plain offline dry run knows
+                # nothing about the target.
+                "exists_on_target": r.get("exists_on_target"),
                 "timestamp": ts,
             })
     return rows
@@ -236,6 +306,10 @@ def main() -> int:
                    help="ISO timestamp; drop rows older than this (one run's worth).")
     p.add_argument("--label", default="AVS run",
                    help="Title for the markdown report.")
+    p.add_argument("--workflow", choices=["a", "c", "d"], default=None,
+                   help="Which workflow ran. WF-C and WF-D push from the same "
+                        "bundle directories, so only you can say which it was; "
+                        "this picks the phase labels. Default: WF-C labels.")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -250,17 +324,29 @@ def main() -> int:
             since = since.replace(tzinfo=timezone.utc)
 
     rows: List[Dict[str, Any]] = []
+    modes: set = set()
     for root in args.report_root:
-        rows.extend(load_rows(Path(root).expanduser(), since))
+        root_path = Path(root).expanduser()
+        rows.extend(load_rows(root_path, since, args.workflow))
+        modes |= load_modes(root_path, since)
+
+    # Is this an apply report? Two independent signals, either of which is
+    # sufficient: a row that was actually written, or a push tool that recorded
+    # mode APPLY in its own summary. The second covers an apply in which every
+    # row failed.
+    #
+    # A `failed` row deliberately does NOT count. A dry run can produce one (an
+    # unparseable YAML in the bundle raises per-file), and treating that as an
+    # apply relabelled the entire dry-run report APPLY and then discarded every
+    # planned row in it as a duplicate, leaving a pre-apply review document that
+    # said nothing would change.
+    is_apply = any(r["bucket"] == "applied" for r in rows) or "APPLY" in modes
 
     # One report describes ONE pass. groups.py archives every pass, so a window
     # containing both a dry run and the apply that followed would otherwise list
-    # each object twice (once planned, once applied) and double every total.
-    # When any row was actually written, this is an apply report: drop the
-    # planned rows. A report with no applied rows is a dry-run report and keeps
-    # them.
-    applied_any = any(r["bucket"] in ("applied", "failed") for r in rows)
-    if applied_any:
+    # each object twice (once planned, once applied) and double every total. On
+    # an apply report the planned rows are the earlier pass: drop them.
+    if is_apply:
         dropped = [r for r in rows if r["bucket"] == "planned"]
         rows = [r for r in rows if r["bucket"] != "planned"]
         if dropped:
@@ -280,9 +366,53 @@ def main() -> int:
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    applied = [r for r in rows if r["bucket"] == "applied"]
+    detail = [r for r in rows if r["bucket"] in ("applied", "planned")]
+    mode = "APPLY" if is_apply else "DRY RUN"
+
+    # Classify what each row actually DID, not merely that it was pushed.
+    #   created   - the object did not exist before this push
+    #   changed   - it existed, and something measurable moved: IPs or rule refs
+    #   rewritten - pushed over an existing object with no measurable delta. For
+    #               groups that means identical IPs; for other classes we cannot
+    #               see inside the payload, so this is NOT a promise that nothing
+    #               changed.
+    #
+    # Create-ness is tested FIRST. An object created WITH content is still a
+    # create, and its delta is still shown in the IPs column, so nothing is lost
+    # by saying so. Testing the delta first (as this did until 2026-09-11) meant
+    # only objects that landed empty were ever called created: a from-empty WF-A
+    # clone reported 5 creates and 7 changes when all 12 were creates.
+    #
+    # Two independent signals, because neither covers every case:
+    #   success_put        - the PUT succeeded outright, so the object was new.
+    #                        Absent on a dry run, and absent when a create went
+    #                        through the already-exists PATCH fallback.
+    #   exists_on_target   - recorded by groups.py whenever it holds a target
+    #                        baseline (--apply, or --diff-target on a dry run).
+    #                        This is what lets a DRY RUN say "would create".
+    def verdict(r: Dict[str, Any]) -> str:
+        if r["bucket"] == "failed":
+            return "failed"
+        if r.get("exists_on_target") is False or str(r.get("status", "")).endswith("_put"):
+            return "created"
+        if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")
+                or r.get("refs_removed_total")):
+            return "changed"
+        return "rewritten"
+
+    for r in detail:
+        r["verdict"] = verdict(r)
+    for r in failed:
+        r["verdict"] = "failed"
+
+    # Written AFTER the verdicts so the machine-readable artifact carries the
+    # same classification the markdown shows.
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "label": args.label,
+        "mode": mode,
+        "workflow": args.workflow,
         "report_roots": args.report_root,
         "since": args.since,
         "totals_by_kind": totals,
@@ -294,29 +424,6 @@ def main() -> int:
     }
     (out_dir / "avs_run_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    applied = [r for r in rows if r["bucket"] == "applied"]
-    detail = [r for r in rows if r["bucket"] in ("applied", "planned")]
-    mode = "APPLY" if applied_any else "DRY RUN"
-
-    # Classify what each row actually DID, not merely that it was pushed.
-    #   created   - the object did not exist (PUT succeeded outright)
-    #   changed   - a measurable delta: IPs moved, or rule refs added
-    #   rewritten - pushed over an object that already existed, with no
-    #               measurable delta. For groups that means the IPs are
-    #               identical; for other classes we cannot see inside the
-    #               payload, so this is NOT a promise that nothing changed.
-    def verdict(r: Dict[str, Any]) -> str:
-        if r["bucket"] == "failed":
-            return "failed"
-        if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")):
-            return "changed"
-        if str(r.get("status", "")).endswith("_put"):
-            return "created"
-        return "rewritten"
-
-    for r in detail:
-        r["verdict"] = verdict(r)
     created   = [r for r in detail if r["verdict"] == "created"]
     changed   = [r for r in detail if r["verdict"] == "changed"]
     rewritten = [r for r in detail if r["verdict"] == "rewritten"]
@@ -327,18 +434,20 @@ def main() -> int:
           + (f" | rows since `{args.since}`" if args.since else ""), ""]
 
     # ---- the answer, first -------------------------------------------------
-    verb = "would be" if not applied_any else ""
-    past = "were" if applied_any else "would be"
+    # Same table in both modes, in the tense that matches what actually
+    # happened, so a dry run never reads as a statement of fact.
+    past = "were" if is_apply else "would be"
     md += ["## What changed", ""]
     if not (created or changed or failed):
-        md += [f"**Nothing{' would be' if not applied_any else ''} changed.** "
+        md += [f"**Nothing{' would be' if not is_apply else ''} changed.** "
                f"{len(rewritten)} object(s) {past} pushed over existing, identical content.", ""]
     else:
         md += table(["Outcome", "Count"], [
-            [f"Created {verb}".strip(),  f"**{len(created)}**"],
-            [f"Changed {verb}".strip(),  f"**{len(changed)}**"],
-            ["Failed",                   f"**{len(failed)}**"],
-            ["Pushed, no measurable change", str(len(rewritten))],
+            ["Created" if is_apply else "Would create", f"**{len(created)}**"],
+            ["Changed" if is_apply else "Would change", f"**{len(changed)}**"],
+            ["Failed",                                  f"**{len(failed)}**"],
+            ["Pushed, no measurable change" if is_apply
+             else "Would be pushed, no measurable change", str(len(rewritten))],
         ]) + [""]
         # Broken out per object class: a reviewer signing off a change window
         # cares about "which RULES changed" as a separate question from
@@ -355,8 +464,23 @@ def main() -> int:
                          for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
                                                              name_of(x)))]) + [""]
 
+    refs_kept = sum(r.get("refs_preserved_total") or 0 for r in rows)
+    refs_lost = sum(r.get("refs_removed_total") or 0 for r in rows)
     md += [f"- IPs added: **{ips_added}**   removed: **{ips_removed}**   "
-           f"rule refs added: **{refs_added}**", ""]
+           f"rule refs added: **{refs_added}**"
+           + (f"   target-only refs kept: **{refs_kept}**" if refs_kept else ""), ""]
+    if refs_lost:
+        # A clone push that drops target-only group refs deletes exactly the
+        # sibling references that keep rules matching literal IPs. Never let
+        # this sit in a totals line.
+        md += ["> **WARNING: this run REMOVES "
+               f"{refs_lost} group reference(s) that exist only on the target.** "
+               "Those are typically WF-C / WF-D sibling refs, and dropping them stops "
+               "the affected rules matching the literal IPs they were given. Re-run "
+               "without `--replace-refs` to merge instead.", ""]
+        md += table(["Class", "Name", "Refs removed"],
+                    [[r["kind"], name_of(r), ", ".join(r.get("refs_removed") or [])]
+                     for r in rows if r.get("refs_removed_total")]) + [""]
 
     if failed:
         md += ["## Failures", ""]
@@ -374,6 +498,16 @@ def main() -> int:
         caveats.append(f"{len(opaque)} non-group object(s) are listed as no measurable change. "
                        "Only groups expose an IP diff, so a policy, rule or service whose "
                        "payload differs would look identical here.")
+    if not is_apply:
+        # Group rows pushed with --diff-target carry exists_on_target and are
+        # exact. Everything else never read the target, so its create-ness is
+        # genuinely unknown and the count can only be a floor.
+        blind = [r for r in detail if r.get("exists_on_target") is None]
+        if blind:
+            caveats.append(f"`Would create` is a lower bound: {len(blind)} row(s) had no target "
+                           "baseline to compare against. Group rows pushed with `--diff-target` "
+                           "are exact; services, policies and rules never read the target on a "
+                           "dry run, so a new one counts as no measurable change.")
     if caveats:
         md += ["## Read this before trusting the counts", ""] + [f"- {c}" for c in caveats] + [""]
 

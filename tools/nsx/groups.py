@@ -1199,6 +1199,11 @@ def cmd_push(args: argparse.Namespace) -> int:
             ips_added: List[str] = []
             ips_removed: List[str] = []
             if have_baseline:
+                # Whether the group is already on the target. An empty ips_before
+                # cannot answer this (a tag-only group that exists also has no
+                # IPs), so record it explicitly: it is what lets a dry run report
+                # "would create" instead of guessing from the IP delta.
+                row["exists_on_target"] = gid in baseline_dict
                 before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
                 after_ips  = _extract_ip_entries(obj)
                 ips_added, ips_removed = _ip_diff(before_ips, after_ips)

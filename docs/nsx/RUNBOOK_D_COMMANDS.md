@@ -19,9 +19,22 @@ export PYTHONPATH="$PWD/app"
 
 ## 0. Capture + IP report (read-only)
 
+**`--live-query` is mandatory.** Without it every tag group looks empty and the
+build produces siblings only for groups that already hold static IPs, with no
+error and a success report. Measured on lm1 2026-09-11: 1 sibling without it,
+**7 with it**.
+
 ```bash
-python tools/nsx/capture_nsx_state.py --source nsx-lm1 \
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query \
   --ip-report-csv data/nonprod_map.csv
+```
+
+Gate before building: the additive step must report `ip_source: 'effective'`,
+non-zero `vm_ip_index_count` / `groups_changed` / `ips_added_total`, and
+`groups_errors: 0`.
+
+```bash
+grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | tail -1
 ```
 
 Then review:

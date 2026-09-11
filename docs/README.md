@@ -23,6 +23,7 @@ a matching revert.
 
 | Workflow | Narrative | Commands | PowerShell | Purpose |
 |---|---|---|---|---|
+| **Driver** (start here) | [RUNBOOK_WORKFLOW.md](nsx/RUNBOOK_WORKFLOW.md) | included | n/a | `run_workflow.py`: one command per phase for A, C and D, with four verbs (dry run / apply / verify / rollback) and a report written in the same invocation so it cannot be forgotten or attributed to the wrong mode |
 | **A** Clone | [RUNBOOK_A.md](nsx/RUNBOOK_A.md) | [cmds](nsx/RUNBOOK_A_COMMANDS.md) | [ps](nsx/RUNBOOK_A_COMMANDS_PS.md) | Clone customer DFW config lm1 to lm2 (3 push phases) |
 | **B** In-place remap | [RUNBOOK_B.md](nsx/RUNBOOK_B.md) | [cmds](nsx/RUNBOOK_B_COMMANDS.md) | [ps](nsx/RUNBOOK_B_COMMANDS_PS.md) | CSV subnet remap in place (strict-additive; IP-only groups by default, `--remap-generic` widens). Includes the B.4 remap audit |
 | **C** Sibling decomposition | [RUNBOOK_C.md](nsx/RUNBOOK_C.md) | [cmds](nsx/RUNBOOK_C_COMMANDS.md) | [ps](nsx/RUNBOOK_C_COMMANDS_PS.md) | After a clone: decompose tagged groups into IP-only siblings on the target |
