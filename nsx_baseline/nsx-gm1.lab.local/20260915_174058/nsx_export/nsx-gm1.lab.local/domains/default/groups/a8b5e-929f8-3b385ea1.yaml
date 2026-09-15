@@ -1,0 +1,27 @@
+expression:
+- ip_addresses:
+  - 10.10.3.0/24
+  - 10.10.2.0/24
+  - 10.10.1.0/24
+  resource_type: IPAddressExpression
+  id: 68bbab28-fb51-4a8e-8a08-7a4a126f2148
+  path: /global-infra/domains/default/groups/a8b5ed22-6b48-4b28-ba2c-0a357bf929f8/ip-address-expressions/68bbab28-fb51-4a8e-8a08-7a4a126f2148
+  relative_path: 68bbab28-fb51-4a8e-8a08-7a4a126f2148
+  parent_path: /global-infra/domains/default/groups/a8b5ed22-6b48-4b28-ba2c-0a357bf929f8
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+group_type:
+- IPAddress
+resource_type: Group
+id: a8b5ed22-6b48-4b28-ba2c-0a357bf929f8
+display_name: ip-address-group-10.10.2.0-24
+path: /global-infra/domains/default/groups/a8b5ed22-6b48-4b28-ba2c-0a357bf929f8
+relative_path: a8b5ed22-6b48-4b28-ba2c-0a357bf929f8
+parent_path: /global-infra/domains/default
+_create_time: 1789493802069
+_create_user: admin
+_last_modified_time: 1789493802069
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

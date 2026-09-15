@@ -1,0 +1,6 @@
+NSX BASELINE (permanent)
+  source : nsx-lm1 (nsx-lm1.lab.local)
+  bundle : nsx_baseline/nsx-lm1.lab.local/20260915_174058
+  saved  : 2026-09-15T17:47:31.952150+00:00
+  content: 13 groups, 4 services, 5 policy dirs (3 customer + 2 default), 15 rule files
+  state  : lm1 immediately before the 2026-09-15 17:07 UTC wipe

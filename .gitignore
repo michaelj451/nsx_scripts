@@ -298,3 +298,10 @@ __marimo__/
 nsx_info_*/
 nsx_info_*.tgz
 nsx_info_*.zip
+
+# nsx_baseline/ holds PERMANENT, committed configuration baselines.
+# The nsx_export/ and nsx_build/ rules above match at any depth, which would
+# exclude the actual payloads inside a baseline bundle and leave only its
+# README and manifests committed: a baseline that describes configuration it
+# does not contain. Re-include everything under nsx_baseline/.
+!nsx_baseline/**

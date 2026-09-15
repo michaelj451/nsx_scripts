@@ -1,0 +1,38 @@
+action: ALLOW
+resource_type: Rule
+id: ping-out
+display_name: ping-out
+path: /global-infra/domains/default/security-policies/Start_Policy/rules/ping-out
+relative_path: ping-out
+parent_path: /global-infra/domains/default/security-policies/Start_Policy
+rule_id: 1003079
+sequence_number: 27
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /global-infra/domains/default/groups/vm1
+- /global-infra/domains/default/groups/vm2
+destination_groups:
+- /global-infra/domains/default/groups/ping-test-groups
+services:
+- /global-infra/services/nested-service-1
+- /global-infra/services/ICMP-ALL
+profiles:
+- ANY
+logged: true
+scope:
+- /global-infra/domains/default/groups/vm2
+- /global-infra/domains/default/groups/ping-test-groups
+- /global-infra/domains/default/groups/vm1
+disabled: false
+notes: this is for ping
+direction: IN_OUT
+tag: this is for ping
+ip_protocol: IPV4
+is_default: false
+_create_time: 1789493875048
+_create_user: admin
+_last_modified_time: 1789493875048
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

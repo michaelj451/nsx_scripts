@@ -1,0 +1,31 @@
+expression:
+- ip_addresses:
+  - 10.6.0.50
+  - 10.6.1.0/24
+  - 10.6.0.51
+  - 10.7.0.50
+  - 10.7.1.0/24
+  - 10.6.0.52-10.6.0.53
+  - 10.7.0.25
+  resource_type: IPAddressExpression
+  id: f4b82012-2475-46a1-9ff6-542c070970de
+  path: /infra/domains/default/groups/ip-address-group/ip-address-expressions/f4b82012-2475-46a1-9ff6-542c070970de
+  relative_path: f4b82012-2475-46a1-9ff6-542c070970de
+  parent_path: /infra/domains/default/groups/ip-address-group
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+group_type:
+- IPAddress
+resource_type: Group
+id: ip-address-group
+display_name: ip-address-group
+path: /infra/domains/default/groups/ip-address-group
+relative_path: ip-address-group
+parent_path: /infra/domains/default
+_create_time: 1789134725650
+_create_user: admin
+_last_modified_time: 1789141258754
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

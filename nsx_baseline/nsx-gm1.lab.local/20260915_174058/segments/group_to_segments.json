@@ -1,0 +1,11 @@
+{
+  "groups": {},
+  "summary": {
+    "domain_id": "default",
+    "generated_at": "2026-09-15T17:41:02.646631+00:00",
+    "groups_scanned": 13,
+    "groups_with_segment_refs": 0,
+    "source_manager": "nsx-gm1.lab.local",
+    "total_segment_references": 0
+  }
+}

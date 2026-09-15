@@ -1,0 +1,32 @@
+{
+  "command": "segments.export",
+  "counts": {
+    "errors": 0,
+    "groups_scanned": 13,
+    "groups_with_segment_refs": 0,
+    "ids_with_special_chars": 0,
+    "segments_referenced_by_at_least_one_group": 0,
+    "segments_total": 0,
+    "skipped_no_id": 0,
+    "skipped_system_owned": 0,
+    "written": 0
+  },
+  "errors_log": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/logs/segments_export_20260915_174102.errors.log",
+  "exported_at": "2026-09-15T17:41:02.646910+00:00",
+  "ids_with_special_chars": [],
+  "log_file": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/logs/segments_export_20260915_174102.log",
+  "paths": {
+    "bundle_dir": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments",
+    "group_to_segments_file": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/group_to_segments.json",
+    "logs_dir": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/logs",
+    "segment_to_groups_file": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/segment_to_groups.json",
+    "segments_dir": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/segments"
+  },
+  "segments": [],
+  "source": {
+    "alias": "nsx-gm1",
+    "domain_id": "default",
+    "federation_global": true,
+    "host": "nsx-gm1.lab.local"
+  }
+}

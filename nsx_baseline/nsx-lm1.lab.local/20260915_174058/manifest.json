@@ -1,0 +1,20 @@
+{
+  "all_domains": false,
+  "backed_up_at": "2026-09-15T17:47:31.952150+00:00",
+  "bundle": "nsx_baseline/nsx-lm1.lab.local/20260915_174058",
+  "domain_id": "default",
+  "domains_captured": [
+    "default"
+  ],
+  "federation_global": false,
+  "host": "nsx-lm1.lab.local",
+  "notes": [
+    "_parent_policy_id injected into all 15 rule files. Without it rules.py push falls back to the slugified folder name and the push 404s. See RUNBOOK_BACKUP.md.",
+    "Paths are LM-shaped (/infra/). To push this to a Global Manager, rewrite /infra/ to /global-infra/ first and add --federation-global."
+  ],
+  "ok": true,
+  "provenance": "lm1's configuration as it stood immediately before the 2026-09-15 17:07 UTC wipe. lm1 itself was already empty when this baseline was assembled, so the payload came from the nsx_build/nsx-lm1_to_gm1 build (LM /infra/ paths, taken 2026-09-15 16:55 UTC). Verified object-for-object against nsx_wipe_bundle/20260915_170727/nsx-lm1.lab.local/pre_wipe_state.json, and against the live restore on nsx-gm1: 13 groups, 4 services, 3 policies, 13 rules, zero content differences once read-only fields and list order are normalised.",
+  "source": "nsx-lm1",
+  "tool": "assembled by hand from nsx_build/nsx-lm1_to_gm1",
+  "workflow": "baseline"
+}

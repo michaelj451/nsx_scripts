@@ -1,0 +1,49 @@
+expression:
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: network|10.6.2.0
+  resource_type: Condition
+  id: e983199e-82f9-4feb-8999-2f6a8ae5454b
+  path: /infra/domains/default/groups/network-2/condition-expressions/e983199e-82f9-4feb-8999-2f6a8ae5454b
+  relative_path: e983199e-82f9-4feb-8999-2f6a8ae5454b
+  parent_path: /infra/domains/default/groups/network-2
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: da50177f-2f85-4aca-b167-917a99f98f24
+  path: /infra/domains/default/groups/network-2/conjunction-expressions/da50177f-2f85-4aca-b167-917a99f98f24
+  relative_path: da50177f-2f85-4aca-b167-917a99f98f24
+  parent_path: /infra/domains/default/groups/network-2
+  _protection: NOT_PROTECTED
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: network|10.7.2.0
+  resource_type: Condition
+  id: b5405ccb-e530-45ee-aacc-7d57af86da5d
+  path: /infra/domains/default/groups/network-2/condition-expressions/b5405ccb-e530-45ee-aacc-7d57af86da5d
+  relative_path: b5405ccb-e530-45ee-aacc-7d57af86da5d
+  parent_path: /infra/domains/default/groups/network-2
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: network-2
+display_name: network-group-2
+tags:
+- scope: network
+  tag: 10.6.2.0
+- scope: network
+  tag: 10.7.2.0
+path: /infra/domains/default/groups/network-2
+relative_path: network-2
+parent_path: /infra/domains/default
+_create_time: 1789134726621
+_create_user: admin
+_last_modified_time: 1789134726621
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

@@ -1,0 +1,33 @@
+action: ALLOW
+resource_type: Rule
+id: default-layer3-rule
+display_name: Default Layer3 Rule
+path: /infra/domains/default/security-policies/default-layer3-section/rules/default-layer3-rule
+relative_path: default-layer3-rule
+parent_path: /infra/domains/default/security-policies/default-layer3-section
+rule_id: 2
+sequence_number: 2147483647
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- ANY
+destination_groups:
+- ANY
+services:
+- ANY
+profiles:
+- ANY
+logged: false
+scope:
+- ANY
+disabled: false
+direction: IN_OUT
+ip_protocol: IPV4_IPV6
+is_default: true
+_create_time: 1776978629153
+_create_user: system
+_last_modified_time: 1789065905532
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED
+_parent_policy_id: default-layer3-section

@@ -1,0 +1,9 @@
+NSX BACKUP OK
+  source : nsx-gm1 (nsx-gm1.lab.local) [GM]
+  bundle : /Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058
+  taken  : 2026-09-15T17:41:02.679411+00:00
+  steps  :
+    OK   1_export_objects
+    OK   2_export_segments
+  restore: push the bundle back with the per-class push tools
+           (dry-run by default; see docs/nsx/RUNBOOK_BACKUP.md)

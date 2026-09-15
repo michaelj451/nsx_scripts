@@ -1,0 +1,130 @@
+expression:
+- expressions:
+  - member_type: VirtualMachine
+    key: Tag
+    operator: EQUALS
+    scope_operator: EQUALS
+    value: network|10.6.0.0
+    resource_type: Condition
+    id: bd078a6f-8eba-47ff-b1a1-4bbc8a3d85c6
+    path: /infra/domains/default/groups/super-nested-group/condition-expressions/bd078a6f-8eba-47ff-b1a1-4bbc8a3d85c6
+    relative_path: bd078a6f-8eba-47ff-b1a1-4bbc8a3d85c6
+    parent_path: /infra/domains/default/groups/super-nested-group
+    _protection: NOT_PROTECTED
+  - conjunction_operator: AND
+    resource_type: ConjunctionOperator
+    id: f7d4c04f-4af2-4bd6-83cc-0f4e7db8f706
+    path: /infra/domains/default/groups/super-nested-group/conjunction-expressions/f7d4c04f-4af2-4bd6-83cc-0f4e7db8f706
+    relative_path: f7d4c04f-4af2-4bd6-83cc-0f4e7db8f706
+    parent_path: /infra/domains/default/groups/super-nested-group
+    _protection: NOT_PROTECTED
+  - member_type: VirtualMachine
+    key: Tag
+    operator: EQUALS
+    scope_operator: EQUALS
+    value: vm|1
+    resource_type: Condition
+    id: 35805fe2-6307-410d-ba0b-beb634ecfa67
+    path: /infra/domains/default/groups/super-nested-group/condition-expressions/35805fe2-6307-410d-ba0b-beb634ecfa67
+    relative_path: 35805fe2-6307-410d-ba0b-beb634ecfa67
+    parent_path: /infra/domains/default/groups/super-nested-group
+    _protection: NOT_PROTECTED
+  resource_type: NestedExpression
+  id: 19fe24ee-7572-4768-8ed3-8921ccf833be
+  path: /infra/domains/default/groups/super-nested-group/nested-expressions/19fe24ee-7572-4768-8ed3-8921ccf833be
+  relative_path: 19fe24ee-7572-4768-8ed3-8921ccf833be
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: 602936ae-76f8-43bd-a609-08a3d46ebaf0
+  path: /infra/domains/default/groups/super-nested-group/conjunction-expressions/602936ae-76f8-43bd-a609-08a3d46ebaf0
+  relative_path: 602936ae-76f8-43bd-a609-08a3d46ebaf0
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: asl_id|1
+  resource_type: Condition
+  id: 527bc660-4009-4cb2-8a8f-0a0af0535960
+  path: /infra/domains/default/groups/super-nested-group/condition-expressions/527bc660-4009-4cb2-8a8f-0a0af0535960
+  relative_path: 527bc660-4009-4cb2-8a8f-0a0af0535960
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: 0cdbda84-6fa2-4003-9e30-d68fcd587797
+  path: /infra/domains/default/groups/super-nested-group/conjunction-expressions/0cdbda84-6fa2-4003-9e30-d68fcd587797
+  relative_path: 0cdbda84-6fa2-4003-9e30-d68fcd587797
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: network|10.7.0.0
+  resource_type: Condition
+  id: 69172309-0d20-4874-bd22-c77fa419bffc
+  path: /infra/domains/default/groups/super-nested-group/condition-expressions/69172309-0d20-4874-bd22-c77fa419bffc
+  relative_path: 69172309-0d20-4874-bd22-c77fa419bffc
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: 295ef47c-ca07-4c4d-8a4a-f24d476298e9
+  path: /infra/domains/default/groups/super-nested-group/conjunction-expressions/295ef47c-ca07-4c4d-8a4a-f24d476298e9
+  relative_path: 295ef47c-ca07-4c4d-8a4a-f24d476298e9
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: network|10.7.1.0
+  resource_type: Condition
+  id: e4cf206a-be88-47ff-bdbf-33191d21f902
+  path: /infra/domains/default/groups/super-nested-group/condition-expressions/e4cf206a-be88-47ff-bdbf-33191d21f902
+  relative_path: e4cf206a-be88-47ff-bdbf-33191d21f902
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: 7b951b4a-c0dc-4ff3-a520-1ee59db3dc45
+  path: /infra/domains/default/groups/super-nested-group/conjunction-expressions/7b951b4a-c0dc-4ff3-a520-1ee59db3dc45
+  relative_path: 7b951b4a-c0dc-4ff3-a520-1ee59db3dc45
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+- ip_addresses:
+  - 10.2.3.0/24
+  - 10.5.20.5
+  resource_type: IPAddressExpression
+  id: 64d84668-8eea-464d-889c-1ef6924ed94c
+  path: /infra/domains/default/groups/super-nested-group/ip-address-expressions/64d84668-8eea-464d-889c-1ef6924ed94c
+  relative_path: 64d84668-8eea-464d-889c-1ef6924ed94c
+  parent_path: /infra/domains/default/groups/super-nested-group
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: super-nested-group
+display_name: super-nested-group
+tags:
+- scope: network
+  tag: 10.6.0.0
+- scope: vm
+  tag: '1'
+- scope: network
+  tag: 10.7.0.0
+- scope: network
+  tag: 10.7.1.0
+path: /infra/domains/default/groups/super-nested-group
+relative_path: super-nested-group
+parent_path: /infra/domains/default
+_create_time: 1789134727406
+_create_user: admin
+_last_modified_time: 1789134727406
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

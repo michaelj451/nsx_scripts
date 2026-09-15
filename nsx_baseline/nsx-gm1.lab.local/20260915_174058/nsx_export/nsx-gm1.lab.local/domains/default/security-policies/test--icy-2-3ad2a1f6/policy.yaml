@@ -1,0 +1,24 @@
+logging_enabled: false
+target_type: DFW
+resource_type: SecurityPolicy
+id: test-policy-2
+display_name: test-policy-2
+path: /global-infra/domains/default/security-policies/test-policy-2
+relative_path: test-policy-2
+parent_path: /global-infra/domains/default
+sequence_number: 5
+internal_sequence_number: 50000005
+category: Application
+stateful: true
+tcp_strict: true
+locked: false
+lock_modified_time: 0
+scope:
+- ANY
+is_default: false
+_create_time: 1789493813268
+_create_user: admin
+_last_modified_time: 1789493875584
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

@@ -1,0 +1,5 @@
+policy: test-policy-2
+rules:
+- this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on
+- special-case-rule-1
+- special-case-rule-2

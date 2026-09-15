@@ -1,0 +1,11 @@
+policy: Start_Policy
+rules:
+- allow-icmp-network-0
+- allow-icmp-network-1
+- allow-icmp-network-2
+- allow-icmp-network-8
+- ssh-network-0
+- ssh-network-1
+- ssh-network-2
+- ping-out
+- web_rule
