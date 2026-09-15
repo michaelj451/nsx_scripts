@@ -172,6 +172,43 @@ and target match, which is the supported in-place mode.
 
 ---
 
+## 4b) Reading the report
+
+Every push run writes `avs_run_report.md` (operator-facing) and
+`avs_run_report.json` (every row, with verdicts) into
+`$R/report/<phase>/<mode>/`. Four sections, in this order:
+
+| Section | Answers |
+|---|---|
+| **What changed** | How many objects were created, changed, failed, or pushed with no measurable change, then one table per object class naming them |
+| **Change detail (audit)** | What actually moved, value by value, for every created or changed object. Removals print first and in capitals |
+| **Read this before trusting the counts** | Where the numbers are weaker than they look |
+| **Appendix** | Every object touched, including the untouched majority |
+
+A verdict of `created` means the object was not on the target beforehand, which
+the push knows because it reads the target first. `changed` means it existed
+and something measurable moved. `rewritten` means it existed and nothing
+measurable moved, which for a non-group object is not a promise that its
+payload is identical: only groups expose an IP diff. `unknown` appears only
+when a run was told not to read the target (`--no-diff-target`), and means
+exactly that: nobody checked.
+
+Three things the report will shout about, because each one costs traffic:
+
+- **Group references removed.** A clone push that drops a target-only sibling
+  reference gets a warning block plus a per-rule table. Should never appear:
+  the rules push merges those by default.
+- **Addresses dropped for having no CSV mapping** (WF-D). A warning block plus
+  a per-sibling table of the lost addresses. Extend the CSV or rebuild with
+  `--skip-uncovered`.
+- **IPs removed** from any group, printed first in its audit block and in
+  capitals.
+
+The WF-D report also notes how many manually entered addresses were copied into
+siblings verbatim, and lists them per group.
+
+---
+
 ## 5) Verify
 
 ```bash

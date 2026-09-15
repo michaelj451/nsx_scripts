@@ -208,15 +208,26 @@ def backup_one(source: str, output_root: Path, args: argparse.Namespace) -> Dict
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     fed = is_global_manager(source)
+    # Resolved per source, because one run can back up a GM and several LMs.
+    # A GM defaults to every domain: in a federated deployment the customer's
+    # policy lives in location-scoped domains, so a default-domain-only backup
+    # captures almost nothing and still writes "NSX BACKUP OK".
+    all_domains = args.all_domains if args.all_domains is not None else fed
     log.info("=" * 60)
     log.info("BACKUP %s (%s)%s -> %s", source, host, " [GM]" if fed else "", bundle)
+    log.info("  domains: %s", "ALL (discovered from the manager)" if all_domains
+             else f"{args.domain_id} only")
+    if fed and not all_domains:
+        log.warning("  GM backup restricted to domain %r by --no-all-domains. If this GM "
+                    "uses location-scoped domains, their policy will NOT be in this "
+                    "bundle.", args.domain_id)
 
     steps = [
         run_step(label, cmd, logs_dir, verbose=not args.quiet)
         for label, cmd in plan_steps(
             source, bundle,
             domain_id=args.domain_id,
-            all_domains=args.all_domains,
+            all_domains=all_domains,
             with_vm_tags=args.with_vm_tags,
         )
     ]
@@ -229,7 +240,12 @@ def backup_one(source: str, output_root: Path, args: argparse.Namespace) -> Dict
         "host": host,
         "federation_global": fed,
         "domain_id": args.domain_id,
-        "all_domains": args.all_domains,
+        # The RESOLVED value, not the raw flag: a bundle has to record which
+        # domains it actually holds, not what was typed on the command line.
+        "all_domains": all_domains,
+        "domains_captured": sorted(
+            {p.name for p in (bundle / "nsx_export" / host / "domains").glob("*")
+             if p.is_dir()}) if (bundle / "nsx_export" / host / "domains").is_dir() else [],
         "with_vm_tags": args.with_vm_tags and not fed,
         "backed_up_at": _utc_now_iso(),
         "bundle": str(bundle),
@@ -290,8 +306,13 @@ def main() -> int:
                    help="One or more managers to back up in this run. GM aliases automatically "
                         "use the Global Manager API surface.")
     p.add_argument("--domain-id", default="default")
-    p.add_argument("--all-domains", action="store_true",
-                   help="Export every domain instead of only --domain-id.")
+    p.add_argument("--all-domains", action=argparse.BooleanOptionalAction, default=None,
+                   help="Export every domain instead of only --domain-id. Left unset it "
+                        "resolves PER SOURCE: ON for a Global Manager, OFF for a Local "
+                        "Manager. A federated GM keeps its policy in location-scoped "
+                        "domains, so a default-domain-only GM backup can be nearly empty "
+                        "and still report success. Pass --no-all-domains to force the old "
+                        "single-domain behaviour.")
     p.add_argument("--no-vm-tags", action="store_false", dest="with_vm_tags", default=True,
                    help="Skip the VM tag inventory step on LM sources (GMs never have it).")
     p.add_argument("--output-root", default=None,

@@ -44,7 +44,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -66,7 +66,8 @@ from palo.pan_group_remap import (  # noqa: E402
     address_value, read_csv_mappings, summarize_refs,
 )
 from palo.pan_ip_rules import (  # noqa: E402
-    expand_group, match_flow, match_rules, parse_ip_lines, parse_port_spec,
+    expand_group, match_flow, match_rules, parse_ip_entry, parse_ip_lines,
+    parse_port_spec,
 )
 from palo.pan_rest_client import PanRestClient, PanRestError  # noqa: E402
 from palo.pan_rule_placement import (  # noqa: E402
@@ -551,6 +552,90 @@ def load_flow_run(run_id: str) -> Dict[str, Any] | None:
 
 
 # =============================================================================
+# Traffic logs (see /traffic-logs): XML type=log, live per query
+# =============================================================================
+
+LOG_FIELDS = ("time_generated", "device_name", "rule", "action", "src", "sport",
+              "dst", "dport", "proto", "app", "bytes", "session_end_reason")
+
+
+def run_logs(payload: Dict[str, Any]) -> Dict[str, Any]:
+    parts: List[str] = []
+    for field, expr in (("src", "addr.src"), ("dst", "addr.dst")):
+        value = (payload.get(field) or "").strip()
+        if value:
+            if parse_ip_entry(value) is None or "-" in value:
+                raise ValueError(f"{field} must be an IP or subnet, got {value!r}")
+            parts.append(f"({expr} in {value})")
+    port = (payload.get("port") or "").strip()
+    if port:
+        if not port.isdigit() or not (0 < int(port) < 65536):
+            raise ValueError(f"Port must be 1-65535, got {port!r}")
+        parts.append(f"(port.dst eq {port})")
+    hours = (payload.get("hours") or "").strip()
+    if hours:
+        if not hours.isdigit() or int(hours) < 1:
+            raise ValueError(f"Hours must be a positive integer, got {hours!r}")
+        since = datetime.now() - timedelta(hours=int(hours))
+        parts.append(f"(receive_time geq '{since.strftime('%Y/%m/%d %H:%M:%S')}')")
+    extra = (payload.get("extra") or "").strip()
+    if extra:
+        parts.append(f"({extra})")
+    query = " and ".join(parts) or None
+
+    nlogs_raw = str(payload.get("nlogs") or "50").strip()
+    if not nlogs_raw.isdigit() or not (1 <= int(nlogs_raw) <= 1000):
+        raise ValueError(f"Max entries must be 1-1000, got {nlogs_raw!r}")
+
+    client = fresh_client()
+    result = client.query_logs("traffic", query=query, nlogs=int(nlogs_raw))
+    entries = [{f: e.get(f, "") for f in LOG_FIELDS} for e in result["entries"]]
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out = {"run_id": run_id,
+           "meta": {"ran_at": datetime.now(timezone.utc).isoformat(),
+                    "target": client.env.url, "username": client.username,
+                    "query": query or "(none: newest logs)",
+                    "job_id": result["job_id"]},
+           "inputs": {k: payload.get(k) or "" for k in
+                      ("src", "dst", "port", "hours", "extra", "nlogs")},
+           "totals": {"returned": len(entries), "total_matching": result["total"]},
+           "entries": entries}
+    d = logs_runs_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{run_id}.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+    log.info("Logs %s: query=%s -> %d entries (total %s)", run_id, query,
+             len(entries), result["total"])
+    return out
+
+
+def logs_runs_dir() -> Path:
+    return REPO_ROOT / "pan_reports" / CONFIG["display_host"].split(".")[0] / "web_traffic_logs"
+
+
+def list_logs_runs() -> List[Dict[str, Any]]:
+    d = logs_runs_dir()
+    if not d.exists():
+        return []
+    out = []
+    for f in sorted(d.glob("*.json"), reverse=True)[:50]:
+        try:
+            r = json.loads(f.read_text(encoding="utf-8"))
+            out.append({"run_id": r["run_id"], "ran_at": r["meta"]["ran_at"],
+                        "query": r["meta"]["query"], "totals": r["totals"]})
+        except (ValueError, KeyError):
+            continue
+    return out
+
+
+def load_logs_run(run_id: str) -> Dict[str, Any] | None:
+    if not RUN_ID_RE.match(run_id):
+        return None
+    f = logs_runs_dir() / f"{run_id}.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+
+
+# =============================================================================
 # Rule placement (see /rule-placement): routing tables via Panorama proxy
 # =============================================================================
 
@@ -900,11 +985,12 @@ def delete_runs(kind: str, run_id: str | None) -> Dict[str, Any]:
     import shutil
     host = CONFIG["display_host"].split(".")[0]
     deleted = 0
-    if kind in ("search", "searchplus", "placement", "flow"):
+    if kind in ("search", "searchplus", "placement", "flow", "logs"):
         d = {"search": search_runs_dir,
              "searchplus": lambda: search_runs_dir(True),
              "placement": placement_runs_dir,
-             "flow": flow_runs_dir}[kind]()
+             "flow": flow_runs_dir,
+             "logs": logs_runs_dir}[kind]()
         files = ([d / f"{run_id}.json"] if run_id else list(d.glob("*.json"))) if d.exists() else []
         for f in files:
             if RUN_ID_RE.match(f.stem) and f.exists():
@@ -1045,7 +1131,8 @@ def shell(title: str, here: str, body: str, script: str) -> str:
                            ("/group-remap", "Group Remap"),
                            ("/remap-pivot", "Remap Pivot"),
                            ("/flow-search", "Flow Match"),
-                           ("/rule-placement", "Rule Placement")))
+                           ("/rule-placement", "Rule Placement"),
+                           ("/traffic-logs", "Traffic Logs")))
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1096,6 +1183,13 @@ HUB_BODY = """
       against each device group's full evaluation chain (shared pre, DG pre,
       DG post, shared post). Shows every matching rule and highlights the one
       that would actually apply.</p>
+  </a>
+  <a class="panel" href="/traffic-logs" style="text-decoration:none;color:inherit">
+    <h2 style="margin-top:0">Traffic Logs</h2>
+    <p class="hint">Live traffic logs from Panorama's log store (XML type=log,
+      the one log path that exists; REST has none). Filter by source,
+      destination, port, and time window; see which rule actually handled
+      the traffic. Works under the read-only agent account.</p>
   </a>
   <a class="panel" href="/rule-placement" style="text-decoration:none;color:inherit">
     <h2 style="margin-top:0">Rule Placement</h2>
@@ -1958,6 +2052,107 @@ $("go").onclick = async () => {
 refreshRuns();
 """
 
+LOGS_BODY = """
+<div class="layout">
+  <div>
+    <div class="panel">
+      <label for="src">Source IP or subnet (optional)</label>
+      <input type="text" id="src" placeholder="10.0.12.5 or 10.0.12.0/24">
+      <label for="dst">Destination IP or subnet (optional)</label>
+      <input type="text" id="dst" placeholder="10.0.1.9">
+      <label for="port">Destination port (optional)</label>
+      <input type="text" id="port" placeholder="443">
+      <label for="hours">Time window</label>
+      <select id="hours">
+        <option value="">any time</option>
+        <option value="1">last hour</option>
+        <option value="24" selected>last 24 hours</option>
+        <option value="168">last 7 days</option>
+      </select>
+      <label for="extra">Extra filter (optional, Monitor-tab syntax)</label>
+      <input type="text" id="extra" placeholder="(action eq deny) or (rule eq 'allow basics')">
+      <label for="nlogs">Max entries</label>
+      <input type="text" id="nlogs" value="50">
+      <button id="go">Query logs (live)</button>
+      <div class="err" id="error"></div>
+      <div class="readonly">Live query of the logs forwarded to Panorama, via
+        XML type=log as the agent account (the only log API; REST has none).
+        Asynchronous upstream: each query runs a short log job. Read-only.</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <label style="margin-top:0">Previous queries
+        <a href="#" id="clear-runs" class="clearlink">clear all</a></label>
+      <ul id="runs" class="runs"></ul>
+    </div>
+  </div>
+  <div id="results"><p class="none">No query yet.</p></div>
+</div>
+"""
+
+LOGS_JS = """
+function render(r) {
+  const rows = r.entries.map(e => [
+    esc(e.time_generated), esc(e.device_name), esc(e.rule),
+    e.action === "allow" ? esc(e.action) : `<span class="flag">${esc(e.action)}</span>`,
+    `<code>${esc(e.src)}${e.sport ? ":" + esc(e.sport) : ""}</code>`,
+    `<code>${esc(e.dst)}${e.dport ? ":" + esc(e.dport) : ""}</code>`,
+    esc(e.proto), esc(e.app), esc(e.bytes), esc(e.session_end_reason)]);
+  $("results").innerHTML = `
+    <div class="chips">
+      <div class="chip"><b>${r.totals.returned}</b><span>entries shown</span></div>
+      <div class="chip"><b>${r.totals.total_matching}</b><span>total matching</span></div>
+    </div>
+    <p class="hint">Query ${esc(r.run_id)} at ${esc(r.meta.ran_at)} against
+      ${esc(r.meta.target)} as ${esc(r.meta.username)}<br>
+      filter: <code>${esc(r.meta.query)}</code></p>
+    <h2>Traffic log entries (newest first)</h2>
+    ${table(["Time","Firewall","Rule","Action","Source","Destination",
+             "Proto","App","Bytes","End reason"], rows)}`;
+}
+
+async function refreshRuns() {
+  const runs = await (await fetch("/api/logs/runs")).json();
+  $("runs").innerHTML = runs.length ? runs.map(r =>
+    `<li data-id="${esc(r.run_id)}">
+       <div><b>${r.totals.returned}</b> of ${r.totals.total_matching} entries</div>
+       <div><code>${esc(r.query)}</code></div>
+       <div class="when">${esc(r.ran_at)}</div>
+       <span class="del" data-del="${esc(r.run_id)}" title="delete this query">&#215;</span></li>`).join("")
+    : '<li class="none" style="cursor:default">none yet</li>';
+  for (const li of $("runs").querySelectorAll("li[data-id]"))
+    li.onclick = async () => {
+      const run = await (await fetch("/api/logs/run?id=" + li.dataset.id)).json();
+      if (!run.error) { render(run); fillInputs(run.inputs); }
+    };
+  wireHistory("logs", refreshRuns);
+}
+
+function fillInputs(i) {
+  if (!i) return;
+  for (const k of ["src", "dst", "port", "hours", "extra", "nlogs"])
+    if ($(k)) $(k).value = i[k] || ($(k).tagName === "SELECT" ? "" : $(k).value);
+}
+
+$("go").onclick = async () => {
+  $("error").textContent = "";
+  $("go").disabled = true;
+  $("go").textContent = "Querying Panorama logs...";
+  try {
+    const resp = await fetch("/api/logs/run", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({src: $("src").value, dst: $("dst").value,
+                            port: $("port").value, hours: $("hours").value,
+                            extra: $("extra").value, nlogs: $("nlogs").value})});
+    const data = await resp.json();
+    if (data.error) $("error").textContent = data.error;
+    else { render(data); refreshRuns(); }
+  } catch (e) { $("error").textContent = String(e); }
+  $("go").disabled = false;
+  $("go").textContent = "Query logs (live)";
+};
+refreshRuns();
+"""
+
 PLACEMENT_BODY = """
 <div class="layout">
   <div>
@@ -2205,6 +2400,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/rule-placement"):
             self._page("SSDD Toolkit : Rule Placement", "/rule-placement",
                        PLACEMENT_BODY, PLACEMENT_JS)
+        elif self.path.startswith("/traffic-logs"):
+            self._page("SSDD Toolkit : Traffic Logs", "/traffic-logs",
+                       LOGS_BODY, LOGS_JS)
         elif self.path == "/api/info":
             self._json({"target": CONFIG["display_target"],
                         "username_source": CONFIG["user_env"] or "PANORAMA_* resolution",
@@ -2235,6 +2433,13 @@ class Handler(BaseHTTPRequestHandler):
             raw = (self.path.split("top=", 1) + [""])[1].split("&")[0]
             top = int(raw) if raw.isdigit() else 10
             self._json(dg_subnet_map(top))
+        elif self.path == "/api/logs/runs":
+            self._json(list_logs_runs())
+        elif self.path.startswith("/api/logs/run?"):
+            run_id = (self.path.split("id=", 1) + [""])[1].split("&")[0]
+            run = load_logs_run(run_id)
+            self._json(run if run else {"error": f"run {run_id!r} not found"},
+                       200 if run else 404)
         elif self.path == "/api/placement/runs":
             self._json(list_placement_runs())
         elif self.path.startswith("/api/placement/run?"):
@@ -2272,6 +2477,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(pull_topology())
             elif self.path == "/api/placement/run":
                 self._json(run_placement(payload))
+            elif self.path == "/api/logs/run":
+                self._json(run_logs(payload))
             elif self.path == "/api/runs/delete":
                 self._json(delete_runs(payload.get("kind", ""), payload.get("id")))
             else:

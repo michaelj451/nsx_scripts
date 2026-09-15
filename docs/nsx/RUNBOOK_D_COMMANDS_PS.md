@@ -65,6 +65,10 @@ python tools/nsx/build_sibling_groups.py `
   --no-stripped-originals
 ```
 
+Manually entered IPs (the group's own IPAddressExpression entries) are
+copied into the sibling verbatim alongside the mapped values. Add
+`--no-copy-manual-ips` to emit mapped values only.
+
 Outputs:
 - `nsx_sibling_groups\nsx-lm1.lab.local\groups\` — siblings (for tag+IP mixed groups)
 - `nsx_sibling_groups\nsx-lm1.lab.local\sibling_map.json` — audit + input for amend-refs and validator
