@@ -66,6 +66,113 @@ $env:PYTHONPATH = "$PWD\app"
 
 ---
 
+## B.0) WHICH SURFACES AND DOMAINS ARE IN SCOPE
+
+Read this before running B against anything other than a single standalone
+Local Manager. Getting it wrong produces a run that reports `failed: 0` and
+silently leaves most of the estate unremapped.
+
+### Two independent group populations
+
+| Population | Lives at | Reached by |
+|---|---|---|
+| **GM-owned** | `/global-infra/` on the Global Manager | `--target nsx-gm1 --federation-global` |
+| **LM-local** | `/infra/` on each Local Manager | `--target nsx-lm1` (no federation flag) |
+
+A GM-scoped run touches only the first. Groups created directly on a site LM
+are invisible to the GM, and nothing in the report hints that they exist. A
+federated estate therefore needs **one run per surface**: once against the GM,
+then once against each LM for its own local groups.
+
+### A Global Manager has several domains, and the tools default to one
+
+`groups.py export` and `groups.py push` both default to `--domain-id default`.
+A GM normally also carries one location-scoped domain per site, and in a real
+deployment that is where the customer's policy lives. Neither tool has an
+`--all-domains` option, so **every domain is a separate invocation**.
+
+Measured on the lab GM, 2026-09-15, running only the default domain would have
+reported success while missing a group that the CSV maps:
+
+```text
+default              seen=13  changed=1  added=3   <- the only domain a plain run sees
+nsx-lm1.lab.local    seen=1   changed=1  added=2   <- MISSED without --domain-id
+nsx-lm2.lab.local    seen=0   changed=0  added=0
+```
+
+List the domains first, and count them against the sites you expect:
+
+```bash
+python tools/nsx/list_domains.py nsx-gm1
+```
+
+### Dry run every GM domain in one pass
+
+Read-only. Each domain gets its own export bundle and its own reports
+directory, so the per-domain revert baselines never overwrite each other.
+
+```bash
+setopt interactive_comments 2>/dev/null || true
+
+M=nsx-gm1
+FED=--federation-global
+CSV=data/subnet_map.csv
+TS=$(date -u +%Y%m%d_%H%M%S)
+
+for DOM in $(python tools/nsx/list_domains.py $M); do
+  python tools/nsx/groups.py export --source $M $FED --domain-id $DOM \
+    --output-dir nsx_groups_export/${M}_${DOM}
+  python tools/nsx/groups.py push --target $M $FED --domain-id $DOM \
+    --groups-dir nsx_groups_export/${M}_${DOM}/groups \
+    --csv-remap $CSV --reports-dir nsx_wfb_runs/$M/${TS}_${DOM}
+done
+```
+
+Review every domain's `summary.json` before applying anything:
+
+```bash
+for f in nsx_wfb_runs/$M/${TS}_*/summary.json; do
+  python -c "
+import json,sys
+d=json.load(open(sys.argv[1])); t=d['totals']
+print(f\"{sys.argv[1].split('/')[-2]:28} mode={d['mode']} seen={t['files_seen']:3} \"
+      f\"changed={t['csv_groups_changed']} added={t['csv_total_added_values']} \"
+      f\"generic_skipped={t['csv_generic_groups_skipped']} failed={t['failed']}\")" $f
+done
+```
+
+To apply, re-run the same push commands with `--apply`. Do it **one domain at a
+time**, reviewing between each: each apply captures its own baseline, so
+reverting one domain does not touch another.
+
+### Then each Local Manager, for its own local groups
+
+```bash
+for M in nsx-lm1 nsx-lm2 nsx-lm3; do
+  python tools/nsx/groups.py export --source $M --output-dir nsx_groups_export/${M}_local
+  python tools/nsx/groups.py push --target $M \
+    --groups-dir nsx_groups_export/${M}_local/groups \
+    --csv-remap $CSV --reports-dir nsx_wfb_runs/$M/${TS}_local
+done
+```
+
+No `--federation-global`, and an LM normally has only the `default` domain, so
+one invocation each. Run `list_domains.py` against one to confirm.
+
+### A standalone Local Manager
+
+Nothing above applies: no federation flag, one surface, one domain. Use the
+commands in B.1 and B.2 as written.
+
+### What still is not covered
+
+`--remap-generic` is off by default, so only `group_type: [IPAddress]` groups
+are remapped. Generic groups that the CSV could map are reported as candidates
+in the dry run (`csv_generic_candidate_values`) and changed by nothing. Decide
+per run whether to widen the scope; see B.2.
+
+---
+
 ## B.1) Capture — read-only snapshot of `nsx-lm1`
 
 ```bash

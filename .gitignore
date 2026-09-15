@@ -26,6 +26,7 @@ nsx_groups_additive*/
 nsx_groups_remapped/
 nsx_groups_transformed/
 nsx_export_verify/
+nsx_wfb_runs
 
 # Workflow A bundle artifacts (capture / transform / push)
 nsx_sibling_groups/
