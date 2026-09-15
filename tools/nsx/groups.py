@@ -50,6 +50,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -1818,6 +1819,79 @@ def cmd_revert(args: argparse.Namespace) -> int:
 # CLI dispatch
 # =============================================================================
 
+def _discover_domains(args: argparse.Namespace) -> List[str]:
+    """Every domain id on the manager this command addresses.
+
+    A Global Manager normally carries one location-scoped domain per site, and
+    in a federated deployment that is where the customer's policy lives. Both
+    subcommands default to --domain-id default, so without this a GM run covers
+    one domain, reports failed=0, and silently leaves the rest untouched.
+    """
+    alias = getattr(args, "target", None) or getattr(args, "source", None)
+    host = resolve_manager(alias)
+    client = NsxPolicyClient(nsxmanager=host, federation_global=args.federation_global)
+    return [d["id"] for d in client.list_domains() if d.get("id")]
+
+
+def _run_all_domains(args: argparse.Namespace) -> int:
+    """Run the requested subcommand once per domain, each fully isolated.
+
+    Every domain gets its own bundle and its own reports directory, so the
+    per-domain revert baselines never overwrite each other: reverting one domain
+    leaves the others alone. One domain failing does not abandon the rest, but
+    the overall exit code is non-zero so a pipeline still fails.
+    """
+    domains = _discover_domains(args)
+    log.info("=" * 60)
+    log.info("ALL DOMAINS: discovered %d on %s: %s", len(domains),
+             getattr(args, "target", None) or getattr(args, "source", None),
+             ", ".join(domains))
+    log.info("=" * 60)
+
+    results: List[Tuple[str, int, str]] = []
+    for dom in domains:
+        sub = copy.copy(args)
+        sub.all_domains = False
+        sub.domain_id = dom
+        # Per-domain paths. Setting output_dir explicitly also means cmd_export
+        # no longer treats it as the default, so it does not wipe the bundle
+        # root (which is where push_report/baselines/ lives).
+        if getattr(args, "output_dir", None):
+            sub.output_dir = str(Path(args.output_dir) / dom)
+        if getattr(args, "groups_dir", None):
+            sub.groups_dir = str(Path(args.groups_dir) / dom / "groups")
+        if getattr(args, "reports_dir", None):
+            sub.reports_dir = str(Path(args.reports_dir) / dom)
+
+        if getattr(sub, "groups_dir", None) and not Path(sub.groups_dir).is_dir():
+            log.warning("DOMAIN %s: no bundle at %s, skipping. Export with "
+                        "--all-domains first so each domain has its own subdirectory.",
+                        dom, sub.groups_dir)
+            results.append((dom, 0, "skipped: no bundle"))
+            continue
+
+        log.info("")
+        log.info("#" * 60)
+        log.info("# DOMAIN %s", dom)
+        log.info("#" * 60)
+        try:
+            rc = args.func(sub)
+        except SystemExit as exc:
+            rc = int(exc.code or 0)
+        except Exception:
+            log.exception("DOMAIN %s: unhandled error", dom)
+            rc = 1
+        results.append((dom, rc, "ok" if rc == 0 else f"rc={rc}"))
+
+    log.info("")
+    log.info("=" * 60)
+    log.info("ALL DOMAINS SUMMARY")
+    for dom, rc, note in results:
+        log.log(logging.INFO if rc == 0 else logging.ERROR, "  %-30s %s", dom, note)
+    log.info("=" * 60)
+    return 0 if all(rc == 0 for _, rc, _ in results) else 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Export NSX groups from a source / push them to a target. Two subcommands.",
@@ -1827,6 +1901,11 @@ def main() -> int:
     pe = sub.add_parser("export", help="Export groups from a source manager into per-file YAMLs (read-only).")
     pe.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
     pe.add_argument("--domain-id", default="default")
+    pe.add_argument("--all-domains", action="store_true",
+                    help="Export EVERY domain on the manager, not just --domain-id. "
+                         "Each lands in <output-dir>/<domain>/. A Global Manager carries "
+                         "one location-scoped domain per site; without this a GM export "
+                         "covers only `default` and reports success.")
     pe.add_argument("--federation-global", action="store_true")
     pe.add_argument("--output-dir", default=None,
                     help="Defaults to nsx_groups_export/<source-host>/. Wiped on each run.")
@@ -1838,6 +1917,11 @@ def main() -> int:
     pp.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pp.add_argument("--groups-dir", required=True)
     pp.add_argument("--domain-id", default="default")
+    pp.add_argument("--all-domains", action="store_true",
+                    help="Push EVERY domain on the target, not just --domain-id. Expects "
+                         "the layout `groups.py export --all-domains` produces: "
+                         "<groups-dir>/<domain>/groups/. Reports and revert baselines are "
+                         "written per domain under <reports-dir>/<domain>/.")
     pp.add_argument("--federation-global", action="store_true")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
@@ -1921,6 +2005,8 @@ def main() -> int:
 
     args = p.parse_args()
     init_cli()
+    if getattr(args, "all_domains", False):
+        return _run_all_domains(args)
     return args.func(args)
 
 

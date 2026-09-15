@@ -84,54 +84,54 @@ are invisible to the GM, and nothing in the report hints that they exist. A
 federated estate therefore needs **one run per surface**: once against the GM,
 then once against each LM for its own local groups.
 
-### A Global Manager has several domains, and the tools default to one
+### A Global Manager has several domains: use `--all-domains`
 
-`groups.py export` and `groups.py push` both default to `--domain-id default`.
-A GM normally also carries one location-scoped domain per site, and in a real
-deployment that is where the customer's policy lives. Neither tool has an
-`--all-domains` option, so **every domain is a separate invocation**.
+`groups.py export` and `push` default to `--domain-id default`. A GM normally
+also carries one location-scoped domain per site, and in a real deployment that
+is where the customer's policy lives. `--all-domains` covers every one of them
+in a single command.
 
-Measured on the lab GM, 2026-09-15, running only the default domain would have
-reported success while missing a group that the CSV maps:
+Measured on the lab GM, 2026-09-15: a default-domain-only run reports success
+while missing a group the CSV maps.
 
 ```text
 default              seen=13  changed=1  added=3   <- the only domain a plain run sees
-nsx-lm1.lab.local    seen=1   changed=1  added=2   <- MISSED without --domain-id
+nsx-lm1.lab.local    seen=1   changed=1  added=2   <- MISSED without --all-domains
 nsx-lm2.lab.local    seen=0   changed=0  added=0
 ```
 
-List the domains first, and count them against the sites you expect:
+List the domains first and count them against the sites you expect:
 
 ```bash
 python tools/nsx/list_domains.py nsx-gm1
 ```
 
-### Dry run every GM domain in one pass
+### Dry run every GM domain
 
-Read-only. Each domain gets its own export bundle and its own reports
-directory, so the per-domain revert baselines never overwrite each other.
+Read-only. Two commands cover the whole GM. Each domain gets its own bundle
+under `<output-dir>/<domain>/` and its own reports under
+`<reports-dir>/<domain>/`, so per-domain revert baselines never collide.
 
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
 M=nsx-gm1
-FED=--federation-global
 CSV=data/subnet_map.csv
 TS=$(date -u +%Y%m%d_%H%M%S)
 
-for DOM in $(python tools/nsx/list_domains.py $M); do
-  python tools/nsx/groups.py export --source $M $FED --domain-id $DOM \
-    --output-dir nsx_groups_export/${M}_${DOM}
-  python tools/nsx/groups.py push --target $M $FED --domain-id $DOM \
-    --groups-dir nsx_groups_export/${M}_${DOM}/groups \
-    --csv-remap $CSV --reports-dir nsx_wfb_runs/$M/${TS}_${DOM}
-done
+python tools/nsx/groups.py export --source $M --federation-global \
+  --all-domains --output-dir nsx_groups_export/${M}_alldom
+
+python tools/nsx/groups.py push --target $M --federation-global \
+  --all-domains --groups-dir nsx_groups_export/${M}_alldom \
+  --csv-remap $CSV --reports-dir nsx_wfb_runs/$M/$TS
 ```
 
-Review every domain's `summary.json` before applying anything:
+The run prints a per-domain summary at the end. Review each domain's numbers
+before applying:
 
 ```bash
-for f in nsx_wfb_runs/$M/${TS}_*/summary.json; do
+for f in nsx_wfb_runs/$M/$TS/*/summary.json; do
   python -c "
 import json,sys
 d=json.load(open(sys.argv[1])); t=d['totals']
@@ -141,9 +141,18 @@ print(f\"{sys.argv[1].split('/')[-2]:28} mode={d['mode']} seen={t['files_seen']:
 done
 ```
 
-To apply, re-run the same push commands with `--apply`. Do it **one domain at a
-time**, reviewing between each: each apply captures its own baseline, so
-reverting one domain does not touch another.
+Add `--apply` to the push to write. One domain failing does not abandon the
+rest, and the exit code is non-zero if any did, so it still gates a pipeline.
+A domain with no bundle (added since your export) is skipped with a warning.
+
+**Revert stays per domain.** Each domain has its own baseline under
+`<reports-dir>/<domain>/baselines/`, so reverting one leaves the others alone:
+
+```bash
+python tools/nsx/groups.py revert --target $M --federation-global \
+  --domain-id nsx-lm1.lab.local \
+  --reports-dir nsx_wfb_runs/$M/$TS/nsx-lm1.lab.local --apply
+```
 
 ### Then each Local Manager, for its own local groups
 
