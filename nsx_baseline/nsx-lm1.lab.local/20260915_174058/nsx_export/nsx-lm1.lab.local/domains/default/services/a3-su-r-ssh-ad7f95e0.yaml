@@ -1,0 +1,31 @@
+is_default: false
+service_entries:
+- l4_protocol: TCP
+  source_ports: []
+  destination_ports:
+  - '22'
+  resource_type: L4PortSetServiceEntry
+  id: a3-service-super-ssh
+  display_name: a3-service-super-ssh
+  path: /infra/services/a3-super-ssh/service-entries/a3-service-super-ssh
+  relative_path: a3-service-super-ssh
+  parent_path: /infra/services/a3-super-ssh
+  _create_time: 1789139665806
+  _create_user: admin
+  _last_modified_time: 1789139665806
+  _last_modified_user: admin
+  _system_owned: false
+  _protection: NOT_PROTECTED
+service_type: NON_ETHER
+resource_type: Service
+id: a3-super-ssh
+display_name: a3-super-ssh
+path: /infra/services/a3-super-ssh
+relative_path: a3-super-ssh
+parent_path: /infra
+_create_time: 1789139665805
+_create_user: admin
+_last_modified_time: 1789139665805
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

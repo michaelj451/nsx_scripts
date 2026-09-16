@@ -1,0 +1,29 @@
+expression:
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: vm|1
+  resource_type: Condition
+  id: 3210f116-9d6f-4db9-972e-550407ff09e0
+  path: /infra/domains/default/groups/vm1/condition-expressions/3210f116-9d6f-4db9-972e-550407ff09e0
+  relative_path: 3210f116-9d6f-4db9-972e-550407ff09e0
+  parent_path: /infra/domains/default/groups/vm1
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: vm1
+display_name: vm-group-1
+tags:
+- scope: vm
+  tag: '1'
+path: /infra/domains/default/groups/vm1
+relative_path: vm1
+parent_path: /infra/domains/default
+_create_time: 1789134727874
+_create_user: admin
+_last_modified_time: 1789134727874
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

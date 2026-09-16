@@ -15,7 +15,18 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r docker\requirements-pip.txt
 $env:PYTHONPATH = "$PWD\app"
+
+$env:OBJECT_APPENDIX_AVS = ((Select-String -Path .env -Pattern '^OBJECT_APPENDIX_AVS=').Line -split '=',2)[1]
+"WF-D sibling suffix: $env:OBJECT_APPENDIX_AVS"
 ```
+
+The Python tools read `.env` themselves, but your **shell** does not, so the
+suffix has to be set before any command below can interpolate it. Confirm it
+prints `_avs_ips` and not an empty string: `build_sibling_groups.py` treats an
+empty `--appendix` as unset and falls back to `OBJECT_APPENDIX` (`_np_ips`),
+WF-C's suffix, which would merge remapped addresses into WF-C's source-IP
+siblings. See
+[RUNBOOK_D.md](RUNBOOK_D.md#sibling-suffix-wf-d-must-not-share-wf-cs).
 
 ---
 
@@ -48,10 +59,15 @@ python tools/nsx/compare_group_ips.py `
 ```powershell
 python tools/nsx/build_sibling_groups.py `
   --source nsx-lm1 `
+  --appendix $env:OBJECT_APPENDIX_AVS `
   --csv-remap data/nonprod_map.csv `
   --skip-segment-groups `
   --no-stripped-originals
 ```
+
+Manually entered IPs (the group's own IPAddressExpression entries) are
+copied into the sibling verbatim alongside the mapped values. Add
+`--no-copy-manual-ips` to emit mapped values only.
 
 Outputs:
 - `nsx_sibling_groups\nsx-lm1.lab.local\groups\` — siblings (for tag+IP mixed groups)
@@ -63,6 +79,7 @@ Outputs:
 ```powershell
 python tools/nsx/build_sibling_groups.py `
   --source nsx-lm1 `
+  --appendix $env:OBJECT_APPENDIX_AVS `
   --csv-remap data/nonprod_map.csv `
   --skip-segment-groups `
   --no-stripped-originals `
@@ -145,6 +162,7 @@ Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit code: `0` = all pass, `1` = at le
 ```powershell
 python tools/nsx/build_sibling_groups.py `
   --source nsx-lm1 `
+  --appendix $env:OBJECT_APPENDIX_AVS `
   --csv-remap data/nonprod_map.csv `
   --skip-segment-groups
 ```

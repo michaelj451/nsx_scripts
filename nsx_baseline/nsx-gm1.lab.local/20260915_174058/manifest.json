@@ -1,0 +1,62 @@
+{
+  "all_domains": true,
+  "backed_up_at": "2026-09-15T17:41:02.679411+00:00",
+  "bundle": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058",
+  "domain_id": "default",
+  "domains_captured": [
+    "default",
+    "nsx-lm1.lab.local",
+    "nsx-lm2.lab.local"
+  ],
+  "federation_global": true,
+  "host": "nsx-gm1.lab.local",
+  "ok": true,
+  "source": "nsx-gm1",
+  "steps": [
+    {
+      "cmd": [
+        "/Users/mxferguson/dev/nsx_scripts/.venv/bin/python",
+        "tools/nsx/export_nsx_objects.py",
+        "--manager",
+        "nsx-gm1",
+        "--base-dir",
+        "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/nsx_export",
+        "--domain-id",
+        "default",
+        "--output-format",
+        "yaml",
+        "--all-domains",
+        "--federation-global"
+      ],
+      "finished_at": "2026-09-15T17:41:02.229151+00:00",
+      "label": "1_export_objects",
+      "log": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/logs/1_export_objects.log",
+      "ok": true,
+      "returncode": 0,
+      "started_at": "2026-09-15T17:40:58.907831+00:00"
+    },
+    {
+      "cmd": [
+        "/Users/mxferguson/dev/nsx_scripts/.venv/bin/python",
+        "tools/nsx/segments.py",
+        "export",
+        "--source",
+        "nsx-gm1",
+        "--domain-id",
+        "default",
+        "--output-dir",
+        "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments",
+        "--federation-global"
+      ],
+      "finished_at": "2026-09-15T17:41:02.679141+00:00",
+      "label": "2_export_segments",
+      "log": "/Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/logs/2_export_segments.log",
+      "ok": true,
+      "returncode": 0,
+      "started_at": "2026-09-15T17:41:02.229205+00:00"
+    }
+  ],
+  "tool": "tools/nsx/backup_nsx_state.py",
+  "with_vm_tags": false,
+  "workflow": "backup"
+}

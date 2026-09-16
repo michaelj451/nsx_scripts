@@ -1,0 +1,3 @@
+policy: test-infrastructure-policy
+rules:
+- test-infrastructure-rule-1

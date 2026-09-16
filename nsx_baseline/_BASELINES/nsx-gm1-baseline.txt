@@ -1,0 +1,7 @@
+# nsx-gm1 PERMANENT BASELINE  -  taken 2026-09-15T17:40:58Z
+# All three domains captured (default, nsx-lm1.lab.local, nsx-lm2.lab.local).
+# domain default holds lm1's pre-wipe configuration, restored to gm1 on
+# 2026-09-15 and verified object-for-object against the wipe snapshot:
+#   13 groups, 4 services, 3 policies, 13 rules
+# The two location-scoped domains are empty, which is their real state.
+bundle: nsx_baseline/nsx-gm1.lab.local/20260915_174058

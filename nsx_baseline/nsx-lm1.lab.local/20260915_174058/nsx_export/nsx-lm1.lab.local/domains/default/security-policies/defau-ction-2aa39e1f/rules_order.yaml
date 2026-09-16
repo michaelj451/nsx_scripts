@@ -1,0 +1,3 @@
+policy: default-layer3-section
+rules:
+- default-layer3-rule

@@ -420,10 +420,27 @@ def cmd_push(args: argparse.Namespace) -> int:
     files = _iter_service_files(services_dir)
     log.info("Found %d service file(s).", len(files))
 
+    # Empty means "target not read", which is different from "target is empty".
+    # Rows only claim exists_on_target when the target was actually contacted.
+    baseline: Dict[str, Dict[str, Any]] = {}
+    target_read = args.apply or args.diff_target
+
     if not args.apply:
-        log.info("Dry-run mode: will iterate every file, sanitize, and confirm id — no NSX calls.")
-        client = None
         baseline_path = None
+        # A dry run reads the target by default so it can say which services
+        # already exist. Without that read every row is a guess, and a report
+        # that guesses is worse than one that says it does not know.
+        if args.diff_target:
+            client = NsxPolicyClient(nsxmanager=target_host,
+                                     federation_global=args.federation_global)
+            baseline = _capture_target_services(client)
+            log.info("  Target has %d customer service(s) (read-only, no baseline written)",
+                     len(baseline))
+            client = None      # nothing below may write in dry-run mode
+        else:
+            log.info("Dry-run mode with --no-diff-target: fully offline, no NSX calls. "
+                     "Rows cannot say whether a service already exists.")
+            client = None
     else:
         client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global)
 
@@ -451,6 +468,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             sid = obj.get("id")
             row["id"] = sid
             row["display_name"] = obj.get("display_name")
+            if target_read and sid:
+                row["exists_on_target"] = sid in baseline
 
             if not sid:
                 row["status"] = "skipped"
@@ -821,6 +840,11 @@ def main() -> int:
     pp.add_argument("--reports-dir", default=None,
                     help="Where to write the run's per-service report + log. "
                          "Defaults to <services-dir>/../push_report/.")
+    pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
+                    help="Read the target on a dry run so each row can say whether the "
+                         "service already exists. On by default: a report that guesses is "
+                         "worse than one that says it does not know. --no-diff-target "
+                         "makes the dry run fully offline.")
     pp.set_defaults(func=cmd_push)
 
     # --- revert subcommand ---

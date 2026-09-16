@@ -1,0 +1,32 @@
+action: ALLOW
+resource_type: Rule
+id: default-layer2-rule
+display_name: Default Layer2 Rule
+path: /infra/domains/default/security-policies/default-layer2-section/rules/default-layer2-rule
+relative_path: default-layer2-rule
+parent_path: /infra/domains/default/security-policies/default-layer2-section
+rule_id: 1
+sequence_number: 2147483647
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- ANY
+destination_groups:
+- ANY
+services:
+- ANY
+profiles:
+- ANY
+logged: false
+scope:
+- ANY
+disabled: false
+direction: IN_OUT
+is_default: true
+_create_time: 1776978629136
+_create_user: system
+_last_modified_time: 1776978629136
+_last_modified_user: system
+_system_owned: false
+_protection: NOT_PROTECTED
+_parent_policy_id: default-layer2-section

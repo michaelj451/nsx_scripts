@@ -13,15 +13,41 @@ or [RUNBOOK_D_COMMANDS_PS.md](RUNBOOK_D_COMMANDS_PS.md) for PowerShell.
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r docker/requirements-pip.txt
 export PYTHONPATH="$PWD/app"
+export OBJECT_APPENDIX_AVS=$(grep -E '^OBJECT_APPENDIX_AVS=' .env | cut -d= -f2-)
+echo "WF-D sibling suffix: $OBJECT_APPENDIX_AVS"
 ```
+
+The Python tools read `.env` themselves, but your **shell** does not, so the
+suffix has to be exported before any command below can interpolate it. Confirm
+the echo prints `_avs_ips` and not an empty string: `build_sibling_groups.py`
+treats an empty `--appendix` as unset and silently falls back to
+`OBJECT_APPENDIX` (`_np_ips`), which is WF-C's suffix and would merge remapped
+addresses into WF-C's source-IP siblings. See
+[RUNBOOK_D.md](RUNBOOK_D.md#sibling-suffix-wf-d-must-not-share-wf-cs).
+
+Or skip all of this and let the driver pick the suffix per phase:
+[RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md).
 
 ---
 
 ## 0. Capture + IP report (read-only)
 
+**`--live-query` is mandatory.** Without it every tag group looks empty and the
+build produces siblings only for groups that already hold static IPs, with no
+error and a success report. Measured on lm1 2026-09-11: 1 sibling without it,
+**7 with it**.
+
 ```bash
-python tools/nsx/capture_nsx_state.py --source nsx-lm1 \
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query \
   --ip-report-csv data/nonprod_map.csv
+```
+
+Gate before building: the additive step must report `ip_source: 'effective'`,
+non-zero `vm_ip_index_count` / `groups_changed` / `ips_added_total`, and
+`groups_errors: 0`.
+
+```bash
+grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | tail -1
 ```
 
 Then review:
@@ -45,11 +71,16 @@ python tools/nsx/compare_group_ips.py \
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
+  --appendix "$OBJECT_APPENDIX_AVS" \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups \
   --no-stripped-originals
 ```
+
+Manually entered IPs (the group's own IPAddressExpression entries) are
+copied into the sibling verbatim alongside the mapped values. Add
+`--no-copy-manual-ips` to emit mapped values only.
 
 Outputs:
 - `nsx_sibling_groups/nsx-lm1.lab.local/groups/` — siblings (for tag+IP mixed groups)
@@ -60,6 +91,7 @@ Outputs:
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
+  --appendix "$OBJECT_APPENDIX_AVS" \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups \
@@ -148,6 +180,7 @@ Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit code: `0` = all pass, `1` = at le
 
 ```bash
 python tools/nsx/build_sibling_groups.py \
+  --appendix "$OBJECT_APPENDIX_AVS" \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups

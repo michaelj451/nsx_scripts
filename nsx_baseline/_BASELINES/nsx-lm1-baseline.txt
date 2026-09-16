@@ -1,0 +1,9 @@
+# nsx-lm1 PERMANENT BASELINE  -  saved 2026-09-15T17:40:58Z
+# lm1's configuration as it stood immediately before the 2026-09-15 17:07 UTC
+# wipe: 13 groups, 4 services, 3 customer policies, 13 rules.
+# lm1 was already empty when this was assembled, so the payload came from the
+# nsx_build/nsx-lm1_to_gm1 build and was verified against
+# nsx_wipe_bundle/20260915_170727/nsx-lm1.lab.local/pre_wipe_state.json.
+# Paths are LM-shaped (/infra/). _parent_policy_id is injected in all 15 rule
+# files, so rules.py push lands them in the right policy.
+bundle: nsx_baseline/nsx-lm1.lab.local/20260915_174058

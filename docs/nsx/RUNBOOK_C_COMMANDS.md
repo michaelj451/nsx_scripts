@@ -50,8 +50,24 @@ Report lands in `$NSX_LOG_DIR/nsx_drift_report/<target-host>/`.
 
 ## 1. Capture (read-only, source side)
 
+**`--live-query` is mandatory.** Without it the capture is a plain copy of the
+export, every tag group looks empty, and step 2 builds siblings only for groups
+that already hold static IPs. Nothing errors; the run reports success. Measured
+on lm1 2026-09-11: 1 sibling without it, **7 with it**.
+
 ```bash
-python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query
+```
+
+Gate before going further. All must hold, or the siblings will be wrong:
+
+```bash
+grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | tail -1
+#   ip_source: 'effective'      anything else means a stale or legacy bundle
+#   vm_ip_index_count: non-zero
+#   groups_changed:    non-zero
+#   ips_added_total:   non-zero
+#   groups_errors:     0        non-zero means unrealized groups: wait, re-run
 ```
 
 ## 2. Transform: build siblings + stripped originals (offline)

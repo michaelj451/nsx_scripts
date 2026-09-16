@@ -1,0 +1,64 @@
+expression:
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: network|10.6.0.0
+  resource_type: Condition
+  id: dc403b22-0f44-43f0-bfa6-bcf9f0d9d41c
+  path: /global-infra/domains/default/groups/network-6-0/condition-expressions/dc403b22-0f44-43f0-bfa6-bcf9f0d9d41c
+  relative_path: dc403b22-0f44-43f0-bfa6-bcf9f0d9d41c
+  parent_path: /global-infra/domains/default/groups/network-6-0
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: ec0d4b3b-7abd-422e-965b-001be166a485
+  path: /global-infra/domains/default/groups/network-6-0/conjunction-expressions/ec0d4b3b-7abd-422e-965b-001be166a485
+  relative_path: ec0d4b3b-7abd-422e-965b-001be166a485
+  parent_path: /global-infra/domains/default/groups/network-6-0
+  _protection: NOT_PROTECTED
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: network|10.7.0.0
+  resource_type: Condition
+  id: bf70f308-a789-4ce6-8031-546806e93a69
+  path: /global-infra/domains/default/groups/network-6-0/condition-expressions/bf70f308-a789-4ce6-8031-546806e93a69
+  relative_path: bf70f308-a789-4ce6-8031-546806e93a69
+  parent_path: /global-infra/domains/default/groups/network-6-0
+  _protection: NOT_PROTECTED
+- conjunction_operator: OR
+  resource_type: ConjunctionOperator
+  id: fd25b747-977d-4569-837c-ea59879f2f17
+  path: /global-infra/domains/default/groups/network-6-0/conjunction-expressions/fd25b747-977d-4569-837c-ea59879f2f17
+  relative_path: fd25b747-977d-4569-837c-ea59879f2f17
+  parent_path: /global-infra/domains/default/groups/network-6-0
+  _protection: NOT_PROTECTED
+- ip_addresses:
+  - 10.50.20.20
+  resource_type: IPAddressExpression
+  id: 62c0a479-920e-422b-8e0c-f630aa08aba2
+  path: /global-infra/domains/default/groups/network-6-0/ip-address-expressions/62c0a479-920e-422b-8e0c-f630aa08aba2
+  relative_path: 62c0a479-920e-422b-8e0c-f630aa08aba2
+  parent_path: /global-infra/domains/default/groups/network-6-0
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: network-6-0
+display_name: network-group-0
+tags:
+- scope: network
+  tag: 10.6.0.0
+- scope: network
+  tag: 10.7.0.0
+path: /global-infra/domains/default/groups/network-6-0
+relative_path: network-6-0
+parent_path: /global-infra/domains/default
+_create_time: 1789493802987
+_create_user: admin
+_last_modified_time: 1789493802987
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

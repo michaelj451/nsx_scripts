@@ -1,0 +1,36 @@
+action: ALLOW
+resource_type: Rule
+id: this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on
+display_name: this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on
+path: /infra/domains/default/security-policies/test-policy-2/rules/this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on
+relative_path: this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on
+parent_path: /infra/domains/default/security-policies/test-policy-2
+rule_id: 5131
+sequence_number: 5
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /infra/domains/default/groups/super-nested-group
+- /infra/domains/default/groups/this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+destination_groups:
+- /infra/domains/default/groups/this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+services:
+- /infra/services/a1-custom-service
+profiles:
+- ANY
+logged: false
+scope:
+- /infra/domains/default/groups/this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789134740159
+_create_user: admin
+_last_modified_time: 1789134740159
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED
+_parent_policy_id: test-policy-2

@@ -164,6 +164,76 @@ class TestExport(unittest.TestCase):
             c.export_configuration()
 
 
+SUBMIT_XML = ("<response status='success' code='19'><result>"
+              "<msg><line>query job enqueued with jobid 42</line></msg>"
+              "<job>42</job></result></response>")
+ACT_XML = ("<response status='success'><result><job><status>ACT</status>"
+           "<id>42</id></job></result></response>")
+FIN_XML = ("<response status='success'><result><job><status>FIN</status><id>42</id></job>"
+           "<log><logs count='2'>"
+           "<entry><src>10.0.12.5</src><dst>10.0.1.9</dst><dport>443</dport>"
+           "<rule>allow basics</rule><action>allow</action></entry>"
+           "<entry><src>10.0.14.7</src><dst>10.0.1.9</dst><dport>53</dport>"
+           "<rule>allow icmp ntp</rule><action>allow</action></entry>"
+           "</logs></log></result></response>")
+
+
+class LogSession(FakeSession):
+    """Answers a type=log submit with a job id, then ACT once, then FIN."""
+
+    def __init__(self, submit=None, polls=None):
+        super().__init__()
+        self.submit = submit or FakeResponse(text=SUBMIT_XML)
+        self.polls = list(polls if polls is not None
+                          else [FakeResponse(text=ACT_XML), FakeResponse(text=FIN_XML)])
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        p = params or {}
+        if p.get("type") == "log":
+            self.calls.append({"url": url, "params": dict(p), "headers": dict(headers or {})})
+            if p.get("action") == "get":
+                return self.polls.pop(0) if self.polls else FakeResponse(text=ACT_XML)
+            return self.submit
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+
+class TestQueryLogs(unittest.TestCase):
+    def test_submit_poll_parse(self):
+        s = LogSession()
+        c = make_client(s)
+        out = c.query_logs("traffic", query="(port.dst eq 443)", nlogs=2,
+                           poll_interval=0)
+        self.assertEqual(out["job_id"], "42")
+        self.assertEqual(out["total"], 2)
+        self.assertEqual(out["entries"][0]["rule"], "allow basics")
+        self.assertEqual(out["entries"][1]["dport"], "53")
+        submit = next(x for x in s.calls
+                      if x["params"].get("type") == "log" and "action" not in x["params"])
+        self.assertEqual(submit["params"]["query"], "(port.dst eq 443)")
+        self.assertEqual(submit["params"]["nlogs"], "2")
+        self.assertEqual(submit["headers"].get("X-PAN-KEY"), "FAKEKEY123")
+
+    def test_denied_raises_with_hint(self):
+        s = LogSession(submit=FakeResponse(status_code=403, text="denied"))
+        with self.assertRaises(PanRestError) as ctx:
+            make_client(s).query_logs()
+        self.assertIn("log access", str(ctx.exception))
+
+    def test_poll_timeout_raises(self):
+        s = LogSession(polls=[FakeResponse(text=ACT_XML)])
+        c = make_client(s)
+        with self.assertRaises(PanRestError) as ctx:
+            c.query_logs(poll_interval=0, poll_timeout=0)
+        self.assertIn("did not finish", str(ctx.exception))
+
+    def test_refusal_response_raises(self):
+        s = LogSession(submit=FakeResponse(
+            text="<response status='error'><msg><line>Query is not valid</line></msg></response>"))
+        with self.assertRaises(PanRestError) as ctx:
+            make_client(s).query_logs(query="garbage (((")
+        self.assertIn("Query is not valid", str(ctx.exception))
+
+
 class TestGet(unittest.TestCase):
     def _client(self, resp):
         return make_client(FakeSession(routes={"/restapi/": resp}))

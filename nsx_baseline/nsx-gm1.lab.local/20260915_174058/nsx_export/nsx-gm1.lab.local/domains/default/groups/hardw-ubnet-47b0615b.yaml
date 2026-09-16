@@ -1,0 +1,23 @@
+expression:
+- ip_addresses:
+  - 10.2.1.0/24
+  resource_type: IPAddressExpression
+  id: b8ecb11c-0aee-48d2-a8eb-bb8e4d8ddfe4
+  path: /global-infra/domains/default/groups/hardware-subnet/ip-address-expressions/b8ecb11c-0aee-48d2-a8eb-bb8e4d8ddfe4
+  relative_path: b8ecb11c-0aee-48d2-a8eb-bb8e4d8ddfe4
+  parent_path: /global-infra/domains/default/groups/hardware-subnet
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: hardware-subnet
+display_name: hardware-subnet
+path: /global-infra/domains/default/groups/hardware-subnet
+relative_path: hardware-subnet
+parent_path: /global-infra/domains/default
+_create_time: 1789493802494
+_create_user: admin
+_last_modified_time: 1789493802494
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

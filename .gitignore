@@ -26,6 +26,7 @@ nsx_groups_additive*/
 nsx_groups_remapped/
 nsx_groups_transformed/
 nsx_export_verify/
+nsx_wfb_runs
 
 # Workflow A bundle artifacts (capture / transform / push)
 nsx_sibling_groups/
@@ -42,6 +43,9 @@ nsx_segments*/
 nsx_membership*/
 nsx_pure_ip_remap*/
 nsx_remap*/
+nsx_gm_to_lm/
+nsx_avs_runs/
+nsx_restore/
 
 # VM Tag Logs
 nsx_vm_files/
@@ -295,3 +299,10 @@ __marimo__/
 nsx_info_*/
 nsx_info_*.tgz
 nsx_info_*.zip
+
+# nsx_baseline/ holds PERMANENT, committed configuration baselines.
+# The nsx_export/ and nsx_build/ rules above match at any depth, which would
+# exclude the actual payloads inside a baseline bundle and leave only its
+# README and manifests committed: a baseline that describes configuration it
+# does not contain. Re-include everything under nsx_baseline/.
+!nsx_baseline/**

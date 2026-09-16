@@ -1,0 +1,35 @@
+action: ALLOW
+resource_type: Rule
+id: ssh-network-0
+display_name: ssh-network-0
+path: /global-infra/domains/default/security-policies/Start_Policy/rules/ssh-network-0
+relative_path: ssh-network-0
+parent_path: /global-infra/domains/default/security-policies/Start_Policy
+rule_id: 1003076
+sequence_number: 17
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /global-infra/domains/default/groups/hardware-subnet
+destination_groups:
+- /global-infra/domains/default/groups/network-6-0
+services:
+- /global-infra/services/SSH
+profiles:
+- ANY
+logged: false
+scope:
+- /global-infra/domains/default/groups/hardware-subnet
+- /global-infra/domains/default/groups/network-6-0
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789493874253
+_create_user: admin
+_last_modified_time: 1789493874253
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

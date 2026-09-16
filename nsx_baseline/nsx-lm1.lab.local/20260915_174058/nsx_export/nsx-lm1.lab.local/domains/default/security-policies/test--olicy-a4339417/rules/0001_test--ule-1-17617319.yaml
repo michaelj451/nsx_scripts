@@ -1,0 +1,36 @@
+action: ALLOW
+resource_type: Rule
+id: test-infrastructure-rule-1
+display_name: test-infrastructure-rule-1
+path: /infra/domains/default/security-policies/test-infrastructure-policy/rules/test-infrastructure-rule-1
+relative_path: test-infrastructure-rule-1
+parent_path: /infra/domains/default/security-policies/test-infrastructure-policy
+rule_id: 5134
+sequence_number: 10
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /infra/domains/default/groups/ip-address-group
+destination_groups:
+- /infra/domains/default/groups/ip-address-group
+services:
+- /infra/services/HTTPS
+- /infra/services/a1-custom-service
+profiles:
+- ANY
+logged: false
+scope:
+- ANY
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789134740943
+_create_user: admin
+_last_modified_time: 1789134740943
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED
+_parent_policy_id: test-infrastructure-policy

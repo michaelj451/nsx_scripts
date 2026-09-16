@@ -1,0 +1,28 @@
+is_default: false
+service_entries:
+- ether_type: 33011
+  resource_type: EtherTypeServiceEntry
+  id: a
+  display_name: a
+  path: /infra/services/a2-custom-non-thernet/service-entries/a
+  relative_path: a
+  parent_path: /infra/services/a2-custom-non-thernet
+  _create_time: 1789134724279
+  _create_user: admin
+  _last_modified_time: 1789134724279
+  _last_modified_user: admin
+  _system_owned: false
+  _protection: NOT_PROTECTED
+service_type: ETHER
+resource_type: Service
+id: a2-custom-non-thernet
+display_name: a2-custom-non-thernet
+path: /infra/services/a2-custom-non-thernet
+relative_path: a2-custom-non-thernet
+parent_path: /infra
+_create_time: 1789134724277
+_create_user: admin
+_last_modified_time: 1789134724277
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

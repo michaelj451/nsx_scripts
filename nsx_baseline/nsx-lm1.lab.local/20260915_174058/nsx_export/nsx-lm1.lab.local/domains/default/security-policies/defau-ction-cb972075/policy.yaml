@@ -1,0 +1,23 @@
+logging_enabled: false
+resource_type: SecurityPolicy
+id: default-layer2-section
+display_name: Default Layer2 Section
+path: /infra/domains/default/security-policies/default-layer2-section
+relative_path: default-layer2-section
+parent_path: /infra/domains/default
+sequence_number: 5000000
+internal_sequence_number: 5000000
+category: Ethernet
+stateful: false
+tcp_strict: false
+locked: false
+lock_modified_time: 0
+scope:
+- ANY
+is_default: true
+_create_time: 1776978629098
+_create_user: system
+_last_modified_time: 1776978629098
+_last_modified_user: system
+_system_owned: false
+_protection: NOT_PROTECTED

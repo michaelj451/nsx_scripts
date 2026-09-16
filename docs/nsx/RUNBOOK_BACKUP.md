@@ -74,19 +74,58 @@ defaults to dry-run; `--apply` is required to write, every apply captures a
 baseline first, and group revert deletes stay blocked unless `--allow-delete`
 is given.
 
+> ### Two things that will bite you, corrected 2026-09-11
+>
+> **Policies do NOT carry their rules.** An earlier version of this section
+> said they did and omitted `rules.py push`. They do not: the exported
+> `policy.yaml` has no `rules` key, and `policies.py push` never sends child
+> rules. Restoring without the rules step gives you policies with **zero
+> rules**, which on a real restore is an empty firewall.
+>
+> **`--reports-dir` is mandatory here.** Push defaults its reports to
+> `<dir>/../push_report`, so pointing a push straight at a backup bundle
+> writes `push_report/` and its baselines *inside that bundle*, contaminating
+> the snapshot you are restoring from. Always send them elsewhere.
+
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-B=nsx_backup/nsx-lm1.lab.local/latest
+B=nsx_backup/nsx-lm1.lab.local/latest/nsx_export/nsx-lm1.lab.local/domains/default
+R=nsx_restore/nsx-lm1.lab.local/$(date -u +%Y%m%d_%H%M%S)
 
-# Order: services -> groups -> policies (policies carry their rules)
+# Order: services -> groups -> policies -> rules. Add --apply to each.
 python tools/nsx/services.py push --target nsx-lm1 \
-  --services-dir $B/nsx_export/nsx-lm1.lab.local/domains/default/services            # + --apply
+  --services-dir $B/services            --reports-dir $R/services
 python tools/nsx/groups.py   push --target nsx-lm1 \
-  --groups-dir   $B/nsx_export/nsx-lm1.lab.local/domains/default/groups              # + --apply
+  --groups-dir   $B/groups              --reports-dir $R/groups --diff-target
 python tools/nsx/policies.py push --target nsx-lm1 \
-  --policies-dir $B/nsx_export/nsx-lm1.lab.local/domains/default/security-policies   # + --apply
+  --policies-dir $B/security-policies   --reports-dir $R/policies
+python tools/nsx/rules.py    push --target nsx-lm1 \
+  --rules-dir    $B/security-policies   --reports-dir $R/rules --diff-target
 ```
+
+### Restoring rules needs one extra step today
+
+Backup bundles are written by `export_nsx_objects.py`, which does **not**
+inject `_parent_policy_id` into each rule. `rules.py push` falls back to the
+containing folder name, and in a backup bundle that is a slugified hash
+(`test--icy-2-3ad2a1f6`), not the real policy id (`test-policy-2`). Rules would
+be pushed into a policy that does not exist.
+
+Until that is fixed in the tool, restore rules from a bundle that does carry
+the field. `capture_nsx_state.py` injects it into `nsx_rules_export/<host>/`,
+so if that tree matches the backup point, use it:
+
+```bash
+python tools/nsx/rules.py push --target nsx-lm1 \
+  --rules-dir nsx_rules_export/nsx-lm1.lab.local/security-policies \
+  --reports-dir $R/rules --apply
+```
+
+Confirm it matches first, comparing rule ids and payloads between the two
+trees. Verified on 2026-09-11: restoring lm1 this way landed 3 services,
+12 or 13 groups, 3 policies and 12 rules with zero failures, and the result
+matched the backup bundle exactly with NSX metadata stripped.
 
 Notes:
 

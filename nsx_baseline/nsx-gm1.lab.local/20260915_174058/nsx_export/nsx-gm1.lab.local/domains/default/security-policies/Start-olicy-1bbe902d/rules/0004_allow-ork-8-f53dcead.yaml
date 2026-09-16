@@ -1,0 +1,39 @@
+action: ALLOW
+resource_type: Rule
+id: allow-icmp-network-8
+display_name: allow-icmp-network-8
+path: /global-infra/domains/default/security-policies/Start_Policy/rules/allow-icmp-network-8
+relative_path: allow-icmp-network-8
+parent_path: /global-infra/domains/default/security-policies/Start_Policy
+rule_id: 1003075
+sequence_number: 15
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /global-infra/domains/default/groups/a8b5ed22-6b48-4b28-ba2c-0a357bf929f8
+- /global-infra/domains/default/groups/hardware-subnet
+- /global-infra/domains/default/groups/network-group-8
+destination_groups:
+- /global-infra/domains/default/groups/network-2
+services:
+- /global-infra/services/nested-service-1
+- /global-infra/services/a3-super-ssh
+- /global-infra/services/ICMP-ALL
+profiles:
+- ANY
+logged: false
+scope:
+- /global-infra/domains/default/groups/hardware-subnet
+- /global-infra/domains/default/groups/network-group-8
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789493873990
+_create_user: admin
+_last_modified_time: 1789493873990
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

@@ -69,8 +69,14 @@ detected — useful for CI gates.
 
 ## Pipeline (5 steps)
 
+> **Step 1 must use `--live-query`.** It is what splices each group's effective
+> IPs into `groups_additive/`, which is the tree step 2 reads. Without it every
+> tag-only group looks empty and you get siblings only for groups that already
+> held static IPs, with no error and a success report. On lm1 2026-09-11 that
+> was 1 sibling instead of 7.
+
 ```text
-1) capture_nsx_state.py                                     (read-only, GET-only)
+1) capture_nsx_state.py --live-query                        (read-only, GET-only)
         ↓
 2) build_sibling_groups.py                                  (offline transform)
         produces nsx_sibling_groups/<host>/groups/         (new IP-only groups)
@@ -125,6 +131,11 @@ Offline transform. **No NSX calls.** Reads the capture bundle, emits two bundles
 ```bash
 python tools/nsx/build_sibling_groups.py --source nsx-lm1
 ```
+
+Expect `files_seen == siblings_written + skipped_no_condition + skipped_empty_ips`.
+A non-zero `skipped_empty_ips` means a tag group NSX resolves to nothing;
+confirm that against the manager rather than assuming, since it is also what a
+capture without `--live-query` produces.
 
 Outputs:
 
