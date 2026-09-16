@@ -50,6 +50,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -994,7 +995,13 @@ def cmd_push(args: argparse.Namespace) -> int:
     files = _iter_group_files(groups_dir)
     log.info("Found %d group file(s).", len(files))
 
-    client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
+    # A plain dry run is fully offline. --diff-target opts into ONE read-only
+    # pass over the target so each dry-run row can report the IPs it would add
+    # or remove; without it a dry run cannot answer the question an operator
+    # actually needs answered before approving a destructive strip.
+    needs_client = args.apply or args.diff_target
+    client = NsxPolicyClient(nsxmanager=target_host,
+                             federation_global=args.federation_global) if needs_client else None
     baseline_path = None
     baseline_dict: Dict[str, Dict[str, Any]] = {}
     # Ids of every group this run actually writes. Persisted next to the
@@ -1007,6 +1014,13 @@ def cmd_push(args: argparse.Namespace) -> int:
         baseline_path = _append_baseline(reports_dir, baseline_dict)
         _write_pushed_ids(baseline_path, pushed_ids)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
+    elif args.diff_target:
+        # Read-only. No baseline file: a baseline is a revert artifact, and
+        # only an apply is allowed to create one.
+        log.info("Reading current groups on %s for the dry-run diff "
+                 "(read-only, no baseline written) ...", target_host)
+        baseline_dict = _capture_target_groups(client, args.domain_id)
+        log.info("  Target has %d customer group(s)", len(baseline_dict))
 
     # Interactive batch state.
     # Default behaviour:
@@ -1176,6 +1190,31 @@ def cmd_push(args: argparse.Namespace) -> int:
                         "as EMPTY (no remaining membership)" if not obj["expression"] else "with reduced membership",
                     )
 
+            # Per-row IP diff against the target's current state. Computed for
+            # BOTH modes so a dry run can preview the delta, feeding interactive
+            # batch mode's per-row preview and the row JSON/JSONL for forensic
+            # auditability. Skipped only for a plain offline dry run, where the
+            # fields are OMITTED rather than guessed: with no baseline every IP
+            # would look newly added, which is worse than saying nothing.
+            have_baseline = args.apply or args.diff_target
+            ips_added: List[str] = []
+            ips_removed: List[str] = []
+            if have_baseline:
+                # Whether the group is already on the target. An empty ips_before
+                # cannot answer this (a tag-only group that exists also has no
+                # IPs), so record it explicitly: it is what lets a dry run report
+                # "would create" instead of guessing from the IP delta.
+                row["exists_on_target"] = gid in baseline_dict
+                before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
+                after_ips  = _extract_ip_entries(obj)
+                ips_added, ips_removed = _ip_diff(before_ips, after_ips)
+                row["ips_before"]      = before_ips    # full list, for audit replayability
+                row["ips_after"]       = after_ips     # full list, for audit replayability
+                row["before_ip_count"] = len(before_ips)
+                row["after_ip_count"]  = len(after_ips)
+                row["ips_added"]       = ips_added
+                row["ips_removed"]     = ips_removed
+
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -1183,8 +1222,18 @@ def cmd_push(args: argparse.Namespace) -> int:
                 if paths_seen:
                     seg_note = (f" (segments_seen={paths_seen} converted={converted_here}"
                                 f" unresolved={unresolved_here})")
-                log.info("[%d/%d  DRY  ok=%d fail=%d skip=%d] %s%s",
-                         i, len(files), ok, failed, skipped, gid, seg_note)
+                ip_note = ""
+                if have_baseline and (ips_added or ips_removed):
+                    ip_note = f" (ips +{len(ips_added)}/-{len(ips_removed)})"
+                log.info("[%d/%d  DRY  ok=%d fail=%d skip=%d] %s%s%s",
+                         i, len(files), ok, failed, skipped, gid, seg_note, ip_note)
+                # Surface a would-be contract violation now rather than at apply
+                # time. The row is not failed: a dry run reports, it does not
+                # decide.
+                if ips_removed and not args.intentional_ip_removal:
+                    log.warning("[%d/%d] %s WOULD REMOVE %d IP(s) on apply: %s. "
+                                "Re-run with --intentional-ip-removal if that is the intent.",
+                                i, len(files), gid, len(ips_removed), ips_removed)
                 rows.append(row)
                 continue
 
@@ -1192,19 +1241,6 @@ def cmd_push(args: argparse.Namespace) -> int:
             # without re-doing CSV/segment transforms (they're deterministic
             # but extra work). Stripped before JSON serialization below.
             row["_payload"] = obj
-
-            # Per-row IP diff against the captured baseline (used by interactive
-            # batch mode for human-readable per-row preview, and recorded in
-            # full in the row's JSON/JSONL for forensic auditability).
-            before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
-            after_ips  = _extract_ip_entries(obj)
-            ips_added, ips_removed = _ip_diff(before_ips, after_ips)
-            row["ips_before"]      = before_ips    # full list, for audit replayability
-            row["ips_after"]       = after_ips     # full list, for audit replayability
-            row["before_ip_count"] = len(before_ips)
-            row["after_ip_count"]  = len(after_ips)
-            row["ips_added"]       = ips_added
-            row["ips_removed"]     = ips_removed
 
             # --- ADDITIVE-ONLY CONTRACT ENFORCEMENT --------------------------
             # When CSV remap is in play, the run must never remove an IP from
@@ -1475,11 +1511,27 @@ def cmd_push(args: argparse.Namespace) -> int:
         "errors_log": str(errors_log),
     }
 
+    # Every pass ALSO writes a timestamped copy. The fixed-name files are the
+    # "latest" pointer that existing tooling reads, but they are overwritten by
+    # the next invocation: without the archive, running a dry run and then the
+    # apply destroys the dry run's machine-readable rows, and the pre-apply
+    # report can never be rebuilt. Timestamped logs already worked this way;
+    # the JSON did not, which made report_avs_run.py unable to see any pass but
+    # the most recent one.
+    mode_tag = "apply" if args.apply else "dryrun"
+    archive = reports_dir / "runs"
+    archive.mkdir(parents=True, exist_ok=True)
+    stem = f"groups_{RUN_TS}_{mode_tag}"
+
     (reports_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    (reports_dir / "groups.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+    (archive / f"{stem}_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    rows_json = json.dumps(rows, indent=2, sort_keys=True)
+    (reports_dir / "groups.json").write_text(rows_json, encoding="utf-8")
+    (archive / f"{stem}.json").write_text(rows_json, encoding="utf-8")
     with (reports_dir / "groups.jsonl").open("w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, sort_keys=True) + "\n")
+    log.info("Report archive: %s", archive / f"{stem}.json")
     if failed:
         failures = [r for r in rows if r.get("status") == "failed"]
         (reports_dir / "failures.json").write_text(json.dumps(failures, indent=2, sort_keys=True), encoding="utf-8")
@@ -1767,6 +1819,79 @@ def cmd_revert(args: argparse.Namespace) -> int:
 # CLI dispatch
 # =============================================================================
 
+def _discover_domains(args: argparse.Namespace) -> List[str]:
+    """Every domain id on the manager this command addresses.
+
+    A Global Manager normally carries one location-scoped domain per site, and
+    in a federated deployment that is where the customer's policy lives. Both
+    subcommands default to --domain-id default, so without this a GM run covers
+    one domain, reports failed=0, and silently leaves the rest untouched.
+    """
+    alias = getattr(args, "target", None) or getattr(args, "source", None)
+    host = resolve_manager(alias)
+    client = NsxPolicyClient(nsxmanager=host, federation_global=args.federation_global)
+    return [d["id"] for d in client.list_domains() if d.get("id")]
+
+
+def _run_all_domains(args: argparse.Namespace) -> int:
+    """Run the requested subcommand once per domain, each fully isolated.
+
+    Every domain gets its own bundle and its own reports directory, so the
+    per-domain revert baselines never overwrite each other: reverting one domain
+    leaves the others alone. One domain failing does not abandon the rest, but
+    the overall exit code is non-zero so a pipeline still fails.
+    """
+    domains = _discover_domains(args)
+    log.info("=" * 60)
+    log.info("ALL DOMAINS: discovered %d on %s: %s", len(domains),
+             getattr(args, "target", None) or getattr(args, "source", None),
+             ", ".join(domains))
+    log.info("=" * 60)
+
+    results: List[Tuple[str, int, str]] = []
+    for dom in domains:
+        sub = copy.copy(args)
+        sub.all_domains = False
+        sub.domain_id = dom
+        # Per-domain paths. Setting output_dir explicitly also means cmd_export
+        # no longer treats it as the default, so it does not wipe the bundle
+        # root (which is where push_report/baselines/ lives).
+        if getattr(args, "output_dir", None):
+            sub.output_dir = str(Path(args.output_dir) / dom)
+        if getattr(args, "groups_dir", None):
+            sub.groups_dir = str(Path(args.groups_dir) / dom / "groups")
+        if getattr(args, "reports_dir", None):
+            sub.reports_dir = str(Path(args.reports_dir) / dom)
+
+        if getattr(sub, "groups_dir", None) and not Path(sub.groups_dir).is_dir():
+            log.warning("DOMAIN %s: no bundle at %s, skipping. Export with "
+                        "--all-domains first so each domain has its own subdirectory.",
+                        dom, sub.groups_dir)
+            results.append((dom, 0, "skipped: no bundle"))
+            continue
+
+        log.info("")
+        log.info("#" * 60)
+        log.info("# DOMAIN %s", dom)
+        log.info("#" * 60)
+        try:
+            rc = args.func(sub)
+        except SystemExit as exc:
+            rc = int(exc.code or 0)
+        except Exception:
+            log.exception("DOMAIN %s: unhandled error", dom)
+            rc = 1
+        results.append((dom, rc, "ok" if rc == 0 else f"rc={rc}"))
+
+    log.info("")
+    log.info("=" * 60)
+    log.info("ALL DOMAINS SUMMARY")
+    for dom, rc, note in results:
+        log.log(logging.INFO if rc == 0 else logging.ERROR, "  %-30s %s", dom, note)
+    log.info("=" * 60)
+    return 0 if all(rc == 0 for _, rc, _ in results) else 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Export NSX groups from a source / push them to a target. Two subcommands.",
@@ -1776,6 +1901,11 @@ def main() -> int:
     pe = sub.add_parser("export", help="Export groups from a source manager into per-file YAMLs (read-only).")
     pe.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
     pe.add_argument("--domain-id", default="default")
+    pe.add_argument("--all-domains", action="store_true",
+                    help="Export EVERY domain on the manager, not just --domain-id. "
+                         "Each lands in <output-dir>/<domain>/. A Global Manager carries "
+                         "one location-scoped domain per site; without this a GM export "
+                         "covers only `default` and reports success.")
     pe.add_argument("--federation-global", action="store_true")
     pe.add_argument("--output-dir", default=None,
                     help="Defaults to nsx_groups_export/<source-host>/. Wiped on each run.")
@@ -1787,6 +1917,11 @@ def main() -> int:
     pp.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pp.add_argument("--groups-dir", required=True)
     pp.add_argument("--domain-id", default="default")
+    pp.add_argument("--all-domains", action="store_true",
+                    help="Push EVERY domain on the target, not just --domain-id. Expects "
+                         "the layout `groups.py export --all-domains` produces: "
+                         "<groups-dir>/<domain>/groups/. Reports and revert baselines are "
+                         "written per domain under <reports-dir>/<domain>/.")
     pp.add_argument("--federation-global", action="store_true")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
@@ -1833,6 +1968,15 @@ def main() -> int:
                          "removed). Without this flag, any per-row diff showing removed IPs is "
                          "refused and marked as a contract failure. Cannot be combined with "
                          "--csv-remap (those workflows have opposite intents).")
+    pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
+                    help="DRY RUN: make one read-only pass over the target so every row "
+                         "reports ips_before/ips_after/ips_added/ips_removed and whether the "
+                         "group already exists, and the summary's total_ips_removed is "
+                         "truthful. ON BY DEFAULT: a fully offline dry run cannot know the "
+                         "delta and reports 0 IPs removed even when the apply removes some, "
+                         "which is exactly the preview you must not approve from. "
+                         "--no-diff-target restores the offline behaviour. Ignored with "
+                         "--apply, which always captures a baseline and diffs against it.")
     pp.set_defaults(func=cmd_push)
 
     pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")
@@ -1861,6 +2005,8 @@ def main() -> int:
 
     args = p.parse_args()
     init_cli()
+    if getattr(args, "all_domains", False):
+        return _run_all_domains(args)
     return args.func(args)
 
 

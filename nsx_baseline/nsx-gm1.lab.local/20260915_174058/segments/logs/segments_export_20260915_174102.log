@@ -1,0 +1,20 @@
+2026-09-15T17:41:02 UTC [INFO] __main__: ============================================================
+2026-09-15T17:41:02 UTC [INFO] __main__: NSX SEGMENTS — EXPORT
+2026-09-15T17:41:02 UTC [INFO] __main__:   Source manager  : nsx-gm1 (nsx-gm1.lab.local)
+2026-09-15T17:41:02 UTC [INFO] __main__:   Domain          : default  (only used for group cross-ref)
+2026-09-15T17:41:02 UTC [INFO] __main__:   Federation GM   : True
+2026-09-15T17:41:02 UTC [INFO] __main__:   Include system  : False
+2026-09-15T17:41:02 UTC [INFO] __main__:   Output bundle   : /Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments
+2026-09-15T17:41:02 UTC [INFO] __main__: ============================================================
+2026-09-15T17:41:02 UTC [INFO] root: Creating NSX session for manager: nsx-gm1.lab.local (federation_global=True)
+2026-09-15T17:41:02 UTC [INFO] __main__: Step 1/2: Fetching segments ...
+2026-09-15T17:41:02 UTC [INFO] __main__:   Fetched 0 segment(s) total.
+2026-09-15T17:41:02 UTC [INFO] __main__: Step 2/2: Fetching groups (for segment cross-reference) ...
+2026-09-15T17:41:02 UTC [INFO] __main__:   Fetched 13 group(s) total.
+2026-09-15T17:41:02 UTC [INFO] __main__: ============================================================
+2026-09-15T17:41:02 UTC [INFO] __main__: Segments export complete:
+2026-09-15T17:41:02 UTC [INFO] __main__:   written=0  sys-skipped=0  no-id=0  errors=0
+2026-09-15T17:41:02 UTC [INFO] __main__:   groups scanned=13  groups-with-seg-refs=0  segments-with-refs=0
+2026-09-15T17:41:02 UTC [INFO] __main__: Bundle:   /Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments
+2026-09-15T17:41:02 UTC [INFO] __main__: Manifest: /Users/mxferguson/dev/nsx_scripts/nsx_baseline/nsx-gm1.lab.local/20260915_174058/segments/manifest.json
+2026-09-15T17:41:02 UTC [INFO] __main__: ============================================================

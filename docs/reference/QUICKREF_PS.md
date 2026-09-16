@@ -207,7 +207,7 @@ Full detail: [RUNBOOK_RULES_USAGE_PS.md](../nsx/RUNBOOK_RULES_USAGE_PS.md).
 - Every push tool is dry-run by default. `--apply` is required to write.
 - Every push captures a pre-write baseline for LIFO revert.
 - Source managers are never written to.
-- `wipe_target_manager.py` also dry-runs by default (see [RUNBOOK_FILTER_COPY_PS.md](../nsx/RUNBOOK_FILTER_COPY_PS.md) for wipe usage).
+- `wipe_target_manager.py` also dry-runs by default (see [RUNBOOK_WIPE.md](../tools/test/RUNBOOK_WIPE.md)). Scope it with `--id-prefix` to clear one family of test objects; an unscoped run also deletes the NDP/DHCP rules from the Default Layer3 Section.
 
 ## See also
 

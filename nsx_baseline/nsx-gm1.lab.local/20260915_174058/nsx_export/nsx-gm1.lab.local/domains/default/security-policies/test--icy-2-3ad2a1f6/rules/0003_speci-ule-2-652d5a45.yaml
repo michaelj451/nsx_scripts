@@ -1,0 +1,35 @@
+action: ALLOW
+resource_type: Rule
+id: special-case-rule-2
+display_name: special-case-rule-2
+path: /global-infra/domains/default/security-policies/test-policy-2/rules/special-case-rule-2
+relative_path: special-case-rule-2
+parent_path: /global-infra/domains/default/security-policies/test-policy-2
+rule_id: 1003083
+sequence_number: 20
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /global-infra/domains/default/groups/segment-group-1
+destination_groups:
+- /global-infra/domains/default/groups/ip-address-group
+services:
+- /global-infra/services/DHCP-Server
+profiles:
+- ANY
+logged: false
+scope:
+- /global-infra/domains/default/groups/segment-group-1
+- /global-infra/domains/default/groups/ip-address-group
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789493876118
+_create_user: admin
+_last_modified_time: 1789493876118
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

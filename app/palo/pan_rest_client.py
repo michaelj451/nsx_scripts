@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
@@ -182,11 +183,19 @@ class PanRestClient:
     def api_key(self) -> str:
         """Keygen on first use (unless a stored key applied at construction)."""
         if self._api_key is None:
-            r = self.session.get(
-                f"{self.env.url}/api/",
-                params={"type": "keygen", "user": self.username, "password": self.password},
-                timeout=self.timeout,
-            )
+            try:
+                r = self.session.get(
+                    f"{self.env.url}/api/",
+                    params={"type": "keygen", "user": self.username, "password": self.password},
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                # NEVER propagate the raw exception: requests embeds the full
+                # URL, and the keygen URL contains the password.
+                cause = type(getattr(exc, "__cause__", None) or exc).__name__
+                raise PanRestError(
+                    f"keygen failed for {self.env.url}: network error ({cause}); "
+                    "is the Panorama reachable?") from None
             if r.status_code >= 400:
                 raise PanRestError(f"keygen failed for {self.env.url}: HTTP {r.status_code}",
                                    status_code=r.status_code)
@@ -346,3 +355,75 @@ class PanRestClient:
         if root.tag != "config":
             raise PanRestError(f"export returned unexpected root <{root.tag}>")
         return r.content
+
+    # -----------------------------------------------------------------------
+    # Log retrieval (XML API type=log; like export, an XML surface that
+    # log-enabled roles such as the agent account may use. The REST API has
+    # no log endpoints; probed paths return 501.)
+    # -----------------------------------------------------------------------
+
+    def query_logs(
+        self,
+        log_type: str = "traffic",
+        query: Optional[str] = None,
+        nlogs: int = 50,
+        skip: int = 0,
+        *,
+        poll_interval: float = 1.0,
+        poll_timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Retrieve logs (traffic, threat, system, url, config, ...).
+
+        Log retrieval is asynchronous upstream: this submits the query,
+        polls the job until FIN, and returns
+            {"job_id", "total", "entries": [ {field: value, ...}, ... ]}
+        where each entry is the flattened XML log record (src, dst, dport,
+        rule, action, app, device_name, time_generated, ...). `query` uses
+        the Monitor-tab filter language, e.g.
+        "(addr.src in 10.0.12.5) and (port.dst eq 443)".
+        """
+        params = {"type": "log", "log-type": log_type, "nlogs": str(nlogs)}
+        if query:
+            params["query"] = query
+        if skip:
+            params["skip"] = str(skip)
+        root = self._log_call(params)
+        job = root.findtext(".//job")
+        if not job:
+            raise PanRestError("log query returned no job id")
+
+        deadline = time.monotonic() + poll_timeout
+        while True:
+            root = self._log_call({"type": "log", "action": "get", "job-id": job})
+            if root.findtext(".//job/status") == "FIN":
+                break
+            if time.monotonic() > deadline:
+                raise PanRestError(f"log job {job} did not finish within "
+                                   f"{poll_timeout:.0f}s")
+            time.sleep(poll_interval)
+
+        logs_el = root.find(".//log/logs")
+        entries = ([{c.tag: (c.text or "") for c in e}
+                    for e in logs_el.findall("entry")] if logs_el is not None else [])
+        total = int(logs_el.get("count", str(len(entries)))) if logs_el is not None \
+            else len(entries)
+        return {"job_id": job, "total": total, "entries": entries}
+
+    def _log_call(self, params: Dict[str, str]) -> ET.Element:
+        r = self.session.get(f"{self.env.url}/api/", params=params,
+                             headers={"X-PAN-KEY": self.api_key},
+                             timeout=self.timeout)
+        if r.status_code >= 400:
+            hint = (" (role lacks XML API log access)" if r.status_code == 403 else "")
+            raise PanRestError(f"log query failed: HTTP {r.status_code}{hint}",
+                               status_code=r.status_code)
+        try:
+            root = ET.fromstring(r.content)
+        except ET.ParseError as exc:
+            raise PanRestError("log query returned unparseable XML") from exc
+        if root.get("status") == "error":
+            msg = "; ".join(l.text for l in root.iter("line") if l.text) \
+                  or (root.findtext("./msg") or "")[:200]
+            raise PanRestError(f"log query refused: {msg}",
+                               status_code=r.status_code, code=root.get("code"))
+        return root

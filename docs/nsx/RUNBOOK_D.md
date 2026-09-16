@@ -162,7 +162,8 @@ window.
 | `--csv-remap <path>` | Apply CSV mapping to each collected IP. Sibling's `IPAddressExpression.ip_addresses` carries the MAPPED values only. Pure-IP groups emitted to remap bundle (not decomposed). |
 | `--skip-segment-groups` | Skip any group with a `PathExpression` anywhere. Recorded in `reports/skipped_segments.json`. |
 | `--no-stripped-originals` | Skip writing the `nsx_stripped_groups/...` bundle entirely (default in WF-D). Add Phase 2 by rebuilding without this flag. |
-| `--skip-uncovered` | If a group has ANY IP without a CSV mapping, skip the group entirely. Default: emit a partial sibling containing only the mapped IPs and surface the uncovered ones in `sibling_map.json`. |
+| `--copy-manual-ips` | **On by default.** Copy the group's own manually entered IPAddressExpression entries into the sibling verbatim, alongside the mapped values. `--no-copy-manual-ips` emits mapped values only. |
+| `--skip-uncovered` | If a group has ANY IP without a CSV mapping, skip the group entirely. Default: emit a partial sibling with the mapped IPs plus any copied manual ones, and surface the uncovered addresses in `sibling_map.json` and the run report. |
 | `--include-pure-ip` | **Deprecated, ignored.** Pure-IP groups now always go to the `nsx_pure_ip_remap/` bundle instead of producing siblings. |
 
 ---
@@ -177,6 +178,48 @@ window.
 | Operator credentials | NSX manager creds with policy/write permissions on lm1. |
 | Change window | Off-peak preferred. The push is strict-additive (only CREATE operations), but each create triggers an effective-member recompute. |
 | Rollback rehearsed | Step 3 revert tested against a lab-equivalent state first. |
+| `OBJECT_APPENDIX_AVS` set in `.env` | WF-D siblings must not share WF-C's suffix. See below. |
+
+---
+
+## Sibling suffix: WF-D must not share WF-C's
+
+WF-C and WF-D both create sibling groups named `<original_id><suffix>`, but
+their contents are **different**:
+
+| Workflow | Sibling holds | Suffix | `.env` variable |
+|---|---|---|---|
+| C | the SOURCE addresses, copied | `_np_ips` | `OBJECT_APPENDIX` |
+| D | the CSV-REMAPPED addresses | `_avs_ips` | `OBJECT_APPENDIX_AVS` |
+
+Sharing one suffix is the failure this split exists to prevent. The ids would
+collide, and the push is strict-additive, so a WF-D push would **merge** mapped
+`10.7.x` addresses into a WF-C sibling already holding source `10.6.x`
+addresses. Both sets end up wrong, the push reports success, and every rule
+referencing that sibling then permits both ranges.
+
+```bash
+OBJECT_APPENDIX=_np_ips
+OBJECT_APPENDIX_AVS=_avs_ips
+```
+
+`run_workflow.py` picks the right one per phase, so the WF-D phases need no
+`--appendix` argument. It refuses to run when `OBJECT_APPENDIX_AVS` is unset,
+and refuses again if you force the WF-C suffix onto a WF-D phase.
+
+Running `build_sibling_groups.py` by hand does **not** get that protection: it
+defaults to `OBJECT_APPENDIX`, so a WF-D build has to pass `--appendix` itself.
+
+```bash
+python tools/nsx/build_sibling_groups.py --source nsx-lm1 \
+  --appendix "$OBJECT_APPENDIX_AVS" \
+  --csv-remap data/nonprod_map.csv \
+  --skip-segment-groups --no-stripped-originals
+```
+
+**Do not change either suffix between runs against the same target.** A changed
+suffix renames nothing, because NSX ids are immutable: it creates a second,
+parallel sibling set and leaves the first in place, still rule-referenced.
 
 ---
 
@@ -185,13 +228,25 @@ window.
 ### 0a. Fresh capture of lm1
 
 ```bash
-python tools/nsx/capture_nsx_state.py --source nsx-lm1 \
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query \
   --ip-report-csv data/nonprod_map.csv
 ```
 
 This GETs lm1's current state, runs the IP-additive enrichment (so
 sub-step 6's IP report sees the spliced VM IPs), and writes the report
 with CSV coverage to `$NSX_LOG_DIR/groups_ip_report/nsx-lm1.lab.local/`.
+
+> **`--live-query` is mandatory and its absence is silent.** The enrichment is
+> what splices each group's effective IPs into `groups_additive/`. Without the
+> flag that tree is a plain copy of the export, every tag-only group appears to
+> have no IPs, and step 1 emits siblings only for groups that already carried
+> static IPs. No error, no warning in the summary, a success report. Measured
+> on lm1 2026-09-11: **1 sibling without it, 7 with it.**
+>
+> Gate on the additive step's summary before building: `ip_source: 'effective'`,
+> non-zero `vm_ip_index_count` / `groups_changed` / `ips_added_total`, and
+> `groups_errors: 0`. A non-zero error count means groups that have not
+> realized yet: wait and re-run rather than proceeding.
 
 ### 0b. Review IP-report counters before designing the push
 
@@ -263,15 +318,78 @@ plan to run Phase 2 in step 5).
 | **Tag + segment hybrid (no IPs)** | Skipped — has PathExpression | reports/skipped_segments.json |
 | **Completely empty** (no expression entries) | Skipped | reports/empty_groups.json |
 
+### Manually entered addresses are copied, not mapped
+
+A group's own `IPAddressExpression` entries are addresses an operator typed in.
+They are part of the group's **definition**, unlike the addresses that arrive
+through tag evaluation, and they usually have no counterpart on the other side:
+a partner subnet, a monitoring host, an out-of-scope range. Mapping them is
+meaningless, and dropping them removes coverage that was asked for explicitly.
+
+So `build_sibling_groups.py --csv-remap` copies them into the sibling
+**verbatim**, alongside the mapped values. On by default; `--no-copy-manual-ips`
+restores the mapped-values-only behaviour.
+
+```text
+network-6-0        tag criteria  +  manually entered 10.50.20.20
+  -> network-6-0_avs_ips :  10.7.0.101, 10.7.0.102, 10.7.0.103,
+                            10.7.1.102, 10.7.2.101      (mapped from tags)
+                            10.50.20.20                 (copied verbatim)
+```
+
+The distinction is only visible in the capture's **raw** export: by the time a
+group reaches `groups_additive/`, the hand-entered and tag-derived addresses
+have been merged into one expression. The build reads both trees from the same
+capture, offline. If the raw tree is missing it warns and copies nothing, so
+the old behaviour is the failure mode rather than a wrong payload.
+
+Each copy is recorded per row in `sibling_map.json` as `ips_manual_copied`, and
+counted in the build summary as `total_manual_ips_copied`.
+
 ### What happens to IPs that have no CSV mapping
 
-Default (without `--skip-uncovered`): the sibling is emitted with only
-the mapped IPs; uncovered IPs are NOT in the sibling (they stay only
-on the original). Per-row `ips_uncovered` in `sibling_map.json` audits
-exactly which IPs were left behind.
+An address the CSV cannot map does **not** reach the sibling, unless it was
+manually entered (see above, those are copied verbatim). It stays only on the
+original, so once enforcement moves to the sibling, a workload on that address
+stops matching.
 
-With `--skip-uncovered`: any group with even one uncovered IP is
-skipped entirely (no sibling, audit row in `skipped_uncovered.json`).
+Per-row `ips_uncovered` in `sibling_map.json` records exactly which addresses
+were left behind, and the run report prints a warning block plus a per-sibling
+table naming them. An address that is both uncovered and manually entered shows
+in `ips_uncovered` (the CSV could not map it) **and** in `ips_manual_copied`
+(it reached the sibling anyway); only addresses in the first list and not the
+second are genuinely lost.
+
+With `--skip-uncovered`: any group with even one uncovered IP is skipped
+entirely, emitting no sibling at all rather than a partial one, with an audit
+row in `skipped_uncovered.json`. Use it when a partial sibling would be worse
+than none.
+
+---
+
+## The run report
+
+Every push writes `avs_run_report.md` and `avs_run_report.json`. Driving the
+phases with [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md) generates it in the same
+invocation, into `<run-dir>/report/<phase>/<mode>/`, so a dry-run report and an
+apply report can never overwrite each other. By hand:
+
+```bash
+python tools/nsx/report_avs_run.py \
+  --report-root nsx_sibling_groups/nsx-lm1.lab.local \
+  --report-root nsx_pure_ip_remap/nsx-lm1.lab.local \
+  --out-dir nsx_avs_runs/d2a_report --workflow d \
+  --label "WF-D2a: siblings to nsx-lm1"
+```
+
+`--workflow d` is what produces the `D2a` / `D2b` / `D3` / `D5` phase labels.
+Without it the rows are labelled as WF-C, because both workflows push from the
+same bundle directories and the path alone cannot tell them apart.
+
+The report names every address that moves, which addresses were copied
+verbatim, and which were dropped for lack of a mapping. See
+[RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md#4b-reading-the-report) for how to read
+each section and what the verdicts mean.
 
 ---
 
@@ -552,8 +670,9 @@ want different.
 | Pure-segment groups | Skipped via `--skip-segment-groups` | — |
 | **Any group with a PathExpression** | **Skipped via `--skip-segment-groups`** (recommended for prod) | Omit the flag to allow tag+segment+IP hybrids to decompose (NOT recommended for prod) |
 | **Pure-IP groups** | **Emitted to `nsx_pure_ip_remap/` for in-place additive CSV-remap push (step 2b)** | Skip step 2b entirely if no mapped IPs are wanted on pure-IP groups |
-| CSV-uncovered IPs | Sibling emitted with only mapped IPs; uncovered noted in audit | `--skip-uncovered` to skip the whole group |
-| Appendix | `_sibling` (from `.env` `OBJECT_APPENDIX`) | Override with `--appendix` per run |
+| CSV-uncovered IPs | Sibling emitted with the mapped IPs; uncovered ones noted in the audit and named in the run report | `--skip-uncovered` to skip the whole group |
+| Manually entered IPs | **Copied into the sibling verbatim** (`--copy-manual-ips`, on by default) | `--no-copy-manual-ips` to drop them unless the CSV maps them |
+| Appendix | `OBJECT_APPENDIX_AVS` from `.env` (`_avs_ips`), NOT `OBJECT_APPENDIX`. See [Sibling suffix](#sibling-suffix-wf-d-must-not-share-wf-cs) | Override with `--appendix` per run |
 | `group_type` on siblings | `[IPAddress]` (consistent with WF-C) | — |
 | Rule amendment (step 3) | **Optional, separate change window** — strict-additive | Skip; rules continue to reference originals only |
 | Empty-groups handling | Reported in `empty_groups.json`; no sibling, no remap entry | — |

@@ -246,6 +246,49 @@ def _strip_orphan_operators(expression: List[Any]) -> List[Any]:
     return out
 
 
+def load_manual_ips(groups_dir: Path, domain_id: str) -> Dict[str, List[str]]:
+    """Map group id -> the addresses typed into that group by hand.
+
+    The input tree is `groups_additive/`, where the capture has SPLICED each
+    group's evaluated member IPs into its IPAddressExpression. That view cannot
+    tell a hand-entered address from one derived by tag evaluation, because by
+    then they sit in the same expression.
+
+    The capture also keeps the untouched export beside it, and there an
+    IPAddressExpression holds only what an operator actually typed. Reading it
+    is the only way to make the distinction, and it is offline: the file is
+    already on disk from the same capture.
+
+    Returns {} when the raw tree is not found, so a bundle from a different
+    layout degrades to the previous behaviour rather than failing.
+    """
+    # <capture>/groups_additive/domains/<d>/groups has four parents up to the
+    # capture root: groups -> default -> domains -> groups_additive -> <capture>
+    try:
+        capture = groups_dir.parents[3]
+    except IndexError:
+        return {}
+    roots = sorted((capture / "nsx_export").glob(f"*/domains/{domain_id}/groups")) \
+        if (capture / "nsx_export").is_dir() else []
+    if not roots:
+        log.warning("No raw export tree under %s: manually entered IPs cannot be "
+                    "distinguished from tag-derived ones, so none will be copied.",
+                    capture / "nsx_export")
+        return {}
+    out: Dict[str, List[str]] = {}
+    for f in roots[0].glob("*.yaml"):
+        try:
+            g = _load_yaml(f)
+        except Exception:
+            log.exception("could not read raw group %s", f)
+            continue
+        if isinstance(g, dict) and g.get("id"):
+            out[g["id"]] = _collect_ips(g.get("expression") or [])
+    log.info("Raw export read for manual-IP detection: %d group(s) from %s",
+             len(out), roots[0])
+    return out
+
+
 def split_group(
     orig_group: Dict[str, Any],
     appendix: str,
@@ -254,6 +297,7 @@ def split_group(
     include_pure_ip: bool = False,
     skip_segment_groups: bool = False,
     skip_uncovered: bool = False,
+    manual_ips: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     """Decompose one group into (sibling_payload, stripped_original_payload, info).
 
@@ -265,6 +309,8 @@ def split_group(
                                 else the CSV-mapped equivalents only)
         ips_uncovered        : source IPs without a CSV mapping
                                (empty when csv_mapping is None or all mapped)
+        ips_manual_copied    : manually entered IPs copied into the sibling
+                               verbatim (empty when csv_mapping is None)
         has_condition        : did the source have a Condition anywhere?
         has_path_expression  : did the source have a PathExpression anywhere?
         has_nested_expression: did the source have a NestedExpression anywhere?
@@ -288,6 +334,12 @@ def split_group(
                              never touching segment-related groups.
       skip_uncovered       : when csv_mapping is provided, skip the group
                              entirely if any source IP lacks a mapping.
+      manual_ips           : addresses taken from the group's OWN payload (its
+                             static IPAddressExpression entries, as opposed to
+                             addresses derived from tag evaluation). With
+                             csv_mapping these are copied into the sibling
+                             verbatim, because they are part of the group's
+                             definition and usually have no mapped counterpart.
     """
     orig_id = orig_group.get("id")
     info: Dict[str, Any] = {
@@ -295,6 +347,7 @@ def split_group(
         "ips_source": [],
         "ips_sibling": [],
         "ips_uncovered": [],
+        "ips_manual_copied": [],
         "has_condition": False,
         "has_path_expression": False,
         "has_nested_expression": False,
@@ -336,17 +389,26 @@ def split_group(
         info["skip_reason"] = "empty_ips"
         return None, None, info
 
-    # CSV mapping (optional) — sibling carries only the mapped equivalents.
+    # CSV mapping (optional): the sibling carries the mapped equivalents, PLUS
+    # a verbatim copy of every address an operator typed into the group by hand.
+    #
+    # Manually entered addresses are part of the group's DEFINITION, not of its
+    # evaluated VM membership, and they frequently have no counterpart on the
+    # other side (a partner subnet, a monitoring host, an out-of-scope range).
+    # Mapping them is meaningless, and dropping them silently removes coverage
+    # the operator explicitly asked for, so they are copied as they are.
     if csv_mapping is not None:
         mapped_ips, uncovered = _apply_csv_mapping(src_ips, csv_mapping)
         info["ips_uncovered"] = uncovered
         if skip_uncovered and uncovered:
             info["skip_reason"] = "uncovered_ips"
             return None, None, info
-        if not mapped_ips:
+        copied = [ip for ip in (manual_ips or []) if ip not in mapped_ips]
+        info["ips_manual_copied"] = copied
+        if not mapped_ips and not copied:
             info["skip_reason"] = "no_mapped_ips"
             return None, None, info
-        sibling_ips = mapped_ips
+        sibling_ips = mapped_ips + copied
     else:
         sibling_ips = list(src_ips)
 
@@ -530,6 +592,14 @@ def main() -> int:
                         "so producing the bundle is wasted work + extra cleanup. "
                         "WF-C should NOT use this (it needs the stripped originals "
                         "for step 4).")
+    p.add_argument("--copy-manual-ips", action=argparse.BooleanOptionalAction, default=True,
+                   help="With --csv-remap, copy addresses typed into the group by hand "
+                        "(its own static IPAddressExpression entries) into the sibling "
+                        "verbatim, alongside the mapped values. ON by default: those "
+                        "addresses are part of the group's definition, usually have no "
+                        "mapped counterpart, and dropping them silently removes coverage "
+                        "the operator asked for. --no-copy-manual-ips restores the "
+                        "mapped-values-only behaviour.")
     p.add_argument("--skip-uncovered", action="store_true",
                    help="When --csv-remap is provided, skip a group entirely if ANY "
                         "of its source IPs has no CSV mapping. Default: emit a "
@@ -627,8 +697,14 @@ def main() -> int:
         "errors": 0,
         "total_ips_in_siblings": 0,
         "total_uncovered_ips":   0,
+        "total_manual_ips_copied": 0,
     }
     pure_ip_remap: List[Dict[str, Any]] = []
+
+    # Only meaningful with a CSV map: without one the sibling already carries
+    # every source address, hand-entered ones included.
+    manual_by_id = load_manual_ips(groups_in, args.domain_id) \
+        if (args.copy_manual_ips and csv_mapping is not None) else {}
 
     for src_yaml in sorted(groups_in.glob("*.yaml")):
         counted["files_seen"] += 1
@@ -659,6 +735,7 @@ def main() -> int:
             include_pure_ip=False,                            # forced off
             skip_segment_groups=args.skip_segment_groups,
             skip_uncovered=args.skip_uncovered,
+            manual_ips=manual_by_id.get(orig_id, []) if args.copy_manual_ips else [],
         )
 
         if sibling is None:
@@ -772,6 +849,7 @@ def main() -> int:
             "ips_source":          info["ips_source"],
             "ips_sibling_mapped":  info["ips_sibling"] if csv_mapping is not None else None,
             "ips_uncovered":       info["ips_uncovered"],
+            "ips_manual_copied":   info["ips_manual_copied"],
             "status":              "ok",
         })
         sibling_map.append({
@@ -784,7 +862,13 @@ def main() -> int:
             "ips_source":            info["ips_source"],
             "ips_sibling_mapped":    info["ips_sibling"] if csv_mapping is not None else None,
             "ips_uncovered":         info["ips_uncovered"],
+            "ips_manual_copied":     info["ips_manual_copied"],
         })
+        if info["ips_manual_copied"]:
+            counted["total_manual_ips_copied"] += len(info["ips_manual_copied"])
+            log.info("[%d] %s: copied %d manually entered IP(s) into the sibling "
+                     "verbatim: %s", counted["files_seen"], orig_id,
+                     len(info["ips_manual_copied"]), info["ips_manual_copied"])
 
     # Write the machine-readable map for the rule-amend step.
     sibling_map_path = sibling_root / "sibling_map.json"

@@ -32,6 +32,81 @@ R=nsx_remap_$M
 
 ---
 
+---
+
+## 0b) Global Manager and multi-domain scope
+
+Sections 1 to 5 below target a single Local Manager. On a federated estate read
+[RUNBOOK_B.md](RUNBOOK_B.md#b0-which-surfaces-and-domains-are-in-scope) first.
+Two things differ:
+
+- **GM-owned groups** (`/global-infra/`) and **LM-local groups** (`/infra/`) are
+  separate populations. A GM run never sees LM-local groups, and GM-owned groups
+  do not appear on the LM surface. Run once per surface.
+- A GM carries one location-scoped domain per site. Both subcommands default to
+  `--domain-id default`, so pass **`--all-domains`** to cover every domain.
+
+```bash
+setopt interactive_comments 2>/dev/null || true
+
+python tools/nsx/list_domains.py nsx-gm1
+```
+
+### GM: dry run every domain
+
+```bash
+M=nsx-gm1
+CSV=data/subnet_map.csv
+TS=$(date -u +%Y%m%d_%H%M%S)
+
+python tools/nsx/groups.py export --source $M --federation-global \
+  --all-domains --output-dir nsx_groups_export/${M}_alldom
+
+python tools/nsx/groups.py push --target $M --federation-global \
+  --all-domains --groups-dir nsx_groups_export/${M}_alldom \
+  --csv-remap $CSV --reports-dir nsx_wfb_runs/$M/$TS
+```
+
+Review each domain, then add `--apply` to the push:
+
+```bash
+for f in nsx_wfb_runs/$M/$TS/*/summary.json; do
+  python -c "
+import json,sys
+d=json.load(open(sys.argv[1])); t=d['totals']
+print(f\"{sys.argv[1].split('/')[-2]:28} mode={d['mode']} seen={t['files_seen']:3} \"
+      f\"changed={t['csv_groups_changed']} added={t['csv_total_added_values']} \"
+      f\"failed={t['failed']}\")" $f
+done
+```
+
+### Then each LM, for its own local groups
+
+```bash
+for M in nsx-lm1 nsx-lm2 nsx-lm3; do
+  python tools/nsx/groups.py export --source $M --output-dir nsx_groups_export/${M}_local
+  python tools/nsx/groups.py push --target $M \
+    --groups-dir nsx_groups_export/${M}_local/groups \
+    --csv-remap $CSV --reports-dir nsx_wfb_runs/$M/${TS}_local
+done
+```
+
+No `--federation-global`, and an LM has only the `default` domain, so no
+`--all-domains` either.
+
+### Revert is per domain
+
+```bash
+python tools/nsx/groups.py revert --target nsx-gm1 --federation-global \
+  --domain-id nsx-lm1.lab.local \
+  --reports-dir nsx_wfb_runs/nsx-gm1/$TS/nsx-lm1.lab.local --apply
+```
+
+### A standalone Local Manager
+
+None of this applies. Use sections 1 to 5 as written.
+
+
 ## 1) CAPTURE : read-only snapshot of `nsx-lm1`
 
 Re-run this before every push session so the bundle matches the manager.

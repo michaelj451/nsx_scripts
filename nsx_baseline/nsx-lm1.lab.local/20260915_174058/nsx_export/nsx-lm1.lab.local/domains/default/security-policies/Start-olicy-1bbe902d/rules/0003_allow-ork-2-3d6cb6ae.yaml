@@ -1,0 +1,39 @@
+action: ALLOW
+resource_type: Rule
+id: allow-icmp-network-2
+display_name: allow-icmp-network-2
+path: /infra/domains/default/security-policies/Start_Policy/rules/allow-icmp-network-2
+relative_path: allow-icmp-network-2
+parent_path: /infra/domains/default/security-policies/Start_Policy
+rule_id: 5125
+sequence_number: 14
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /infra/domains/default/groups/network-2
+- /infra/domains/default/groups/hardware-subnet
+- /infra/domains/default/groups/a8b5ed22-6b48-4b28-ba2c-0a357bf929f8
+destination_groups:
+- /infra/domains/default/groups/network-2
+services:
+- /infra/services/ICMP-ALL
+- /infra/services/nested-service-1
+profiles:
+- ANY
+logged: false
+scope:
+- /infra/domains/default/groups/network-2
+- /infra/domains/default/groups/hardware-subnet
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789134738489
+_create_user: admin
+_last_modified_time: 1789134738489
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED
+_parent_policy_id: Start_Policy

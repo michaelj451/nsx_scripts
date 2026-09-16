@@ -1,0 +1,38 @@
+action: ALLOW
+resource_type: Rule
+id: web_rule
+display_name: web_rule
+path: /global-infra/domains/default/security-policies/Start_Policy/rules/web_rule
+relative_path: web_rule
+parent_path: /global-infra/domains/default/security-policies/Start_Policy
+rule_id: 1003080
+sequence_number: 32
+sources_excluded: false
+destinations_excluded: false
+source_groups:
+- /global-infra/domains/default/groups/hardware-subnet
+destination_groups:
+- /global-infra/domains/default/groups/vm2
+- /global-infra/domains/default/groups/vm1
+services:
+- /global-infra/services/HTTPS
+- /global-infra/services/HTTP
+profiles:
+- ANY
+logged: false
+scope:
+- /global-infra/domains/default/groups/vm2
+- /global-infra/domains/default/groups/hardware-subnet
+- /global-infra/domains/default/groups/vm1
+disabled: false
+notes: ''
+direction: IN_OUT
+tag: ''
+ip_protocol: IPV4_IPV6
+is_default: false
+_create_time: 1789493875316
+_create_user: admin
+_last_modified_time: 1789493875316
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

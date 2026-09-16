@@ -1,0 +1,26 @@
+expression:
+- ip_addresses:
+  - 10.6.2.0/24
+  - 10.6.1.0/24
+  - 10.6.0.0/24
+  - 10.5.0.0/24
+  resource_type: IPAddressExpression
+  id: c012ff51-a9af-415d-9c2b-807ee3f571c5
+  path: /infra/domains/default/groups/segment-group-1/ip-address-expressions/c012ff51-a9af-415d-9c2b-807ee3f571c5
+  relative_path: c012ff51-a9af-415d-9c2b-807ee3f571c5
+  parent_path: /infra/domains/default/groups/segment-group-1
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: segment-group-1
+display_name: segment-group-1
+path: /infra/domains/default/groups/segment-group-1
+relative_path: segment-group-1
+parent_path: /infra/domains/default
+_create_time: 1789134727134
+_create_user: admin
+_last_modified_time: 1789134727134
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

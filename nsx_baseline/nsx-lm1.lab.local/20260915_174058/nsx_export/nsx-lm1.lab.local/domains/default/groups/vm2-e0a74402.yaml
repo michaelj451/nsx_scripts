@@ -1,0 +1,29 @@
+expression:
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: vm|2
+  resource_type: Condition
+  id: f481111f-e5a6-4aaf-b1fb-da8fee098529
+  path: /infra/domains/default/groups/vm2/condition-expressions/f481111f-e5a6-4aaf-b1fb-da8fee098529
+  relative_path: f481111f-e5a6-4aaf-b1fb-da8fee098529
+  parent_path: /infra/domains/default/groups/vm2
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: vm2
+display_name: vm-group-2
+tags:
+- scope: vm
+  tag: '2'
+path: /infra/domains/default/groups/vm2
+relative_path: vm2
+parent_path: /infra/domains/default
+_create_time: 1789134728126
+_create_user: admin
+_last_modified_time: 1789134728126
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

@@ -1,0 +1,31 @@
+is_default: false
+service_entries:
+- l4_protocol: TCP
+  source_ports: []
+  destination_ports:
+  - '22'
+  resource_type: L4PortSetServiceEntry
+  id: ssh-1
+  display_name: ssh-1
+  path: /global-infra/services/a1-custom-service/service-entries/ssh-1
+  relative_path: ssh-1
+  parent_path: /global-infra/services/a1-custom-service
+  _create_time: 1789493794456
+  _create_user: admin
+  _last_modified_time: 1789493794456
+  _last_modified_user: admin
+  _system_owned: false
+  _protection: NOT_PROTECTED
+service_type: NON_ETHER
+resource_type: Service
+id: a1-custom-service
+display_name: a1-custom-service
+path: /global-infra/services/a1-custom-service
+relative_path: a1-custom-service
+parent_path: /global-infra
+_create_time: 1789493794451
+_create_user: admin
+_last_modified_time: 1789493794451
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

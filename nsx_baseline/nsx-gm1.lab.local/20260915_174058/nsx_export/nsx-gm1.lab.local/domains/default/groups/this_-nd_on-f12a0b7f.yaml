@@ -1,0 +1,23 @@
+expression:
+- ip_addresses:
+  - 10.0.0.0/8
+  resource_type: IPAddressExpression
+  id: 8ba2bb7c-fe79-481d-b8c9-6cebf0a45ec1
+  path: /global-infra/domains/default/groups/this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on/ip-address-expressions/8ba2bb7c-fe79-481d-b8c9-6cebf0a45ec1
+  relative_path: 8ba2bb7c-fe79-481d-b8c9-6cebf0a45ec1
+  parent_path: /global-infra/domains/default/groups/this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+display_name: this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+path: /global-infra/domains/default/groups/this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+relative_path: this_is_a_very_super_long_group_name_that_continues_on_and_on_and_on_and_on_and_on_and_on
+parent_path: /global-infra/domains/default
+_create_time: 1789493805218
+_create_user: admin
+_last_modified_time: 1789493805218
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED

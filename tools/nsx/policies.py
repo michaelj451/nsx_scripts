@@ -396,13 +396,25 @@ def cmd_push(args: argparse.Namespace) -> int:
     policy_dirs = sorted(p for p in policies_dir.iterdir() if p.is_dir())
     log.info("Found %d policy folder(s).", len(policy_dirs))
 
-    client = NsxPolicyClient(nsxmanager=target_host, federation_global=args.federation_global) if args.apply else None
+    # Empty means "target not read", which is different from "target is empty".
+    # Rows only claim exists_on_target when the target was actually contacted.
+    baseline: Dict[str, Dict[str, Any]] = {}
+    target_read = args.apply or args.diff_target
+    client = NsxPolicyClient(nsxmanager=target_host,
+                             federation_global=args.federation_global) if target_read else None
     baseline_path = None
-    if args.apply:
-        log.info("Capturing target baseline (current customer policies on %s) ...", target_host)
+    if target_read:
+        log.info("Capturing target state (current customer policies on %s) ...", target_host)
         baseline = _capture_target_policies(client, args.domain_id)
-        baseline_path = _append_baseline(reports_dir, baseline)
-        log.info("  Baseline: %d customer policy/policies → %s", len(baseline), baseline_path)
+        if args.apply:
+            baseline_path = _append_baseline(reports_dir, baseline)
+            log.info("  Baseline: %d customer policy/policies → %s", len(baseline), baseline_path)
+        else:
+            # Read-only: a baseline file is a revert artifact, and a dry run has
+            # nothing to revert.
+            log.info("  Target has %d customer policy/policies (read-only, no baseline written)",
+                     len(baseline))
+            client = None      # nothing below may write in dry-run mode
 
     policy_rows: List[Dict[str, Any]] = []
     pol_ok = pol_failed = pol_skipped = pol_dry = 0
@@ -431,6 +443,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             policy_id = policy.get("id")
             row["id"] = policy_id
             row["display_name"] = policy.get("display_name")
+            if target_read and policy_id:
+                row["exists_on_target"] = policy_id in baseline
 
             if not policy_id:
                 row["status"] = "skipped"
@@ -758,6 +772,11 @@ def main() -> int:
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <policies-dir>/../push_report/.")
+    pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
+                    help="Read the target on a dry run so each row can say whether the "
+                         "policy already exists. On by default: a report that guesses is "
+                         "worse than one that says it does not know. --no-diff-target "
+                         "makes the dry run fully offline.")
     pp.set_defaults(func=cmd_push)
 
     pr = sub.add_parser("revert", help="Undo the most recent push using the auto-captured baseline.")

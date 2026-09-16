@@ -23,6 +23,7 @@ a matching revert.
 
 | Workflow | Narrative | Commands | PowerShell | Purpose |
 |---|---|---|---|---|
+| **Driver** (start here) | [RUNBOOK_WORKFLOW.md](nsx/RUNBOOK_WORKFLOW.md) | included | n/a | `run_workflow.py`: one command per phase for A, C and D, with four verbs (dry run / apply / verify / rollback) and a report written in the same invocation so it cannot be forgotten or attributed to the wrong mode |
 | **A** Clone | [RUNBOOK_A.md](nsx/RUNBOOK_A.md) | [cmds](nsx/RUNBOOK_A_COMMANDS.md) | [ps](nsx/RUNBOOK_A_COMMANDS_PS.md) | Clone customer DFW config lm1 to lm2 (3 push phases) |
 | **B** In-place remap | [RUNBOOK_B.md](nsx/RUNBOOK_B.md) | [cmds](nsx/RUNBOOK_B_COMMANDS.md) | [ps](nsx/RUNBOOK_B_COMMANDS_PS.md) | CSV subnet remap in place (strict-additive; IP-only groups by default, `--remap-generic` widens). Includes the B.4 remap audit |
 | **C** Sibling decomposition | [RUNBOOK_C.md](nsx/RUNBOOK_C.md) | [cmds](nsx/RUNBOOK_C_COMMANDS.md) | [ps](nsx/RUNBOOK_C_COMMANDS_PS.md) | After a clone: decompose tagged groups into IP-only siblings on the target |
@@ -31,6 +32,7 @@ a matching revert.
 | Selective category copy | [RUNBOOK_FILTER_COPY.md](nsx/RUNBOOK_FILTER_COPY.md) | included | [ps](nsx/RUNBOOK_FILTER_COPY_PS.md) | Copy chosen DFW policies plus only their transitive dependencies |
 | Services only | [RUNBOOK_SERVICES.md](nsx/RUNBOOK_SERVICES.md) | included | included | Export / push / revert customer services alone |
 | GM to LM copy | `tools/nsx/transform_gm_export_to_lm.py` | tool docstring | n/a | Rewrite a Global Manager export's `/global-infra/` refs (and optionally the domain) so the standard Workflow A pushes land it on a Local Manager |
+| **AVS** Federation teardown | [RUNBOOK_AVS.md](nsx/RUNBOOK_AVS.md) | included | n/a | End-to-end GM to LM to target with tag groups decomposed to IP-only siblings, for a destination with no matching VM inventory or tag scheme. Read the two failure modes first: a capture without `--live-query` and any powered-off VM both silently drop IPs |
 
 ## Backup (separate from capture on purpose)
 
@@ -64,11 +66,15 @@ a matching revert.
 | [RUNBOOK_PAN_PROD.md](pan/RUNBOOK_PAN_PROD.md) / [ps](pan/RUNBOOK_PAN_PROD_PS.md) | Production Panorama, manual / file-driven (no API): offline policy lookup flow |
 | [RUNBOOK_PAN_FLOW_RULES.md](pan/RUNBOOK_PAN_FLOW_RULES.md) / [ps](pan/RUNBOOK_PAN_FLOW_RULES_PS.md) | Offline flow/rule report: a CSV of source/destination pairs in, every covering rule out, plus a subnet list that suppresses matches by attribution |
 
-## Testing
+## Testing and cleanup (`tools/test/`)
+
+Lab-only scaffolding and the destructive cleanup tools. Documentation for
+everything under `tools/test/` lives in [`docs/tools/test/`](tools/test/).
 
 | Doc | Purpose |
 |---|---|
-| [README-TEST.md](reference/README-TEST.md) | Load-test scaffolding under `tools/test/` for exercising the NSX tools at scale |
+| [README-TEST.md](tools/test/README-TEST.md) | Load-test scaffolding under `tools/test/` for exercising the NSX tools at scale |
+| [RUNBOOK_WIPE.md](tools/test/RUNBOOK_WIPE.md) | `wipe_target_manager.py`: delete customer DFW objects in dependency order. Full wipe, or `--id-prefix` to clear one family of test objects while leaving the Default sections (and their NDP/DHCP rules) alone. Back up first: there is no paired revert |
 
 Unit tests for the remap / audit / backup / Panorama code live in
 [`tests/`](../tests/): `python -m unittest discover tests`.

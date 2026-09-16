@@ -27,6 +27,88 @@ $R = "nsx_remap_$M"
 
 ---
 
+---
+
+## 0b) Global Manager and multi-domain scope
+
+Read [RUNBOOK_B.md](RUNBOOK_B.md#b0-which-surfaces-and-domains-are-in-scope)
+first. Two things bite on a federated estate:
+
+- **GM-owned groups** (`/global-infra/`) and **LM-local groups** (`/infra/`) are
+  separate populations. A GM run never sees LM-local groups. Run once per
+  surface.
+- `groups.py export` and `push` default to `--domain-id default`. A GM carries
+  one location-scoped domain per site, so pass **`--all-domains`** to cover them
+  all in one command.
+
+List the domains and count them against the sites you expect:
+
+```powershell
+python tools/nsx/list_domains.py nsx-gm1
+```
+
+### Dry run every GM domain
+
+Read-only. Each domain gets its own bundle under `<output-dir>/<domain>/` and
+its own reports under `<reports-dir>/<domain>/`, so per-domain revert baselines
+never collide.
+
+```powershell
+$M   = "nsx-gm1"
+$CSV = "data/subnet_map.csv"
+$TS  = (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss")
+
+python tools/nsx/groups.py export --source $M --federation-global `
+  --all-domains --output-dir "nsx_groups_export/${M}_alldom"
+
+python tools/nsx/groups.py push --target $M --federation-global `
+  --all-domains --groups-dir "nsx_groups_export/${M}_alldom" `
+  --csv-remap $CSV --reports-dir "nsx_wfb_runs/$M/$TS"
+```
+
+The run prints a per-domain summary at the end. Review each domain before
+applying:
+
+```powershell
+Get-ChildItem "nsx_wfb_runs/$M/$TS" -Directory | ForEach-Object {
+  $d = Get-Content "$($_.FullName)/summary.json" | ConvertFrom-Json
+  "{0,-28} mode={1} seen={2} changed={3} added={4} failed={5}" -f `
+    $_.Name, $d.mode, $d.totals.files_seen, `
+    $d.totals.csv_groups_changed, $d.totals.csv_total_added_values, $d.totals.failed
+}
+```
+
+Add `--apply` to the push to write. One domain failing does not abandon the
+rest, and the exit code is non-zero if any did.
+
+**Revert stays per domain:**
+
+```powershell
+python tools/nsx/groups.py revert --target $M --federation-global `
+  --domain-id "nsx-lm1.lab.local" `
+  --reports-dir "nsx_wfb_runs/$M/$TS/nsx-lm1.lab.local" --apply
+```
+
+### Then each Local Manager, for its own local groups
+
+```powershell
+foreach ($M in @("nsx-lm1","nsx-lm2","nsx-lm3")) {
+  python tools/nsx/groups.py export --source $M --output-dir "nsx_groups_export/${M}_local"
+  python tools/nsx/groups.py push --target $M `
+    --groups-dir "nsx_groups_export/${M}_local/groups" `
+    --csv-remap $CSV --reports-dir "nsx_wfb_runs/$M/${TS}_local"
+}
+```
+
+No `--federation-global`. An LM normally has only the `default` domain; confirm
+with `list_domains.py`.
+
+### A standalone Local Manager
+
+None of the above applies. Use the commands in the following sections as
+written: one surface, one domain, no federation flag.
+
+
 ## 1) CAPTURE : read-only snapshot of `nsx-lm1`
 
 Re-run this before every push session so the bundle matches the manager.

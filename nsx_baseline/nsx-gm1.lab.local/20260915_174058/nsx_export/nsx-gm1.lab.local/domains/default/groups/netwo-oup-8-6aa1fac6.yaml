@@ -1,0 +1,26 @@
+expression:
+- member_type: VirtualMachine
+  key: Tag
+  operator: EQUALS
+  scope_operator: EQUALS
+  value: asl_id|8
+  resource_type: Condition
+  id: a9180e60-47e4-49c3-bc1f-1b819a0cc2af
+  path: /global-infra/domains/default/groups/network-group-8/condition-expressions/a9180e60-47e4-49c3-bc1f-1b819a0cc2af
+  relative_path: a9180e60-47e4-49c3-bc1f-1b819a0cc2af
+  parent_path: /global-infra/domains/default/groups/network-group-8
+  _protection: NOT_PROTECTED
+extended_expression: []
+reference: false
+resource_type: Group
+id: network-group-8
+display_name: network-group-8
+path: /global-infra/domains/default/groups/network-group-8
+relative_path: network-group-8
+parent_path: /global-infra/domains/default
+_create_time: 1789493803473
+_create_user: admin
+_last_modified_time: 1789493803473
+_last_modified_user: admin
+_system_owned: false
+_protection: NOT_PROTECTED
