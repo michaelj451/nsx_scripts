@@ -5,7 +5,8 @@ One page that says what every document in `docs/` is for. Start here.
 Naming convention: the change workflows each have a narrative runbook
 (`RUNBOOK_X.md`), a bare bash command sheet (`RUNBOOK_X_COMMANDS.md`), and a
 PowerShell command sheet (`RUNBOOK_X_COMMANDS_PS.md`). Single-file runbooks
-pair `RUNBOOK_X.md` (bash) with `RUNBOOK_X_PS.md` (PowerShell).
+pair `RUNBOOK_X.md` (bash) with `RUNBOOK_X_PS.md` (PowerShell). A `RUN_*.md`
+is different: it pins one workflow to named managers in this lab.
 
 ## Reference (read first)
 
@@ -33,6 +34,25 @@ a matching revert.
 | Services only | [RUNBOOK_SERVICES.md](nsx/RUNBOOK_SERVICES.md) | included | included | Export / push / revert customer services alone |
 | GM to LM copy | `tools/nsx/transform_gm_export_to_lm.py` | tool docstring | n/a | Rewrite a Global Manager export's `/global-infra/` refs (and optionally the domain) so the standard Workflow A pushes land it on a Local Manager |
 | **AVS** Federation teardown | [RUNBOOK_AVS.md](nsx/RUNBOOK_AVS.md) | included | n/a | End-to-end GM to LM to target with tag groups decomposed to IP-only siblings, for a destination with no matching VM inventory or tag scheme. Read the two failure modes first: a capture without `--live-query` and any powered-off VM both silently drop IPs |
+
+## Environment-pinned run cards
+
+The workflow docs above are generic and variable-driven. These pin one workflow
+to named managers, with the preconditions, the review gate at each step, the
+revert path, and the counts a clean dry run produced on 2026-09-18 so a later
+run has something to be compared against.
+
+| Card | PowerShell | Workflow | Managers |
+|---|---|---|---|
+| [RUN_B_GM1_LM1.md](nsx/RUN_B_GM1_LM1.md) | [ps](nsx/RUN_B_GM1_LM1_PS.md) | **B**, in-place CSV subnet remap | `nsx-gm1` (federation surface, all three domains) and `nsx-lm1` (local surface). Both halves are required: the two group populations do not overlap |
+| [RUN_AC_LM2.md](nsx/RUN_AC_LM2.md) | [ps](nsx/RUN_AC_LM2_PS.md) | **A** then **C**, through `run_workflow.py` | source `nsx-lm1`, target `nsx-lm2` |
+| [RUN_D_LM1.md](nsx/RUN_D_LM1.md) | [ps](nsx/RUN_D_LM1_PS.md) | **D**, four separate change windows | `nsx-lm1` in place |
+
+Each card restates the capture gate in full, because the driver's own gate
+checks only two of its five fields (see `pending_decisions` item 4). The
+PowerShell variants are not transliterations: every inspection block was run
+under pwsh against real run artifacts, so the gates print parsed fields rather
+than raw log lines.
 
 ## Backup (separate from capture on purpose)
 
