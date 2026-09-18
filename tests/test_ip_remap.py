@@ -334,9 +334,9 @@ class GroupsPushHelpersTests(unittest.TestCase):
                          "Never remapped by design", "range", "no CSV row covers", "`1.2.3.4`",
                          "Confidence ramp", "1 -> 25", "**pass**"):
             self.assertIn(expected, md)
-        for row in ("| ip-grp | `ip-grp` | ip-only | `10.7.0.1` | `10.6.0.1` | 2 | success_put |",
-                    "| steady | `steady` | ip-only | `10.6.0.5` | `10.7.0.5` | 2 |",
-                    "| gen | `gen` | `10.7.5.0/24` | 1 |"):
+        for row in ("| ip-grp | ip-only | `10.7.0.1` | `10.6.0.1` | 2 | success_put |",
+                    "| steady | ip-only | `10.6.0.5` | `10.7.0.5` | 2 |",
+                    "| gen | `10.7.5.0/24` | 1 |"):
             self.assertIn(row, sq)
         self.assertNotIn(chr(0x2014), md)
 
@@ -368,10 +368,10 @@ class GroupsPushHelpersTests(unittest.TestCase):
         md = groups._write_remap_markdown(out, summary, rows).read_text()
         sq = " ".join(md.split())
         self.assertIn("## 1. Added (1 IPs in 1 groups)", md)
-        self.assertIn("| written-friendly | `written` | ip-only | `10.7.0.9` |", sq)
+        self.assertIn("| written-friendly | ip-only | `10.7.0.9` |", sq)
         self.assertIn("No changes needed (1)", md)
         self.assertIn("stale-bundle", md)
-        self.assertNotIn("| stale-bundle | `stale-bundle` | ip-only |", sq)   # not in the Added table
+        self.assertNotIn("| stale-bundle | ip-only |", sq)   # not in the Added table
         self.assertTrue((out / "remap_report.md").exists())
         self.assertEqual(len(list(out.glob("remap_report_*.md"))), 1)
 
