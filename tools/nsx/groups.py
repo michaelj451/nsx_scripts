@@ -270,12 +270,8 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
         return f"`{v}`"
 
     def name(r: Dict[str, Any]) -> str:
-        """Group column: the display name (falls back to the id)."""
+        """Display name column (falls back to the id when no name is set)."""
         return str(r.get("display_name") or r.get("id"))
-
-    def gidc(r: Dict[str, Any]) -> str:
-        """Id column: always the NSX id, code-formatted."""
-        return code(r.get("id"))
 
     def vals(items: List[str], cap: int = 8) -> str:
         if not items:
@@ -331,8 +327,8 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
     L.append(f"## 1. {verb} ({ips_added_total} IPs in {len(changed)} groups)")
     L.append("")
     if changed:
-        L.append(f"| Group | Id | Type | {verb} | From original | CSV row | Status |")
-        L.append("|---|---|---|---|---|---:|---|")
+        L.append(f"| Display name | Type | {verb} | From original | CSV row | Status |")
+        L.append("|---|---|---|---|---:|---|")
         for r in changed:
             added = r.get("ips_added") if apply_mode else r.get("csv_added_values", [])
             pairs = {_canonical_ip_token(p["mapped"]): p for p in r.get("csv_added_pairs", [])}
@@ -340,7 +336,7 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
                 p = pairs.get(_canonical_ip_token(v))
                 why = code(p["original"]) if p else "(capture bundle, not CSV)"
                 rowno = p["csv_row"] if p else ""
-                L.append(f"| {name(r)} | {gidc(r)} | {r.get('group_type', '')} | {code(v)} "
+                L.append(f"| {name(r)} | {r.get('group_type', '')} | {code(v)} "
                          f"| {why} | {rowno} | {r.get('status')} |")
     else:
         L.append("None. Every mapped value the CSV calls for is already present.")
@@ -356,10 +352,10 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
         L.append("Both the original and its mapped value are present: completed by an "
                  "earlier run, or already satisfied. Nothing is sent for these.")
         L.append("")
-        L.append("| Group | Id | Type | Original | Mapped (present) | CSV row |")
-        L.append("|---|---|---|---|---|---:|")
+        L.append("| Display name | Type | Original | Mapped (present) | CSV row |")
+        L.append("|---|---|---|---|---:|")
         for r, p in already:
-            L.append(f"| {name(r)} | {gidc(r)} | {r.get('group_type', '')} | {code(p['original'])} "
+            L.append(f"| {name(r)} | {r.get('group_type', '')} | {code(p['original'])} "
                      f"| {code(p['mapped'])} | {p['csv_row']} |")
     else:
         L.append("None detected.")
@@ -369,10 +365,10 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
         L.append(f"## {sec}. Failures ({len(failures)})")
         sec += 1
         L.append("")
-        L.append("| Group | Id | Status | Error |")
-        L.append("|---|---|---|---|")
+        L.append("| Display name | Status | Error |")
+        L.append("|---|---|---|")
         for r in failures:
-            L.append(f"| {name(r)} | {gidc(r)} | {r.get('status')} | {str(r.get('error', ''))[:140]} |")
+            L.append(f"| {name(r)} | {r.get('status')} | {str(r.get('error', ''))[:140]} |")
         L.append("")
 
     L.append(f"## {sec}. Left alone")
@@ -389,11 +385,11 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
             L.append(f"**Generic groups the CSV covers ({len(with_candidates)} groups, {n_vals} values):** "
                      "out of scope for this run; a `--remap-generic` push would add:")
             L.append("")
-            L.append("| Group | Id | Would add with --remap-generic | Count |")
-            L.append("|---|---|---|---:|")
+            L.append("| Display name | Would add with --remap-generic | Count |")
+            L.append("|---|---|---:|")
             for r in with_candidates:
                 cand = r["csv_generic_candidate_values"]
-                L.append(f"| {name(r)} | {gidc(r)} | {vals(cand)} | {len(cand)} |")
+                L.append(f"| {name(r)} | {vals(cand)} | {len(cand)} |")
             L.append("")
         if without:
             L.append(f"**Generic groups, out of scope, nothing to map ({len(without)}):** "
@@ -403,19 +399,19 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
     if by_design:
         L.append("**Never remapped by design:**")
         L.append("")
-        L.append("| Group | Id | Entry | Reason |")
-        L.append("|---|---|---|---|")
+        L.append("| Display name | Entry | Reason |")
+        L.append("|---|---|---|")
         for r, s in by_design:
-            L.append(f"| {name(r)} | {gidc(r)} | {code(s['value'])} | {s['reason']} |")
+            L.append(f"| {name(r)} | {code(s['value'])} | {s['reason']} |")
         L.append("")
     uncovered = [(r, r.get("csv_unmapped_values")) for r in rows if r.get("csv_unmapped_values")]
     if uncovered:
         L.append("**IPv4 entries no CSV row covers:**")
         L.append("")
-        L.append("| Group | Id | Entries |")
-        L.append("|---|---|---|")
+        L.append("| Display name | Entries |")
+        L.append("|---|---|")
         for r, u in uncovered:
-            L.append(f"| {name(r)} | {gidc(r)} | {vals(u)} |")
+            L.append(f"| {name(r)} | {vals(u)} |")
         L.append("")
 
     decisions = summary.get("interactive_decisions") or []
@@ -1078,6 +1074,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             gid = obj.get("id")
             row["id"] = gid
             row["display_name"] = obj.get("display_name")
+            group_name = row["display_name"] or gid
 
             if not gid:
                 row["status"] = "skipped"
@@ -1113,12 +1110,12 @@ def cmd_push(args: argparse.Namespace) -> int:
                     total_csv_generic_candidates += len(gen_candidates)
                     log.info("[%d/%d] %s: generic group, CSV remap not applied; "
                              "--remap-generic would add %d value(s): %s",
-                             i, len(files), gid, len(gen_candidates),
+                             i, len(files), group_name, len(gen_candidates),
                              _format_entries(gen_candidates))
                 else:
                     log.info("[%d/%d] %s: generic group, CSV remap not applied "
                              "(default remaps IP-Addresses-Only groups; use --remap-generic to include it)",
-                             i, len(files), gid)
+                             i, len(files), group_name)
             if csv_remap_applies:
                 updated, csv_report = _csv_remap_group(
                     group=obj,
@@ -1145,7 +1142,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                     row["csv_skipped_values"] = csv_skipped
                     total_csv_skipped += len(csv_skipped)
                     log.info("[%d/%d] %s: %d entr%s left untouched (never remapped): %s",
-                             i, len(files), gid, len(csv_skipped),
+                             i, len(files), group_name, len(csv_skipped),
                              "y" if len(csv_skipped) == 1 else "ies",
                              _format_entries([f"{s['value']} ({s['reason']})" for s in csv_skipped]))
                 csv_unmapped = csv_report.get("unmapped_values") or []
@@ -1186,7 +1183,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                     log.warning(
                         "[%d/%d] %s — stripped %d fabric path(s) (host/edge TN or transport-zone); "
                         "group will land %s",
-                        i, len(files), gid, len(fabric_stripped_here),
+                        i, len(files), group_name, len(fabric_stripped_here),
                         "as EMPTY (no remaining membership)" if not obj["expression"] else "with reduced membership",
                     )
 
@@ -1226,14 +1223,14 @@ def cmd_push(args: argparse.Namespace) -> int:
                 if have_baseline and (ips_added or ips_removed):
                     ip_note = f" (ips +{len(ips_added)}/-{len(ips_removed)})"
                 log.info("[%d/%d  DRY  ok=%d fail=%d skip=%d] %s%s%s",
-                         i, len(files), ok, failed, skipped, gid, seg_note, ip_note)
+                         i, len(files), ok, failed, skipped, group_name, seg_note, ip_note)
                 # Surface a would-be contract violation now rather than at apply
                 # time. The row is not failed: a dry run reports, it does not
                 # decide.
                 if ips_removed and not args.intentional_ip_removal:
                     log.warning("[%d/%d] %s WOULD REMOVE %d IP(s) on apply: %s. "
                                 "Re-run with --intentional-ip-removal if that is the intent.",
-                                i, len(files), gid, len(ips_removed), ips_removed)
+                                i, len(files), group_name, len(ips_removed), ips_removed)
                 rows.append(row)
                 continue
 
@@ -1370,14 +1367,14 @@ def cmd_push(args: argparse.Namespace) -> int:
                 log.warning(
                     "[%d/%d  ok=%d fail=%d skip=%d] %s — referenced object missing (404); PENDING RETRY (queued=%d)",
                     i, len(files), ok, failed, skipped,
-                    row.get("id") or f.name, pending,
+                    row.get("display_name") or row.get("id") or f.name, pending,
                 )
             else:
                 row["status"] = "failed"
                 log.error(
                     "[%d/%d  ok=%d fail=%d skip=%d] %s — FAILED: %s\n%s",
                     i, len(files), ok, failed, skipped,
-                    row.get("id") or f.name, e, row["traceback"],
+                    row.get("display_name") or row.get("id") or f.name, e, row["traceback"],
                 )
 
         rows.append(row)
