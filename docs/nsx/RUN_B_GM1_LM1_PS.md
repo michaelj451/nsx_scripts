@@ -348,3 +348,63 @@ what you need, fall back to the backup taken in the preconditions and follow
 [EMERGENCY_RESTORE_PS.md](EMERGENCY_RESTORE_PS.md). Read its rules caveat first:
 backup bundles do not carry `_parent_policy_id`, though for a groups-only
 Workflow B rollback that trap does not apply.
+
+---
+
+## Dry runs only (copy and paste)
+
+In **PowerShell**, open the `nsx_scripts` folder and paste this. It uses the existing `.venv` on either macOS or Windows:
+
+```powershell
+$Python = if (Test-Path ".venv/Scripts/python.exe") {
+    ".venv/Scripts/python.exe"
+} else {
+    ".venv/bin/python"
+}
+
+$env:PYTHONPATH = Join-Path $PWD "app"
+$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
+$R = "nsx_wfb_runs/gm1_lm1_$Stamp"
+$GM_CSV = "data/subnet_map.csv"
+$LM_CSV = "data/nonprod_map.csv"
+
+& $Python tools/nsx/groups.py export `
+    --source nsx-gm1 --federation-global --all-domains `
+    --output-dir "$R/export/nsx-gm1"
+
+if ($LASTEXITCODE -eq 0) {
+    & $Python tools/nsx/groups.py push `
+        --target nsx-gm1 --federation-global --all-domains `
+        --groups-dir "$R/export/nsx-gm1" `
+        --csv-remap $GM_CSV `
+        --reports-dir "$R/reports/nsx-gm1"
+}
+
+if ($LASTEXITCODE -eq 0) {
+    & $Python tools/nsx/groups.py export `
+        --source nsx-lm1 `
+        --output-dir "$R/export/nsx-lm1"
+}
+
+if ($LASTEXITCODE -eq 0) {
+    & $Python tools/nsx/groups.py push `
+        --target nsx-lm1 `
+        --groups-dir "$R/export/nsx-lm1/groups" `
+        --csv-remap $LM_CSV `
+        --reports-dir "$R/reports/nsx-lm1"
+}
+```
+
+This previews **GM1-owned groups across all GM domains**, then **LM1-local groups in the default domain**, proceeding only when the previous command succeeds. **No NSX configuration changes are applied.**
+
+The CSV selections match this run card: `data/subnet_map.csv` for GM1 and `data/nonprod_map.csv` for LM1. Change `$GM_CSV` or `$LM_CSV` before running if you need a different map.
+
+Reports:
+
+```powershell
+Get-ChildItem -Path "$R/reports/nsx-gm1/*/remap_report.md", `
+    "$R/reports/nsx-lm1/remap_report.md" |
+    Select-Object -ExpandProperty FullName
+```
+
+The default scope is **IP-Addresses-Only groups**. Generic-group candidates are listed in the reports but are not included in the proposed changes. Mapped addresses would be added alongside the originals.

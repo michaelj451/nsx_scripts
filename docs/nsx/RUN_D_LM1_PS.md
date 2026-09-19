@@ -372,3 +372,81 @@ taken in the preconditions and follow
 [EMERGENCY_RESTORE_PS.md](EMERGENCY_RESTORE_PS.md). Read its rules caveat first:
 backup bundles do not carry `_parent_policy_id`, so restoring rules straight from
 one lands them in a policy that does not exist. That doc has the working recipe.
+
+---
+
+## Dry runs only (copy and paste)
+
+In **PowerShell**, open the `nsx_scripts` folder and paste this. It uses the existing `.venv` on either macOS or Windows:
+
+```powershell
+$Python = if (Test-Path ".venv/Scripts/python.exe") {
+    ".venv/Scripts/python.exe"
+} else {
+    ".venv/bin/python"
+}
+
+$env:PYTHONPATH = Join-Path $PWD "app"
+$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
+$R = "nsx_avs_runs/lm1_workflow_d_$Stamp"
+$D5R = "$R/d5_preview"
+$CSV = "data/nonprod_map.csv"
+$Appendix = "_avs_ips"
+
+function wf {
+    & $Python tools/nsx/run_workflow.py `
+        --source nsx-lm1 `
+        --target nsx-lm1 `
+        --run-dir $R `
+        --appendix $Appendix @args
+}
+
+wf --phase d2a --csv-remap $CSV
+
+if ($LASTEXITCODE -eq 0) {
+    wf --phase d2b --csv-remap $CSV --no-capture
+}
+
+if ($LASTEXITCODE -eq 0) {
+    wf --phase d3 --no-capture
+}
+
+if ($LASTEXITCODE -eq 0) {
+    & $Python tools/nsx/build_sibling_groups.py `
+        --source nsx-lm1 `
+        --output-base $D5R `
+        --domain-id default `
+        --appendix $Appendix `
+        --csv-remap $CSV `
+        --skip-segment-groups
+}
+
+if ($LASTEXITCODE -eq 0) {
+    & $Python tools/nsx/run_workflow.py `
+        --source nsx-lm1 `
+        --target nsx-lm1 `
+        --run-dir $D5R `
+        --appendix $Appendix `
+        --phase d5 --no-capture
+}
+```
+
+This previews **Workflow D in place on LM1**, proceeding only when the previous command succeeds. **No NSX configuration changes are applied.**
+
+- **`d2a`** captures LM1 automatically with `--live-query`, builds the mapped siblings, and previews their creation or update.
+- **`d2b`** previews mapped IP additions to pure-IP groups.
+- **`d3`** previews sibling-reference additions to the rules currently on LM1.
+- **`d5`** previews IP removal from tag-side originals. Its extra local build writes under `$D5R`, preserving the earlier bundles and reports under `$R`.
+
+All four use the same source capture. The CSV and suffix match this run card: `data/nonprod_map.csv` and `_avs_ips`.
+
+Reports:
+
+```powershell
+"$R/report/d2a/dryrun/avs_run_report.md"
+"$R/report/d2b/dryrun/avs_run_report.md"
+"$R/report/d3/dryrun/avs_run_report.md"
+"$D5R/report/d5/dryrun/avs_run_report.md"
+```
+
+Each preview compares against LM1's current live state; preceding dry runs do not change that state. The `d5` preview does not establish that its removals are safe to apply. Applying `d5` still requires `d2a` and `d3` to be applied and validated, as described in section 5.
