@@ -244,7 +244,7 @@ with CSV coverage to `$NSX_LOG_DIR/groups_ip_report/nsx-lm1.lab.local/`.
 > on lm1 2026-09-11: **1 sibling without it, 7 with it.**
 >
 > Gate on the additive step's summary before building: `ip_source: 'effective'`,
-> non-zero `vm_ip_index_count` / `groups_changed` / `ips_added_total`, and
+> non-zero `effective_ip_queries` / `groups_changed` / `ips_added_total`, and
 > `groups_errors: 0`. A non-zero error count means groups that have not
 > realized yet: wait and re-run rather than proceeding.
 

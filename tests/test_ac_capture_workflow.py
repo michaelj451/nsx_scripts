@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -23,6 +24,8 @@ def load_tool(name):
 workflow = load_tool("run_workflow")
 verify = load_tool("verify_avs_run")
 capture_tool = load_tool("capture_nsx_state")
+additive_tool = load_tool("build_group_ip_additive_from_live_members")
+transform_tool = load_tool("transform_capture")
 
 
 def write_json(path, value):
@@ -49,7 +52,8 @@ class CaptureTests(unittest.TestCase):
         write_json(self.capture / "manifest.json", self.manifest)
         self.summary_path = self.capture / "groups_additive/domains/default/groups/manifest.json"
         self.summary = {"source_manager_host": "lm1.test", "domain_id": "default",
-                        "ip_source": "effective", "groups_errors": 0, "vm_ip_index_count": 2}
+                        "ip_source": "effective", "groups_errors": 0, "vm_ip_index_count": 0,
+                        "groups_seen": 3, "effective_ip_queries": 3}
         write_json(self.summary_path, self.summary)
         self.reports = self.capture / "groups_additive/domains/default/reports/captured-member-ip-additive"
         write_json(self.reports / "groups_changed.json", [
@@ -92,7 +96,7 @@ class CaptureTests(unittest.TestCase):
             with self.subTest(host=host, domain=domain), self.assertRaises(ValueError):
                 validate_capture(self.capture, host, domain)
         for field, value in (("ip_source", "n/a (offline copy)"), ("groups_errors", 1),
-                             ("vm_ip_index_count", 0), ("domain_id", "wrong")):
+                             ("groups_seen", 0), ("effective_ip_queries", 2), ("domain_id", "wrong")):
             write_json(self.summary_path, {**self.summary, field: value})
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate_capture(self.capture, "lm1.test", "default")
@@ -105,7 +109,8 @@ class CaptureTests(unittest.TestCase):
         old_reports = self.root / "old_logs/capture_123"
         old_reports.parent.mkdir(parents=True)
         self.reports.rename(old_reports)
-        write_json(self.summary_path, {**self.summary, "reports_dir": str(old_reports)})
+        legacy_summary = {k: v for k, v in self.summary.items() if k != "effective_ip_queries"}
+        write_json(self.summary_path, {**legacy_summary, "reports_dir": str(old_reports)})
         write_json(old_reports / "groups_changed.json", [{"group_id": "g1",
                    "candidate_ips": ["10.0.0.1", "10.0.0.3"], "ips_added": ["10.0.0.3"]}])
         src = CapturedSource(self.capture, "lm1.test", "default")
@@ -241,27 +246,156 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(connected, [])
 
-    def test_capture_keeps_effective_reports_inside_bundle(self):
+    def run_capture(self, *flags):
         commands = []
 
         def run_step(label, cmd, *args, **kwargs):
             commands.append(cmd)
+            if label == "1_export_nsx_objects":
+                dest = self.root / "new_capture/nsx_export/lm1.test/domains/default"
+                shutil.copytree(self.raw, dest, dirs_exist_ok=True)
             return {"label": label, "ok": True, "returncode": 0, "cmd": cmd}
 
         argv = ["capture_nsx_state.py", "--source", "nsx-lm1", "--live-query",
-                "--output-dir", str(self.root / "new_capture"), "--no-flat-exports"]
+                "--output-dir", str(self.root / "new_capture"), *flags]
         with patch.object(capture_tool, "run_step", run_step), \
+                patch.object(capture_tool, "REPO_ROOT", self.root), \
                 patch.object(capture_tool, "setup_logging", return_value=self.root / "test.log"), \
                 patch.object(capture_tool, "resolve_manager", resolver), \
                 patch.object(capture_tool, "init_cli"), \
                 patch.object(capture_tool, "write_summary"), patch.object(sys, "argv", argv):
             rc = capture_tool.main()
         self.assertEqual(rc, 0)
+        manifest = json.loads((self.root / "new_capture/manifest.json").read_text())
+        return commands, manifest
+
+    def test_capture_defaults_keep_only_core_steps_and_flat_exports(self):
+        commands, manifest = self.run_capture()
+        self.assertEqual([s["label"] for s in manifest["steps"]], [
+            "1_export_nsx_objects", "2_build_group_ip_additive_from_live_members", "7_emit_flat_exports"])
+        self.assertTrue(manifest["ok"])
+        self.assertTrue((self.root / "nsx_groups_export/lm1.test/groups/g1.json").is_file())
+        for option in ("with_segments", "with_vm_tags", "with_vm_attribution", "with_ip_report", "with_impact_report"):
+            self.assertFalse(manifest["options"][option], option)
+        for key in ("segment_inventory_dir", "segment_details_file", "segments_inventory_file", "vm_tags_export_root", "impact_report_dir"):
+            self.assertIsNone(manifest["paths"][key], key)
+        self.assertNotIn("--with-vm-attribution", commands[1])
+
+    def test_optional_capture_steps_are_explicitly_available(self):
+        commands, manifest = self.run_capture("--with-segments", "--with-vm-tags",
+            "--with-vm-attribution", "--with-ip-report", "--impact-report")
+        self.assertEqual(len(manifest["steps"]), 7)
+        self.assertIn("--with-vm-attribution", commands[1])
+        self.assertTrue(manifest["paths"]["segment_details_file"])
+        self.assertTrue(manifest["paths"]["vm_tags_export_root"])
+
+    def test_csv_report_is_explicit_opt_in_and_no_flags_still_work(self):
+        commands, manifest = self.run_capture("--ip-report-csv", "map.csv")
+        self.assertTrue(manifest["options"]["with_ip_report"])
+        self.assertIn("--csv", commands[-1])
+        commands, manifest = self.run_capture("--ip-report-csv", "map.csv", "--no-ip-report",
+                                               "--no-vm-tags", "--no-flat-exports")
+        self.assertFalse(manifest["options"]["with_ip_report"])
+        self.assertEqual(len(manifest["steps"]), 2)
+
+    def test_capture_keeps_effective_reports_inside_bundle(self):
+        commands, _ = self.run_capture()
         cmd = next(c for c in commands if "tools/nsx/build_group_ip_additive_from_live_members.py" in c)
         reports = Path(cmd[cmd.index("--reports-dir") + 1])
         self.assertTrue(reports.is_relative_to(self.root / "new_capture"))
         self.assertIn("--live-query", cmd)
         self.assertFalse(any("find_rules_affected_by_group_changes.py" in " ".join(c) for c in commands))
+
+    def test_segment_conversion_requires_opt_in_capture(self):
+        argv = ["transform_capture.py", "--capture", str(self.capture), "--segment-mode", "convert",
+                "--output-dir", str(self.root / "transformed")]
+        with patch.object(transform_tool, "init_cli"), \
+                patch.object(transform_tool, "setup_logging", return_value=self.root / "test.log"), \
+                patch.object(transform_tool, "run_step") as run_step, patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(SystemExit, "--with-segments"):
+                transform_tool.main()
+            run_step.assert_not_called()
+
+
+class AdditiveCaptureTests(unittest.TestCase):
+    """Exercise the real builder with a fake API that records every query."""
+
+    def run_build(self, *flags, fail_group=None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        source, output, reports = root / "source", root / "groups", root / "reports"
+        for gid, ips in (("g1", []), ("g2", ["10.0.0.2"]), ("empty", [])):
+            write_json(source / f"{gid}.json", {"id": gid, "display_name": gid, "resource_type": "Group",
+                "expression": [{"resource_type": "IPAddressExpression", "ip_addresses": ips}] if ips else []})
+        calls = []
+
+        class Client:
+            def __init__(self, **kwargs):
+                calls.append("connect")
+
+            def build_vm_ip_index(self):
+                calls.append("vm_index")
+                return {"vm1": ["10.0.0.99"]}
+
+            def get_group_member_vm_ips(self, *, group_id, **kwargs):
+                calls.append(("vm_members", group_id))
+                return {"vm1": ["10.0.0.99"]} if group_id != "empty" else {}
+
+            def get_group_effective_ips(self, *, group_id, **kwargs):
+                calls.append(("effective", group_id))
+                if group_id == fail_group:
+                    raise RuntimeError("group not realized")
+                return {"g1": ["10.0.0.1"], "g2": ["10.0.0.2"], "empty": []}[group_id]
+
+        argv = ["build_group_ip_additive_from_live_members.py", "--source-manager", "nsx-lm1",
+                "--source-groups-dir", str(source), "--output-groups-dir", str(output),
+                "--reports-dir", str(reports), "--copy-first", "--output-format", "json", *flags]
+        with patch.object(additive_tool, "NsxPolicyClient", Client), \
+                patch.object(additive_tool, "resolve_manager", resolver), \
+                patch.object(additive_tool, "init_cli"), \
+                patch.object(additive_tool, "_setup_logging", return_value=root / "test.log"), \
+                patch.object(sys, "argv", argv):
+            additive_tool.main()
+        return calls, json.loads((output / "manifest.json").read_text()), output, reports
+
+    def test_effective_capture_skips_vm_queries_and_preserves_truth(self):
+        calls, summary, output, reports = self.run_build("--live-query")
+        self.assertEqual(calls, ["connect", ("effective", "empty"), ("effective", "g1"), ("effective", "g2")])
+        self.assertEqual(summary["effective_ip_queries"], 3)
+        self.assertEqual(summary["vm_ip_index_count"], 0)
+        self.assertFalse(summary["vm_attribution_collected"])
+        self.assertEqual(json.loads((output / "g1.json").read_text())["expression"][0]["ip_addresses"], ["10.0.0.1"])
+        self.assertEqual(json.loads((reports / "groups_no_new_ips.json").read_text())[0]["candidate_ips"], ["10.0.0.2"])
+        self.assertEqual(json.loads((reports / "groups_no_ips.json").read_text())[0]["group_id"], "empty")
+        self.assertEqual(summary["groups_errors"], 0)
+
+    def test_vm_attribution_opt_in_does_not_change_effective_truth(self):
+        calls, summary, output, _ = self.run_build("--live-query", "--with-vm-attribution")
+        self.assertIn("vm_index", calls)
+        self.assertIn(("vm_members", "g1"), calls)
+        self.assertEqual(summary["effective_ip_queries"], 3)
+        self.assertTrue(summary["vm_attribution_collected"])
+        self.assertEqual(json.loads((output / "g1.json").read_text())["expression"][0]["ip_addresses"], ["10.0.0.1"])
+
+    def test_legacy_vm_vif_still_uses_vm_queries(self):
+        calls, summary, output, _ = self.run_build("--live-query", "--ip-source", "vm-vif")
+        self.assertIn("vm_index", calls)
+        self.assertIn(("vm_members", "g1"), calls)
+        self.assertEqual(summary["effective_ip_queries"], 0)
+        self.assertTrue(summary["vm_attribution_collected"])
+        self.assertEqual(json.loads((output / "g1.json").read_text())["expression"][0]["ip_addresses"], ["10.0.0.99"])
+
+    def test_offline_copy_does_not_connect_even_with_attribution_flag(self):
+        calls, summary, _, _ = self.run_build("--with-vm-attribution")
+        self.assertEqual(calls, [])
+        self.assertEqual(summary["ip_source"], "n/a (offline copy)")
+        self.assertFalse(summary["vm_attribution_collected"])
+
+    def test_failed_effective_query_is_recorded_for_capture_gate(self):
+        _, summary, _, _ = self.run_build("--live-query", "--continue-on-group-error", fail_group="g1")
+        self.assertEqual(summary["groups_errors"], 1)
+        self.assertEqual(summary["effective_ip_queries"], 2)
 
 
 if __name__ == "__main__":

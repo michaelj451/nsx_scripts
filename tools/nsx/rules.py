@@ -63,6 +63,7 @@ from typing import Any, Dict, List
 
 import yaml
 
+from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
@@ -489,6 +490,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_push(args: argparse.Namespace) -> int:
+    batch = ApplyBatch(args.apply, log, getattr(args, "batch_size", None))
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -615,6 +617,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            if not batch.before_write():
+                break
             try:
                 client.put_security_rule(
                     security_policy_id=policy_id, rule_id=rid,
@@ -631,6 +635,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                 else:
                     raise
 
+            batch.record(row)
             ok += 1
             log.info("[%d/%d  ok=%d fail=%d skip=%d] %s/%s — %s",
                      i, total, ok, failed, skipped, policy_id, rid, row["status"])
@@ -674,7 +679,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     MAX_RETRY_ROUNDS = 5
     retry_round = 0
     retry_attempts = 0
-    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+    while args.apply and not batch.stopped and retry_round < MAX_RETRY_ROUNDS:
         to_retry = [r for r in rows if r.get("status") == "failed_pending_retry"]
         if not to_retry:
             break
@@ -693,6 +698,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rule = _load_file(Path(row["file"]))
                 rule.pop("_parent_policy_id", None)
                 rule = _sanitize(rule)
+                if not batch.before_write():
+                    break
                 try:
                     client.put_security_rule(
                         security_policy_id=policy_id, rule_id=rid,
@@ -712,6 +719,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row.pop("error", None)
                 row.pop("error_type", None)
                 row.pop("traceback", None)
+                batch.record(row)
                 ok += 1
                 failed -= 1
                 progress = True
@@ -747,7 +755,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                    "federation_global": args.federation_global, "domain_id": args.domain_id},
         "rules_dir": str(rules_dir),
         "mode": mode,
+        "interactive_decisions": batch.decisions,
         "totals": {
+            **batch.totals(),
             "files_seen": total,
             "ok": ok,
             "failed": failed,
@@ -783,7 +793,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
-    return 0 if failed == 0 else 1
+    return 130 if batch.stopped else (0 if failed == 0 else 1)
 
 
 # =============================================================================
@@ -791,6 +801,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_revert(args: argparse.Namespace) -> int:
+    batch = ApplyBatch(args.apply, log)
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -845,6 +856,8 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     # DELETEs first
     for i, (key, info) in enumerate(to_delete, start=1):
+        if not batch.before_write():
+            break
         pid = info["policy_id"]
         rid = info["rule_id"]
         try:
@@ -853,6 +866,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
             log.info("[DELETE %d/%d  ok=%d fail=%d] %s/%s",
                      i, len(to_delete), deleted_ok, deleted_failed, pid, rid)
             rows.append({"action": "delete", "policy_id": pid, "rule_id": rid, "status": "success"})
+            batch.record(rows[-1])
             time.sleep(THROTTLE_SECONDS)
         except Exception as e:
             deleted_failed += 1
@@ -863,6 +877,8 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     # RESTOREs
     for i, (key, info) in enumerate(to_restore, start=1):
+        if not batch.before_write():
+            break
         pid = info["policy_id"]
         rid = info["rule_id"]
         payload = info["payload"]
@@ -881,6 +897,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
             restored_ok += 1
             log.info("[RESTORE %d/%d  ok=%d fail=%d] %s/%s",
                      i, len(to_restore), restored_ok, restored_failed, pid, rid)
+            batch.record(rows[-1])
             time.sleep(THROTTLE_SECONDS)
         except Exception as e:
             restored_failed += 1
@@ -889,15 +906,19 @@ def cmd_revert(args: argparse.Namespace) -> int:
             rows.append({"action": "restore", "policy_id": pid, "rule_id": rid, "status": "failed",
                          "error": str(e), "error_type": type(e).__name__, "traceback": tb})
 
-    _mark_baseline_reverted(baseline_path)
+    completed = not batch.stopped and restored_failed == 0 and deleted_failed == 0
+    if completed:
+        _mark_baseline_reverted(baseline_path)
 
     summary = {
         "command": "rules.revert",
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "target": {"alias": args.target, "host": target_host,
                    "federation_global": args.federation_global, "domain_id": args.domain_id},
-        "baseline_file": str(baseline_path) + ".reverted",
+        "baseline_file": str(baseline_path) + (".reverted" if completed else ""),
+        "interactive_decisions": batch.decisions,
         "totals": {
+            **batch.totals(),
             "restored_ok": restored_ok, "restored_failed": restored_failed,
             "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
         },
@@ -916,7 +937,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
-    return 0 if (restored_failed == 0 and deleted_failed == 0) else 1
+    return 130 if batch.stopped else (0 if completed else 1)
 
 
 # =============================================================================

@@ -45,7 +45,7 @@ write to independent output directories and never touch each other.
 
 | Script | What it captures | Output bundle |
 |---|---|---|
-| `capture_nsx_state.py` | Orchestrator: raw policy export + groups-with-captured-VM-IPs snapshot + segment inventory + optional rule-impact report (`--impact-report`) + VM tag inventory | `nsx_capture/<host>/` |
+| `capture_nsx_state.py` | Raw policy export + additive copy + flat exports; `--live-query` captures effective IPs. Segments, VM tags, VM attribution and review reports are opt-in | `nsx_capture/<host>/` |
 | `services.py export` | Customer L4/nested services (system-owned skipped) | `nsx_services_export/<host>/services/` |
 | `groups.py export` | Customer groups (dynamic + static), system groups skipped | `nsx_groups_export/<host>/groups/` |
 | `policies.py export` | Customer security policies (one folder per policy with a `policy.yaml` + `rules_order.yaml`) | `nsx_policies_export/<host>/security-policies/` |
@@ -348,7 +348,7 @@ Plus:
 setopt interactive_comments 2>/dev/null || true
 
 # EXPORT — read-only against nsx-lm1, run once
-python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # VM-IP freeze is opt-in; needed for Part 3
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query --with-segments   # Explicit segment details for Parts 2/3
 python tools/nsx/services.py    export --source nsx-lm1
 python tools/nsx/groups.py      export --source nsx-lm1
 python tools/nsx/policies.py    export --source nsx-lm1

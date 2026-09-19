@@ -96,24 +96,30 @@ python tools/nsx/capture_nsx_state.py --source $S --live-query
 if ($LASTEXITCODE -ne 0) { throw "LM1 capture failed; stop here." }
 ```
 
+This now skips segment inventory, VM-tag export, VM attribution and optional
+review reports by default. It keeps the configuration, effective-IP evidence
+and flat exports that A/C consume. `vm_ip_index_count: 0` is expected;
+the gate checks effective-IP queries instead. Optional collection flags are
+listed in [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md#1-capture-read-only-source-side).
+
 ### The gate: check all five fields yourself
 
 ```powershell
 Get-Content "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json" |
   ConvertFrom-Json |
-  Select-Object ip_source, vm_ip_index_count, groups_changed, ips_added_total, groups_errors
+  Select-Object ip_source, effective_ip_queries, groups_changed, ips_added_total, groups_errors
 ```
 
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'`. Anything else is a stale or legacy bundle |
-| `vm_ip_index_count` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
 | `groups_changed` | Review against expected source membership; 0 may mean no enrichment was needed |
 | `ips_added_total` | Review against expected source membership; 0 may mean IPs were already present |
 | `groups_errors` | `0`. Non-zero means groups have not realized yet: wait, re-run |
 
 The driver checks that this capture succeeded, matches the source/domain,
-uses effective IPs, has zero group errors and has a non-zero VM IP index.
+uses effective IPs, has zero group errors and queried effective IPs for every processed group.
 Review the change counts yourself against the expected source configuration;
 zero additions can also mean those IPs were already present in the export.
 

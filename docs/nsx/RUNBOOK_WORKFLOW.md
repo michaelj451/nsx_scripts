@@ -97,6 +97,25 @@ errors. Measured on lm1 2026-09-11: 1 sibling without it, **7 with it**.
 python tools/nsx/capture_nsx_state.py --source $S --live-query
 ```
 
+This collects the raw configuration and effective group IPs, then writes the
+flat exports used by the push commands. The following extras are **off by
+default**; add a flag only when that output is needed:
+
+| Optional collection | Enable with |
+|---|---|
+| Segment inventory/details for segment-to-CIDR conversion | `--with-segments` |
+| VM tag export | `--with-vm-tags` |
+| VM IP index and per-group VM attribution | `--with-vm-attribution` (with `--live-query`) |
+| Groups-with-IPs classification report | `--with-ip-report` |
+| Affected-rule impact report | `--impact-report` |
+
+`--ip-report-csv <path>` also explicitly enables the classification/coverage
+report, unless `--no-ip-report` is set. Effective-IP evidence for verification
+is always saved with `--live-query`, independently of those optional reports.
+`vm_ip_index_count: 0` is normal when VM attribution is skipped; check the
+effective-IP query count below. Legacy `--ip-source vm-vif` still requires VM
+inventory queries and is not accepted by the A/C validation gate.
+
 Gate before going further:
 
 ```bash
@@ -106,7 +125,7 @@ cat "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json"
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'`, anything else is a stale or legacy bundle |
-| `vm_ip_index_count` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
 | `groups_changed` | Review against expected source membership; 0 may mean no enrichment was needed |
 | `ips_added_total` | Review against expected source membership; 0 may mean IPs were already present |
 | `groups_errors` | **0**. Non-zero means groups have not realized yet: wait, re-run |

@@ -31,7 +31,7 @@ export PYTHONPATH="$PWD/app"
 setopt interactive_comments 2>/dev/null || true
 
 # Source: nsx-lm1 -> https://nsx-lm1.lab.local
-python tools/nsx/capture_nsx_state.py --source nsx-lm1
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query --with-segments
 python tools/nsx/services.py    export --source nsx-lm1
 python tools/nsx/groups.py      export --source nsx-lm1
 python tools/nsx/policies.py    export --source nsx-lm1

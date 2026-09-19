@@ -34,6 +34,10 @@ Produces in one command:
 - `nsx_rules_export\$SRC_HOST\security-policies\` (with `_parent_policy_id` injected)
 - `$env:NSX_LOG_DIR\groups_ip_report\$SRC_HOST\` — IP-coverage report
 
+The explicit `--ip-report-csv` above opts into the IP report. Without it, review
+reports are off by default. Segment inventory, VM tags and VM attribution are
+also skipped unless requested. Add `--live-query` for effective IPs used by C/D.
+
 To skip the flat-exports step:
 
 ```powershell
@@ -81,6 +85,9 @@ python tools/nsx/rules.py push --target $DST `
 explanation of why Parts 2 and 3 are NOT part of the WF-D path.
 
 ### ⚠️  Parts 2 + 3 (alternative — NOT compatible with WF-D's goal)
+
+Capture with `--live-query --with-segments` using the source credentials before
+this alternative path. Segment details are no longer collected by default.
 
 These steps push IPs INTO the tag groups' expression on the target,
 producing mixed `Condition + IPAddressExpression` groups — exactly

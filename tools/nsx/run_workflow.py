@@ -59,11 +59,9 @@ a step fails, so a failed run is still auditable.
 from __future__ import annotations
 
 import argparse
-import codecs
 import json
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +70,7 @@ from typing import Any, Dict, List, Optional
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
+from nsx.streaming import stream_command
 from nsx.cli_bootstrap import init_cli          # noqa: E402
 from nsx.nsx_constants import resolve_manager  # noqa: E402
 from nsx.captured_source import validate_capture  # noqa: E402
@@ -89,38 +88,11 @@ def run_step(label: str, cmd: List[str], log_dir: Path) -> Dict[str, Any]:
     step_log = log_dir / f"{label}.log"
     log.info("STEP %s", label)
     log.info("  cmd: %s", " ".join(cmd))
-    env = dict(os.environ)
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    with step_log.open("w", encoding="utf-8") as fh:
-        with subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT) as proc:
-            assert proc.stdout is not None
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            try:
-                # Read available chunks so prompts without a newline are shown
-                # immediately too. stdin stays inherited for interactive steps.
-                while chunk := proc.stdout.read1(8192):
-                    output = decoder.decode(chunk)
-                    fh.write(output)
-                    fh.flush()
-                    sys.stdout.write(output)
-                    sys.stdout.flush()
-                output = decoder.decode(b"", final=True)
-                fh.write(output)
-                sys.stdout.write(output)
-                sys.stdout.flush()
-                proc.wait()
-            except BaseException:
-                proc.kill()
-                proc.wait()
-                raise
-    ok = proc.returncode == 0
+    returncode, _ = stream_command(cmd, REPO_ROOT, step_log)
+    ok = returncode == 0
     log.log(logging.INFO if ok else logging.ERROR,
-            "  %s (rc=%d)  log: %s", "OK" if ok else "FAILED",
-            proc.returncode, step_log)
-    return {"label": label, "cmd": cmd, "rc": proc.returncode, "ok": ok,
-            "log": str(step_log)}
+            "  %s (rc=%d)  log: %s", "OK" if ok else "FAILED", returncode, step_log)
+    return {"label": label, "cmd": cmd, "rc": returncode, "ok": ok, "log": str(step_log)}
 
 
 def check_capture_gate(capture: Path, source_host: str, domain_id: str) -> Optional[str]:

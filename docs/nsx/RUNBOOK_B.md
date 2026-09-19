@@ -197,7 +197,7 @@ nsx_capture/nsx-lm1.lab.local/
 ├── nsx_export/<host>/                   ← raw NSX policy state
 ├── groups_additive/                     ← export copy (VM-IP freeze is opt-in: --live-query)
 │   └── domains/default/groups/<short>.yaml
-├── segment_inventory/                   ← path → CIDR map (informational; not used by Workflow B)
+├── segment_inventory/                   ← optional (--with-segments); not used by Workflow B
 │   └── segment_details.json
 ├── affected_rule_reports/                ← optional: --impact-report
 ├── vm_tag_inventory/

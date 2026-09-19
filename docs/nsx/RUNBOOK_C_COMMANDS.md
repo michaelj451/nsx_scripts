@@ -64,7 +64,7 @@ Gate before going further. All must hold, or the siblings will be wrong:
 ```bash
 grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | tail -1
 #   ip_source: 'effective'      anything else means a stale or legacy bundle
-#   vm_ip_index_count: non-zero
+#   effective_ip_queries: non-zero
 #   groups_changed:    non-zero
 #   ips_added_total:   non-zero
 #   groups_errors:     0        non-zero means unrealized groups: wait, re-run

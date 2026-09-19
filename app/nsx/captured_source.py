@@ -32,8 +32,13 @@ def validate_capture(capture: Path, source_host: str, domain_id: str) -> dict:
         raise ValueError("Capture needs --live-query --ip-source effective; effective IPs were not saved")
     if summary.get("groups_errors") != 0:
         raise ValueError(f"Capture has unresolved group errors: {summary.get('groups_errors')}")
-    if not summary.get("vm_ip_index_count"):
-        raise ValueError("Capture vm_ip_index_count is 0; review the source capture before continuing")
+    groups_seen = summary.get("groups_seen", 0)
+    if not isinstance(groups_seen, int) or groups_seen <= 0:
+        raise ValueError("Capture has no processed groups; review the source capture before continuing")
+    # Older effective captures lack this counter. Their ip_source/groups_errors
+    # checks still apply; new captures must record one successful query per group.
+    if "effective_ip_queries" in summary and summary["effective_ip_queries"] != groups_seen:
+        raise ValueError("Capture did not complete an effective-IP query for every processed group")
     return manifest
 
 

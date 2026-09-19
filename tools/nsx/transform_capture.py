@@ -318,9 +318,10 @@ def main() -> int:
             segment_details_file = Path(candidate_seg).expanduser().resolve()
             log.info("Using cached segment details: %s", segment_details_file)
         else:
-            log.warning(
-                "--segment-mode convert requested but no segment_details.json found in capture. "
-                "transform_group_segments will fall back to plain strip behavior."
+            raise SystemExit(
+                "--segment-mode convert requires captured segment_details.json. "
+                "Recapture with --with-segments using the source credentials, "
+                "or explicitly choose --segment-mode strip or skip."
             )
 
     # Output paths

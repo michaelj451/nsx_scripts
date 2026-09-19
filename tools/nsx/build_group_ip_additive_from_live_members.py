@@ -213,15 +213,15 @@ def ensure_ip_expression(group: Dict[str, Any], ips_to_add: List[str]) -> Tuple[
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Add evaluated VM member IPs from source NSX LM into exported group files for target NSX"
+        description="Add effective group IPs from source NSX LM into exported group files for target NSX"
     )
 
     parser.add_argument(
         "--source-manager",
         required=True,
         choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
-        help="Source manager. For LMs, current VM group membership and VIF IPs are "
-             "captured live. Global Managers have no VM inventory API, so a GM source "
+        help="Source manager. With --live-query, effective group IPs are captured from LMs. "
+             "Global Managers have no VM inventory API, so a GM source "
              "automatically runs as --no-live-query (groups copied as-is, no VM IP enrichment).",
     )
 
@@ -267,9 +267,9 @@ def main() -> None:
         action="store_true",
         default=False,
         help=(
-            "Opt IN to contacting the source NSX manager to build the VM IP "
-            "index and evaluate per-group live members, freezing the resulting "
-            "VM IPs into the additive bundle. DEFAULT IS OFF: the output tree "
+            "Opt IN to contacting the source NSX manager for per-group effective "
+            "IPs, freezing them into the additive bundle. VM attribution is "
+            "separately opt-in. DEFAULT IS OFF: the output tree "
             "is a copy of the export with group expressions preserved as-is "
             "(no VM IP enrichment, no inventory calls). Only needed for "
             "workflows that push captured VM IPs (e.g. Workflow A Part 3)."
@@ -279,6 +279,11 @@ def main() -> None:
         "--no-live-query",
         action="store_true",
         help="Deprecated: this is now the default. Kept for compatibility; overrides --live-query.",
+    )
+    parser.add_argument(
+        "--with-vm-attribution", action="store_true",
+        help="With --live-query, also query the VM IP index and per-group VM members "
+             "for auditing. Default OFF for effective IPs; always collected in vm-vif mode.",
     )
     parser.add_argument(
         "--ip-source",
@@ -374,7 +379,10 @@ def main() -> None:
         output_groups_dir.mkdir(parents=True, exist_ok=True)
         working_groups_dir = source_groups_dir
 
-    # Build the VM IP index ONLY if we will actually do enrichment.
+    # Effective IPs do not depend on the VM/VIF index. Collect it only for
+    # explicit VM attribution or the legacy VM-derived address mode.
+    collect_vm_attribution = not args.no_live_query and (
+        args.with_vm_attribution or args.ip_source == "vm-vif")
     vm_ip_index: Dict[str, List[str]] = {}
     if args.no_live_query:
         log.warning(
@@ -382,11 +390,13 @@ def main() -> None:
             "evaluated-member lookups. Output is the source export copied "
             "as-is; group expressions are NOT enriched with static IPs."
         )
-    else:
+    elif collect_vm_attribution:
         assert client is not None  # for type-checkers; created earlier when not --no-live-query
         log.info("Building VM IP index from source manager: %s", args.source_manager)
         vm_ip_index = client.build_vm_ip_index()
         log.info("VMs with discovered IPs: %d", len(vm_ip_index))
+    else:
+        log.info("VM attribution skipped; querying effective group IPs only")
 
     group_files = sorted(iter_group_files(working_groups_dir))
     log.info("Group files found: %d", len(group_files))
@@ -398,6 +408,7 @@ def main() -> None:
     groups_errors = 0
     groups_no_new_ips = 0
     ips_added_total = 0
+    effective_ip_queries = 0
 
     changed_rows: List[Dict[str, Any]] = []
     no_members_rows: List[Dict[str, Any]] = []
@@ -453,14 +464,13 @@ def main() -> None:
             try:
                 log.info("Processing group %s (%s)", group_name, group_id)
 
-                # vm_to_ips is kept for the audit trail in every mode: it shows
-                # WHICH VMs contributed, which the effective-IP endpoint does
-                # not tell you. It is only the source of `ips` in vm-vif mode.
-                vm_to_ips = client.get_group_member_vm_ips(
-                    group_id=group_id,
-                    domain_id=args.domain_id,
-                    vm_ip_index=vm_ip_index,
-                )
+                vm_to_ips = {}
+                if collect_vm_attribution:
+                    vm_to_ips = client.get_group_member_vm_ips(
+                        group_id=group_id,
+                        domain_id=args.domain_id,
+                        vm_ip_index=vm_ip_index,
+                    )
 
                 ips: Set[str] = set()
                 if args.ip_source == "effective":
@@ -469,11 +479,12 @@ def main() -> None:
                     # vm-vif path is not equivalent.
                     ips.update(client.get_group_effective_ips(
                         group_id=group_id, domain_id=args.domain_id))
+                    effective_ip_queries += 1
                 else:
                     for ip_list in vm_to_ips.values():
                         ips.update(ip_list)
 
-                if not ips and not vm_to_ips:
+                if not ips and not vm_to_ips and collect_vm_attribution:
                     groups_no_members += 1
                     no_members_rows.append({
                         "group_id": group_id,
@@ -493,7 +504,8 @@ def main() -> None:
                         "status": "no_ips",
                         "vm_to_ips": vm_to_ips,
                     })
-                    log.info("Group %s has evaluated VM members but no discovered IPs", group_name)
+                    log.info("Group %s returned no IPs (VM attribution collected: %s)",
+                             group_name, collect_vm_attribution)
                     continue
 
                 updated_group, added_ips = ensure_ip_expression(group, sorted(ips))
@@ -571,6 +583,8 @@ def main() -> None:
         "copy_first": args.copy_first,
         "continue_on_group_error": args.continue_on_group_error,
         "ip_source": ("n/a (offline copy)" if args.no_live_query else args.ip_source),
+        "effective_ip_queries": effective_ip_queries,
+        "vm_attribution_collected": collect_vm_attribution,
         "vm_ip_index_count": len(vm_ip_index),
         "group_files_found": len(group_files),
         "groups_seen": groups_seen,

@@ -47,6 +47,7 @@ from typing import Any, Dict, List
 
 import yaml
 
+from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
@@ -397,6 +398,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_push(args: argparse.Namespace) -> int:
+    batch = ApplyBatch(args.apply, log, getattr(args, "batch_size", None))
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -487,6 +489,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            if not batch.before_write():
+                break
             try:
                 client.put_service(sid, obj)
                 row["status"] = "success_put"
@@ -497,6 +501,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                 else:
                     raise
 
+            batch.record(row)
             ok += 1
             log.info("[%d/%d  ok=%d fail=%d skip=%d] %s — %s",
                      i, len(files), ok, failed, skipped, sid, row["status"])
@@ -542,7 +547,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     MAX_RETRY_ROUNDS = 5
     retry_round = 0
     retry_attempts = 0
-    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+    while args.apply and not batch.stopped and retry_round < MAX_RETRY_ROUNDS:
         to_retry = [r for r in rows if r.get("status") == "failed_pending_retry"]
         if not to_retry:
             break
@@ -559,6 +564,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             sid = row.get("id") or ""
             try:
                 obj = _sanitize(_load_file(f))
+                if not batch.before_write():
+                    break
                 try:
                     client.put_service(sid, obj)
                     row["status"] = "success_put_retry"
@@ -572,6 +579,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row.pop("error", None)
                 row.pop("error_type", None)
                 row.pop("traceback", None)
+                batch.record(row)
                 ok += 1
                 failed -= 1
                 progress = True
@@ -608,7 +616,9 @@ def cmd_push(args: argparse.Namespace) -> int:
         "target": {"alias": args.target, "host": target_host, "federation_global": args.federation_global},
         "services_dir": str(services_dir),
         "mode": mode,
+        "interactive_decisions": batch.decisions,
         "totals": {
+            **batch.totals(),
             "files_seen": len(files),
             "ok": ok,
             "failed": failed,
@@ -638,7 +648,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
-    return 0 if failed == 0 else 1
+    return 130 if batch.stopped else (0 if failed == 0 else 1)
 
 
 # =============================================================================
@@ -646,6 +656,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_revert(args: argparse.Namespace) -> int:
+    batch = ApplyBatch(args.apply, log)
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -719,12 +730,15 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     # --- DELETEs first (newly-created services that aren't in baseline) ---
     for i, sid in enumerate(to_delete, start=1):
+        if not batch.before_write():
+            break
         try:
             client.delete_service(sid)
             deleted_ok += 1
             log.info("[DELETE %d/%d  ok=%d fail=%d] %s",
                      i, len(to_delete), deleted_ok, deleted_failed, sid)
             rows.append({"action": "delete", "id": sid, "status": "success"})
+            batch.record(rows[-1])
             time.sleep(THROTTLE_SECONDS)
         except Exception as e:
             deleted_failed += 1
@@ -735,12 +749,15 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     # --- RESTOREs (PUT back to baseline) ---
     for i, (sid, payload) in enumerate(to_restore, start=1):
+        if not batch.before_write():
+            break
         try:
             client.put_service(sid, payload)
             restored_ok += 1
             log.info("[RESTORE %d/%d  ok=%d fail=%d] %s",
                      i, len(to_restore), restored_ok, restored_failed, sid)
             rows.append({"action": "restore", "id": sid, "status": "success_put"})
+            batch.record(rows[-1])
             time.sleep(THROTTLE_SECONDS)
         except NsxApiError as e:
             if _is_already_exists_error(e):
@@ -750,6 +767,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
                     log.info("[RESTORE %d/%d  ok=%d fail=%d] %s (patched)",
                              i, len(to_restore), restored_ok, restored_failed, sid)
                     rows.append({"action": "restore", "id": sid, "status": "success_patch"})
+                    batch.record(rows[-1])
                     time.sleep(THROTTLE_SECONDS)
                     continue
                 except Exception as e2:
@@ -767,14 +785,18 @@ def cmd_revert(args: argparse.Namespace) -> int:
                          "error": str(e), "error_type": type(e).__name__, "traceback": tb})
 
     # Mark the baseline as reverted so the next revert pops the next-most-recent
-    _mark_baseline_reverted(baseline_path)
+    completed = not batch.stopped and restored_failed == 0 and deleted_failed == 0
+    if completed:
+        _mark_baseline_reverted(baseline_path)
 
     summary = {
         "command": "services.revert",
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "target": {"alias": args.target, "host": target_host, "federation_global": args.federation_global},
-        "baseline_file": str(baseline_path) + ".reverted",
+        "baseline_file": str(baseline_path) + (".reverted" if completed else ""),
+        "interactive_decisions": batch.decisions,
         "totals": {
+            **batch.totals(),
             "restored_ok": restored_ok,
             "restored_failed": restored_failed,
             "deleted_ok": deleted_ok,
@@ -795,7 +817,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
-    return 0 if (restored_failed == 0 and deleted_failed == 0) else 1
+    return 130 if batch.stopped else (0 if completed else 1)
 
 
 # =============================================================================

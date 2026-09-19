@@ -23,9 +23,9 @@ What's captured:
     nsx_export/<host>/                     raw NSX state (groups + services + policies + rules)
     groups_additive/                       export copy; add --live-query to freeze evaluated VM IPs in (LM only)
       domains/<domain>/reports/            effective-IP results used by offline-source A/C verification
-    segment_inventory/                     every referenced segment + live segment details
+    segment_inventory/                     optional segment details (--with-segments)
     affected_rule_reports/                 optional rules ↔ groups report (--impact-report)
-    vm_tag_inventory/                      VM + tag state (LM only, GET-only)
+    vm_tag_inventory/                      optional VM + tag state (--with-vm-tags, LM only)
     logs/                                  per-step log files
 
 The default capture bundle directory is wiped at the start of every run so it
@@ -47,13 +47,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from nsx.streaming import stream_command
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 
@@ -97,94 +96,23 @@ def setup_logging(bundle_logs_dir: Path) -> Path:
     return bundle_log_file
 
 
-def run_step(label: str, cmd: List[str], cwd: Path, step_log_dir: Path,
-             verbose: bool = True) -> Dict[str, Any]:
-    """Run a subprocess step. Streams stdout/stderr to a per-step log file. Returns a structured record.
-
-    When verbose=True (default), the sub-script's output is also streamed
-    live to the terminal so the operator can see per-object detail
-    (each policy/group/service/rule being exported, etc.) as it happens.
-    Every line is prefixed with the step label for easy scanning.
-    When verbose=False, output is captured silently and only the step
-    label + OK/FAILED status appears on the terminal (original behavior).
-    """
+def run_step(label: str, cmd: List[str], cwd: Path, step_log_dir: Path) -> Dict[str, Any]:
+    """Always stream combined child output to the terminal and a live log file."""
     safe_label = label.replace(" ", "_").replace(":", "").replace("/", "_")
     step_log_file = step_log_dir / f"{safe_label}.log"
-
     log.info("STEP: %s", label)
     log.info("  cmd: %s", " ".join(cmd))
     log.info("  step log: %s", step_log_file)
-
-    env = dict(os.environ)
-    env.setdefault("PYTHONPATH", str(cwd / "app"))
-
     started_at = datetime.now(timezone.utc).isoformat()
-
-    if verbose:
-        # Tee-style: read the sub-script's combined stdout+stderr line by
-        # line, echo to the terminal with a prefix, and collect the full
-        # output for the step log file.
-        prefix = f"  [{label}] "
-        collected: List[str] = []
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,   # merge stderr into stdout for ordered streaming
-            text=True,
-            bufsize=1,                  # line-buffered
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line_no_nl = line.rstrip("\n")
-            sys.stdout.write(prefix + line_no_nl + "\n")
-            sys.stdout.flush()
-            collected.append(line)
-        proc.wait()
-        stdout_captured = "".join(collected)
-        stderr_captured = ""            # stderr was merged into stdout above
-        returncode = proc.returncode
-    else:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), env=env, capture_output=True, text=True,
-        )
-        stdout_captured = proc.stdout
-        stderr_captured = proc.stderr
-        returncode = proc.returncode
-
+    returncode, tail = stream_command(cmd, cwd, step_log_file)
     finished_at = datetime.now(timezone.utc).isoformat()
-
-    step_log_file.write_text(
-        f"# step: {label}\n# started_at: {started_at}\n# finished_at: {finished_at}\n"
-        f"# returncode: {returncode}\n# cmd: {' '.join(cmd)}\n\n"
-        f"===== STDOUT =====\n{stdout_captured}\n\n===== STDERR =====\n{stderr_captured}\n",
-        encoding="utf-8",
-    )
-
-    if returncode != 0:
-        log.error(
-            "STEP FAILED: %s (exit=%d) - see %s for full output",
-            label, returncode, step_log_file,
-        )
-        # When we streamed live output, the operator already saw the errors;
-        # avoid re-echoing the tail redundantly.
-        if not verbose:
-            for line in stderr_captured.splitlines()[-10:]:
-                log.error("  | %s", line)
-    else:
-        log.info("  OK")
-
+    log.log(logging.INFO if returncode == 0 else logging.ERROR,
+            "STEP %s: %s (exit=%d)", label, "OK" if returncode == 0 else "FAILED", returncode)
     return {
-        "label": label,
-        "cmd": cmd,
-        "ok": returncode == 0,
-        "returncode": returncode,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "step_log": str(step_log_file),
-        "stdout_tail": "\n".join(stdout_captured.splitlines()[-20:]),
-        "stderr_tail": "\n".join(stderr_captured.splitlines()[-20:]) if returncode != 0 else "",
+        "label": label, "cmd": cmd, "ok": returncode == 0, "returncode": returncode,
+        "started_at": started_at, "finished_at": finished_at,
+        "step_log": str(step_log_file), "stdout_tail": tail,
+        "stderr_tail": tail if returncode else "",
     }
 
 
@@ -242,38 +170,42 @@ def main() -> int:
                        "the latest capture (previous capture artifacts are deleted). "
                        "Pass --output-dir to preserve specific bundles."
                    ))
-    # Segment inventory stays MANDATORY (offline transform needs it). Live
-    # VM-member enrichment is OPT-IN via --live-query: by default the
-    # groups_additive/ tree is a faithful copy of the export with no inventory
-    # calls. Workflows that push captured VM IPs (Workflow A Part 3) must
-    # capture with --live-query.
+    # Only configuration export, the additive copy and flat exports run by
+    # default. A/C add --live-query for effective IPs; other collection is opt-in.
     p.add_argument("--live-query", action="store_true", default=False,
-                   help="Opt in to live VM-member enrichment: evaluate each group's members on the "
-                        "source and freeze their VM IPs into groups_additive/ (LM sources only; "
+                   help="Capture each group's effective IPs into groups_additive/ (LM sources only; "
                         "ignored for GM). Default off: groups_additive/ is a faithful copy of the "
-                        "export. Required when Workflow A Part 3 will push captured VM IPs.")
+                        "export. Required for the A/C driver and captured-IP workflows.")
     p.add_argument("--ip-source", choices=["effective", "vm-vif"], default="effective",
                    help="With --live-query: where group IPs come from. 'effective' (default) "
                         "asks NSX via .../groups/<id>/members/ip-addresses (what the UI's "
                         "Effective Members tab shows: static IPs, ranges, segment subnets, "
                         "nested groups, stopped VMs). 'vm-vif' is the legacy running-VM-only "
                         "path that under-reported 10 of 12 groups on nsx-lm1.")
-    p.add_argument("--with-vm-tags", action="store_true", default=True,
-                   help="Capture VM tag state (LM only). Default ON; ignored for GM.")
+    p.add_argument("--with-segments", action="store_true",
+                   help="Collect referenced segments and live details. Default OFF. "
+                        "Required for later segment-to-CIDR conversion, not A/C strip mode.")
+    p.add_argument("--with-vm-attribution", action="store_true",
+                   help="With --live-query, also collect the VM IP index and per-group VM "
+                        "attribution for auditing. Default OFF for effective IPs. "
+                        "The legacy --ip-source vm-vif mode always needs these queries.")
+    p.add_argument("--with-vm-tags", action="store_true", default=False,
+                   help="Capture VM tag state (LM only). Default OFF; ignored for GM.")
     p.add_argument("--no-vm-tags", action="store_false", dest="with_vm_tags",
                    help="Skip VM-tag capture (not used by Workflow A/B transforms — safe to skip if only doing groups/policies).")
     p.add_argument("--impact-report", action="store_true", default=False, dest="with_impact_report",
                    help="Generate the affected-rules impact report (offline, reads export). "
                         "Default OFF; review artifact only, doesn't affect transform.")
-    p.add_argument("--with-ip-report", action="store_true", default=True,
+    p.add_argument("--with-ip-report", action="store_true", default=None,
                    help="Run report_groups_with_ips.py against the captured groups bundle. "
                         "Produces a per-group classification (pure-ip / pure-tag / tag+ip "
-                        "hybrid / nested / segment) + optional CSV-mapping coverage. Default ON.")
+                        "hybrid / nested / segment) + optional CSV-mapping coverage. Default OFF.")
     p.add_argument("--no-ip-report", action="store_false", dest="with_ip_report",
                    help="Skip the groups-with-IPs report.")
     p.add_argument("--ip-report-csv", default=None,
                    help="Path to a 2-col CSV (old,new) to cross-reference IP coverage in "
-                        "the IP report. Optional; report runs without it if omitted.")
+                        "the IP report. Supplying a CSV opts into the report unless "
+                        "--no-ip-report is set; --with-ip-report also works without a CSV.")
     p.add_argument("--emit-flat-exports", action="store_true", default=True,
                    help="Also copy the captured groups / services / policies / rules to the "
                         "standalone-export paths (nsx_groups_export/<host>/groups/, "
@@ -287,11 +219,9 @@ def main() -> int:
     p.add_argument("--no-flat-exports", action="store_false", dest="emit_flat_exports",
                    help="Skip the flat-exports copy (sub-step 7). Capture bundle "
                         "still contains all the data internally.")
-    p.add_argument("--quiet", action="store_true",
-                   help="Suppress live per-object output on the terminal. "
-                        "Step logs still capture the full output for later review. "
-                        "Default is verbose (each object being copied is echoed live).")
     args = p.parse_args()
+    if args.with_ip_report is None:
+        args.with_ip_report = bool(args.ip_report_csv)
 
     init_cli()
 
@@ -322,6 +252,9 @@ def main() -> int:
     log.info("  Source manager   : %s (%s)", args.source, source_host)
     log.info("  Domain           : %s", args.domain_id)
     log.info("  Federation GM    : %s", args.federation_global)
+    log.info("  Segments         : %s", args.with_segments)
+    log.info("  VM attribution   : %s", bool(args.live_query and not args.federation_global
+                                          and (args.with_vm_attribution or args.ip_source == "vm-vif")))
     log.info("  VM tags          : %s", args.with_vm_tags)
     log.info("  Impact report    : %s", args.with_impact_report)
     log.info("  IP report        : %s%s", args.with_ip_report,
@@ -349,14 +282,14 @@ def main() -> int:
     ]
     if args.federation_global:
         cmd.append("--federation-global")
-    steps.append(run_step("1_export_nsx_objects", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
+    steps.append(run_step("1_export_nsx_objects", cmd, REPO_ROOT, logs_dir))
 
     source_export_dir = export_root / source_host
     source_groups_dir = source_export_dir / "domains" / args.domain_id / "groups"
 
     # 2. Build groups_additive/. Default: a faithful copy of the export (no
-    # inventory calls). With --live-query (LM sources only): also snapshot each
-    # group's evaluated VM members and freeze their IPs into the copies; push
+    # inventory calls). With --live-query (LM sources only): snapshot each
+    # group's effective IPs into the copies; push
     # tools read from disk, NOT from NSX, so that is a one-time live read.
     cmd = [
         sys.executable, "tools/nsx/build_group_ip_additive_from_live_members.py",
@@ -371,19 +304,21 @@ def main() -> int:
     ]
     if args.live_query and not args.federation_global:
         cmd.extend(["--live-query", "--ip-source", args.ip_source])
-    steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
+        if args.with_vm_attribution:
+            cmd.append("--with-vm-attribution")
+    steps.append(run_step("2_build_group_ip_additive_from_live_members", cmd, REPO_ROOT, logs_dir))
 
-    # 3. Segment inventory WITH live details so transform can run offline. MANDATORY:
-    # the segment-convert mode needs the cached segment_details.json from this step.
-    cmd = [
-        sys.executable, "tools/nsx/find_segments_referenced.py",
-        "--export-root", str(export_root),
-        "--source-manager", args.source,
-        "--output-dir", str(segment_inv_dir),
-    ]
-    if args.federation_global:
-        cmd.append("--federation-global")
-    steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
+    # 3. Optional segment details for the separate segment-convert workflow.
+    if args.with_segments:
+        cmd = [
+            sys.executable, "tools/nsx/find_segments_referenced.py",
+            "--export-root", str(export_root),
+            "--source-manager", args.source,
+            "--output-dir", str(segment_inv_dir),
+        ]
+        if args.federation_global:
+            cmd.append("--federation-global")
+        steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir))
 
     # 4. Optional affected-rules impact report (offline, reads export + additive)
     if args.with_impact_report:
@@ -396,7 +331,7 @@ def main() -> int:
         ]
         if args.federation_global:
             cmd.append("--federation-global")
-        steps.append(run_step("4_find_rules_affected_by_group_changes", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
+        steps.append(run_step("4_find_rules_affected_by_group_changes", cmd, REPO_ROOT, logs_dir))
 
     # 5. VM tag capture (LM only, GET-only)
     if args.with_vm_tags and not args.federation_global:
@@ -405,7 +340,7 @@ def main() -> int:
             "--manager", args.source,
             "--base-dir", str(vm_tags_export_root),
         ]
-        steps.append(run_step("5_export_vm_tags", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
+        steps.append(run_step("5_export_vm_tags", cmd, REPO_ROOT, logs_dir))
     elif args.with_vm_tags and args.federation_global:
         log.info("STEP 5 skipped — VM tag fabric API is LM-only (--federation-global is GM)")
 
@@ -421,7 +356,7 @@ def main() -> int:
         ]
         if args.ip_report_csv:
             cmd.extend(["--csv", args.ip_report_csv])
-        steps.append(run_step("6_report_groups_with_ips", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
+        steps.append(run_step("6_report_groups_with_ips", cmd, REPO_ROOT, logs_dir))
 
     # 7. Flat-export emit — copy captured groups/services/policies/rules to the
     #    standalone-export paths so RUNBOOK_A / RUNBOOK_D commands can run
@@ -527,6 +462,8 @@ def main() -> int:
         "options": {
             "live_query": args.live_query,
             "ip_source": args.ip_source,
+            "with_segments": args.with_segments,
+            "with_vm_attribution": args.with_vm_attribution,
             "with_vm_tags": args.with_vm_tags,
             "with_impact_report": args.with_impact_report,
             "with_ip_report": args.with_ip_report,
@@ -540,9 +477,9 @@ def main() -> int:
             "source_groups_dir": str(source_groups_dir),
             "additive_groups_dir": str(additive_groups_dir),
             "additive_reports_dir": str(additive_reports_dir),
-            "segment_inventory_dir": str(segment_inv_dir),
-            "segment_details_file": str(segment_inv_dir / "segment_details.json"),
-            "segments_inventory_file": str(segment_inv_dir / "segments_inventory.json"),
+            "segment_inventory_dir": str(segment_inv_dir) if args.with_segments else None,
+            "segment_details_file": str(segment_inv_dir / "segment_details.json") if args.with_segments else None,
+            "segments_inventory_file": str(segment_inv_dir / "segments_inventory.json") if args.with_segments else None,
             "impact_report_dir": str(impact_report_dir) if args.with_impact_report else None,
             "vm_tags_export_root": str(vm_tags_export_root) if args.with_vm_tags and not args.federation_global else None,
             "logs_dir": str(logs_dir),

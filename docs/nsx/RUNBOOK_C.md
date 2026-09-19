@@ -98,7 +98,7 @@ Steps 3, 4, and 5 each capture a baseline and are independently revertible.
 
 | Tool | Phase | Purpose |
 |---|---|---|
-| [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | 1 | Standard capture (existing). Produces `groups_additive/` and `segment_inventory/` which the transform reads |
+| [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | 1 | Use `--live-query` for `groups_additive/` and effective-IP evidence. Segment inventory, VM tags, VM attribution and review reports are off by default; C does not need them |
 | [tools/nsx/build_sibling_groups.py](../../tools/nsx/build_sibling_groups.py) | 2 | **NEW** — offline transform. Decomposes tag+IP groups into IP-only sibling + stripped original. Outputs two bundles + sibling_map.json |
 | [tools/nsx/groups.py](../../tools/nsx/groups.py) `push` | 3, 4 | Existing push tool. Step 3 is plain additive. Step 4 requires `--intentional-ip-removal` to allow IPs being removed from the originals |
 | [tools/nsx/rules.py](../../tools/nsx/rules.py) `amend-refs` | 5 | **NEW** subcommand. For every customer rule on the target, appends sibling-group paths alongside any matching original-group path in `source_groups` / `destination_groups` (and optionally `scope` via `--include-scope`). Strict-additive |

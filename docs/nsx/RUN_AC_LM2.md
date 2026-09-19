@@ -88,6 +88,11 @@ without it, 7 with it.
 python tools/nsx/capture_nsx_state.py --source $S --live-query
 ```
 
+Segment inventory, VM tags, VM attribution and optional review reports are
+skipped by default. The configuration, effective-IP evidence and flat exports
+remain. `vm_ip_index_count: 0` is expected; use the effective-IP query gate below.
+See [optional collection flags](RUNBOOK_WORKFLOW.md#1-capture-read-only-source-side).
+
 ### The gate: check all five fields yourself
 
 ```bash
@@ -97,13 +102,13 @@ cat "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json"
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'`. Anything else is a stale or legacy bundle |
-| `vm_ip_index_count` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
 | `groups_changed` | Review against expected source membership; 0 may mean no enrichment was needed |
 | `ips_added_total` | Review against expected source membership; 0 may mean IPs were already present |
 | `groups_errors` | `0`. Non-zero means groups have not realized yet: wait, re-run |
 
 The driver checks capture success, source/domain identity, effective IP mode,
-zero group errors and a non-zero VM IP index. Review the change counts yourself.
+zero group errors and a successful effective-IP query for every processed group. Review the change counts yourself.
 
 ### Switch credentials once, then work only against LM2
 
