@@ -36,16 +36,17 @@ run produces the dry-run report; an apply produces the apply report. Neither
 can be forgotten, and the two can never be conflated, because one invocation
 runs exactly one mode.
 
-FRESH ON DRY RUN, FROZEN ON APPLY
+CAPTURE FIRST, THEN SWITCH CREDENTIALS
 
-A dry run re-captures the source first (--live-query, then a gate check on the
-capture's own summary) and rebuilds the sibling bundle, so it always reflects
-the source as it is right now. An apply does NEITHER: it pushes exactly the
-bundle its dry run previewed. That asymmetry is the point. If the source
-changed after you reviewed the preview, you want the apply to push what you
-approved, not something you have never seen. Re-run the dry run to pick up the
-change. --no-capture skips the re-capture when you deliberately want to push an
-older bundle.
+A/C use a two-step process. First run capture_nsx_state.py --source <source>
+--live-query using the source credentials. Then change NSX_USERNAME and
+NSX_PASSWORD to the target credentials. A/C dry run, apply, verify and rollback
+contact only the target; verification compares it with the saved source capture.
+C rebuilds siblings from that capture on each dry run, never on apply. Keep the
+capture and its flat exports unchanged until the run is finished.
+
+WF-D still re-captures before a dry run by default; --no-capture reuses its saved
+capture. No phase captures on apply.
 
 WHAT IT DOES NOT DO
 
@@ -58,6 +59,7 @@ a step fails, so a failed run is still auditable.
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import logging
 import os
@@ -71,7 +73,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
 from nsx.cli_bootstrap import init_cli          # noqa: E402
-from nsx.nsx_constants import resolve_manager, nsx_log_dir  # noqa: E402
+from nsx.nsx_constants import resolve_manager  # noqa: E402
+from nsx.captured_source import validate_capture  # noqa: E402
 
 log = logging.getLogger("run_workflow")
 
@@ -81,63 +84,51 @@ NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
 
 
 def run_step(label: str, cmd: List[str], log_dir: Path) -> Dict[str, Any]:
-    """Run one push as a subprocess, streaming to a per-step log.
-
-    Mirrors capture_nsx_state.run_step so the two orchestrators behave the
-    same way for an operator reading logs.
-    """
+    """Stream a step's combined output live to the terminal and its log file."""
     log_dir.mkdir(parents=True, exist_ok=True)
     step_log = log_dir / f"{label}.log"
     log.info("STEP %s", label)
     log.info("  cmd: %s", " ".join(cmd))
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     with step_log.open("w", encoding="utf-8") as fh:
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True)
-        fh.write(proc.stdout or "")
+        with subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT) as proc:
+            assert proc.stdout is not None
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            try:
+                # Read available chunks so prompts without a newline are shown
+                # immediately too. stdin stays inherited for interactive steps.
+                while chunk := proc.stdout.read1(8192):
+                    output = decoder.decode(chunk)
+                    fh.write(output)
+                    fh.flush()
+                    sys.stdout.write(output)
+                    sys.stdout.flush()
+                output = decoder.decode(b"", final=True)
+                fh.write(output)
+                sys.stdout.write(output)
+                sys.stdout.flush()
+                proc.wait()
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
     ok = proc.returncode == 0
     log.log(logging.INFO if ok else logging.ERROR,
             "  %s (rc=%d)  log: %s", "OK" if ok else "FAILED",
             proc.returncode, step_log)
-    if not ok:
-        for line in (proc.stdout or "").splitlines()[-15:]:
-            log.error("    %s", line)
     return {"label": label, "cmd": cmd, "rc": proc.returncode, "ok": ok,
             "log": str(step_log)}
 
 
-def check_capture_gate() -> Optional[str]:
-    """Read the capture's own summary and say why it is not usable, or None.
-
-    These four numbers are the difference between a real capture and a silent
-    no-op. A capture without --live-query produces a groups_additive/ tree that
-    is a plain copy of the export: every tag group looks empty, the sibling
-    build yields almost nothing, and every step still reports success. Checking
-    the summary is the only thing standing between that and a wrong push.
-    """
-    # nsx_constants resolves NSX_LOG_DIR properly: the .env value is
-    # "$ROOT_DIR/nsx_logs", so reading os.environ directly yields a literal
-    # unexpanded path that matches nothing.
-    base = Path(nsx_log_dir) if nsx_log_dir else (REPO_ROOT / "nsx_logs")
-    dirs = sorted(d for d in (base / "build_group_ip_additive_from_live_members").glob("*")
-                  if d.is_dir())
-    if not dirs:
-        return "no additive report directory: did the capture run?"
-    f = dirs[-1] / "summary.json"
-    if not f.is_file():
-        return f"no summary.json under {dirs[-1]}"
+def check_capture_gate(capture: Path, source_host: str, domain_id: str) -> Optional[str]:
+    """Reject a missing, failed, mismatched or non-live source capture."""
     try:
-        s = json.loads(f.read_text(encoding="utf-8"))
+        validate_capture(capture, source_host, domain_id)
     except (ValueError, OSError) as exc:
-        return f"unreadable {f}: {exc}"
-    if s.get("ip_source") != "effective":
-        return (f"ip_source is {s.get('ip_source')!r}, not 'effective': this bundle "
-                "under-reports group IPs and must not be pushed")
-    if s.get("groups_errors"):
-        return (f"groups_errors={s['groups_errors']}: some groups did not resolve, "
-                "usually because they were created moments ago and have not realized. "
-                "Wait, then re-run")
-    if not s.get("vm_ip_index_count"):
-        return "vm_ip_index_count is 0: the capture ran without --live-query"
+        return str(exc)
     return None
 
 
@@ -216,7 +207,7 @@ def phase_d_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
 
 
 def verify_steps(phase: str, source: str, target: str, sib: Path,
-                 out_dir: Path, run_dir: Path) -> List[Dict[str, Any]]:
+                 out_dir: Path, run_dir: Path, domain_id: str = "default") -> List[Dict[str, Any]]:
     """The read-only check that belongs to this phase.
 
     WF-A and WF-C are checked by verify_avs_run (source-to-target parity plus
@@ -226,10 +217,15 @@ def verify_steps(phase: str, source: str, target: str, sib: Path,
     smap = sib / "sibling_map.json"
     if phase in ("a", "c"):
         cmd = [PY, "tools/nsx/verify_avs_run.py", "--source", source,
-               "--target", target, "--report-dir", str(out_dir)]
-        # After a plain WF-A clone there is no sibling bundle yet. The verifier
-        # runs V1 and V6 alone in that case rather than refusing.
-        if smap.exists():
+               "--target", target, "--report-dir", str(out_dir),
+               "--domain-id", domain_id, "--source-capture",
+               str(REPO_ROOT / "nsx_capture" / resolve_manager(source))]
+        # A checks the clone even if a C preview already created a local map.
+        # C must have a map, otherwise its sibling checks would silently skip.
+        if phase == "c":
+            if not smap.is_file():
+                log.error("C verification requires the sibling map: %s", smap)
+                return []
             cmd += ["--sibling-map", str(smap)]
         return [{"label": f"{phase}_verify", "roots": [], "cmd": cmd}]
 
@@ -332,11 +328,10 @@ def main() -> int:
                         "WF-C siblings hold the SOURCE addresses and WF-D siblings hold "
                         "the CSV-REMAPPED ones, so a shared suffix would merge mapped "
                         "addresses into the source-IP siblings.")
-    p.add_argument("--capture", action=argparse.BooleanOptionalAction, default=True,
-                   help="Re-capture the source before a DRY RUN so it reflects the "
-                        "source as it is now, and gate on the capture summary. On by "
-                        "default. Never runs on an apply, which must push exactly what "
-                        "its dry run previewed.")
+    p.add_argument("--capture", action=argparse.BooleanOptionalAction, default=None,
+                   help="WF-D only: re-capture before a dry run (default on for D). "
+                        "A/C require a separate source capture and never contact the "
+                        "source. --no-capture is accepted for all phases.")
     p.add_argument("--continue-on-error", action="store_true",
                    help="Keep going after a failed step (default: stop, so a broken "
                         "push does not cascade into the next dependency level).")
@@ -347,6 +342,14 @@ def main() -> int:
                         datefmt="%Y-%m-%dT%H:%M:%S", stream=sys.stderr)
     logging.Formatter.converter = __import__("time").gmtime
     init_cli()
+
+    if args.phase in ("a", "c") and args.capture:
+        log.error("A/C require a separate capture with the source credentials: "
+                  "python tools/nsx/capture_nsx_state.py --source %s --live-query. "
+                  "Then switch credentials to the target and run this phase.", args.source)
+        return 2
+    if args.capture is None:
+        args.capture = args.phase.startswith("d")
 
     # Refuse before creating anything, so a rejected invocation leaves no
     # half-made run directory behind to be mistaken for a real run.
@@ -414,27 +417,31 @@ def main() -> int:
     wf = "d" if args.phase.startswith("d") else args.phase
     out_dir = run_dir / "report" / args.phase / mode
 
-    # Re-capture FIRST, on a dry run only. The source moves between runs, and a
-    # preview built from a stale bundle is a preview of the wrong change.
+    capture = REPO_ROOT / "nsx_capture" / src_host
+    # Only WF-D can capture here. A/C run after the manual credential switch.
     if action == "push" and not args.apply and args.capture:
         rec = run_step("a0_capture", [PY, "tools/nsx/capture_nsx_state.py",
                                       "--source", args.source, "--live-query",
-                                      "--domain-id", args.domain_id, "--quiet"], log_dir)
+                                      "--domain-id", args.domain_id], log_dir)
         if not rec["ok"]:
             log.error("Capture failed; nothing pushed.")
             return 1
-        why = check_capture_gate()
+    if (action == "push" and not args.apply and args.capture) or \
+            (args.phase in ("a", "c") and action != "rollback"):
+        why = check_capture_gate(capture, src_host, args.domain_id)
         if why:
             log.error("Capture gate FAILED: %s", why)
-            log.error("Refusing to continue: the bundle would push wrong data.")
+            log.error("Capture %s with its credentials first, then switch to %s "
+                      "credentials. No target steps have run.", args.source, args.target)
             return 2
         log.info("Capture gate passed (ip_source=effective, groups_errors=0).")
 
     if args.verify:
-        steps = verify_steps(args.phase, args.source, args.target, sib, out_dir, run_dir)
+        steps = verify_steps(args.phase, args.source, args.target, sib, out_dir, run_dir,
+                             args.domain_id)
         if not steps:
-            log.error("Nothing to verify for %s: no baseline under %s. Run the apply "
-                      "first.", args.phase, sib / "push_report" / "baselines")
+            log.error("Nothing to verify for %s: required sibling map or baseline "
+                      "is missing under %s. Run the phase first.", args.phase, sib)
             return 2
     elif args.rollback:
         steps = rollback_steps(args.phase, args.target, args.apply, sib, strip,
@@ -443,10 +450,19 @@ def main() -> int:
             log.info("Rollback DRY RUN: each revert prints its plan and writes nothing.")
     elif args.phase == "a":
         steps = phase_a_steps(src_host, args.target, args.apply)
+        # A consumes the flat exports emitted by the source capture. Refuse
+        # before the first target command if any required bundle is missing.
+        manifest = json.loads((capture / "manifest.json").read_text(encoding="utf-8"))
+        if not manifest.get("options", {}).get("emit_flat_exports") or any(
+                not (REPO_ROOT / step["cmd"][step["cmd"].index(flag) + 1]).is_dir()
+                for step, flag in zip(steps, ("--services-dir", "--groups-dir", "--policies-dir", "--rules-dir"))):
+            log.error("A requires all four flat exports from capture_nsx_state.py. "
+                      "Recapture with --emit-flat-exports using the source credentials.")
+            return 2
     elif args.phase in ("c", "d2a"):
-        # Rebuild on EVERY dry run, not just when missing: the source changes
-        # between runs, and a stale sibling bundle silently previews the wrong
-        # IPs. build_sibling_groups rmtrees its own output dirs, so this leaves
+        # Rebuild from the saved capture on EVERY dry run. This is offline;
+        # --source identifies a local directory, not a source API connection.
+        # build_sibling_groups rmtrees its own output dirs, so this leaves
         # nothing behind from a previous build. An apply never rebuilds, so it
         # pushes exactly what its dry run previewed.
         if args.apply:
@@ -521,6 +537,7 @@ def main() -> int:
         "csv_remap": args.csv_remap,
         "source": args.source, "target": args.target,
         "source_host": src_host, "target_host": tgt_host,
+        "source_capture": str(capture) if args.phase in ("a", "c") else None,
         "started_at": started.isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "steps": records, "report_dir": str(out_dir),

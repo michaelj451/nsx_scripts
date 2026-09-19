@@ -45,7 +45,7 @@ write to independent output directories and never touch each other.
 
 | Script | What it captures | Output bundle |
 |---|---|---|
-| `capture_nsx_state.py` | Orchestrator: raw policy export + groups-with-captured-VM-IPs snapshot + segment inventory + rule-impact report + VM tag inventory | `nsx_capture/<host>/` |
+| `capture_nsx_state.py` | Orchestrator: raw policy export + groups-with-captured-VM-IPs snapshot + segment inventory + optional rule-impact report (`--impact-report`) + VM tag inventory | `nsx_capture/<host>/` |
 | `services.py export` | Customer L4/nested services (system-owned skipped) | `nsx_services_export/<host>/services/` |
 | `groups.py export` | Customer groups (dynamic + static), system groups skipped | `nsx_groups_export/<host>/groups/` |
 | `policies.py export` | Customer security policies (one folder per policy with a `policy.yaml` + `rules_order.yaml`) | `nsx_policies_export/<host>/security-policies/` |

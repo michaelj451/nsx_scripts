@@ -4,6 +4,15 @@
 writes that phase's report in the same invocation. Four verbs, identical shape
 for every phase: **dry run, apply, verify, rollback**.
 
+Every phase shows its child scripts' output live in the terminal and also saves
+it under `<run-dir>/logs/<timestamp>_<phase>_<mode>/`. Capture also runs with its
+normal verbose output; no extra logging flag is needed.
+
+**A/C use two credential stages:** capture LM1 using its credentials, then
+manually change the shared `NSX_USERNAME` / `NSX_PASSWORD` to LM2 credentials.
+A/C dry run, apply, verify and rollback use saved source files and contact only
+the target. The [PowerShell run card](RUN_AC_LM2_PS.md) includes both stages.
+
 | Verb | Command | Writes to NSX |
 |---|---|---|
 | Dry run | `wf --phase a` | no |
@@ -76,7 +85,9 @@ wf --help | head -3
 
 ## 1) Capture (read-only, source side)
 
-The driver does not capture. Do it first, and **`--live-query` is mandatory**:
+A/C require a separate capture with the source credentials. WF-D still captures
+before dry runs by default; `--no-capture` disables that for D.
+For the source capture, **`--live-query` is mandatory**:
 it is what splices each group's effective IPs into `groups_additive/`, the tree
 WF-C and WF-D build siblings from. Without it every tag-only group looks empty,
 you get siblings only for groups that already held static IPs, and nothing
@@ -89,16 +100,23 @@ python tools/nsx/capture_nsx_state.py --source $S --live-query
 Gate before going further:
 
 ```bash
-grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | tail -1
+cat "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json"
 ```
 
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'`, anything else is a stale or legacy bundle |
 | `vm_ip_index_count` | non-zero |
-| `groups_changed` | non-zero |
-| `ips_added_total` | non-zero |
+| `groups_changed` | Review against expected source membership; 0 may mean no enrichment was needed |
+| `ips_added_total` | Review against expected source membership; 0 may mean IPs were already present |
 | `groups_errors` | **0**. Non-zero means groups have not realized yet: wait, re-run |
+
+For A/C, now edit `.env`'s `NSX_USERNAME` and `NSX_PASSWORD` to the target's
+credentials. Keep manager addresses unchanged. If credentials were exported in
+the shell, run `unset NSX_USERNAME NSX_PASSWORD` so subsequent Python commands
+read the edited `.env`. Keep the source capture and the four flat-export trees
+unchanged through preview, apply and verification. To refresh source data,
+repeat the source capture using source credentials before switching back.
 
 ---
 
@@ -129,8 +147,8 @@ wf --phase c --apply
 wf --phase c --verify
 ```
 
-The dry run builds the sibling bundle if it is missing; the apply never
-rebuilds, so it pushes exactly what you previewed. Check the build counters
+The dry run rebuilds the sibling bundle from the saved source capture without
+contacting the source; the apply never rebuilds. Check the build counters
 before approving:
 
 ```bash
@@ -217,16 +235,20 @@ wf --phase c --verify
 wf --phase d2a --verify
 ```
 
-Read-only. `a` and `c` run `verify_avs_run.py`; the WF-D phases run
+Read-only. `a` and `c` run `verify_avs_run.py --source-capture <saved-capture>`
+and query only the target, comparing it against the captured source state.
+The report records the capture path and timestamp; later source changes are
+not checked. The WF-D phases run
 `validate_wf_d.py` against the baseline that phase's push captured.
 
 | Phase | Checks |
 |---|---|
-| `a`, `c` | V1 object parity, V2 siblings exist, V3 sibling IPs equal the source's effective IPs, V4 originals stripped, V5 rules reference original OR sibling, V6 membership resolves |
+| `a` | V1 object parity against the capture, V6 target membership resolves |
+| `c` | V1 object parity, V2 siblings exist, V3 sibling IPs equal the source's captured effective IPs, V4 originals stripped, V5 rules reference original OR sibling, V6 target membership resolves |
 | `d*` | G1 nothing deleted, G2 no IP removed, G3 criteria intact, S1/S2 siblings exist and typed `IPAddress`, R1 amend completeness, R2 rules still present |
 
-After a plain WF-A clone there is no sibling bundle, and the verifier runs V1
-and V6 alone rather than refusing. **V3 is the one that matters most**: it
+A verification runs V1 and V6 even if a C preview already created a sibling map.
+C verification requires that map. **V3 is the one that matters most**: it
 catches a sibling that looks structurally fine but is quietly missing
 addresses.
 
@@ -304,6 +326,7 @@ up an older run's baseline.
 | `--rollback` | Undo the phase. Combine with `--apply` to write |
 | `--csv-remap` | Required for `d2a` / `d2b`. Not needed for verify or rollback |
 | `--run-dir` | Default `nsx_avs_runs/<source>_to_<target>` |
+| `--capture` / `--no-capture` | D captures before dry runs by default; `--no-capture` reuses saved data. A/C require a separate capture and reject `--capture`; `--no-capture` is accepted but unnecessary for A/C |
 | `--appendix` | Sibling suffix. Default: `OBJECT_APPENDIX` (`_np_ips`) for phase `c`, `OBJECT_APPENDIX_AVS` (`_avs_ips`) for the `d*` phases. The driver picks per phase and refuses if WF-D would share WF-C's suffix. **Do not change either between runs**: a different suffix creates a second, parallel sibling set rather than renaming anything |
 | `--domain-id` | Default `default` |
 | `--continue-on-error` | Keep going after a failed step. Default is to stop, so a broken push does not cascade into the next dependency level |

@@ -5,6 +5,10 @@ decompose the tag-based groups on the target into IP-only siblings (Workflow C).
 Both run through the driver, `tools/nsx/run_workflow.py`, which executes a whole
 phase and writes that phase's report in the same invocation.
 
+Use two credential stages: capture LM1 with its credentials, then manually
+change the shared `NSX_USERNAME` / `NSX_PASSWORD` to LM2's credentials. A/C
+dry run, apply, verify and rollback use saved source files and contact only LM2.
+
 Concepts: [RUNBOOK_A.md](RUNBOOK_A.md), [RUNBOOK_C.md](RUNBOOK_C.md), and the
 driver itself in [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md). Per-tool commands,
 if you need to run a step by hand:
@@ -29,21 +33,8 @@ Run A first. C replaces WF-A Part 2 and Part 3, so do not run those as well.
 
 ## Before you start
 
-**1. Back up the target.** `nsx-lm2` was empty on 2026-09-18 (0 customer groups,
-0 services, only the two default sections), but take the bundle anyway so the
-rollback has a floor.
-
-```bash
-python tools/nsx/backup_nsx_state.py --source nsx-lm2 --retain 14
-cat nsx_backup/nsx-lm2.lab.local/latest/summary.txt
-```
-
-**2. Confirm what is on the target now**, so the dry-run verdicts mean what you
-think. Everything the report calls `created` should be absent here.
-
-```bash
-python tools/nsx/list_domains.py nsx-lm2
-```
+Run from the repository root. Set `NSX_LM1` and `NSX_LM2` in `.env` to the
+correct managers. Back up and inspect LM2 after switching credentials below.
 
 ---
 
@@ -83,8 +74,9 @@ wf --help | head -3
 
 ## 1) Capture the source (read-only)
 
-The driver re-captures on every dry run, but run it once by hand first so you
-can read the gate yourself.
+Set `.env`'s `NSX_USERNAME` and `NSX_PASSWORD` to LM1 credentials. Clear shell
+overrides with `unset NSX_USERNAME NSX_PASSWORD` so Python reads `.env`.
+A/C do not capture automatically; this is the only source-side stage.
 
 **`--live-query` is mandatory.** It is what splices each group's effective IPs
 into `groups_additive/`, which is the tree Workflow C builds siblings from.
@@ -99,22 +91,36 @@ python tools/nsx/capture_nsx_state.py --source $S --live-query
 ### The gate: check all five fields yourself
 
 ```bash
-grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | tail -1
+cat "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json"
 ```
 
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'`. Anything else is a stale or legacy bundle |
 | `vm_ip_index_count` | non-zero |
-| `groups_changed` | non-zero |
-| `ips_added_total` | non-zero |
+| `groups_changed` | Review against expected source membership; 0 may mean no enrichment was needed |
+| `ips_added_total` | Review against expected source membership; 0 may mean IPs were already present |
 | `groups_errors` | `0`. Non-zero means groups have not realized yet: wait, re-run |
 
-> **The driver's own gate only checks two of these** (`ip_source` and
-> `groups_errors`). On 2026-09-18 an empty source passed it: the driver logged
-> "Capture gate passed", WF-A reported "4/4 steps ok", and the report said
-> "Nothing would be changed". A run that exercised nothing looked clean. Read the
-> three count fields with your own eyes before approving a phase.
+The driver checks capture success, source/domain identity, effective IP mode,
+zero group errors and a non-zero VM IP index. Review the change counts yourself.
+
+### Switch credentials once, then work only against LM2
+
+After capture succeeds, manually change `.env`'s `NSX_USERNAME` and
+`NSX_PASSWORD` to LM2 credentials. Keep manager addresses unchanged. Run
+`unset NSX_USERNAME NSX_PASSWORD` again if shell overrides were set.
+Keep `nsx_capture/$SH` and the four `nsx_*_export/$SH` source trees unchanged
+through preview, apply and verification. Refreshing LM1 requires repeating
+the capture with LM1 credentials, then switching back to LM2.
+
+Back up and inspect LM2 with its credentials before applying:
+
+```bash
+python tools/nsx/backup_nsx_state.py --source "$T" --retain 14
+cat "nsx_backup/$TH/latest/summary.txt"
+python tools/nsx/list_domains.py "$T"
+```
 
 ---
 
@@ -165,9 +171,8 @@ wf --phase c --apply
 wf --phase c --verify
 ```
 
-The dry run rebuilds the sibling bundle every time, so it always reflects the
-source as it is now. The apply never rebuilds, so it pushes exactly what you
-previewed.
+The dry run rebuilds siblings from the saved LM1 capture without contacting
+LM1. The apply never rebuilds, so it pushes the bundle you previewed.
 
 ### Review gate
 
@@ -201,8 +206,10 @@ grep -E "files seen|siblings written|stripped originals|skipped: empty IPs|error
 ## 4) Verify
 
 Read-only, both phases. `verify_avs_run.py` runs V1 object parity, V2 siblings
-exist, V3 sibling IPs equal the source's effective IPs, V4 originals stripped,
+exist, V3 sibling IPs equal the source's captured effective IPs, V4 originals stripped,
 V5 rules reference original or sibling, V6 membership resolves.
+Only LM2 is queried live. The driver supplies `--source-capture`; the report
+records the source capture path and timestamp. Later LM1 changes are not checked.
 
 ```bash
 wf --phase a --verify
@@ -213,11 +220,9 @@ cat $R/report/c/verify/verify_avs_run.json
 **V3 is the one that matters most.** It catches a sibling that looks
 structurally fine but is quietly missing addresses.
 
-> Running `--phase a --verify` *after* a WF-C dry run has left a
-> `sibling_map.json` in the run dir makes the verifier run the sibling checks
-> too, and they fail with 404s until WF-C has actually been applied. That is
-> expected, not a clone failure. With no sibling bundle present the verifier runs
-> V1 and V6 alone.
+`--phase a --verify` runs V1 and V6 only, even if you already previewed C.
+`--phase c --verify` requires C's sibling map and runs the sibling checks too;
+run it after applying C.
 
 ---
 

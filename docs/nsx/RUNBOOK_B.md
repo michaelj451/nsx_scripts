@@ -199,7 +199,7 @@ nsx_capture/nsx-lm1.lab.local/
 │   └── domains/default/groups/<short>.yaml
 ├── segment_inventory/                   ← path → CIDR map (informational; not used by Workflow B)
 │   └── segment_details.json
-├── affected_rule_reports/                ← rules ↔ groups impact reference
+├── affected_rule_reports/                ← optional: --impact-report
 ├── vm_tag_inventory/
 └── logs/
 ```
@@ -208,7 +208,7 @@ nsx_capture/nsx-lm1.lab.local/
 
 - `summary.txt` — all sub-steps OK
 - `manifest.json` — `"ok": true`
-- `affected_rule_reports/affected_rules_impact.json` — which rules touch which groups you're about to mutate
+- `affected_rule_reports/affected_rules_impact.json` — which rules reference the captured groups; generated only with `--impact-report`
 
 ---
 
@@ -584,7 +584,7 @@ nsx_capture/nsx-lm1.lab.local/                     ← capture bundle
 │           ├── failures.json                      ← only if real failures
 │           └── fabric_paths_stripped.json         ← only if any host/edge-TN refs auto-stripped
 ├── segment_inventory/segment_details.json        ← informational; not used by Workflow B
-├── affected_rule_reports/
+├── affected_rule_reports/                         ← optional: --impact-report
 ├── vm_tag_inventory/
 ├── logs/, manifest.json, summary.txt
 ```

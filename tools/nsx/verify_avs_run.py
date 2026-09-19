@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """tools/nsx/verify_avs_run.py
 
-Live, read-only verification that an AVS / WF-C decomposition landed correctly.
+Read-only verification that an AVS / WF-C decomposition landed correctly.
+
+The A/C driver supplies --source-capture, so only the target is queried live.
+Source object parity and effective-IP truth come from the saved source capture.
+Without --source-capture, this standalone tool retains its live-source mode.
 
 Answers the only question that matters after the pushes: does the target now
 resolve to the same address space the source did, with the tag criteria and the
@@ -25,6 +29,7 @@ fine structurally and is quietly missing addresses.
 USAGE:
     python tools/nsx/verify_avs_run.py \\
         --source nsx-lm1 --target nsx-lm3 \\
+        --source-capture nsx_capture/nsx-lm1.lab.local \\
         --sibling-map nsx_avs_runs/v2/nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json \\
         --report-dir nsx_avs_runs/v2/report
 
@@ -46,6 +51,7 @@ sys.path.insert(0, str(REPO_ROOT / "app"))
 from nsx.cli_bootstrap import init_cli                       # noqa: E402
 from nsx.nsx_constants import resolve_manager                # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError  # noqa: E402
+from nsx.captured_source import CapturedSource                # noqa: E402
 
 log = logging.getLogger("verify_avs_run")
 
@@ -75,6 +81,10 @@ def main() -> int:
         epilog=__doc__.split("USAGE:", 1)[1] if "USAGE:" in __doc__ else None)
     p.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
     p.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
+    p.add_argument("--source-capture", type=Path,
+                   help="Compare with this saved capture instead of contacting the "
+                        "source. Only target credentials are needed. The A/C driver "
+                        "always uses this mode; without it this standalone tool reads both managers.")
     p.add_argument("--sibling-map", default=None,
                    help="sibling_map.json from build_sibling_groups.py. Omit after a "
                         "plain clone (WF-A Part 1) with no decomposition yet: V1 object "
@@ -107,7 +117,17 @@ def main() -> int:
         log.info("No --sibling-map given: running V1 object parity and V6 membership "
                  "only (no siblings to check).")
 
-    src = NsxPolicyClient(nsxmanager=resolve_manager(args.source), federation_global=False)
+    if args.source_capture:
+        try:
+            src = CapturedSource(args.source_capture.expanduser(), resolve_manager(args.source),
+                                 args.domain_id)
+        except (ValueError, KeyError, TypeError) as exc:
+            log.error("Cannot verify against source capture: %s", exc)
+            return 2
+        log.info("Source truth: capture %s from %s (no source connection)",
+                 src.capture, src.manifest.get("captured_at"))
+    else:
+        src = NsxPolicyClient(nsxmanager=resolve_manager(args.source), federation_global=False)
     tgt = NsxPolicyClient(nsxmanager=resolve_manager(args.target), federation_global=False)
     D = args.domain_id
 
@@ -163,7 +183,7 @@ def main() -> int:
 
         try:
             truth = sorted(src.get_group_effective_ips(orig_id, domain_id=D))
-        except NsxApiError as exc:
+        except (NsxApiError, ValueError) as exc:
             record("V3", sib_id, False, f"source truth unavailable: {exc}")
             truth = None
         if truth is not None:
@@ -222,6 +242,9 @@ def main() -> int:
     (out_dir / "verify_avs_run.json").write_text(json.dumps({
         "verified_at": datetime.now(timezone.utc).isoformat(),
         "source": args.source, "target": args.target,
+        "source_mode": "capture" if args.source_capture else "live",
+        "source_capture": str(src.capture) if args.source_capture else None,
+        "source_captured_at": src.manifest.get("captured_at") if args.source_capture else None,
         "sibling_map": str(smap_path) if smap_path else None,
         "checks_total": len(checks), "checks_failed": len(failed),
         "ok": not failed, "checks": checks,

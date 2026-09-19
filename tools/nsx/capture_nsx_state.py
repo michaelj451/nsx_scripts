@@ -22,8 +22,9 @@ What's captured:
     summary.txt                            human-readable summary
     nsx_export/<host>/                     raw NSX state (groups + services + policies + rules)
     groups_additive/                       export copy; add --live-query to freeze evaluated VM IPs in (LM only)
+      domains/<domain>/reports/            effective-IP results used by offline-source A/C verification
     segment_inventory/                     every referenced segment + live segment details
-    affected_rule_reports/                 cross-reference of rules ↔ groups (offline)
+    affected_rule_reports/                 optional rules ↔ groups report (--impact-report)
     vm_tag_inventory/                      VM + tag state (LM only, GET-only)
     logs/                                  per-step log files
 
@@ -261,10 +262,9 @@ def main() -> int:
                    help="Capture VM tag state (LM only). Default ON; ignored for GM.")
     p.add_argument("--no-vm-tags", action="store_false", dest="with_vm_tags",
                    help="Skip VM-tag capture (not used by Workflow A/B transforms — safe to skip if only doing groups/policies).")
-    p.add_argument("--with-impact-report", action="store_true", default=True,
-                   help="Generate the affected-rules impact report (offline, reads export). Default ON.")
-    p.add_argument("--no-impact-report", action="store_false", dest="with_impact_report",
-                   help="Skip the affected-rules impact report (review artifact only; doesn't affect transform).")
+    p.add_argument("--impact-report", action="store_true", default=False, dest="with_impact_report",
+                   help="Generate the affected-rules impact report (offline, reads export). "
+                        "Default OFF; review artifact only, doesn't affect transform.")
     p.add_argument("--with-ip-report", action="store_true", default=True,
                    help="Run report_groups_with_ips.py against the captured groups bundle. "
                         "Produces a per-group classification (pure-ip / pure-tag / tag+ip "
@@ -332,6 +332,7 @@ def main() -> int:
     # Per-step output paths inside the bundle
     export_root           = output_dir / "nsx_export"
     additive_groups_dir   = output_dir / "groups_additive" / "domains" / args.domain_id / "groups"
+    additive_reports_dir  = additive_groups_dir.parent / "reports" / "captured-member-ip-additive"
     segment_inv_dir       = output_dir / "segment_inventory"
     impact_report_dir     = output_dir / "affected_rule_reports"
     vm_tags_export_root   = output_dir / "vm_tag_inventory"
@@ -363,6 +364,7 @@ def main() -> int:
         "--domain-id", args.domain_id,
         "--source-groups-dir", str(source_groups_dir),
         "--output-groups-dir", str(additive_groups_dir),
+        "--reports-dir", str(additive_reports_dir),
         "--output-format", "yaml",
         "--copy-first",
         "--continue-on-group-error",
@@ -383,7 +385,7 @@ def main() -> int:
         cmd.append("--federation-global")
     steps.append(run_step("3_find_segments_referenced", cmd, REPO_ROOT, logs_dir, verbose=not args.quiet))
 
-    # 4. Affected-rules impact report (offline, reads from local export + additive)
+    # 4. Optional affected-rules impact report (offline, reads export + additive)
     if args.with_impact_report:
         additive_root_for_impact = output_dir / "groups_additive"
         cmd = [
@@ -523,6 +525,8 @@ def main() -> int:
             "domain_id": args.domain_id,
         },
         "options": {
+            "live_query": args.live_query,
+            "ip_source": args.ip_source,
             "with_vm_tags": args.with_vm_tags,
             "with_impact_report": args.with_impact_report,
             "with_ip_report": args.with_ip_report,
@@ -535,6 +539,7 @@ def main() -> int:
             "source_export_dir": str(source_export_dir),
             "source_groups_dir": str(source_groups_dir),
             "additive_groups_dir": str(additive_groups_dir),
+            "additive_reports_dir": str(additive_reports_dir),
             "segment_inventory_dir": str(segment_inv_dir),
             "segment_details_file": str(segment_inv_dir / "segment_details.json"),
             "segments_inventory_file": str(segment_inv_dir / "segments_inventory.json"),

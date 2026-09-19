@@ -9,7 +9,7 @@ and must not be confused with it:
 | | **backup_nsx_state.py** (this runbook) | **capture_nsx_state.py** (Workflows A/B/C/D) |
 |---|---|---|
 | Purpose | Restorable snapshot of definitions | Input bundle for clone / remap workflows |
-| Contents | Groups, services, policies+rules, segments, VM tags (LM) as held | Same raw export PLUS `groups_additive/` (evaluated VM IPs frozen into groups), rule-impact reports, flat export refresh |
+| Contents | Groups, services, policies+rules, segments, VM tags (LM) as held | Same raw export PLUS `groups_additive/` (evaluated VM IPs frozen into groups), optional rule-impact report (`--impact-report`), flat export refresh |
 | History | Timestamped bundles under `nsx_backup/<host>/<UTC ts>/`, KEPT (optional `--retain N`) | One bundle per host, WIPED on every run |
 | Restore | Push the bundle back (dry-run first) | Pushing `groups_additive` back is NOT a faithful restore (it materializes VM IPs into definitions) |
 | NSX impact | GET-only | GET-only |

@@ -359,7 +359,6 @@ def main() -> int:
             sys.executable, "tools/nsx/capture_nsx_state.py",
             "--source", args.target,
             "--domain-id", domain_id,
-            "--no-impact-report",
         ]
         if args.federation_global:
             cmd.append("--federation-global")
