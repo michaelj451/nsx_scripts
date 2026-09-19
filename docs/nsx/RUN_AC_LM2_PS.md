@@ -302,3 +302,41 @@ bundle taken in the preconditions and follow
 [EMERGENCY_RESTORE_PS.md](EMERGENCY_RESTORE_PS.md). Read its rules caveat first:
 backup bundles do not carry `_parent_policy_id`, so restoring rules straight from
 one lands them in a policy that does not exist. The fix is in that doc.
+
+In **PowerShell**, open the `nsx_scripts` folder and paste this. It uses the existing `.venv` on either macOS or Windows:
+
+```powershell
+$Python = if (Test-Path ".venv/Scripts/python.exe") {
+    ".venv/Scripts/python.exe"
+} else {
+    ".venv/bin/python"
+}
+
+$env:PYTHONPATH = Join-Path $PWD "app"
+$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
+$R = "nsx_avs_runs/lm1_to_lm2_$Stamp"
+
+function wf {
+    & $Python tools/nsx/run_workflow.py `
+        --source nsx-lm1 `
+        --target nsx-lm2 `
+        --run-dir $R @args
+}
+
+wf --phase a
+
+if ($LASTEXITCODE -eq 0) {
+    wf --phase c --no-capture
+}
+```
+
+This previews **LM1 → LM2**, running C only if A succeeds. **No NSX configuration changes are applied.**
+
+Reports:
+
+```powershell
+"$R/report/a/dryrun/avs_run_report.md"
+"$R/report/c/dryrun/avs_run_report.md"
+```
+
+C previews amendments to rules **currently on LM2**; it cannot preview amendments to rules that an unapplied A would create.
