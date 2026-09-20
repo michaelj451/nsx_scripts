@@ -154,8 +154,9 @@ python tools/nsx/groups.py push `
 
 At each prompt: `Enter` continue at current size, `<number>` change size
 (e.g. `25`), `n` reset to 1, `x` clean exit. Every decision lands in
-`summary.json` as `interactive_decisions`. Start at a different size with
-`--batch-size N`; `--batch-size 0` disables prompts (automation).
+`summary.json` as `interactive_decisions`. Every apply starts at one; increase
+the size at a checkpoint. Disabling prompts with `--batch-size 0` or starting
+above one is rejected. Closed input stops further writes.
 
 Re-running the same apply is a no-op by design: rows with nothing to add are
 `skipped_no_change` and NOTHING is sent to NSX (no revision bumps). Review

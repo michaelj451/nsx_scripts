@@ -93,6 +93,10 @@ mode, not a mistake.
 
 ## 1) Capture the source (read-only)
 
+Capture logs stream live with no quiet mode. Every apply and rollback starts at
+one object; Enter continues, a positive number increases the next batch, `n`
+resets to one, and `x` stops. Lost input stops the run. Dry runs never prompt.
+
 **`--live-query` is mandatory.** Without it every tag-only group looks empty, the
 build produces siblings only for groups that already held static IPs, and
 nothing errors. Measured on lm1: 1 sibling without it, 7 with it.

@@ -162,7 +162,8 @@ python tools/nsx/groups.py push --target nsx-gm1 --federation-global `
   --csv-remap $GM_CSV --reports-dir "nsx_wfb_runs/nsx-gm1/$TS" --apply
 ```
 
-Add `--batch-size 0` to disable the prompts for an unattended run.
+Every apply starts at one; `--batch-size 0` is no longer supported. Increase
+the size at a prompt. Lost input stops the run instead of auto-approving.
 
 ---
 

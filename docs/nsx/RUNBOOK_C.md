@@ -180,7 +180,7 @@ Sibling payload contains:
 
 ## Step 3 — Push siblings
 
-These are **new objects**. Plain additive — no special flags. Default batch behaviour applies (no prompting unless you pass `--batch-size N`).
+These are **new objects**. Plain additive — no special flags. Apply starts with one object and prompts before the next batch; enter a positive number at a prompt to increase the batch size.
 
 ```bash
 python tools/nsx/groups.py push --target nsx-lm2 \
@@ -282,7 +282,7 @@ Strict-additive — never removes a reference. Captures a baseline at `nsx_rules
 | `--target <alias>` | required | The manager whose rules to amend |
 | `--sibling-map <path>` | required | Path to `sibling_map.json` from step 2 |
 | `--domain-id` | from sibling_map | NSX domain |
-| `--batch-size N` | `1` when `--apply` | Step through every rule update. Same prompt vocabulary as `groups.py push`: Y/Enter/n/x/<number> |
+| `--batch-size 1` | `1` | Apply always starts at one. Increase the next batch at a checkpoint: Y/Enter/n/x/<positive number> |
 | `--include-scope` | off | Also append sibling refs to the rule's `scope` (applied-to) field. Default off — see note above. |
 | `--apply` | off (dry-run) | Required to actually PATCH rules |
 

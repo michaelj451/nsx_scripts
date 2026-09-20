@@ -59,14 +59,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import shutil
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from nsx.streaming import stream_command
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 
@@ -110,53 +109,22 @@ def setup_logging(bundle_logs_dir: Path, mode_name: str) -> Path:
 
 
 def run_step(label: str, cmd: List[str], cwd: Path, step_log_dir: Path) -> Dict[str, Any]:
+    """Always stream combined child output to the terminal and a live log file."""
     safe_label = label.replace(" ", "_").replace(":", "").replace("/", "_")
     step_log_file = step_log_dir / f"{safe_label}.log"
-
     log.info("STEP: %s", label)
     log.info("  cmd: %s", " ".join(cmd))
     log.info("  step log: %s", step_log_file)
-
-    env = dict(os.environ)
-    env.setdefault("PYTHONPATH", str(cwd / "app"))
-
     started_at = datetime.now(timezone.utc).isoformat()
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    returncode, tail = stream_command(cmd, cwd, step_log_file)
     finished_at = datetime.now(timezone.utc).isoformat()
-
-    step_log_file.write_text(
-        f"# step: {label}\n# started_at: {started_at}\n# finished_at: {finished_at}\n"
-        f"# returncode: {proc.returncode}\n# cmd: {' '.join(cmd)}\n\n"
-        f"===== STDOUT =====\n{proc.stdout}\n\n===== STDERR =====\n{proc.stderr}\n",
-        encoding="utf-8",
-    )
-
-    if proc.returncode != 0:
-        log.error(
-            "STEP FAILED: %s (exit=%d) — see %s for full output",
-            label, proc.returncode, step_log_file,
-        )
-        for line in proc.stderr.splitlines()[-10:]:
-            log.error("  | %s", line)
-    else:
-        log.info("  OK")
-
+    log.log(logging.INFO if returncode == 0 else logging.ERROR,
+            "STEP %s: %s (exit=%d)", label, "OK" if returncode == 0 else "FAILED", returncode)
     return {
-        "label": label,
-        "cmd": cmd,
-        "ok": proc.returncode == 0,
-        "returncode": proc.returncode,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "step_log": str(step_log_file),
-        "stdout_tail": "\n".join(proc.stdout.splitlines()[-20:]),
-        "stderr_tail": "\n".join(proc.stderr.splitlines()[-20:]) if proc.returncode != 0 else "",
+        "label": label, "cmd": cmd, "ok": returncode == 0, "returncode": returncode,
+        "started_at": started_at, "finished_at": finished_at,
+        "step_log": str(step_log_file), "stdout_tail": tail,
+        "stderr_tail": tail if returncode else "",
     }
 
 

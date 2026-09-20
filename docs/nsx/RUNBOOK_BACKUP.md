@@ -33,6 +33,9 @@ Exit code is `0` only when every requested manager backed up clean, so the
 command is cron-safe. A failed bundle is kept for inspection but is never
 marked `latest`.
 
+Collection logs stream to the terminal and per-step log files as work happens.
+Logging is always on; `--quiet` is no longer supported.
+
 ## Bundle layout
 
 ```text
@@ -65,7 +68,6 @@ nsx_backup/<host>/latest -> <UTC_TS>  symlink to newest clean bundle
 | `--no-vm-tags` | off | Skip VM tag inventory on LM sources |
 | `--output-root` | `nsx_backup/` | Where bundles land |
 | `--retain N` | `0` (keep all) | After a clean backup, prune to the N newest bundles for that host |
-| `--quiet` | off | Less per-step console output |
 
 ## Restore
 
@@ -73,6 +75,10 @@ Restore is the existing per-class push tooling pointed at a bundle. Everything
 defaults to dry-run; `--apply` is required to write, every apply captures a
 baseline first, and group revert deletes stay blocked unless `--allow-delete`
 is given.
+
+Each apply starts with one object. Before the next batch, press Enter to
+continue, enter a positive number to change the batch size, `n` to reset to
+one, or `x` to stop. Closed input stops further writes. Dry runs do not prompt.
 
 > ### Two things that will bite you, corrected 2026-09-11
 >

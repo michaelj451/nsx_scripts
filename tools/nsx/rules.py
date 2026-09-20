@@ -948,40 +948,6 @@ def cmd_revert(args: argparse.Namespace) -> int:
 # listed alongside the original (idempotency), the rule is skipped.
 # =============================================================================
 
-class _AmendInteractiveExit(Exception):
-    pass
-
-
-def _amend_prompt(applied: int, current: int) -> int:
-    while True:
-        try:
-            ans = input(
-                f"\nApplied {applied} rule update(s). "
-                f"Continue with current batch_size={current}? "
-                f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: "
-            ).strip().lower()
-        except EOFError:
-            log.warning("Non-interactive stdin at batch boundary; auto-approving (batch_size=%d).", current)
-            return current
-        if ans in ("", "y", "yes"):
-            return current
-        if ans in ("n", "no"):
-            log.warning("Operator chose RESET-TO-1 after %d applied update(s).", applied)
-            return 1
-        if ans in ("x", "exit", "q", "quit"):
-            log.warning("Operator chose EXIT after %d applied update(s).", applied)
-            raise _AmendInteractiveExit()
-        try:
-            n = int(ans)
-            if n <= 0:
-                print("Please enter a positive integer.")
-                continue
-            log.info("Operator changed batch_size from %d to %d.", current, n)
-            return n
-        except ValueError:
-            print("Please enter Y / Enter, n, x, or a positive integer.")
-
-
 def _build_path_pair_map(sibling_map_doc: Dict[str, Any], domain_id: str) -> Dict[str, str]:
     """Build {original_group_path: sibling_group_path} for both /infra and
     /global-infra variants — rules can reference either."""
@@ -1010,6 +976,7 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
     the tagged group, but the rule was originally scoped to be enforced on
     whatever the tag dynamically matches.
     """
+    batch = ApplyBatch(args.apply, log, getattr(args, "batch_size", None))
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -1037,20 +1004,6 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
              sib_map_path, len(sibling_doc.get("map", []) or []))
     log.info("  Reports dir     : %s", reports_dir)
     log.info("=" * 60)
-
-    # Resolve batch size — default to 1 in apply mode for the same reasons as groups.py push.
-    if args.batch_size is None:
-        resolved_batch_size = 1 if args.apply else 0
-        if args.apply:
-            log.info("Auto-defaulting --batch-size to 1 (rule amend is additive; "
-                     "step-through is safer). Bump higher at any prompt as confidence grows.")
-    else:
-        resolved_batch_size = int(args.batch_size)
-    batch_size = resolved_batch_size
-    interactive_mode = args.apply and batch_size > 0
-    applied_in_batch = 0
-    batch_summary_rows: List[Dict[str, Any]] = []
-    interactive_exit_requested = False
 
     client = None
     baseline_path = None
@@ -1129,6 +1082,8 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
             continue
 
         # Apply.
+        if not batch.before_write():
+            break
         try:
             client.patch_security_rule(
                 security_policy_id=pid, rule_id=rid,
@@ -1153,29 +1108,7 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
             rows.append(row)
             continue
 
-        # Interactive batch boundary.
-        if interactive_mode:
-            applied_in_batch += 1
-            batch_summary_rows.append(row)
-            if applied_in_batch >= batch_size:
-                log.info("=" * 60)
-                log.info("BATCH REVIEW — %d rule update(s) just applied:", applied_in_batch)
-                for j, br in enumerate(batch_summary_rows, start=1):
-                    notes = ", ".join(
-                        f"{f}: +{len(d['added'])}"
-                        for f, d in (br.get("per_field_diff") or {}).items()
-                    )
-                    log.info("  [%d] %s/%s  %s  refs_added=%d  (%s)",
-                             j, br.get("policy_id"), br.get("rule_id"),
-                             br.get("status"), br.get("refs_added_total", 0), notes)
-                log.info("=" * 60)
-                try:
-                    batch_size = _amend_prompt(applied_in_batch, batch_size)
-                except _AmendInteractiveExit:
-                    interactive_exit_requested = True
-                    break
-                applied_in_batch = 0
-                batch_summary_rows = []
+        batch.record(row)
 
         time.sleep(THROTTLE_SECONDS)
 
@@ -1192,10 +1125,9 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
             "ok": ok,
             "no_change": no_change,
             "failed": failed,
-            "interactive_batch_size_initial": resolved_batch_size,
-            "interactive_batch_size_final":   batch_size if interactive_mode else 0,
-            "interactive_exit_requested":     interactive_exit_requested,
+            **batch.totals(),
         },
+        "interactive_decisions": batch.decisions,
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
         "errors_log": str(errors_log),
@@ -1215,13 +1147,13 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
     log.info("=" * 60)
     log.info("Amend-refs %s — ok=%d no_change=%d failed=%d (rules seen=%d)",
              "APPLY" if args.apply else "DRY-RUN", ok, no_change, failed, len(baseline))
-    if interactive_exit_requested:
+    if batch.stopped:
         log.warning("INTERACTIVE EXIT — operator stopped after %d applied update(s).", ok)
     log.info("Reports: %s", reports_dir)
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
-    return 0 if (failed == 0 and not interactive_exit_requested) else 1
+    return 130 if batch.stopped else (0 if failed == 0 else 1)
 
 
 # =============================================================================
@@ -1298,11 +1230,9 @@ def main() -> int:
     pa.add_argument("--reports-dir", default=None,
                     help="Where to write the amend reports + baseline. Defaults to "
                          "nsx_rules_export/<target-host>/push_report/.")
-    pa.add_argument("--batch-size", type=int, default=None,
-                    help="Interactive batching: pause every N applied updates. Defaults "
-                         "to 1 in apply mode (step-through). Set to 0 for fully automated. "
-                         "At each prompt: Y/Enter=continue, n=reset to 1, x=exit, "
-                         "<number>=change size.")
+    pa.add_argument("--batch-size", type=int, choices=[1], default=1,
+                    help="Apply always starts with 1. Increase the batch size at a checkpoint "
+                         "by entering a positive number; Enter=continue, n=reset, x=stop.")
     pa.add_argument("--include-scope", action="store_true", default=False,
                     help="Also append sibling refs to the rule's 'scope' (applied-to) "
                          "field. OFF by default — scope controls where the rule is "

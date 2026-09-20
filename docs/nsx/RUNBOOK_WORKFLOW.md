@@ -6,7 +6,26 @@ for every phase: **dry run, apply, verify, rollback**.
 
 Every phase shows its child scripts' output live in the terminal and also saves
 it under `<run-dir>/logs/<timestamp>_<phase>_<mode>/`. Capture also runs with its
-normal verbose output; no extra logging flag is needed.
+normal verbose output; no extra logging flag is needed. Capture and backup no
+longer accept `--quiet`. Output is unbuffered and written to the log file while
+the step runs, including interactive prompts without a trailing newline.
+
+Every services/groups/policies/rules push, rule amendment and rollback starts
+with **one object per batch**. Before another batch is written, the terminal
+shows the completed objects and asks how to continue:
+
+| Input | Next action |
+|---|---|
+| Enter / `y` | Continue at the current batch size |
+| `5`, `10`, or another positive integer | Apply that many objects before the next checkpoint |
+| `n` | Reset to one object per batch |
+| `x` | Stop and save the partial-run reports |
+
+Each tool invocation starts at one again. Batch size controls how many objects
+are applied between reviews; the API request throttle is unchanged. Dry runs
+never prompt. A closed input stream stops the apply instead of approving it.
+Stopping also stops remaining domains/workflow steps, even with
+`--continue-on-error`, and a partial rollback keeps its baseline available.
 
 **A/C use two credential stages:** capture LM1 using its credentials, then
 manually change the shared `NSX_USERNAME` / `NSX_PASSWORD` to LM2 credentials.
@@ -368,11 +387,10 @@ tag-side original that C stripped comes back with its static IPs, and C's strip
 step removes them again on the next C run. Visible in the report as a positive
 IP delta on those groups.
 
-**The step-through gate does not gate when driven.** `--intentional-ip-removal`
-auto-sets `--batch-size 1`, and through the driver that prompt gets non-TTY
-stdin and is auto-approved. Each decision is recorded in `summary.json` as
-`auto_approve_non_tty`, so it stays auditable, but if you want a real operator
-gate on a production strip, run that step from your own terminal.
+**Interactive checkpoints work through the driver.** Child scripts inherit
+your terminal input and their prompts stream live. Input loss or `x` stops
+the run. Decisions and the initial/final batch sizes are recorded in each
+tool's summary; checkpoints also cover dependency retries.
 
 **Group expressions are replaced wholesale.** The IP list is protected by the
 additive contract, but a tag criterion added by hand on the target would be

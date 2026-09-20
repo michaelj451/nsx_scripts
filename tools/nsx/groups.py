@@ -439,77 +439,18 @@ class _InteractiveExit(Exception):
     """Signals operator chose to exit the interactive batch loop cleanly."""
 
 
-def _record_decision(decisions: Optional[List[Dict[str, Any]]], applied_count: int,
-                     decision: str, before: int, after: int) -> None:
-    if decisions is None:
-        return
-    decisions.append({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "applied_count": applied_count,
-        "decision": decision,
-        "batch_size_before": before,
-        "batch_size_after": after,
-    })
-
-
 def _prompt_batch_continue(applied_count: int, current_batch_size: int,
                            decisions: Optional[List[Dict[str, Any]]] = None) -> int:
-    """Prompt after a batch of applied group updates. Returns the batch size
-    to use for the next batch. Every operator decision is logged AND appended
-    to `decisions` so summary.json carries the full confidence-ramp history.
-
-    Allowed responses:
-      y / yes / <Enter>  -> continue at current batch size
-      n / no             -> continue but RESET batch size to 1 (be conservative)
-      <positive number>  -> continue at that new batch size
-      x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
-    """
-    prompt_text = (f"Applied {applied_count} group update(s). "
-                   f"Continue with current batch_size={current_batch_size}? "
-                   f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: ")
-    while True:
-        # Log the prompt itself so the log file has context for the response.
-        log.info("PROMPT: %s", prompt_text.strip())
-        try:
-            answer = input(f"\n{prompt_text}").strip().lower()
-        except EOFError:
-            # Non-interactive stdin (piped, no TTY): treat as auto-approve
-            log.warning("Non-interactive stdin at batch boundary; auto-approving (batch_size=%d).",
-                        current_batch_size)
-            _record_decision(decisions, applied_count, "auto_approve_non_tty",
-                             current_batch_size, current_batch_size)
-            return current_batch_size
-
-        if answer in ("", "y", "yes"):
-            log.info("Operator approved batch (continue at batch_size=%d) after %d applied update(s).",
-                     current_batch_size, applied_count)
-            _record_decision(decisions, applied_count, "approve",
-                             current_batch_size, current_batch_size)
-            return current_batch_size
-
-        if answer in ("n", "no"):
-            log.warning("Operator chose RESET-TO-1 after %d applied update(s) "
-                        "(was batch_size=%d).", applied_count, current_batch_size)
-            _record_decision(decisions, applied_count, "reset_to_1", current_batch_size, 1)
-            return 1
-
-        if answer in ("x", "exit", "quit", "q"):
-            log.warning("Operator chose EXIT after %d applied update(s).", applied_count)
-            _record_decision(decisions, applied_count, "exit",
-                             current_batch_size, current_batch_size)
-            raise _InteractiveExit(f"Stopped by operator after {applied_count} update(s).")
-
-        try:
-            new_value = int(answer)
-            if new_value <= 0:
-                print("Please enter a positive integer (e.g. 1, 5, 25).")
-                continue
-            log.info("Operator changed batch_size from %d to %d after %d applied update(s).",
-                     current_batch_size, new_value, applied_count)
-            _record_decision(decisions, applied_count, "resize", current_batch_size, new_value)
-            return new_value
-        except ValueError:
-            print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
+    """Compatibility entry point for the shared interactive checkpoint."""
+    batch = ApplyBatch(True, log)
+    batch.size = current_batch_size
+    batch.total = applied_count
+    batch.pending = ["Applied group update"] * current_batch_size
+    if decisions is not None:
+        batch.decisions = decisions
+    if not batch.before_write():
+        raise _InteractiveExit("Stopped at group checkpoint")
+    return batch.size
 
 
 def _is_missing_dependency_error(err_msg: str) -> bool:
@@ -1837,6 +1778,9 @@ def _run_all_domains(args: argparse.Namespace) -> int:
             log.exception("DOMAIN %s: unhandled error", dom)
             rc = 1
         results.append((dom, rc, "ok" if rc == 0 else f"rc={rc}"))
+        if rc == 130:
+            log.warning("Operator stopped; remaining domains will not be applied.")
+            break
 
     log.info("")
     log.info("=" * 60)
@@ -1844,7 +1788,7 @@ def _run_all_domains(args: argparse.Namespace) -> int:
     for dom, rc, note in results:
         log.log(logging.INFO if rc == 0 else logging.ERROR, "  %-30s %s", dom, note)
     log.info("=" * 60)
-    return 0 if all(rc == 0 for _, rc, _ in results) else 1
+    return 130 if any(rc == 130 for _, rc, _ in results) else (0 if all(rc == 0 for _, rc, _ in results) else 1)
 
 
 def main() -> int:
@@ -1908,14 +1852,9 @@ def main() -> int:
                          "the summary as csv_generic_groups_skipped.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <groups-dir>/../push_report/.")
-    pp.add_argument("--batch-size", type=int, default=None,
-                    help="Interactive batching: pause every N applied updates and prompt to "
-                         "continue (y/Enter), reset-to-1 (n), exit (x), or change to a new size "
-                         "(<number>). When --csv-remap or --intentional-ip-removal is set, "
-                         "defaults to 1 (step through every change). Otherwise defaults to 0 "
-                         "(fully automated). Set to any positive integer to start at that batch "
-                         "size; you can bump higher (or lower) at any prompt during the run. "
-                         "Only takes effect with --apply.")
+    pp.add_argument("--batch-size", type=int, choices=[1], default=1,
+                    help="Apply always starts with 1. Increase the batch size at a checkpoint "
+                         "by entering a positive number; Enter=continue, n=reset, x=stop.")
     pp.add_argument("--intentional-ip-removal", action="store_true",
                     help="Allow this push to REMOVE IPs from groups on the target. Required for "
                          "the decomposition workflow (e.g. pushing the stripped-original bundle "

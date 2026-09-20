@@ -131,6 +131,11 @@ python tools/nsx/list_domains.py "$T"
 
 ## 2) Workflow A: the clone
 
+Logging is always live; capture has no quiet mode. Each apply step starts with
+one object and pauses before the next batch. Enter continues, a positive number
+increases the batch, `n` resets to one, and `x` stops. C and rollback use the
+same controls. Lost input stops the run; dry runs never prompt.
+
 ```bash
 # Dry run, then read the report
 wf --phase a

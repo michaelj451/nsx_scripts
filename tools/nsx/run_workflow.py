@@ -484,6 +484,9 @@ def main() -> int:
         rec = run_step(step["label"], step["cmd"], log_dir)
         records.append(rec)
         roots.extend(step["roots"])
+        if rec["rc"] == 130:
+            log.warning("Operator stopped %s; remaining workflow steps will not run.", step["label"])
+            break
         if not rec["ok"] and not args.continue_on_error:
             log.error("Stopping: %s failed. Re-run after fixing, or pass "
                       "--continue-on-error.", step["label"])
