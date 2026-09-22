@@ -52,7 +52,6 @@ import json
 import logging
 import re
 import shutil
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +60,7 @@ from typing import Any, Dict, List, Tuple
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
+from nsx.streaming import stream_command
 from nsx.cli_bootstrap import init_cli                     # noqa: E402
 from nsx.nsx_constants import nsx_log_dir, resolve_manager  # noqa: E402
 
@@ -170,31 +170,17 @@ def update_latest_symlink(host_dir: Path, bundle: Path) -> None:
 # Step runner
 # =============================================================================
 
-def run_step(label: str, cmd: List[str], logs_dir: Path, verbose: bool) -> Dict[str, Any]:
+def run_step(label: str, cmd: List[str], logs_dir: Path) -> Dict[str, Any]:
     started = _utc_now_iso()
-    log.info("  step %s", label)
-    if verbose:
-        log.info("    cmd: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     step_log = logs_dir / f"{label}.log"
-    step_log.write_text(
-        f"# cmd: {' '.join(cmd)}\n# returncode: {proc.returncode}\n"
-        f"# ---- stdout ----\n{proc.stdout}\n# ---- stderr ----\n{proc.stderr}\n",
-        encoding="utf-8",
-    )
-    ok = proc.returncode == 0
-    if not ok:
-        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-6:])
-        log.error("  STEP FAILED: %s (exit=%d). See %s\n%s", label, proc.returncode, step_log, tail)
-    return {
-        "label": label,
-        "cmd": cmd,
-        "returncode": proc.returncode,
-        "ok": ok,
-        "started_at": started,
-        "finished_at": _utc_now_iso(),
-        "log": str(step_log),
-    }
+    log.info("STEP %s: %s", label, " ".join(cmd))
+    returncode, _ = stream_command(cmd, REPO_ROOT, step_log)
+    log.log(logging.INFO if returncode == 0 else logging.ERROR,
+            "STEP %s: %s (exit=%d); log: %s", label,
+            "OK" if returncode == 0 else "FAILED", returncode, step_log)
+    return {"label": label, "cmd": cmd, "returncode": returncode,
+            "ok": returncode == 0, "started_at": started,
+            "finished_at": _utc_now_iso(), "log": str(step_log)}
 
 
 def backup_one(source: str, output_root: Path, args: argparse.Namespace) -> Dict[str, Any]:
@@ -223,7 +209,7 @@ def backup_one(source: str, output_root: Path, args: argparse.Namespace) -> Dict
                     "bundle.", args.domain_id)
 
     steps = [
-        run_step(label, cmd, logs_dir, verbose=not args.quiet)
+        run_step(label, cmd, logs_dir)
         for label, cmd in plan_steps(
             source, bundle,
             domain_id=args.domain_id,
@@ -321,7 +307,6 @@ def main() -> int:
     p.add_argument("--retain", type=int, default=0,
                    help="Keep only the N newest bundles per host after a clean backup "
                         "(default 0 = keep everything).")
-    p.add_argument("--quiet", action="store_true", help="Less per-step console output.")
     args = p.parse_args()
 
     init_cli()

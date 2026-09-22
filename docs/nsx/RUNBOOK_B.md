@@ -197,9 +197,9 @@ nsx_capture/nsx-lm1.lab.local/
 ├── nsx_export/<host>/                   ← raw NSX policy state
 ├── groups_additive/                     ← export copy (VM-IP freeze is opt-in: --live-query)
 │   └── domains/default/groups/<short>.yaml
-├── segment_inventory/                   ← path → CIDR map (informational; not used by Workflow B)
+├── segment_inventory/                   ← optional (--with-segments); not used by Workflow B
 │   └── segment_details.json
-├── affected_rule_reports/                ← rules ↔ groups impact reference
+├── affected_rule_reports/                ← optional: --impact-report
 ├── vm_tag_inventory/
 └── logs/
 ```
@@ -208,7 +208,7 @@ nsx_capture/nsx-lm1.lab.local/
 
 - `summary.txt` — all sub-steps OK
 - `manifest.json` — `"ok": true`
-- `affected_rule_reports/affected_rules_impact.json` — which rules touch which groups you're about to mutate
+- `affected_rule_reports/affected_rules_impact.json` — which rules reference the captured groups; generated only with `--impact-report`
 
 ---
 
@@ -233,7 +233,7 @@ structure; the scope is a policy choice (a locked static list is safe to
 rewrite mechanically, a generic group may be under dynamic management), not a
 technical limitation.
 
-When `--csv-remap` is in play, `--batch-size` **defaults to 1** so you
+Every apply starts with batch size **1** so you
 step through every change one at a time. Bump higher at any prompt as
 confidence grows (`5`, `25`, `100`, `500` …). Type `n` to reset to 1.
 Type `x` for a clean exit.
@@ -252,11 +252,11 @@ python tools/nsx/groups.py push --target nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --apply
 
-# Or start at a higher batch size and bump from there at prompts
+# Start at one; enter 10 at the first prompt to increase the next batch
 python tools/nsx/groups.py push --target nsx-lm1 \
   --groups-dir nsx_capture/nsx-lm1.lab.local/groups_additive/domains/default/groups \
   --csv-remap data/nonprod_map.csv \
-  --batch-size 10 \
+  --batch-size 1 \
   --apply
 ```
 
@@ -327,14 +327,13 @@ That's a self-contained replayable record per group — diff `ips_before` agains
 | `--bidirectional` | off | With `--csv-remap`: treat each CSV row as a bidirectional mapping |
 | `--remap-generic` | off | With `--csv-remap`: ALSO remap generic groups. Default scope is IP-Addresses-Only groups (`group_type: IPAddress`); generic groups are pushed untouched and counted as `csv_generic_groups_skipped` |
 | `--segments-mode {keep,strip,convert}` | `keep` | For Workflow B, leave at `keep` (default) so segment refs in groups aren't disturbed |
-| `--batch-size N` | `0` (off) | **Interactive batching.** Pauses every `N` applied updates, prints a compact per-group diff (status, +added/-removed IPs, segment/CSV/fabric notes), and prompts. Default `0` = fully automated. Set to `1` to step through every change; bump higher as confidence grows. Only takes effect with `--apply`. See below. |
+| `--batch-size 1` | `1` | Apply always starts at one. Before the next batch, review the completed objects and enter a positive number to increase the size. Starting at another size or disabling checkpoints with `0` is rejected |
 | `--apply` | off | Required to actually mutate. Default is dry-run. |
 
-### Interactive batch mode (`--batch-size N`)
+### Interactive batch mode
 
-Pass `--batch-size N` (any positive integer) to step through the push and
-review what's changing before NSX is allowed to do more. Useful for a
-first-run sanity pass on production-shaped data.
+Every apply starts at one without an extra flag. Review the completed objects
+before allowing the next batch; increase its size at the prompt as needed.
 
 At each prompt the operator can answer:
 
@@ -348,15 +347,15 @@ At each prompt the operator can answer:
 Each batch printout shows one line per applied group:
 
 ```
-[1] netwo-k-6-0   success_patch   +2/-0 IPs   added=[10.7.0.101, 10.7.0.102]  csv_added=2
-[2] vm1           success_patch   +3/-0 IPs   added=[10.7.0.101, 10.7.1.101, 10.7.2.101]  csv_added=3
-[3] vm2           success_patch   +3/-0 IPs   added=[10.7.0.102, 10.7.1.102, 10.7.2.102]  csv_added=3
+Network group 6: success_patch; IPs +2/-0
+VM group 1: success_patch; IPs +3/-0
+VM group 2: success_patch; IPs +3/-0
 ```
 
 Notes:
-- The diff is computed against the auto-captured baseline (state of each group BEFORE the push), so `added=` is exactly what NSX received that wasn't there before.
-- If stdin is not a TTY (piped/non-interactive shell), prompts auto-approve at the current batch size to keep CI/test runs unblocked.
-- The push summary records `interactive_mode`, `interactive_batch_size_initial`, `interactive_batch_size_final`, and `interactive_exit_requested`, plus `interactive_decisions`: the full confidence-ramp history, one record per prompt (`approve` / `resize` / `reset_to_1` / `exit` / `auto_approve_non_tty`, each with UTC timestamp, applied count, and batch size before/after). The same decisions are written to the run log, including the prompt text itself.
+- IP deltas are computed against the captured baseline. Detailed addresses remain in the per-object report.
+- A closed input stream stops the apply; it never auto-approves. `x` also prevents later domains from applying.
+- The push summary records `interactive_mode`, initial/final batch sizes, `interactive_exit_requested`, and `interactive_decisions` (`approve` / `resize` / `reset_to_1` / `exit` / `input_closed`, with timestamps and applied counts). Decisions are also logged live.
 - Re-runs are zero-impact: a group whose diff shows nothing to add is `skipped_no_change` and **no API write is sent at all** (no PUT, no `_revision` bump, no realization cycle). Running the workflow 50 times yields one run of additions and 49 runs of pure GETs; `summary.json` counts these under `csv_no_change_skipped`.
 
 Example:
@@ -584,7 +583,7 @@ nsx_capture/nsx-lm1.lab.local/                     ← capture bundle
 │           ├── failures.json                      ← only if real failures
 │           └── fabric_paths_stripped.json         ← only if any host/edge-TN refs auto-stripped
 ├── segment_inventory/segment_details.json        ← informational; not used by Workflow B
-├── affected_rule_reports/
+├── affected_rule_reports/                         ← optional: --impact-report
 ├── vm_tag_inventory/
 ├── logs/, manifest.json, summary.txt
 ```

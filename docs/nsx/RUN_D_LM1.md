@@ -93,6 +93,10 @@ mode, not a mistake.
 
 ## 1) Capture the source (read-only)
 
+Capture logs stream live with no quiet mode. Every apply and rollback starts at
+one object; Enter continues, a positive number increases the next batch, `n`
+resets to one, and `x` stops. Lost input stops the run. Dry runs never prompt.
+
 **`--live-query` is mandatory.** Without it every tag-only group looks empty, the
 build produces siblings only for groups that already held static IPs, and
 nothing errors. Measured on lm1: 1 sibling without it, 7 with it.
@@ -110,15 +114,16 @@ grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | t
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'` |
-| `vm_ip_index_count` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
 | `groups_changed` | non-zero |
 | `ips_added_total` | non-zero |
 | `groups_errors` | `0`. Non-zero means groups have not realized yet: wait, re-run |
 
-> **The driver's own gate only checks two of these** (`ip_source` and
-> `groups_errors`). On 2026-09-18 an empty source passed it and `d2a` reported
-> "1/1 steps ok" having built zero siblings. Read the three count fields
-> yourself before approving any phase.
+The driver checks capture success, source/domain identity, effective IP mode,
+zero group errors and a successful effective-IP query for every processed group.
+The optional VM index can now be empty. Review the change counts yourself;
+zero additions can mean those IPs were already present in the export.
+The explicit `--ip-report-csv` above enables the optional coverage report.
 
 Then review what the CSV does and does not cover:
 

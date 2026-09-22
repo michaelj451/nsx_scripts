@@ -97,6 +97,10 @@ mode, not a mistake.
 
 ## 1) Capture the source (read-only)
 
+Capture logs stream live with no quiet mode. Every apply and rollback starts at
+one object; Enter continues, a positive number increases the next batch, `n`
+resets to one, and `x` stops. Lost input stops the run. Dry runs never prompt.
+
 **`--live-query` is mandatory.** Without it every tag-only group looks empty, the
 build produces siblings only for groups that already held static IPs, and
 nothing errors. Measured on lm1: 1 sibling without it, 7 with it.
@@ -111,7 +115,7 @@ python tools/nsx/capture_nsx_state.py --source $S --live-query --ip-report-csv $
 $glog = Get-ChildItem "$env:NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log" |
   Sort-Object LastWriteTime | Select-Object -Last 1
 $line = (Select-String -Path $glog -Pattern "Summary:" | Select-Object -Last 1).Line
-foreach ($k in "ip_source","vm_ip_index_count","groups_changed","ips_added_total","groups_errors") {
+foreach ($k in "ip_source","effective_ip_queries","groups_changed","ips_added_total","groups_errors") {
   if ($line -match "${k}.: ([^,}]+)") { "{0,-20} {1}" -f $k, $Matches[1].Trim() }
 }
 ```
@@ -119,15 +123,16 @@ foreach ($k in "ip_source","vm_ip_index_count","groups_changed","ips_added_total
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'` |
-| `vm_ip_index_count` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
 | `groups_changed` | non-zero |
 | `ips_added_total` | non-zero |
 | `groups_errors` | `0`. Non-zero means groups have not realized yet: wait, re-run |
 
-> **The driver's own gate only checks two of these** (`ip_source` and
-> `groups_errors`). On 2026-09-18 an empty source passed it and `d2a` reported
-> "1/1 steps ok" having built zero siblings. Read the three count fields
-> yourself before approving any phase.
+The driver checks capture success, source/domain identity, effective IP mode,
+zero group errors and a successful effective-IP query for every processed group.
+The optional VM index can now be empty. Review the change counts yourself;
+zero additions can mean those IPs were already present in the export.
+The explicit `--ip-report-csv` above enables the optional coverage report.
 
 Then review what the CSV does and does not cover:
 
@@ -386,17 +391,22 @@ $Python = if (Test-Path ".venv/Scripts/python.exe") {
     ".venv/bin/python"
 }
 
-$env:PYTHONPATH = Join-Path $PWD "app"
-$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
-$R = "nsx_avs_runs/lm1_workflow_d_$Stamp"
+$env:PYTHONPATH  = Join-Path $PWD "app"
+$env:NSX_LOG_DIR = Join-Path $PWD "nsx_logs"
+
+$S   = "nsx-lm1"
+$T   = "nsx-lm1"
+$SH  = "nsx-lm1.lab.local"
+$R   = "nsx_avs_runs/${S}_to_${T}"
 $D5R = "$R/d5_preview"
 $CSV = "data/nonprod_map.csv"
 $Appendix = "_avs_ips"
+New-Item -ItemType Directory -Force -Path $R | Out-Null
 
 function wf {
     & $Python tools/nsx/run_workflow.py `
-        --source nsx-lm1 `
-        --target nsx-lm1 `
+        --source $S `
+        --target $T `
         --run-dir $R `
         --appendix $Appendix @args
 }
@@ -413,7 +423,7 @@ if ($LASTEXITCODE -eq 0) {
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/build_sibling_groups.py `
-        --source nsx-lm1 `
+        --source $S `
         --output-base $D5R `
         --domain-id default `
         --appendix $Appendix `
@@ -423,8 +433,8 @@ if ($LASTEXITCODE -eq 0) {
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/run_workflow.py `
-        --source nsx-lm1 `
-        --target nsx-lm1 `
+        --source $S `
+        --target $T `
         --run-dir $D5R `
         --appendix $Appendix `
         --phase d5 --no-capture
@@ -437,6 +447,13 @@ This previews **Workflow D in place on LM1**, proceeding only when the previous 
 - **`d2b`** previews mapped IP additions to pure-IP groups.
 - **`d3`** previews sibling-reference additions to the rules currently on LM1.
 - **`d5`** previews IP removal from tag-side originals. Its extra local build writes under `$D5R`, preserving the earlier bundles and reports under `$R`.
+
+This block sets the same variables as section 0, including `$SH` and
+`$env:NSX_LOG_DIR`, and `$R` is the same stable run directory
+(`nsx_avs_runs/nsx-lm1_to_nsx-lm1`). The review gates in sections 1, 2a and 5a
+and the rollback commands in section 6 therefore work in this session without
+redefining anything. Do not swap `$R` for a timestamped directory: section 6
+pops the revert baselines from the run dir, and a per-run name hides them.
 
 All four use the same source capture. The CSV and suffix match this run card: `data/nonprod_map.csv` and `_avs_ips`.
 

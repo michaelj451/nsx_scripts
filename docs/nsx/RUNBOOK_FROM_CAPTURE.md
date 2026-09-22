@@ -71,12 +71,16 @@ After this single command:
 
 | Path | Purpose |
 |---|---|
-| `nsx_capture/$SRC_HOST/` | Full capture bundle (`nsx_export/`, `groups_additive/`, `segment_inventory/`, etc.) |
+| `nsx_capture/$SRC_HOST/` | Configuration bundle (`nsx_export/`, `groups_additive/`, manifest and logs); segment inventory requires `--with-segments` |
 | `nsx_groups_export/$SRC_HOST/groups/` | Used by WF-A Part 1/2 group pushes |
 | `nsx_services_export/$SRC_HOST/services/` | Used by WF-A services push |
 | `nsx_policies_export/$SRC_HOST/security-policies/` | Used by WF-A policies push |
 | `nsx_rules_export/$SRC_HOST/security-policies/` | Used by WF-A rules push (`_parent_policy_id` auto-injected) |
 | `$NSX_LOG_DIR/groups_ip_report/$SRC_HOST/` | IP-coverage report — CSV match per group |
+
+The explicit `--ip-report-csv` above opts into the IP report. Without it, review
+reports are off by default. Segment inventory, VM tags and VM attribution are
+also skipped unless requested. Add `--live-query` for effective IPs used by C/D.
 
 Disable the flat-exports step if needed:
 
@@ -149,6 +153,9 @@ or 3 unless you have a specific reason — see the warning below.
 | Part 3 (additive, from `groups_additive/`) | `Condition + IPAddressExpression(segment-CIDRs + VM-IPs)` | ✗ creates worse mixing |
 
 ### When you DO want Parts 2 + 3 (alternative mode — not the WF-D path)
+
+Capture with `--live-query --with-segments` using the source credentials before
+this alternative path. Segment details are no longer collected by default.
 
 If you want the target to be a **full functional clone** of the source
 (useful for some lab tests where you need rules to actually match

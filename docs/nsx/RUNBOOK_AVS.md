@@ -173,14 +173,14 @@ not part of this design.
 python tools/nsx/capture_nsx_state.py --source "$SRC" --live-query
 
 # 2b. GATE. All three must be non-zero, and errors must be zero.
-grep -E '"ip_source"|"vm_ip_index_count"|"groups_changed"|"ips_added_total"|"groups_errors"' \
+grep -E '"ip_source"|"effective_ip_queries"|"groups_changed"|"ips_added_total"|"groups_errors"' \
   nsx_capture/$SRC_HOST/logs/2_build_group_ip_additive_from_live_members.log
 ```
 
 | Field | Required |
 |---|---|
 | `ip_source` | `"effective"`. Anything else means a stale or legacy bundle |
-| `vm_ip_index_count` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
 | `groups_changed` | non-zero |
 | `ips_added_total` | non-zero |
 | `groups_errors` | **0**. Non-zero means unrealized groups; see [below](#failure-mode-unrealized-groups) |
@@ -470,6 +470,10 @@ the step log:
 lookups. Output is the source export copied as-is
 vm_ip_index_count: 0   groups_skipped: 12   ips_added_total: 0
 ```
+
+In current captures, a zero VM index alone is normal: VM attribution is opt-in.
+Use `ip_source`, `effective_ip_queries` versus `groups_seen`, and `groups_errors`
+to distinguish a successful effective-IP capture from an offline copy.
 
 WF-C then reports `skipped_empty_ips` for every dynamic group and builds
 siblings only for statically authored IPs.

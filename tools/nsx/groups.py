@@ -65,6 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
@@ -438,77 +439,18 @@ class _InteractiveExit(Exception):
     """Signals operator chose to exit the interactive batch loop cleanly."""
 
 
-def _record_decision(decisions: Optional[List[Dict[str, Any]]], applied_count: int,
-                     decision: str, before: int, after: int) -> None:
-    if decisions is None:
-        return
-    decisions.append({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "applied_count": applied_count,
-        "decision": decision,
-        "batch_size_before": before,
-        "batch_size_after": after,
-    })
-
-
 def _prompt_batch_continue(applied_count: int, current_batch_size: int,
                            decisions: Optional[List[Dict[str, Any]]] = None) -> int:
-    """Prompt after a batch of applied group updates. Returns the batch size
-    to use for the next batch. Every operator decision is logged AND appended
-    to `decisions` so summary.json carries the full confidence-ramp history.
-
-    Allowed responses:
-      y / yes / <Enter>  -> continue at current batch size
-      n / no             -> continue but RESET batch size to 1 (be conservative)
-      <positive number>  -> continue at that new batch size
-      x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
-    """
-    prompt_text = (f"Applied {applied_count} group update(s). "
-                   f"Continue with current batch_size={current_batch_size}? "
-                   f"[Y(es) / n(o, reset to 1) / x(it) / <new size>]: ")
-    while True:
-        # Log the prompt itself so the log file has context for the response.
-        log.info("PROMPT: %s", prompt_text.strip())
-        try:
-            answer = input(f"\n{prompt_text}").strip().lower()
-        except EOFError:
-            # Non-interactive stdin (piped, no TTY): treat as auto-approve
-            log.warning("Non-interactive stdin at batch boundary; auto-approving (batch_size=%d).",
-                        current_batch_size)
-            _record_decision(decisions, applied_count, "auto_approve_non_tty",
-                             current_batch_size, current_batch_size)
-            return current_batch_size
-
-        if answer in ("", "y", "yes"):
-            log.info("Operator approved batch (continue at batch_size=%d) after %d applied update(s).",
-                     current_batch_size, applied_count)
-            _record_decision(decisions, applied_count, "approve",
-                             current_batch_size, current_batch_size)
-            return current_batch_size
-
-        if answer in ("n", "no"):
-            log.warning("Operator chose RESET-TO-1 after %d applied update(s) "
-                        "(was batch_size=%d).", applied_count, current_batch_size)
-            _record_decision(decisions, applied_count, "reset_to_1", current_batch_size, 1)
-            return 1
-
-        if answer in ("x", "exit", "quit", "q"):
-            log.warning("Operator chose EXIT after %d applied update(s).", applied_count)
-            _record_decision(decisions, applied_count, "exit",
-                             current_batch_size, current_batch_size)
-            raise _InteractiveExit(f"Stopped by operator after {applied_count} update(s).")
-
-        try:
-            new_value = int(answer)
-            if new_value <= 0:
-                print("Please enter a positive integer (e.g. 1, 5, 25).")
-                continue
-            log.info("Operator changed batch_size from %d to %d after %d applied update(s).",
-                     current_batch_size, new_value, applied_count)
-            _record_decision(decisions, applied_count, "resize", current_batch_size, new_value)
-            return new_value
-        except ValueError:
-            print("Please enter Y / Enter, n, x, or a positive integer like 1, 5, or 25.")
+    """Compatibility entry point for the shared interactive checkpoint."""
+    batch = ApplyBatch(True, log)
+    batch.size = current_batch_size
+    batch.total = applied_count
+    batch.pending = ["Applied group update"] * current_batch_size
+    if decisions is not None:
+        batch.decisions = decisions
+    if not batch.before_write():
+        raise _InteractiveExit("Stopped at group checkpoint")
+    return batch.size
 
 
 def _is_missing_dependency_error(err_msg: str) -> bool:
@@ -914,6 +856,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_push(args: argparse.Namespace) -> int:
+    batch = ApplyBatch(args.apply, log, getattr(args, "batch_size", None))
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -1017,33 +960,6 @@ def cmd_push(args: argparse.Namespace) -> int:
                  "(read-only, no baseline written) ...", target_host)
         baseline_dict = _capture_target_groups(client, args.domain_id)
         log.info("  Target has %d customer group(s)", len(baseline_dict))
-
-    # Interactive batch state.
-    # Default behaviour:
-    #   --csv-remap set  AND  --batch-size not specified  → batch_size = 1  (step-through)
-    #   --csv-remap unset AND --batch-size not specified  → batch_size = 0  (fully automated)
-    #   --batch-size N explicitly passed                  → batch_size = N
-    if args.batch_size is None:
-        resolved_batch_size = 1 if (args.csv_remap or args.intentional_ip_removal) else 0
-        if (args.csv_remap or args.intentional_ip_removal) and args.apply:
-            reason = "CSV remap" if args.csv_remap else "intentional IP removal"
-            log.info("Auto-defaulting --batch-size to 1 (%s in play; step-through is safer). "
-                     "Bump higher at any prompt as confidence grows; type 'n' to reset to 1; 'x' to exit.",
-                     reason)
-    else:
-        resolved_batch_size = int(args.batch_size)
-    interactive_mode = args.apply and resolved_batch_size > 0
-    batch_size = resolved_batch_size
-    applied_in_batch = 0
-    batch_summary_rows: List[Dict[str, Any]] = []  # rows collected since last prompt
-    interactive_exit_requested = False
-    interactive_decisions: List[Dict[str, Any]] = []   # full confidence-ramp history for summary.json
-    if interactive_mode:
-        log.info("=" * 60)
-        log.info("INTERACTIVE MODE — batch_size=%d. Will prompt after every %d applied update(s).",
-                 batch_size, batch_size)
-        log.info("At each prompt: Y/Enter=continue  n=reset-to-1  x=exit  <number>=change size")
-        log.info("=" * 60)
 
     rows: List[Dict[str, Any]] = []
     ok = 0
@@ -1296,6 +1212,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            if not batch.before_write():
+                break
             try:
                 client.put_group(gid, obj, domain_id=args.domain_id)
                 row["status"] = "success_put"
@@ -1317,37 +1235,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             log.info("[%d/%d  ok=%d fail=%d skip=%d] %s — %s%s",
                      i, len(files), ok, failed, skipped, gid, row["status"], seg_note)
 
-            # ---- Interactive batch boundary ----
-            if interactive_mode:
-                applied_in_batch += 1
-                batch_summary_rows.append(row)
-                if applied_in_batch >= batch_size:
-                    # Print compact per-row summary of the just-applied batch
-                    log.info("=" * 60)
-                    log.info("BATCH REVIEW — %d update(s) just applied:", applied_in_batch)
-                    for j, br in enumerate(batch_summary_rows, start=1):
-                        delta = f"+{len(br.get('ips_added', []))}/-{len(br.get('ips_removed', []))} IPs"
-                        added = _format_entries(br.get("ips_added", []))
-                        notes = []
-                        if br.get("csv_added_count"):
-                            notes.append(f"csv_added={br['csv_added_count']}")
-                        if br.get("segments_converted"):
-                            notes.append(f"segments_converted={br['segments_converted']}")
-                        if br.get("fabric_paths_stripped"):
-                            notes.append(f"fabric_stripped={len(br['fabric_paths_stripped'])}")
-                        notes_str = ("  " + "  ".join(notes)) if notes else ""
-                        log.info("  [%d] %-40s %-18s %-12s added=%s%s",
-                                 j, str(br.get("id"))[:40], br.get("status"), delta, added, notes_str)
-                    log.info("=" * 60)
-                    try:
-                        batch_size = _prompt_batch_continue(applied_in_batch, batch_size,
-                                                            interactive_decisions)
-                    except _InteractiveExit:
-                        interactive_exit_requested = True
-                        rows.append(row)
-                        break
-                    applied_in_batch = 0
-                    batch_summary_rows = []
+            batch.record(row)
 
             time.sleep(THROTTLE_SECONDS)
 
@@ -1388,7 +1276,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     MAX_RETRY_ROUNDS = 5
     retry_round = 0
     retry_attempts = 0
-    while args.apply and retry_round < MAX_RETRY_ROUNDS:
+    while args.apply and not batch.stopped and retry_round < MAX_RETRY_ROUNDS:
         to_retry = [r for r in rows if r.get("status") == "failed_pending_retry"]
         if not to_retry:
             break
@@ -1414,6 +1302,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                     log.error("[retry-%d] %s — could not reload payload: %s", retry_round, gid, e)
                     continue
             try:
+                if not batch.before_write():
+                    break
                 try:
                     client.put_group(gid, obj, domain_id=args.domain_id)
                     row["status"] = "success_put_retry"
@@ -1427,6 +1317,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row.pop("error", None)
                 row.pop("error_type", None)
                 row.pop("traceback", None)
+                batch.record(row)
                 ok += 1
                 failed -= 1
                 progress = True
@@ -1495,12 +1386,9 @@ def cmd_push(args: argparse.Namespace) -> int:
             "csv_no_change_skipped": total_csv_no_change,
             "fabric_paths_stripped": total_fabric_stripped,
             "fabric_groups_affected": total_fabric_groups_affected,
-            "interactive_mode":          interactive_mode,
-            "interactive_batch_size_initial": resolved_batch_size,
-            "interactive_batch_size_final":   batch_size if interactive_mode else 0,
-            "interactive_exit_requested":     interactive_exit_requested,
+            **batch.totals(),
         },
-        "interactive_decisions": interactive_decisions,
+        "interactive_decisions": batch.decisions,
         "baseline_file": str(baseline_path) if baseline_path else None,
         "pushed_ids_file": str(_pushed_ids_path(baseline_path)) if baseline_path else None,
         "pushed_ids_count": len(pushed_ids),
@@ -1578,7 +1466,7 @@ def cmd_push(args: argparse.Namespace) -> int:
              mode, ok, failed, skipped, dry_run_count, len(files),
              args.segments_mode, total_paths_seen, total_converted, total_unresolved,
              total_fabric_stripped, total_fabric_groups_affected)
-    if interactive_exit_requested:
+    if batch.stopped:
         log.warning("INTERACTIVE EXIT — operator stopped after %d applied update(s); "
                     "%d file(s) NOT processed.", ok, len(files) - (ok + failed + skipped + dry_run_count))
 
@@ -1632,7 +1520,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     print(json.dumps(summary, indent=2))
     # Non-zero exit if there were real failures OR operator aborted partway through
     # OR the additive-only contract was violated.
-    return 0 if (failed == 0 and not interactive_exit_requested and contract_ok) else 1
+    return 130 if batch.stopped else (0 if failed == 0 and contract_ok else 1)
 
 
 # =============================================================================
@@ -1640,6 +1528,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_revert(args: argparse.Namespace) -> int:
+    batch = ApplyBatch(args.apply, log)
     target_host = resolve_manager(args.target)
     if not target_host:
         raise SystemExit(f"Target manager not defined: {args.target}")
@@ -1741,12 +1630,15 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     # DELETEs first
     for i, gid in enumerate(to_delete, start=1):
+        if not batch.before_write():
+            break
         try:
             client.delete_group(gid, domain_id=args.domain_id)
             deleted_ok += 1
             log.info("[DELETE %d/%d  ok=%d fail=%d] %s",
                      i, len(to_delete), deleted_ok, deleted_failed, gid)
             rows.append({"action": "delete", "id": gid, "status": "success"})
+            batch.record(rows[-1])
             time.sleep(THROTTLE_SECONDS)
         except Exception as e:
             deleted_failed += 1
@@ -1757,6 +1649,8 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
     # RESTOREs
     for i, (gid, payload) in enumerate(to_restore, start=1):
+        if not batch.before_write():
+            break
         try:
             try:
                 client.put_group(gid, payload, domain_id=args.domain_id)
@@ -1770,6 +1664,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
             restored_ok += 1
             log.info("[RESTORE %d/%d  ok=%d fail=%d] %s",
                      i, len(to_restore), restored_ok, restored_failed, gid)
+            batch.record(rows[-1])
             time.sleep(THROTTLE_SECONDS)
         except Exception as e:
             restored_failed += 1
@@ -1778,17 +1673,21 @@ def cmd_revert(args: argparse.Namespace) -> int:
             rows.append({"action": "restore", "id": gid, "status": "failed",
                          "error": str(e), "error_type": type(e).__name__, "traceback": tb})
 
-    _mark_baseline_reverted(baseline_path)
+    completed = not batch.stopped and restored_failed == 0 and deleted_failed == 0
+    if completed:
+        _mark_baseline_reverted(baseline_path)
 
     summary = {
         "command": "groups.revert",
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "target": {"alias": args.target, "host": target_host,
                    "federation_global": args.federation_global, "domain_id": args.domain_id},
-        "baseline_file": str(baseline_path) + ".reverted",
+        "baseline_file": str(baseline_path) + (".reverted" if completed else ""),
         "scope": args.scope,
-        "pushed_ids_file": (str(pushed_path) + ".reverted") if pushed_ids is not None else None,
+        "pushed_ids_file": (str(pushed_path) + (".reverted" if completed else "")) if pushed_ids is not None else None,
+        "interactive_decisions": batch.decisions,
         "totals": {
+            **batch.totals(),
             "restored_ok": restored_ok, "restored_failed": restored_failed,
             "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
             "deletes_blocked": deletes_blocked,
@@ -1809,7 +1708,7 @@ def cmd_revert(args: argparse.Namespace) -> int:
     log.info("=" * 60)
 
     print(json.dumps(summary, indent=2))
-    return 0 if (restored_failed == 0 and deleted_failed == 0) else 1
+    return 130 if batch.stopped else (0 if completed else 1)
 
 
 # =============================================================================
@@ -1879,6 +1778,9 @@ def _run_all_domains(args: argparse.Namespace) -> int:
             log.exception("DOMAIN %s: unhandled error", dom)
             rc = 1
         results.append((dom, rc, "ok" if rc == 0 else f"rc={rc}"))
+        if rc == 130:
+            log.warning("Operator stopped; remaining domains will not be applied.")
+            break
 
     log.info("")
     log.info("=" * 60)
@@ -1886,7 +1788,7 @@ def _run_all_domains(args: argparse.Namespace) -> int:
     for dom, rc, note in results:
         log.log(logging.INFO if rc == 0 else logging.ERROR, "  %-30s %s", dom, note)
     log.info("=" * 60)
-    return 0 if all(rc == 0 for _, rc, _ in results) else 1
+    return 130 if any(rc == 130 for _, rc, _ in results) else (0 if all(rc == 0 for _, rc, _ in results) else 1)
 
 
 def main() -> int:
@@ -1950,14 +1852,9 @@ def main() -> int:
                          "the summary as csv_generic_groups_skipped.")
     pp.add_argument("--reports-dir", default=None,
                     help="Defaults to <groups-dir>/../push_report/.")
-    pp.add_argument("--batch-size", type=int, default=None,
-                    help="Interactive batching: pause every N applied updates and prompt to "
-                         "continue (y/Enter), reset-to-1 (n), exit (x), or change to a new size "
-                         "(<number>). When --csv-remap or --intentional-ip-removal is set, "
-                         "defaults to 1 (step through every change). Otherwise defaults to 0 "
-                         "(fully automated). Set to any positive integer to start at that batch "
-                         "size; you can bump higher (or lower) at any prompt during the run. "
-                         "Only takes effect with --apply.")
+    pp.add_argument("--batch-size", type=int, choices=[1], default=1,
+                    help="Apply always starts with 1. Increase the batch size at a checkpoint "
+                         "by entering a positive number; Enter=continue, n=reset, x=stop.")
     pp.add_argument("--intentional-ip-removal", action="store_true",
                     help="Allow this push to REMOVE IPs from groups on the target. Required for "
                          "the decomposition workflow (e.g. pushing the stripped-original bundle "

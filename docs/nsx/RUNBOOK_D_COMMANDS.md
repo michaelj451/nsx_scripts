@@ -43,7 +43,7 @@ python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query \
 ```
 
 Gate before building: the additive step must report `ip_source: 'effective'`,
-non-zero `vm_ip_index_count` / `groups_changed` / `ips_added_total`, and
+non-zero `effective_ip_queries` / `groups_changed` / `ips_added_total`, and
 `groups_errors: 0`.
 
 ```bash

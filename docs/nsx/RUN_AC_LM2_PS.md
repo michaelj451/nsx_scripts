@@ -4,6 +4,11 @@ Clone the customer DFW config from `nsx-lm1` to `nsx-lm2` (Workflow A), then
 decompose the tag-based groups on the target into IP-only siblings (Workflow C).
 Both run through the driver, `tools/nsx/run_workflow.py`.
 
+Use **two credential stages**: capture LM1 with its credentials, then manually
+change the shared `NSX_USERNAME` / `NSX_PASSWORD` to LM2's credentials. All A/C
+driver commands after that use saved source files and contact only LM2,
+including verification. No second set of credential variables is needed.
+
 Bash variant: [RUN_AC_LM2.md](RUN_AC_LM2.md). Concepts:
 [RUNBOOK_A.md](RUNBOOK_A.md), [RUNBOOK_C.md](RUNBOOK_C.md),
 [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md).
@@ -28,21 +33,9 @@ Run A first. C replaces WF-A Part 2 and Part 3, so do not run those as well.
 
 ## Before you start
 
-**1. Back up the target.** `nsx-lm2` was empty on 2026-09-18 (0 customer groups,
-0 services, only the two default sections), but take the bundle anyway so the
-rollback has a floor.
-
-```powershell
-python tools/nsx/backup_nsx_state.py --source nsx-lm2 --retain 14
-Get-Content nsx_backup/nsx-lm2.lab.local/latest/summary.txt
-```
-
-**2. Confirm what is on the target now**, so the dry-run verdicts mean what you
-think. Everything the report calls `created` should be absent here.
-
-```powershell
-python tools/nsx/list_domains.py nsx-lm2
-```
+Run these commands from the repository root. Set `NSX_LM1` and `NSX_LM2` in
+`.env` to the correct managers and keep those addresses unchanged when switching
+credentials. Back up and inspect LM2 after the credential switch below.
 
 ---
 
@@ -83,8 +76,14 @@ wf --help | Select-Object -First 3
 
 ## 1) Capture the source (read-only)
 
-The driver re-captures on every dry run, but run it once by hand first so you
-can read the gate yourself.
+Set `NSX_USERNAME` and `NSX_PASSWORD` in `.env` to the **LM1** credentials.
+The driver does not capture for A/C: this is the only source-side stage.
+If those credentials were previously exported in PowerShell, clear the shell
+overrides so each new Python process reads the edited `.env`:
+
+```powershell
+Remove-Item Env:NSX_USERNAME, Env:NSX_PASSWORD -ErrorAction SilentlyContinue
+```
 
 **`--live-query` is mandatory.** It is what splices each group's effective IPs
 into `groups_additive/`, which is the tree Workflow C builds siblings from.
@@ -94,36 +93,68 @@ without it, 7 with it.
 
 ```powershell
 python tools/nsx/capture_nsx_state.py --source $S --live-query
+if ($LASTEXITCODE -ne 0) { throw "LM1 capture failed; stop here." }
 ```
+
+This now skips segment inventory, VM-tag export, VM attribution and optional
+review reports by default. It keeps the configuration, effective-IP evidence
+and flat exports that A/C consume. `vm_ip_index_count: 0` is expected;
+the gate checks effective-IP queries instead. Optional collection flags are
+listed in [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md#1-capture-read-only-source-side).
 
 ### The gate: check all five fields yourself
 
 ```powershell
-$glog = Get-ChildItem "$env:NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log" |
-  Sort-Object LastWriteTime | Select-Object -Last 1
-$line = (Select-String -Path $glog -Pattern "Summary:" | Select-Object -Last 1).Line
-foreach ($k in "ip_source","vm_ip_index_count","groups_changed","ips_added_total","groups_errors") {
-  if ($line -match "${k}.: ([^,}]+)") { "{0,-20} {1}" -f $k, $Matches[1].Trim() }
-}
+Get-Content "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json" |
+  ConvertFrom-Json |
+  Select-Object ip_source, effective_ip_queries, groups_changed, ips_added_total, groups_errors
 ```
 
 | Field | Required |
 |---|---|
 | `ip_source` | `'effective'`. Anything else is a stale or legacy bundle |
-| `vm_ip_index_count` | non-zero |
-| `groups_changed` | non-zero |
-| `ips_added_total` | non-zero |
+| `effective_ip_queries` | non-zero and equal to `groups_seen` |
+| `groups_changed` | Review against expected source membership; 0 may mean no enrichment was needed |
+| `ips_added_total` | Review against expected source membership; 0 may mean IPs were already present |
 | `groups_errors` | `0`. Non-zero means groups have not realized yet: wait, re-run |
 
-> **The driver's own gate only checks two of these** (`ip_source` and
-> `groups_errors`). On 2026-09-18 an empty source passed it: the driver logged
-> "Capture gate passed", WF-A reported "4/4 steps ok", and the report said
-> "Nothing would be changed". A run that exercised nothing looked clean. Read the
-> three count fields with your own eyes before approving a phase.
+The driver checks that this capture succeeded, matches the source/domain,
+uses effective IPs, has zero group errors and queried effective IPs for every processed group.
+Review the change counts yourself against the expected source configuration;
+zero additions can also mean those IPs were already present in the export.
+
+### Switch credentials once, then work only against LM2
+
+Manually edit `.env`: replace `NSX_USERNAME` and `NSX_PASSWORD` with the **LM2**
+credentials. Keep `NSX_LM1` / `NSX_LM2` unchanged. Clear any shell overrides:
+
+```powershell
+Remove-Item Env:NSX_USERNAME, Env:NSX_PASSWORD -ErrorAction SilentlyContinue
+```
+
+Each command below starts a new Python process and reads the updated credentials.
+Keep `nsx_capture/$SH` and the four `nsx_*_export/$SH` source trees unchanged
+through dry run, apply and verification. To refresh LM1 data later, repeat the
+source capture with LM1 credentials, switch back to LM2, and review a new dry run.
+
+Back up and inspect the target with its credentials before applying:
+
+```powershell
+python tools/nsx/backup_nsx_state.py --source $T --retain 14
+if ($LASTEXITCODE -ne 0) { throw "LM2 backup failed; stop here." }
+Get-Content "nsx_backup/$TH/latest/summary.txt"
+python tools/nsx/list_domains.py $T
+```
 
 ---
 
 ## 2) Workflow A: the clone
+
+Logging is always live; capture has no quiet mode. Each apply step starts at
+**one object**, then pauses before writing the next batch. Enter continues;
+type `5` or `10` to increase the next batch, `n` to reset to one, or `x` to
+stop. The same controls apply to C and rollback. Losing terminal input stops
+the run, and dry runs never prompt. API request throttling stays unchanged.
 
 ```powershell
 # Dry run, then read the report
@@ -170,9 +201,8 @@ wf --phase c --apply
 wf --phase c --verify
 ```
 
-The dry run rebuilds the sibling bundle every time, so it always reflects the
-source as it is now. The apply never rebuilds, so it pushes exactly what you
-previewed.
+The dry run rebuilds the sibling bundle from the **saved LM1 capture**, without
+contacting LM1. The apply never rebuilds, so it pushes the bundle you previewed.
 
 ### Review gate
 
@@ -206,8 +236,11 @@ Select-String -Path $blog -Pattern "files seen|siblings written|stripped origina
 ## 4) Verify
 
 Read-only, both phases. `verify_avs_run.py` runs V1 object parity, V2 siblings
-exist, V3 sibling IPs equal the source's effective IPs, V4 originals stripped,
+exist, V3 sibling IPs equal the source's **captured** effective IPs, V4 originals stripped,
 V5 rules reference original or sibling, V6 membership resolves.
+The driver passes `--source-capture` automatically. Only LM2 is queried live;
+the report records the source capture path and timestamp. It does not detect
+changes on LM1 made after capture.
 
 ```powershell
 wf --phase a --verify
@@ -218,11 +251,9 @@ Get-Content "$R/report/c/verify/verify_avs_run.json"
 **V3 is the one that matters most.** It catches a sibling that looks
 structurally fine but is quietly missing addresses.
 
-> Running `--phase a --verify` *after* a WF-C dry run has left a
-> `sibling_map.json` in the run dir makes the verifier run the sibling checks
-> too, and they fail with 404s until WF-C has actually been applied. That is
-> expected, not a clone failure. With no sibling bundle present the verifier runs
-> V1 and V6 alone.
+`--phase a --verify` runs V1 and V6 only, even if you already previewed C.
+`--phase c --verify` requires C's sibling map and runs the sibling checks too;
+run it after applying C.
 
 ---
 
@@ -303,7 +334,10 @@ bundle taken in the preconditions and follow
 backup bundles do not carry `_parent_policy_id`, so restoring rules straight from
 one lands them in a policy that does not exist. The fix is in that doc.
 
-In **PowerShell**, open the `nsx_scripts` folder and paste this. It uses the existing `.venv` on either macOS or Windows:
+## Copy/paste: two-stage A then C dry runs (PowerShell on macOS or Windows)
+
+**Stage 1: pull LM1.** Open the `nsx_scripts` folder. Set `.env`'s
+`NSX_USERNAME` / `NSX_PASSWORD` to **LM1** credentials, then run:
 
 ```powershell
 $Python = if (Test-Path ".venv/Scripts/python.exe") {
@@ -312,25 +346,53 @@ $Python = if (Test-Path ".venv/Scripts/python.exe") {
     ".venv/bin/python"
 }
 
-$env:PYTHONPATH = Join-Path $PWD "app"
-$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
-$R = "nsx_avs_runs/lm1_to_lm2_$Stamp"
+$env:PYTHONPATH  = Join-Path $PWD "app"
+$env:NSX_LOG_DIR = Join-Path $PWD "nsx_logs"
+
+$S  = "nsx-lm1"
+$T  = "nsx-lm2"
+$SH = "nsx-lm1.lab.local"
+$TH = "nsx-lm2.lab.local"
+$R  = "nsx_avs_runs/${S}_to_${T}"
+New-Item -ItemType Directory -Force -Path $R | Out-Null
+
+Remove-Item Env:NSX_USERNAME, Env:NSX_PASSWORD -ErrorAction SilentlyContinue
+& $Python tools/nsx/capture_nsx_state.py --source $S --live-query
+if ($LASTEXITCODE -ne 0) { throw "LM1 capture failed; stop here." }
+```
+
+**Manual switch:** change only `NSX_USERNAME` and `NSX_PASSWORD` in `.env` to
+**LM2** credentials. Keep the same PowerShell session and manager addresses.
+
+**Stage 2: preview A, then C using the saved LM1 files.**
+
+```powershell
+Remove-Item Env:NSX_USERNAME, Env:NSX_PASSWORD -ErrorAction SilentlyContinue
 
 function wf {
     & $Python tools/nsx/run_workflow.py `
-        --source nsx-lm1 `
-        --target nsx-lm2 `
+        --source $S `
+        --target $T `
         --run-dir $R @args
 }
 
 wf --phase a
 
 if ($LASTEXITCODE -eq 0) {
-    wf --phase c --no-capture
+    wf --phase c
 }
 ```
 
-This previews **LM1 → LM2**, running C only if A succeeds. **No NSX configuration changes are applied.**
+This previews **LM1 to LM2**, running C only if A succeeds. **No NSX configuration changes are applied.**
+A/C no longer capture automatically, so `--no-capture` is unnecessary. Normal
+logs remain visible. Both dry runs use LM2 credentials and the saved LM1 capture.
+
+Stage 1 sets the same variables as section 0, including `$SH` and
+`$env:NSX_LOG_DIR`, and `$R` is the same stable run directory
+(`nsx_avs_runs/nsx-lm1_to_nsx-lm2`). So the review gates in sections 1 and 3 and
+the rollback commands in section 5 all work in this session without redefining
+anything. Do not swap `$R` for a timestamped directory: section 5 pops the
+revert baselines from the run dir, and a per-run name hides them.
 
 Reports:
 
@@ -340,3 +402,8 @@ Reports:
 ```
 
 C previews amendments to rules **currently on LM2**; it cannot preview amendments to rules that an unapplied A would create.
+
+For the actual push, remain on LM2 credentials: back up LM2, review A's preview,
+run `wf --phase a --apply`, then `wf --phase a --verify`. Next run a fresh
+`wf --phase c` against the cloned LM2 rules, review it, run
+`wf --phase c --apply`, then `wf --phase c --verify`. Stop on any non-zero exit.

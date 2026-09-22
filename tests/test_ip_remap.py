@@ -375,17 +375,18 @@ class GroupsPushHelpersTests(unittest.TestCase):
         self.assertTrue((out / "remap_report.md").exists())
         self.assertEqual(len(list(out.glob("remap_report_*.md"))), 1)
 
-    def test_batch_prompt_non_tty_auto_approves_and_records(self):
+    def test_batch_prompt_eof_stops_and_records(self):
         import builtins
         def raise_eof(*_): raise EOFError
         original_input = builtins.input
         builtins.input = raise_eof
         try:
             decisions = []
-            self.assertEqual(groups._prompt_batch_continue(5, 10, decisions), 10)
+            with self.assertRaises(groups._InteractiveExit):
+                groups._prompt_batch_continue(5, 10, decisions)
         finally:
             builtins.input = original_input
-        self.assertEqual(decisions[0]["decision"], "auto_approve_non_tty")
+        self.assertEqual(decisions[0]["decision"], "input_closed")
 
 
 if __name__ == "__main__":

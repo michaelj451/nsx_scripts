@@ -24,7 +24,7 @@ dependency order, or just one phase.
 
 | Tool | Used in | Purpose |
 |---|---|---|
-| [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | EXPORT | Orchestrator: raw policy dump + segment inventory + VM-IP snapshot + impact reports |
+| [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | EXPORT | Orchestrator: raw policy dump + segment inventory + VM-IP snapshot + optional impact report (`--impact-report`) |
 | [tools/nsx/services.py](../../tools/nsx/services.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` services |
 | [tools/nsx/groups.py](../../tools/nsx/groups.py) | EXPORT, PUSH 1/2/3, REVERT | `export` / `push` / `revert` groups. Push accepts `--segments-mode {keep,strip,convert}` |
 | [tools/nsx/policies.py](../../tools/nsx/policies.py) | EXPORT, PUSH 1, REVERT | `export` / `push` / `revert` security policies |
@@ -59,7 +59,7 @@ $env:PYTHONPATH = "$PWD\app"
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query   # --live-query freezes VM IPs; REQUIRED for Part 3
+python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query --with-segments   # --live-query freezes VM IPs; REQUIRED for Part 3
 python tools/nsx/services.py    export --source nsx-lm1
 python tools/nsx/groups.py      export --source nsx-lm1
 python tools/nsx/policies.py    export --source nsx-lm1
@@ -114,7 +114,7 @@ Each export bundle writes its own `manifest.json` + `summary.txt` + `logs/` and 
 ### Review gates after EXPORT
 
 - `nsx_capture/<host>/summary.txt` — all five sub-steps OK
-- `nsx_capture/<host>/affected_rule_reports/affected_rules_impact.json` — which rules touch which groups (forensic, optional)
+- `nsx_capture/<host>/affected_rule_reports/affected_rules_impact.json` — which rules touch which groups (generated only with `--impact-report`)
 - Each per-tool `summary.json` shows: `written`, `errors`, `ids_with_special_chars`
 
 ---
@@ -350,8 +350,8 @@ nsx_capture/<source-host>/                     ← capture orchestrator output
 ├── groups_additive/                           ← VM-IP-frozen groups (Part 3 input)
 │   └── domains/default/groups/<short>.yaml
 ├── segment_inventory/segment_details.json     ← path → CIDR map (Parts 2&3 input)
-├── affected_rule_reports/                     ← which rules touch which groups
-├── vm_tag_inventory/                          ← VM tag dump
+├── affected_rule_reports/                     ← optional: --impact-report
+├── vm_tag_inventory/                          ← optional VM tag dump (--with-vm-tags)
 └── logs/, manifest.json, summary.txt
 
 nsx_<class>_export/<source-host>/              ← per-tool exports
