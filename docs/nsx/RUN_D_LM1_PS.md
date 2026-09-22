@@ -391,17 +391,22 @@ $Python = if (Test-Path ".venv/Scripts/python.exe") {
     ".venv/bin/python"
 }
 
-$env:PYTHONPATH = Join-Path $PWD "app"
-$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
-$R = "nsx_avs_runs/lm1_workflow_d_$Stamp"
+$env:PYTHONPATH  = Join-Path $PWD "app"
+$env:NSX_LOG_DIR = Join-Path $PWD "nsx_logs"
+
+$S   = "nsx-lm1"
+$T   = "nsx-lm1"
+$SH  = "nsx-lm1.lab.local"
+$R   = "nsx_avs_runs/${S}_to_${T}"
 $D5R = "$R/d5_preview"
 $CSV = "data/nonprod_map.csv"
 $Appendix = "_avs_ips"
+New-Item -ItemType Directory -Force -Path $R | Out-Null
 
 function wf {
     & $Python tools/nsx/run_workflow.py `
-        --source nsx-lm1 `
-        --target nsx-lm1 `
+        --source $S `
+        --target $T `
         --run-dir $R `
         --appendix $Appendix @args
 }
@@ -418,7 +423,7 @@ if ($LASTEXITCODE -eq 0) {
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/build_sibling_groups.py `
-        --source nsx-lm1 `
+        --source $S `
         --output-base $D5R `
         --domain-id default `
         --appendix $Appendix `
@@ -428,8 +433,8 @@ if ($LASTEXITCODE -eq 0) {
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/run_workflow.py `
-        --source nsx-lm1 `
-        --target nsx-lm1 `
+        --source $S `
+        --target $T `
         --run-dir $D5R `
         --appendix $Appendix `
         --phase d5 --no-capture
@@ -442,6 +447,13 @@ This previews **Workflow D in place on LM1**, proceeding only when the previous 
 - **`d2b`** previews mapped IP additions to pure-IP groups.
 - **`d3`** previews sibling-reference additions to the rules currently on LM1.
 - **`d5`** previews IP removal from tag-side originals. Its extra local build writes under `$D5R`, preserving the earlier bundles and reports under `$R`.
+
+This block sets the same variables as section 0, including `$SH` and
+`$env:NSX_LOG_DIR`, and `$R` is the same stable run directory
+(`nsx_avs_runs/nsx-lm1_to_nsx-lm1`). The review gates in sections 1, 2a and 5a
+and the rollback commands in section 6 therefore work in this session without
+redefining anything. Do not swap `$R` for a timestamped directory: section 6
+pops the revert baselines from the run dir, and a per-run name hides them.
 
 All four use the same source capture. The CSV and suffix match this run card: `data/nonprod_map.csv` and `_avs_ips`.
 

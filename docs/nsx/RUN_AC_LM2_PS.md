@@ -346,12 +346,18 @@ $Python = if (Test-Path ".venv/Scripts/python.exe") {
     ".venv/bin/python"
 }
 
-$env:PYTHONPATH = Join-Path $PWD "app"
-$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
-$R = "nsx_avs_runs/lm1_to_lm2_$Stamp"
+$env:PYTHONPATH  = Join-Path $PWD "app"
+$env:NSX_LOG_DIR = Join-Path $PWD "nsx_logs"
+
+$S  = "nsx-lm1"
+$T  = "nsx-lm2"
+$SH = "nsx-lm1.lab.local"
+$TH = "nsx-lm2.lab.local"
+$R  = "nsx_avs_runs/${S}_to_${T}"
+New-Item -ItemType Directory -Force -Path $R | Out-Null
 
 Remove-Item Env:NSX_USERNAME, Env:NSX_PASSWORD -ErrorAction SilentlyContinue
-& $Python tools/nsx/capture_nsx_state.py --source nsx-lm1 --live-query
+& $Python tools/nsx/capture_nsx_state.py --source $S --live-query
 if ($LASTEXITCODE -ne 0) { throw "LM1 capture failed; stop here." }
 ```
 
@@ -365,8 +371,8 @@ Remove-Item Env:NSX_USERNAME, Env:NSX_PASSWORD -ErrorAction SilentlyContinue
 
 function wf {
     & $Python tools/nsx/run_workflow.py `
-        --source nsx-lm1 `
-        --target nsx-lm2 `
+        --source $S `
+        --target $T `
         --run-dir $R @args
 }
 
@@ -377,9 +383,16 @@ if ($LASTEXITCODE -eq 0) {
 }
 ```
 
-This previews **LM1 → LM2**, running C only if A succeeds. **No NSX configuration changes are applied.**
+This previews **LM1 to LM2**, running C only if A succeeds. **No NSX configuration changes are applied.**
 A/C no longer capture automatically, so `--no-capture` is unnecessary. Normal
 logs remain visible. Both dry runs use LM2 credentials and the saved LM1 capture.
+
+Stage 1 sets the same variables as section 0, including `$SH` and
+`$env:NSX_LOG_DIR`, and `$R` is the same stable run directory
+(`nsx_avs_runs/nsx-lm1_to_nsx-lm2`). So the review gates in sections 1 and 3 and
+the rollback commands in section 5 all work in this session without redefining
+anything. Do not swap `$R` for a timestamped directory: section 5 pops the
+revert baselines from the run dir, and a per-run name hides them.
 
 Reports:
 

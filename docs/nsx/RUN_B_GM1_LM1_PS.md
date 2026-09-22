@@ -363,36 +363,38 @@ $Python = if (Test-Path ".venv/Scripts/python.exe") {
     ".venv/bin/python"
 }
 
-$env:PYTHONPATH = Join-Path $PWD "app"
-$Stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
-$R = "nsx_wfb_runs/gm1_lm1_$Stamp"
+$env:PYTHONPATH  = Join-Path $PWD "app"
+$env:NSX_LOG_DIR = Join-Path $PWD "nsx_logs"
+
+$TS     = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
+$EXP    = "nsx_wfb_runs/_exports/$TS"
 $GM_CSV = "data/subnet_map.csv"
 $LM_CSV = "data/nonprod_map.csv"
 
 & $Python tools/nsx/groups.py export `
     --source nsx-gm1 --federation-global --all-domains `
-    --output-dir "$R/export/nsx-gm1"
+    --output-dir "$EXP/nsx-gm1"
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/groups.py push `
         --target nsx-gm1 --federation-global --all-domains `
-        --groups-dir "$R/export/nsx-gm1" `
+        --groups-dir "$EXP/nsx-gm1" `
         --csv-remap $GM_CSV `
-        --reports-dir "$R/reports/nsx-gm1"
+        --reports-dir "nsx_wfb_runs/nsx-gm1/$TS"
 }
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/groups.py export `
         --source nsx-lm1 `
-        --output-dir "$R/export/nsx-lm1"
+        --output-dir "$EXP/nsx-lm1"
 }
 
 if ($LASTEXITCODE -eq 0) {
     & $Python tools/nsx/groups.py push `
         --target nsx-lm1 `
-        --groups-dir "$R/export/nsx-lm1/groups" `
+        --groups-dir "$EXP/nsx-lm1/groups" `
         --csv-remap $LM_CSV `
-        --reports-dir "$R/reports/nsx-lm1"
+        --reports-dir "nsx_remap_nsx-lm1/$TS"
 }
 ```
 
@@ -400,11 +402,19 @@ This previews **GM1-owned groups across all GM domains**, then **LM1-local group
 
 The CSV selections match this run card: `data/subnet_map.csv` for GM1 and `data/nonprod_map.csv` for LM1. Change `$GM_CSV` or `$LM_CSV` before running if you need a different map.
 
+This block sets `$TS`, `$GM_CSV` and `$LM_CSV` and writes its reports to the
+same paths as the numbered sections: `nsx_wfb_runs/nsx-gm1/$TS` for the GM and
+`nsx_remap_nsx-lm1/$TS` for the LM. The review gates in 1.4 and 2.3 and the
+per-domain revert commands in section 4 therefore work in this session without
+redefining anything. Only the transient export bundles live under `$EXP`, away
+from any capture bundle, so no revert baseline is ever written inside a
+snapshot.
+
 Reports:
 
 ```powershell
-Get-ChildItem -Path "$R/reports/nsx-gm1/*/remap_report.md", `
-    "$R/reports/nsx-lm1/remap_report.md" |
+Get-ChildItem -Path "nsx_wfb_runs/nsx-gm1/$TS/*/remap_report.md", `
+    "nsx_remap_nsx-lm1/$TS/remap_report.md" -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty FullName
 ```
 
