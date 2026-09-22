@@ -7,9 +7,8 @@ Confirms the additive contracts that WF-D promises:
 
   G1  No customer group present in the baseline was deleted from the target.
   G2  No IP present in any baseline group was removed from the target.
-      (Phase 2 forced strip is its own separate validation — this check
-      reflects the pre-Phase-2 additive contract. If Phase 2 was applied,
-      pass --phase-2-applied to limit G2 to groups WITHOUT siblings.)
+      This is absolute: the toolkit has no path that removes an IP from a
+      group, so any loss is a real finding.
   G3  Every Condition / PathExpression entry that was in a baseline group
       is still present in the current target payload (no tag-match or
       segment-ref silently dropped).
@@ -202,10 +201,8 @@ def _ref_to_group_id(ref: str) -> str:
 
 def _check_groups(baseline: Dict[str, Dict[str, Any]],
                   current: Dict[str, Dict[str, Any]],
-                  sibling_map: Dict[str, str],
-                  phase_2_applied: bool) -> List[Dict[str, Any]]:
+                  sibling_map: Dict[str, str]) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
-    pair_originals = set(sibling_map.keys())
 
     for gid, before_g in baseline.items():
         # G1
@@ -218,26 +215,17 @@ def _check_groups(baseline: Dict[str, Dict[str, Any]],
 
         cur_g = current[gid]
 
-        # G2 — IP preservation (unless Phase 2 stripped this exact group)
+        # G2 — IP preservation. Absolute: nothing in this toolkit removes an
+        # IP from a group, so any loss came from somewhere else.
         before_ips = _collect_ips(before_g.get("expression") or [])
         cur_ips    = _collect_ips(cur_g.get("expression") or [])
         missing_ips = sorted(set(before_ips) - set(cur_ips))
         if missing_ips:
-            if phase_2_applied and gid in pair_originals:
-                # Phase 2 explicitly strips IPs from originals whose siblings exist.
-                # That's the only forced-removal path the toolkit offers, so report
-                # it as INFO rather than CRITICAL.
-                findings.append({
-                    "severity": "INFO", "check": "G2_phase2_strip",
-                    "group_id": gid, "msg": f"Phase-2 strip removed {len(missing_ips)} IPs from this group (sibling carries the mapped equivalents).",
-                    "ips_removed": missing_ips,
-                })
-            else:
-                findings.append({
-                    "severity": "CRITICAL", "check": "G2_no_ip_removed",
-                    "group_id": gid, "msg": f"Group lost {len(missing_ips)} IPs since baseline.",
-                    "ips_removed": missing_ips,
-                })
+            findings.append({
+                "severity": "CRITICAL", "check": "G2_no_ip_removed",
+                "group_id": gid, "msg": f"Group lost {len(missing_ips)} IPs since baseline.",
+                "ips_removed": missing_ips,
+            })
 
         # G3 — Condition / PathExpression preservation
         before_conds = _collect_conditions(before_g.get("expression") or [])
@@ -345,11 +333,6 @@ def main() -> int:
                    help="Path to the sibling_map.json from build_sibling_groups.")
     p.add_argument("--rules-baseline", default=None,
                    help="(Optional) Path to a rules baseline JSON for R2 rule-preservation check.")
-    p.add_argument("--phase-2-applied", action="store_true",
-                   help="Set this flag if Phase 2 (--intentional-ip-removal) was applied. "
-                        "G2 will then DOWNGRADE IP-removal findings on tag-side originals "
-                        "(those with siblings) from CRITICAL to INFO, since Phase 2 is the "
-                        "designated path that DOES remove IPs from those groups.")
     p.add_argument("--domain-id", default="default")
     p.add_argument("--federation-global", action="store_true")
     p.add_argument("--output-base", default=None,
@@ -377,7 +360,6 @@ def main() -> int:
     log.info("  Group baseline    : %s", baseline_path)
     log.info("  Sibling map       : %s", sib_map_path)
     log.info("  Rules baseline    : %s", rules_baseline_path or "(none — R2 skipped)")
-    log.info("  Phase 2 applied   : %s", args.phase_2_applied)
     log.info("  Reports           : %s", reports_dir)
     log.info("=" * 60)
 
@@ -396,7 +378,7 @@ def main() -> int:
     log.info("  current customer rules:  %d", len(current_rules))
 
     findings: List[Dict[str, Any]] = []
-    findings.extend(_check_groups(baseline, current_groups, sibling_map, args.phase_2_applied))
+    findings.extend(_check_groups(baseline, current_groups, sibling_map))
     findings.extend(_check_rules(current_rules, sibling_map, rules_baseline_path))
 
     by_sev: Dict[str, int] = {"CRITICAL": 0, "WARNING": 0, "INFO": 0}
@@ -414,7 +396,6 @@ def main() -> int:
         "overall":      overall,
         "baseline":     str(baseline_path),
         "sibling_map":  str(sib_map_path),
-        "phase_2_applied": args.phase_2_applied,
         "counts": {
             "baseline_groups":  len(baseline),
             "current_groups":   len(current_groups),

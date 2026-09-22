@@ -72,7 +72,6 @@ export TGT_HOST=nsx-lm3.lab.local      # amend-refs writes its baseline here
 export RUN=nsx_avs_runs/v2             # bump per run: v1, v2, ...
 export GM2LM=nsx_gm_to_lm/$GM_HOST     # Phase 1 transformed bundles
 export SIB=$RUN/nsx_sibling_groups/$SRC_HOST
-export STRIP=$RUN/nsx_stripped_groups/$SRC_HOST
 export DRY=$RUN/dryrun
 export REPORT=$RUN/report
 
@@ -88,7 +87,7 @@ echo "run starts $RUN_START -> $RUN"
 ```
 
 Keeping `$RUN` distinct per run matters: `build_sibling_groups.py
---output-base "$RUN"` puts each run's siblings, stripped originals, push
+--output-base "$RUN"` puts each run's siblings, push
 reports and baselines in their own tree, so a later revert cannot pick up an
 older run's baseline.
 
@@ -242,10 +241,6 @@ nothing; confirm against 3a rather than assuming.
 # 3d. Push siblings (additive, creates new objects)
 python tools/nsx/groups.py push --target "$TGT" --groups-dir "$SIB/groups" --apply
 
-# 3e. Strip IPs from tag-side originals (the only destructive step)
-python tools/nsx/groups.py push --target "$TGT" --groups-dir "$STRIP/groups" \
-  --intentional-ip-removal --apply
-
 # 3f. Amend rules: original OR sibling
 python tools/nsx/rules.py amend-refs --target "$TGT" \
   --sibling-map "$SIB/sibling_map.json" --apply
@@ -270,7 +265,6 @@ python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$EXP_GRP" --seg
 python tools/nsx/policies.py push --target "$TGT" --policies-dir "$EXP_POL" > $DRY/3_policies.json 2>$DRY/3_policies.log
 python tools/nsx/rules.py    push --target "$TGT" --rules-dir    "$EXP_RUL" > $DRY/4_rules.json 2>$DRY/4_rules.log
 python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$SIB/groups" --diff-target > $DRY/5_siblings.json 2>$DRY/5_siblings.log
-python tools/nsx/groups.py   push --target "$TGT" --groups-dir  "$STRIP/groups" --intentional-ip-removal --diff-target > $DRY/6_stripped.json 2>$DRY/6_stripped.log
 python tools/nsx/rules.py    amend-refs --target "$TGT" --sibling-map "$SIB/sibling_map.json" > $DRY/7_amend.json 2>$DRY/7_amend.log
 
 for f in $DRY/*.json; do
@@ -285,7 +279,7 @@ would add or remove and reports `total_ips_removed: 0` even when the apply
 removes some. `--diff-target` adds one read-only pass over the target and fills
 in `ips_before` / `ips_after` / `ips_added` / `ips_removed` on every row, makes
 the summary total truthful, and logs a warning for any group that would lose
-IPs without `--intentional-ip-removal`.
+IPs, which the apply then refuses outright.
 
 Measured on the reference run, same bundle and same target:
 
@@ -315,7 +309,7 @@ python tools/nsx/report_avs_run.py \
   --report-root nsx_policies_export/$SRC_HOST \
   --report-root nsx_rules_export/$SRC_HOST \
   --report-root nsx_rules_export/$TGT_HOST \
-  --report-root "$SIB" --report-root "$STRIP" \
+  --report-root "$SIB" \
   --out-dir "$REPORT/dryrun" --since "$RUN_START" \
   --label "PRE-APPLY dry run: $SRC to $TGT"
 ```
@@ -330,7 +324,7 @@ python tools/nsx/report_avs_run.py \
   --report-root nsx_policies_export/$SRC_HOST \
   --report-root nsx_rules_export/$SRC_HOST \
   --report-root nsx_rules_export/$TGT_HOST \
-  --report-root "$SIB" --report-root "$STRIP" \
+  --report-root "$SIB" \
   --out-dir "$REPORT/apply" --since "$RUN_START" \
   --label "APPLIED: $SRC to $TGT"
 ```
@@ -342,8 +336,8 @@ failed, so it gates a pipeline.
 
 Add `--workflow d` on a WF-D run. WF-C and WF-D push from the same bundle
 directories, so the path alone cannot say which ran, and the flag is what picks
-the phase labels (`D2a siblings` / `D2b pure-ip` / `D3 amend-refs` /
-`D5 stripped` instead of WF-C's). It defaults to the WF-C labels.
+the phase labels (`D2a siblings` / `D2b pure-ip` / `D3 amend-refs` instead of
+WF-C's). It defaults to the WF-C labels.
 `run_workflow.py` passes it for you.
 
 The report's mode banner comes from each push tool's own `summary.json`
@@ -364,7 +358,6 @@ Read-only, six checks, exit 0 only when all pass:
 | V1 | every source object exists on the target (groups, services, policies, rules) |
 | V2 | every sibling in `sibling_map.json` exists on the target |
 | V3 | each sibling's IPs equal the **source group's effective IPs**, exactly |
-| V4 | each stripped original has no `IPAddressExpression` left |
 | V5 | every rule referencing an original also references its sibling |
 | V6 | every target group's membership resolves (nothing left unrealized) |
 
@@ -382,10 +375,6 @@ Reverse order. Each phase pops its own baseline, so run these against the
 # 5a. amend-refs (restores each rule's pre-amend payload)
 python tools/nsx/rules.py revert --target "$TGT" \
   --reports-dir nsx_rules_export/$TGT_HOST/push_report --apply
-
-# 5b. stripped originals (restores the mixed tag+IP payload)
-python tools/nsx/groups.py revert --target "$TGT" \
-  --reports-dir "$STRIP/push_report" --apply
 
 # 5c. siblings. --allow-delete IS REQUIRED, see below.
 python tools/nsx/groups.py revert --target "$TGT" \

@@ -10,12 +10,8 @@ into two sibling artifacts:
        Contains ONLY the captured IPAddressExpression — no Conditions, no
        PathExpressions, no tags.
 
-  2. nsx_stripped_groups/<host>/groups/<gid>.yaml
-       The original group, but with IPAddressExpression entries REMOVED.
-       Conditions / PathExpressions / tags / display_name all untouched.
-
 Plus a machine-readable map for downstream rule-amend step:
-  3. nsx_sibling_groups/<host>/sibling_map.json
+  2. nsx_sibling_groups/<host>/sibling_map.json
        { "original_id": "...", "sibling_id": "...", ... } per row.
 
 INPUTS:
@@ -28,10 +24,8 @@ INPUTS:
 OPTIONS:
   --appendix <str>     Override the sibling-id suffix. Defaults to
                        OBJECT_APPENDIX from .env (e.g. "_sibling").
-  --output-base <dir>  Root for the two output bundles. Default:
-                       repo root (so outputs land at
-                       nsx_sibling_groups/<host>/ and
-                       nsx_stripped_groups/<host>/).
+  --output-base <dir>  Root for the output bundles. Default: repo root
+                       (so outputs land at nsx_sibling_groups/<host>/).
   --include-empty      Also emit siblings for tagged groups whose captured
                        IPAddressExpression is empty (zero IPs). Default
                        off — pointless siblings are skipped.
@@ -209,43 +203,6 @@ def _collect_ips(expression: List[Any]) -> List[str]:
     return out
 
 
-def _strip_ip_expressions(expression: List[Any]) -> List[Any]:
-    """Recursively remove IPAddressExpression entries at any depth. Empty
-    NestedExpressions (those that contained only IPs) are dropped entirely
-    so they don't leave a hollow shell behind. Orphan ConjunctionOperators
-    inside surviving NestedExpressions are cleaned up locally."""
-    out: List[Any] = []
-    for e in expression or []:
-        if _is_ip_expression(e):
-            continue
-        if _is_nested_expression(e):
-            cleaned = _strip_orphan_operators(_strip_ip_expressions(e.get("expressions") or []))
-            if not cleaned:
-                continue  # nested expression went empty — drop it
-            new_e = dict(e)
-            new_e["expressions"] = cleaned
-            out.append(new_e)
-            continue
-        out.append(e)
-    return out
-
-
-def _strip_orphan_operators(expression: List[Any]) -> List[Any]:
-    """Drop leading/trailing/back-to-back ConjunctionOperators that became
-    orphans after stripping IPAddressExpression neighbors."""
-    out: List[Any] = []
-    prev_was_op = True   # treat list-start as "after-operator" so leading op gets dropped
-    for e in expression:
-        is_op = isinstance(e, dict) and e.get("resource_type") == "ConjunctionOperator"
-        if is_op and prev_was_op:
-            continue
-        out.append(e)
-        prev_was_op = is_op
-    while out and isinstance(out[-1], dict) and out[-1].get("resource_type") == "ConjunctionOperator":
-        out.pop()
-    return out
-
-
 def load_manual_ips(groups_dir: Path, domain_id: str) -> Dict[str, List[str]]:
     """Map group id -> the addresses typed into that group by hand.
 
@@ -298,8 +255,8 @@ def split_group(
     skip_segment_groups: bool = False,
     skip_uncovered: bool = False,
     manual_ips: Optional[List[str]] = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
-    """Decompose one group into (sibling_payload, stripped_original_payload, info).
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Decompose one group into (sibling_payload, info).
 
     `info` is always a dict with these keys:
         source_id            : the original group id
@@ -355,12 +312,12 @@ def split_group(
     }
     if not orig_id:
         info["skip_reason"] = "no_id"
-        return None, None, info
+        return None, info
 
     expression = orig_group.get("expression") or []
     if not isinstance(expression, list):
         info["skip_reason"] = "no_id"
-        return None, None, info
+        return None, info
 
     has_condition = _has_condition_anywhere(expression)
     has_path      = _has_path_expression_anywhere(expression)
@@ -376,18 +333,18 @@ def split_group(
     # Gate 0 (WF-D): skip any group with a PathExpression at any depth.
     if skip_segment_groups and has_path:
         info["skip_reason"] = "segment_group"
-        return None, None, info
+        return None, info
 
     # Gate 1: must have a Condition somewhere — unless --include-pure-ip
     # relaxes this so pure-IP groups can produce siblings too.
     if not has_condition and not include_pure_ip:
         info["skip_reason"] = "no_condition"
-        return None, None, info
+        return None, info
 
     # Gate 2: must have at least one IP — unless --include-empty relaxes it.
     if not src_ips and not include_empty:
         info["skip_reason"] = "empty_ips"
-        return None, None, info
+        return None, info
 
     # CSV mapping (optional): the sibling carries the mapped equivalents, PLUS
     # a verbatim copy of every address an operator typed into the group by hand.
@@ -402,12 +359,12 @@ def split_group(
         info["ips_uncovered"] = uncovered
         if skip_uncovered and uncovered:
             info["skip_reason"] = "uncovered_ips"
-            return None, None, info
+            return None, info
         copied = [ip for ip in (manual_ips or []) if ip not in mapped_ips]
         info["ips_manual_copied"] = copied
         if not mapped_ips and not copied:
             info["skip_reason"] = "no_mapped_ips"
-            return None, None, info
+            return None, info
         sibling_ips = mapped_ips + copied
     else:
         sibling_ips = list(src_ips)
@@ -434,14 +391,7 @@ def split_group(
         ],
     })
 
-    # Stripped original: same payload sans IPAddressExpression entries at any
-    # depth (NestedExpression bodies are also descended into and cleaned).
-    # Orphan ConjunctionOperators left after IP removal are dropped.
-    new_expression = _strip_ip_expressions(expression)
-    new_expression = _strip_orphan_operators(new_expression)
-    stripped = _sanitize({**orig_group, "expression": new_expression})
-
-    return sibling, stripped, info
+    return sibling, info
 
 
 # =============================================================================
@@ -530,7 +480,7 @@ def _resolve_input(args: argparse.Namespace) -> Tuple[Path, str]:
 def main() -> int:
     p = argparse.ArgumentParser(
         description=("Offline transform: decompose tagged groups (with captured "
-                     "IPs) into IP-only sibling groups + stripped originals. "
+                     "IPs) into IP-only sibling groups. "
                      "Read-only against NSX.")
     )
     src = p.add_mutually_exclusive_group(required=True)
@@ -557,7 +507,7 @@ def main() -> int:
                         f"(currently {ENV_APPENDIX!r}).")
     p.add_argument("--output-base", default=None,
                    help="Output root. Default: repo root (so "
-                        "nsx_sibling_groups/<host>/ and nsx_stripped_groups/<host>/ "
+                        "nsx_sibling_groups/<host>/ "
                         "land beside the existing bundles).")
     p.add_argument("--include-empty", action="store_true",
                    help="Also emit siblings for tagged groups whose captured IPs "
@@ -586,12 +536,6 @@ def main() -> int:
                         "expression (top-level or nested). WF-D's safety default "
                         "for never touching segment-related groups on a live prod "
                         "target. Skipped groups are recorded in reports/skipped_segments.json.")
-    p.add_argument("--no-stripped-originals", action="store_true",
-                   help="Do NOT write the nsx_stripped_groups/<host>/ bundle. "
-                        "WF-D uses this — the prod path never pushes the strip step, "
-                        "so producing the bundle is wasted work + extra cleanup. "
-                        "WF-C should NOT use this (it needs the stripped originals "
-                        "for step 4).")
     p.add_argument("--copy-manual-ips", action=argparse.BooleanOptionalAction, default=True,
                    help="With --csv-remap, copy addresses typed into the group by hand "
                         "(its own static IPAddressExpression entries) into the sibling "
@@ -635,28 +579,22 @@ def main() -> int:
 
     output_base = Path(args.output_base).expanduser().resolve() if args.output_base else REPO_ROOT
     sibling_root      = output_base / "nsx_sibling_groups"  / label
-    stripped_root     = output_base / "nsx_stripped_groups" / label
     pure_ip_remap_root = output_base / "nsx_pure_ip_remap"  / label
     # Carry the label forward so log/manifest reads use it consistently.
     source_host = label
 
     # Wipe previous run's output dirs (idempotent — they're regenerable).
-    # When --no-stripped-originals is set, we still wipe the stripped dir so
-    # an old WF-C bundle doesn't get accidentally pushed during a WF-D run.
-    dirs_to_prepare = [sibling_root, pure_ip_remap_root]
-    if not args.no_stripped_originals:
-        dirs_to_prepare.append(stripped_root)
-    for d in dirs_to_prepare:
+    # Any nsx_stripped_groups/ dir from before this tool stopped emitting one
+    # is removed too, so a stale bundle can never be mistaken for fresh output.
+    legacy_stripped_root = output_base / "nsx_stripped_groups" / label
+    if legacy_stripped_root.exists():
+        shutil.rmtree(legacy_stripped_root)
+    for d in [sibling_root, pure_ip_remap_root]:
         if d.exists():
             shutil.rmtree(d)
         (d / "groups").mkdir(parents=True, exist_ok=True)
-    # If WF-D suppressed the stripped bundle, also wipe any stale dir on disk
-    # so a previous run's artifact isn't mistaken for fresh output.
-    if args.no_stripped_originals and stripped_root.exists():
-        shutil.rmtree(stripped_root)
 
     sibling_groups_dir      = sibling_root      / "groups"
-    stripped_groups_dir     = stripped_root     / "groups"
     pure_ip_remap_groups_dir = pure_ip_remap_root / "groups"
     reports_dir = sibling_root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -668,10 +606,6 @@ def main() -> int:
     log.info("  Groups input      : %s", groups_in)
     log.info("  Appendix          : %s", appendix)
     log.info("  Sibling bundle    : %s", sibling_root)
-    if args.no_stripped_originals:
-        log.info("  Stripped bundle   : (suppressed by --no-stripped-originals)")
-    else:
-        log.info("  Stripped bundle   : %s", stripped_root)
     log.info("  Include empty     : %s", args.include_empty)
     log.info("  Include pure-IP   : %s", args.include_pure_ip)
     log.info("  Skip segments     : %s", args.skip_segment_groups)
@@ -687,7 +621,6 @@ def main() -> int:
     counted = {
         "files_seen": 0,
         "siblings_written": 0,
-        "stripped_written": 0,
         "pure_ip_remap_written": 0,
         "skipped_no_condition": 0,
         "skipped_empty_ips": 0,
@@ -727,7 +660,7 @@ def main() -> int:
         # back-compat). Pure-IP groups are NEVER decomposed into siblings
         # any more; they are emitted to the pure_ip_remap bundle instead so
         # `groups.py push --csv-remap` can add mapped IPs in place.
-        sibling, stripped, info = split_group(
+        sibling, info = split_group(
             orig,
             appendix=appendix,
             include_empty=args.include_empty,
@@ -825,15 +758,8 @@ def main() -> int:
         if info["ips_uncovered"]:
             counted["total_uncovered_ips"] += len(info["ips_uncovered"])
 
-        str_path: Optional[Path] = None
-        if not args.no_stripped_originals:
-            str_path = stripped_groups_dir / f"{short_id_filename(orig_id)}.yaml"
-            _write_yaml(str_path, stripped)
-            counted["stripped_written"] += 1
-
-        log.info("[%d] %s → sibling %s (+%d IPs)%s%s%s",
+        log.info("[%d] %s → sibling %s (+%d IPs)%s%s",
                  counted["files_seen"], orig_id, sibling_id, len(info["ips_sibling"]),
-                 f"  •  stripped original written" if str_path else "",
                  f"  •  source had {len(info['ips_source'])} IPs, mapped to {len(info['ips_sibling'])}"
                  if csv_mapping is not None and len(info['ips_source']) != len(info['ips_sibling']) else "",
                  f"  •  {len(info['ips_uncovered'])} uncovered" if info['ips_uncovered'] else "")
@@ -843,7 +769,6 @@ def main() -> int:
             "id":                  orig_id,
             "sibling_id":          sibling_id,
             "sibling_file":        str(sib_path),
-            "stripped_file":       str(str_path) if str_path else None,
             "ip_count_source":     len(info["ips_source"]),
             "ip_count_sibling":    len(info["ips_sibling"]),
             "ips_source":          info["ips_source"],
@@ -929,13 +854,11 @@ def main() -> int:
         "include_pure_ip": args.include_pure_ip,
         "skip_segment_groups": args.skip_segment_groups,
         "skip_uncovered": args.skip_uncovered,
-        "no_stripped_originals": args.no_stripped_originals,
         "csv_remap": csv_path_resolved,
         "counts": counted,
         "rows": rows,
         "paths": {
             "sibling_bundle": str(sibling_root),
-            "stripped_bundle": str(stripped_root) if not args.no_stripped_originals else None,
             "pure_ip_remap_bundle": str(pure_ip_remap_root),
             "sibling_map": str(sibling_map_path),
             "skipped_segments_report": str(reports_dir / "skipped_segments.json"),
@@ -945,19 +868,12 @@ def main() -> int:
     }
     (sibling_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True),
                                                 encoding="utf-8")
-    if not args.no_stripped_originals:
-        (stripped_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True),
-                                                     encoding="utf-8")
 
     log.info("=" * 60)
     log.info("BUILD SIBLING GROUPS — complete")
     log.info("  files seen               : %d", counted["files_seen"])
     log.info("  siblings written         : %d  (total IPs in siblings: %d)",
              counted["siblings_written"], counted["total_ips_in_siblings"])
-    if args.no_stripped_originals:
-        log.info("  stripped originals       : (suppressed by --no-stripped-originals)")
-    else:
-        log.info("  stripped originals       : %d", counted["stripped_written"])
     log.info("  skipped: no Condition    : %d", counted["skipped_no_condition"])
     log.info("  skipped: empty IPs       : %d", counted["skipped_empty_ips"])
     log.info("  skipped: segment groups  : %d  (see reports/skipped_segments.json)", counted["skipped_segment_groups"])
@@ -974,7 +890,6 @@ def main() -> int:
 
     print(json.dumps({
         "sibling_bundle": str(sibling_root),
-        "stripped_bundle": str(stripped_root) if not args.no_stripped_originals else None,
         "sibling_map": str(sibling_map_path),
         "counts": counted,
     }, indent=2))

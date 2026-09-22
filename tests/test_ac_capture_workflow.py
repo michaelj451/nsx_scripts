@@ -223,7 +223,10 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(connected, ["lm2.test"])
         self.assertEqual(report["source_mode"], "capture")
         self.assertEqual(report["source_captured_at"], self.manifest["captured_at"])
-        self.assertEqual({r["check"] for r in report["checks"]}, {"V1", "V2", "V3", "V4", "V5", "V6"})
+        # V4 (originals carry no IPAddressExpression) was removed with the IP
+        # strip: the toolkit no longer removes an IP from any group, so the
+        # tag-side originals keep theirs and there is nothing to assert.
+        self.assertEqual({r["check"] for r in report["checks"]}, {"V1", "V2", "V3", "V5", "V6"})
 
     def test_verification_fails_wrong_ips_and_missing_rules(self):
         rc, _, report = self.run_verify(ips=["10.0.0.99"])

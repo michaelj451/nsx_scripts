@@ -61,8 +61,7 @@ python tools/nsx/build_sibling_groups.py `
   --source nsx-lm1 `
   --appendix $env:OBJECT_APPENDIX_AVS `
   --csv-remap data/nonprod_map.csv `
-  --skip-segment-groups `
-  --no-stripped-originals
+  --skip-segment-groups
 ```
 
 Manually entered IPs (the group's own IPAddressExpression entries) are
@@ -82,7 +81,6 @@ python tools/nsx/build_sibling_groups.py `
   --appendix $env:OBJECT_APPENDIX_AVS `
   --csv-remap data/nonprod_map.csv `
   --skip-segment-groups `
-  --no-stripped-originals `
   --skip-uncovered
 ```
 
@@ -149,47 +147,7 @@ python tools/nsx/validate_wf_d.py `
   --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json
 ```
 
-Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit code: `0` = all pass, `1` = at least one CRITICAL finding. Add `--phase-2-applied` after step 5 has run. Add `--rules-baseline <path>` for the R2 check.
-
----
-
-## 5. Phase 2 forced strip (OPTIONAL, FORCED — separate change window)
-
-**REMOVES IPs from tag-side originals.** Gated by `--intentional-ip-removal`. Run only after step 2a + 3 are validated and CAB approves the strip.
-
-### 5a. Rebuild bundle WITH stripped originals (omit `--no-stripped-originals`)
-
-```powershell
-python tools/nsx/build_sibling_groups.py `
-  --source nsx-lm1 `
-  --appendix $env:OBJECT_APPENDIX_AVS `
-  --csv-remap data/nonprod_map.csv `
-  --skip-segment-groups
-```
-
-### 5b. Push stripped originals (force flag required)
-
-```powershell
-# Dry-run
-python tools/nsx/groups.py push --target nsx-lm1 `
-  --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups `
-  --intentional-ip-removal
-
-# Apply
-python tools/nsx/groups.py push --target nsx-lm1 `
-  --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups `
-  --intentional-ip-removal --apply
-```
-
-### 5c. Re-validate with Phase-2 awareness
-
-```powershell
-python tools/nsx/validate_wf_d.py `
-  --target nsx-lm1 `
-  --baseline nsx_sibling_groups/nsx-lm1.lab.local/push_report/baselines/<ts>_target_baseline.json `
-  --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json `
-  --phase-2-applied
-```
+Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit code: `0` = all pass, `1` = at least one CRITICAL finding. Add `--rules-baseline <path>` for the R2 check.
 
 ---
 
@@ -198,10 +156,6 @@ python tools/nsx/validate_wf_d.py `
 Revert in reverse to avoid dangling rule refs (NSX 409s on DELETE if rules still reference the sibling).
 
 ```powershell
-# 5 — restore IPs to tag-side originals
-python tools/nsx/groups.py revert --target nsx-lm1 `
-  --reports-dir nsx_stripped_groups/nsx-lm1.lab.local/push_report --apply
-
 # 3 — remove sibling refs from rules
 python tools/nsx/rules.py revert --target nsx-lm1 `
   --reports-dir nsx_rules_export/nsx-lm1.lab.local/push_report --apply

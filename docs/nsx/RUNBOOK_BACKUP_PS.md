@@ -43,4 +43,4 @@ python tools/nsx/policies.py push --target nsx-lm1 `
 
 Same safety notes as the main runbook: every apply captures a baseline,
 group deletes stay blocked without `--allow-delete`, and a restore that would
-remove IPs requires `--intentional-ip-removal` after reviewing the diff.
+remove IPs is refused outright, with no override.

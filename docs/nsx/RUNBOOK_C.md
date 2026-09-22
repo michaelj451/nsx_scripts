@@ -19,9 +19,10 @@ the **rule** level rather than mixed inside one group's expression.
 The sibling name is `<original_id><OBJECT_APPENDIX>` where `OBJECT_APPENDIX`
 is read from `.env` (e.g. `_sibling`). Override per run with `--appendix`.
 
-Everything is **strict-additive** except the explicit "strip IPs out of
-tagged originals" step, which is gated behind `--intentional-ip-removal`
-on `groups.py push`.
+Everything is **strict-additive**. Nothing in this workflow removes an IP from
+a group: the tagged originals keep their addresses and their criteria, and each
+rule ends up referencing the original AND its sibling, so membership is the
+union of the two.
 
 ---
 
@@ -67,7 +68,7 @@ detected — useful for CI gates.
 | **(a) Realign lm2 to current lm1** | Capture lm1 fresh → run WF-C normally with `--source nsx-lm1`. Any drift on lm2 gets overwritten with whatever's on lm1 now |
 | **(b) Preserve lm2's current IPs, just decompose them** | Export lm2 fresh (`groups.py export --source nsx-lm2`), then transform from that: `build_sibling_groups.py --groups-dir nsx_groups_export/nsx-lm2.lab.local/groups`. The siblings end up with whatever IPs lm2 already has, regardless of lm1 |
 
-## Pipeline (5 steps)
+## Pipeline (4 steps)
 
 > **Step 1 must use `--live-query`.** It is what splices each group's effective
 > IPs into `groups_additive/`, which is the tree step 2 reads. Without it every
@@ -80,14 +81,11 @@ detected — useful for CI gates.
         ↓
 2) build_sibling_groups.py                                  (offline transform)
         produces nsx_sibling_groups/<host>/groups/         (new IP-only groups)
-                 nsx_stripped_groups/<host>/groups/        (originals minus IPs)
                  nsx_sibling_groups/<host>/sibling_map.json
         ↓
 3) groups.py push   (sibling groups → target, additive)
         ↓
-4) groups.py push   (stripped originals → target, --intentional-ip-removal)
-        ↓
-5) rules.py amend-refs   (per rule, append sibling alongside the original)
+4) rules.py amend-refs   (per rule, append sibling alongside the original)
 ```
 
 Steps 3, 4, and 5 each capture a baseline and are independently revertible.
@@ -99,8 +97,8 @@ Steps 3, 4, and 5 each capture a baseline and are independently revertible.
 | Tool | Phase | Purpose |
 |---|---|---|
 | [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | 1 | Use `--live-query` for `groups_additive/` and effective-IP evidence. Segment inventory, VM tags, VM attribution and review reports are off by default; C does not need them |
-| [tools/nsx/build_sibling_groups.py](../../tools/nsx/build_sibling_groups.py) | 2 | **NEW** — offline transform. Decomposes tag+IP groups into IP-only sibling + stripped original. Outputs two bundles + sibling_map.json |
-| [tools/nsx/groups.py](../../tools/nsx/groups.py) `push` | 3, 4 | Existing push tool. Step 3 is plain additive. Step 4 requires `--intentional-ip-removal` to allow IPs being removed from the originals |
+| [tools/nsx/build_sibling_groups.py](../../tools/nsx/build_sibling_groups.py) | 2 | **NEW** — offline transform. Derives an IP-only sibling from each tag+IP group. Outputs the sibling bundle + sibling_map.json |
+| [tools/nsx/groups.py](../../tools/nsx/groups.py) `push` | 3 | Existing push tool, plain additive. It refuses any row whose diff would remove an IP |
 | [tools/nsx/rules.py](../../tools/nsx/rules.py) `amend-refs` | 5 | **NEW** subcommand. For every customer rule on the target, appends sibling-group paths alongside any matching original-group path in `source_groups` / `destination_groups` (and optionally `scope` via `--include-scope`). Strict-additive |
 
 ---
@@ -116,8 +114,7 @@ EXPORT      capture + 6 per-tool exports against source
 PUSH P1     services + groups (strip) + policies + rules → target     (WF-A Part 1)
 TRANSFORM   build_sibling_groups.py                                    (WF-C step 2)
 PUSH P3'    push siblings → target                                     (WF-C step 3)
-PUSH P3''   push stripped originals → target  (--intentional-ip-removal)  (WF-C step 4)
-AMEND       rules.py amend-refs → target                               (WF-C step 5)
+AMEND       rules.py amend-refs → target                               (WF-C step 4)
 ```
 
 WF-A Part 2 (segment-convert) is **not used** with Workflow C — segments are not part of this design.
@@ -142,13 +139,9 @@ Outputs:
 ```text
 nsx_sibling_groups/<host>/
 ├── groups/<sibling-id>.yaml          # one IP-only group per tagged-with-IPs source
-├── sibling_map.json                  # { original_id → sibling_id } map for step 5
+├── sibling_map.json                  # { original_id → sibling_id } map for step 4
 ├── manifest.json
 ├── reports/
-
-nsx_stripped_groups/<host>/
-├── groups/<original-id>.yaml         # original groups with IPAddressExpression entries removed
-└── manifest.json
 ```
 
 ### What gets a sibling
@@ -221,38 +214,7 @@ for each.
 
 ---
 
-## Step 4 — Push stripped originals
-
-Replaces each tagged-original group's payload with the stripped version. Removes any IPAddressExpression entries that were on the original. **Requires `--intentional-ip-removal`** — without it, the push refuses any row that would drop IPs.
-
-```bash
-python tools/nsx/groups.py push --target nsx-lm2 \
-  --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups \
-  --intentional-ip-removal \
-  --apply
-```
-
-### What `--intentional-ip-removal` does
-
-- Allows `ips_removed` to be non-empty without failing the row.
-- Defaults `--batch-size` to **1** (step-through) so the operator approves each strip individually. Bump higher at any prompt as confidence grows; type `n` to reset to 1; `x` for clean exit.
-- Each row in the push report records `ips_before`, `ips_after`, and `ips_removed` (the dropped IPs) for full audit replayability.
-- Cannot be combined with `--csv-remap` — those workflows have opposite intents (CSV remap is strict-additive).
-
-Summary block records:
-
-```json
-"totals": {
-  ...
-  "intentional_ip_removal": true,
-  "total_ips_removed": 12,
-  "additive_only_contract": "n/a (intentional-ip-removal)"
-}
-```
-
----
-
-## Step 5 — `rules.py amend-refs`
+## Step 4 — `rules.py amend-refs`
 
 For every customer rule on the target, walks the rule's **match-criteria** fields (`source_groups` and `destination_groups` by default). For each entry that matches an `original_id` in `sibling_map.json`, **appends** the corresponding `sibling_id` to the same field. Idempotent: if the sibling is already listed, the rule is reported `no_change` and no PATCH is sent.
 
@@ -319,13 +281,9 @@ In reverse order, each phase pops its baseline cleanly:
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-# 5. amend-refs revert — restores each rule's pre-amend payload
+# 4. amend-refs revert — restores each rule's pre-amend payload
 python tools/nsx/rules.py revert --target nsx-lm2 \
   --reports-dir nsx_rules_export/nsx-lm2.lab.local/push_report --apply
-
-# 4. stripped-originals revert — restores the original group payloads
-python tools/nsx/groups.py revert --target nsx-lm2 \
-  --reports-dir nsx_stripped_groups/nsx-lm1.lab.local/push_report --apply
 
 # 3. siblings revert — deletes the sibling groups
 python tools/nsx/groups.py revert --target nsx-lm2 \
@@ -339,7 +297,7 @@ Then continue with the standard Workflow A revert chain for the underlying WF-A 
 ## Common questions
 
 **What happens if WF-C was already run and I run it again?**
-Step 5 is idempotent — rules already carrying the sibling reference become `no_change`. Step 3 will see the sibling already exists and PATCH it (additive). Step 4 will see the originals already stripped and PATCH them (no-op since target = source). Re-running is safe.
+Step 4 is idempotent — rules already carrying the sibling reference become `no_change`. Step 3 will see the sibling already exists and PATCH it (additive). Re-running is safe.
 
 **Can I run WF-C against the same manager I captured from (in-place)?**
 Yes. Pass `--target <source>` for steps 3, 4, 5. Same idempotency applies.

@@ -123,9 +123,10 @@ state to diff against, every row is reported with no `ips_added` /
 `ips_removed` at all, and the summary's `total_ips_removed` is `0` no matter
 what the apply would do.
 
-That is worst exactly where it matters most. The decomposition workflow's
-destructive step (`--intentional-ip-removal`, pushing the stripped originals)
-is gated on an operator approving a removal count, and the preview showed zero.
+That mattered most for the decomposition workflow's IP-strip step, which has
+since been removed entirely: no push can remove an IP any more. The gap below
+still applies to any push whose payload happens to be out of sync with the
+target, because that is now a hard refusal rather than a silent removal.
 
 Measured on the same bundle and target, 2026-09-09:
 
@@ -137,8 +138,8 @@ Measured on the same bundle and target, 2026-09-09:
 **The fix.** `groups.py push --diff-target` makes one read-only pass over the
 target, populates `ips_before` / `ips_after` / `ips_added` / `ips_removed` on
 every dry-run row, makes the summary total truthful, and logs
-`WOULD REMOVE n IP(s) on apply` for any group that would lose IPs without
-`--intentional-ip-removal`. It is opt-in, so a plain dry run stays fully
+`WOULD REMOVE n IP(s) on apply` for any group that would lose IPs, which the
+apply then refuses outright. It is opt-in, so a plain dry run stays fully
 offline and no existing behaviour changes. Ignored with `--apply`, which
 always captures a baseline and diffs against it.
 

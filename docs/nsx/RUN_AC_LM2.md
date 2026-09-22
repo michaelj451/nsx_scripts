@@ -22,12 +22,14 @@ PowerShell variant of this card: [RUN_AC_LM2_PS.md](RUN_AC_LM2_PS.md).
 | Manager | Role | NSX impact |
 |---|---|---|
 | `nsx-lm1.lab.local` | Source | **Read only.** Never written to by either workflow |
-| `nsx-lm2.lab.local` | Target | Services, groups, policies, rules created; then siblings added and originals stripped |
+| `nsx-lm2.lab.local` | Target | Services, groups, policies, rules created; then IP-only siblings added alongside the originals |
 
 Workflow A pushes services, groups (segment references stripped), policies and
-rules. Workflow C then adds one IP-only sibling group per tag-based group,
-strips the IPs out of the originals, and amends the rules to reference both.
-Run A first. C replaces WF-A Part 2 and Part 3, so do not run those as well.
+rules. Workflow C then adds one IP-only sibling group per tag-based group and
+amends the rules to reference both the original and its sibling. **Nothing is
+removed**: the originals keep their IPs and their tag criteria, so membership
+is the union of the two. Run A first. C replaces WF-A Part 2 and Part 3, so do
+not run those as well.
 
 ---
 
@@ -207,7 +209,7 @@ The four counters in that table come from the build log, not from
 `sibling_map.json`:
 
 ```bash
-grep -E "files seen|siblings written|stripped originals|skipped: empty IPs|errors  " \
+grep -E "files seen|siblings written|skipped: empty IPs|errors  " \
   $(ls -t $NSX_LOG_DIR/build_sibling_groups_*.log | head -1) | sed 's/.*__main__: //'
 ```
 
@@ -216,7 +218,7 @@ grep -E "files seen|siblings written|stripped originals|skipped: empty IPs|error
 ## 4) Verify
 
 Read-only, both phases. `verify_avs_run.py` runs V1 object parity, V2 siblings
-exist, V3 sibling IPs equal the source's captured effective IPs, V4 originals stripped,
+exist, V3 sibling IPs equal the source's captured effective IPs,
 V5 rules reference original or sibling, V6 membership resolves.
 Only LM2 is queried live. The driver supplies `--source-capture`; the report
 records the source capture path and timestamp. Later LM1 changes are not checked.
@@ -255,7 +257,7 @@ references it, so unwinding the clone underneath live siblings fails.
 
 | Phase | Reverts, in order |
 |---|---|
-| `c` | amend-refs, stripped originals, siblings |
+| `c` | amend-refs, then siblings |
 | `a` | rules, policies, groups, services |
 
 The driver passes `--allow-delete` for you, which matters: reverting a push that
@@ -280,12 +282,11 @@ moves.
 | Policies | 3 |
 | Rules | 13 |
 
-**Workflow C: 14 objects, 30 IPs in siblings, 0 errors.**
+**Workflow C: 7 sibling groups created, 30 IPs in siblings, 0 errors.**
 
 | Part | Count | Detail |
 |---|---:|---|
 | Siblings created (`_np_ips`) | 7 | `network-group-0/1/2/8`, `super-nested-group`, `vm-group-1/2` |
-| Stripped originals | 7 | same seven groups, IPAddressExpression entries removed |
 
 The 7 siblings match the figure the runbook records for a correct
 `--live-query` capture on this source. One sibling would mean the capture was

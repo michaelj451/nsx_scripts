@@ -11,14 +11,13 @@ Answers the only question that matters after the pushes: does the target now
 resolve to the same address space the source did, with the tag criteria and the
 IPs living in separate objects?
 
-Six checks, all GET-only:
+Five checks, all GET-only:
 
   V1  every source object exists on the target
       (services, groups, policies, rules; default sections excluded)
   V2  every sibling in sibling_map.json exists on the target
   V3  each sibling's IPs match the SOURCE group's effective IPs exactly
       (source of truth: .../groups/<id>/members/ip-addresses)
-  V4  each stripped original on the target carries NO IPAddressExpression
   V5  every rule that referenced an original also references its sibling
   V6  target group membership resolves (no unrealized groups left behind)
 
@@ -67,11 +66,6 @@ def ips_of(group: Dict[str, Any]) -> List[str]:
         for ip in e.get("ip_addresses", []) or []:
             out.add(str(ip))
     return sorted(out)
-
-
-def has_ip_expression(group: Dict[str, Any]) -> bool:
-    return any((e or {}).get("resource_type") == "IPAddressExpression"
-               for e in group.get("expression", []) or [])
 
 
 def main() -> int:
@@ -170,8 +164,11 @@ def main() -> int:
         record("V1", "rules", not missing_rules,
                f"missing: {missing_rules}" if missing_rules else "all present")
 
-    # ---- V2 / V3 / V4: siblings -------------------------------------------
-    log.info("V2 sibling exists / V3 IPs match source truth / V4 original stripped")
+    # ---- V2 / V3: siblings -------------------------------------------------
+    # The tag-side originals keep their IPs: this toolkit never removes one.
+    # Membership is the union of the original and its sibling, so there is
+    # nothing to assert about the original's address list here.
+    log.info("V2 sibling exists / V3 IPs match source truth")
     for e in entries:
         sib_id, orig_id = e["sibling_id"], e["original_id"]
         try:
@@ -191,13 +188,6 @@ def main() -> int:
             extra, missing = sorted(set(got) - set(truth)), sorted(set(truth) - set(got))
             record("V3", sib_id, not missing and not extra,
                    "" if not (missing or extra) else f"missing={missing} extra={extra}")
-
-        try:
-            orig = tgt.get_group(group_id=orig_id, domain_id=D)
-            record("V4", orig_id, not has_ip_expression(orig),
-                   "" if not has_ip_expression(orig) else f"still has {ips_of(orig)}")
-        except NsxApiError as exc:
-            record("V4", orig_id, False, f"original missing on target: {exc}")
 
     # ---- V5: rules reference the sibling alongside the original ------------
     log.info("V5 rule references")

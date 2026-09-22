@@ -118,8 +118,7 @@ python tools/nsx/groups.py push --target $DST `
 python tools/nsx/build_sibling_groups.py `
   --source $SRC `
   --csv-remap data/nonprod_map.csv `
-  --skip-segment-groups `
-  --no-stripped-originals `
+  --skip-segment-groups
   --label $SRC_HOST
 ```
 
@@ -192,52 +191,8 @@ python tools/nsx/validate_wf_d.py `
 ```
 
 Read-only. Runs G1/G2/G3/S1/S2/R1 checks. Exit 0 = PASS, 1 = FAIL.
-Add `--phase-2-applied` after step 7 has run. Add `--rules-baseline <path>`
 for R2 rule-preservation check. See [RUNBOOK_FROM_CAPTURE.md](RUNBOOK_FROM_CAPTURE.md)
 for full check descriptions.
-
----
-
-## 7. (optional, FORCED, separate change window) Phase 2 — move IPs from originals to siblings
-
-> ⚠️  This is the only flow that REMOVES IPs from existing groups.
-> Gated behind `--intentional-ip-removal`. Groups themselves are NEVER
-> deleted — only their `IPAddressExpression` entries are stripped.
-> Group deletion is only possible via `groups.py revert`.
-
-### 7a. Rebuild the bundle WITH stripped originals (omit `--no-stripped-originals`)
-
-```powershell
-python tools/nsx/build_sibling_groups.py `
-  --source $SRC `
-  --csv-remap data/nonprod_map.csv `
-  --include-pure-ip `
-  --skip-segment-groups `
-  --label $SRC_HOST
-  # NOTE: --no-stripped-originals deliberately OMITTED so the stripped bundle is produced
-```
-
-### 7b. Push the stripped originals — REQUIRES `--intentional-ip-removal`
-
-```powershell
-# DRY RUN
-python tools/nsx/groups.py push --target $DST `
-  --groups-dir nsx_stripped_groups/$SRC_HOST/groups `
-  --intentional-ip-removal
-
-# APPLY
-python tools/nsx/groups.py push --target $DST `
-  --groups-dir nsx_stripped_groups/$SRC_HOST/groups `
-  --intentional-ip-removal `
-  --apply
-```
-
-### 7c. Revert Phase 2
-
-```powershell
-python tools/nsx/groups.py revert --target $DST `
-  --reports-dir nsx_stripped_groups/$SRC_HOST/push_report --apply
-```
 
 ---
 

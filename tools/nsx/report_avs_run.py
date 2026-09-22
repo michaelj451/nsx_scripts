@@ -24,7 +24,6 @@ USAGE:
         --report-root nsx_policies_export/nsx-lm1.lab.local \\
         --report-root nsx_rules_export/nsx-lm1.lab.local \\
         --report-root nsx_avs_runs/v2/nsx_sibling_groups/nsx-lm1.lab.local \\
-        --report-root nsx_avs_runs/v2/nsx_stripped_groups/nsx-lm1.lab.local \\
         --out-dir nsx_avs_runs/v2/report
 
     # Only rows from this run (skip older baselines in the same bundle)
@@ -86,17 +85,17 @@ def bucket_for(status: Optional[str]) -> str:
 
 
 # Which workflow step a bundle belongs to. Without this the same object id shows
-# up twice with no way to tell the WF-A push from the WF-C stripped push, which
+# up twice with no way to tell the WF-A push from the WF-C sibling push, which
 # reads like a duplicate-row bug.
 #
-# WF-C and WF-D push from the SAME bundle directories (nsx_sibling_groups,
-# nsx_stripped_groups), so the path alone cannot say which one ran. --workflow
-# supplies what the path cannot. Without it the labels stay on WF-C, which is
-# what every report before this flag existed already said.
+# WF-C and WF-D push from the SAME bundle directory (nsx_sibling_groups), so
+# the path alone cannot say which one ran. --workflow supplies what the path
+# cannot. Without it the labels stay on WF-C, which is what every report before
+# this flag existed already said.
 WF_STEP_LABELS = {
-    "c": {"siblings": "C3 siblings", "stripped": "C4 stripped",
+    "c": {"siblings": "C3 siblings",
           "pure_ip": "C pure-ip", "amend": "C5 amend-refs"},
-    "d": {"siblings": "D2a siblings", "stripped": "D5 stripped",
+    "d": {"siblings": "D2a siblings",
           "pure_ip": "D2b pure-ip", "amend": "D3 amend-refs"},
 }
 
@@ -108,8 +107,6 @@ def phase_for(bundle: str, report: str, workflow: Optional[str] = None) -> str:
         return steps["amend"]
     if "nsx_sibling_groups" in b:
         return steps["siblings"]
-    if "nsx_stripped_groups" in b:
-        return steps["stripped"]
     if "nsx_pure_ip_remap" in b:
         return steps["pure_ip"]
     if "nsx_services_export" in b:
@@ -764,7 +761,7 @@ def main() -> int:
     if detail:
         md += ["## Appendix: every object touched", "",
                f"{len(detail)} row(s). An object appears once per phase that touches it, so a "
-               "group in both the WF-A push and the WF-C stripped push is listed twice.", ""]
+               "group in both the WF-A push and a later sibling push is listed twice.", ""]
         for kind in KIND_ORDER:
             hits = [r for r in detail if r["kind"] == kind]
             if not hits:
