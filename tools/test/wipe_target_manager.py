@@ -274,6 +274,49 @@ def _delete_services(client: NsxPolicyClient, snap: Dict[str, Any],
 # Main
 # =============================================================================
 
+def _confirm_wipe(alias: str, host: str, snap: Dict[str, Any]) -> bool:
+    """Require the operator to type the manager's hostname, then WIPE.
+
+    A dry run never reaches this: only --apply asks, because only --apply
+    deletes. Both answers must match exactly, including case. Anything else,
+    and a closed or non-interactive stdin (EOFError), is a refusal: the tool
+    stops before its first DELETE and nothing on the manager changes. There is
+    deliberately no flag that skips this, because the point is that a person
+    reads the plan and the target name before objects are destroyed.
+    """
+    total = (len(snap["rules_to_delete"]) + len(snap["customer_policies"])
+             + len(snap["customer_groups"]) + len(snap["customer_services"]))
+    log.warning("")
+    log.warning("!" * 70)
+    log.warning("  ABOUT TO PERMANENTLY DELETE %d OBJECT(S) FROM %s (%s)", total, alias, host)
+    log.warning("    rules    : %d", len(snap["rules_to_delete"]))
+    log.warning("    policies : %d", len(snap["customer_policies"]))
+    log.warning("    groups   : %d", len(snap["customer_groups"]))
+    log.warning("    services : %d", len(snap["customer_services"]))
+    log.warning("  There is no paired revert. Restore = push a backup bundle back.")
+    log.warning("!" * 70)
+    try:
+        typed_host = input(f"Type the manager hostname to confirm ({host}): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        log.error("No input (closed or non-interactive stdin). Wipe ABORTED; nothing deleted.")
+        return False
+    if typed_host != host:
+        log.error("Hostname mismatch: typed %r, expected %r. Wipe ABORTED; nothing deleted.",
+                  typed_host, host)
+        return False
+    try:
+        typed_confirm = input("Type WIPE to proceed: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        log.error("No input (closed or non-interactive stdin). Wipe ABORTED; nothing deleted.")
+        return False
+    if typed_confirm != "WIPE":
+        log.error("Confirmation not given (typed %r, expected 'WIPE'). Wipe ABORTED; nothing deleted.",
+                  typed_confirm)
+        return False
+    log.warning("Confirmed by operator: host=%s. Proceeding with deletion.", host)
+    return True
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     p.add_argument("--target", required=True,
@@ -349,6 +392,14 @@ def main() -> int:
     log.info("  rules to delete  : %d (%s)", len(snap["rules_to_delete"]),
              "inside in-scope policies only" if args.id_prefix
              else "across customer policies + default sections")
+
+    if args.apply and not _confirm_wipe(args.target, host, snap):
+        (out_dir / "wipe_aborted.json").write_text(json.dumps({
+            "target": args.target, "host": host, "domain_id": args.domain_id,
+            "aborted_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "operator did not confirm (hostname + WIPE)",
+        }, indent=2), encoding="utf-8")
+        return 3
 
     # Delete in dependency order
     log.info("")

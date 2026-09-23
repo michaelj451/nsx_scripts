@@ -240,11 +240,22 @@ Every push run writes `avs_run_report.md` (operator-facing) and
 
 A verdict of `created` means the object was not on the target beforehand, which
 the push knows because it reads the target first. `changed` means it existed
-and something measurable moved. `rewritten` means it existed and nothing
-measurable moved, which for a non-group object is not a promise that its
-payload is identical: only groups expose an IP diff. `unknown` appears only
-when a run was told not to read the target (`--no-diff-target`), and means
-exactly that: nobody checked.
+and something measurable moved. `unknown` appears only when a run was told not
+to read the target (`--no-diff-target`), and means exactly that: nobody checked.
+
+**Objects the target already holds identically are skipped, not pushed.** That
+is the default. The push compares the payload against the live object with
+NSX-managed metadata set aside (`_revision`, timestamps, the per-manager
+`rule_id`, the toolkit's own `_parent_policy_id`) and treats reference lists
+such as `scope` and `source_groups` as sets, because NSX returns them in
+arbitrary order. When nothing meaningful differs the row is
+`skipped_unchanged` and no API write is made, so no `_revision` bumps and no
+realization cycle. A re-run of a workflow that is already applied touches
+nothing.
+
+`--force-push` turns the skip off and writes every object, for the case where
+the write itself is the point, such as forcing a re-realization after an
+NSX-side problem.
 
 Three things the report will shout about, because each one costs traffic:
 

@@ -132,6 +132,7 @@ python tools/pan/check_policy_match.py \
 | **Dry-run is the default safe mode** | Every push tool requires an explicit `--apply` to write. Dry-runs emit the same diff artifacts as real applies, minus the API calls. |
 | **Idempotent push** | Push tools handle "already exists" and 412 revision-conflict by falling back from PUT to PATCH automatically. |
 | **Strict-additive amendments** | Group amendments never remove IPs, under any flag; rule amendments only ever append refs, never remove. |
+| **Skip-unchanged by default** | A push compares each payload against the live object and skips the write when nothing meaningful differs, so a re-run leaves no footprint: no `_revision` bump, no realization cycle, and no chance of overwriting a target-side edit with identical content. `--force-push` overrides. |
 | **LIFO baseline revert** | Every push tool captures a per-run baseline; revert pops the most-recent unreverted baseline. Reverts run in reverse phase order to avoid dangling refs. |
 | **Per-run reports + logs** | Every step writes to `nsx_logs/<tool>/<host>/<UTC_TS>/` and a timestamped JSON report. |
 | **Source state is never mutated** | The live source manager is never written to in any workflow. |

@@ -50,6 +50,7 @@ import yaml
 from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
+from nsx.push_skip import is_unchanged, SKIPPED_STATUS
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -481,6 +482,19 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            # --- SKIP-UNCHANGED (default) ------------------------------------
+            # Target already holds identical content: an identical PUT would
+            # only bump _revision and re-realize. Decided before the
+            # dry-run/apply fork so the preview matches the apply.
+            if not args.force_push and is_unchanged(obj, baseline.get(sid)):
+                row["status"] = SKIPPED_STATUS
+                row["skipped_reason"] = "target content already identical"
+                skipped += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
+                         "nothing sent to NSX", i, len(files), ok, failed, skipped, sid)
+                rows.append(row)
+                continue
+
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -857,6 +871,10 @@ def main() -> int:
                     help="Directory containing per-service YAML/JSON files.")
     pp.add_argument("--federation-global", action="store_true",
                     help="Target is a Global Manager.")
+    pp.add_argument("--force-push", action="store_true",
+                    help="Push every object even when the target already holds identical "
+                         "content. Default is to skip those: an identical PUT only bumps "
+                         "_revision and re-realizes.")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,

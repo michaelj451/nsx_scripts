@@ -70,6 +70,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
+from nsx.push_skip import is_unchanged, SKIPPED_STATUS
 
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1118,6 +1119,23 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row["ips_added"]       = ips_added
                 row["ips_removed"]     = ips_removed
 
+            # --- SKIP-UNCHANGED (default) ------------------------------------
+            # The target already holds this content. A PUT would bump
+            # _revision and re-realize for no behavioural gain, and would
+            # overwrite whatever is there with something identical. Decided
+            # before the dry-run/apply fork so the preview matches the apply.
+            unchanged = (have_baseline and not args.force_push
+                         and is_unchanged(obj, baseline_dict.get(gid)))
+            if unchanged:
+                row["status"] = SKIPPED_STATUS
+                row["skipped_reason"] = "target content already identical"
+                skipped += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
+                         "nothing sent to NSX", i, len(files), ok, failed, skipped,
+                         group_name)
+                rows.append(row)
+                continue
+
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -1825,6 +1843,11 @@ def main() -> int:
     pp.add_argument("--batch-size", type=int, choices=[1], default=1,
                     help="Apply always starts with 1. Increase the batch size at a checkpoint "
                          "by entering a positive number; Enter=continue, n=reset, x=stop.")
+    pp.add_argument("--force-push", action="store_true",
+                    help="Push every object even when the target already holds identical "
+                         "content. Default is to skip those: an identical PUT only bumps "
+                         "_revision and re-realizes. Use this when the write itself is the "
+                         "point, e.g. forcing re-realization after an NSX-side problem.")
     pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
                     help="DRY RUN: make one read-only pass over the target so every row "
                          "reports ips_before/ips_after/ips_added/ips_removed and whether the "
