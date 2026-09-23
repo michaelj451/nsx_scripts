@@ -83,3 +83,42 @@ def is_unchanged(payload: Optional[Dict[str, Any]],
 
 
 SKIPPED_STATUS = "skipped_unchanged"
+
+
+def _is_scalar_list(v: Any) -> bool:
+    return v is None or (isinstance(v, list) and all(not isinstance(x, (dict, list)) for x in v))
+
+
+def field_diff(payload: Optional[Dict[str, Any]],
+               live: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """What a push changes, field by field: target as it was, versus what is sent.
+
+    Same shape as `rules.py amend-refs` records, so the run report renders both
+    the same way: {field: {"before", "after", "added", "removed"}}. List fields
+    of scalars (group refs, services, scope, tags) get `added` / `removed`
+    item lists, which is the answer a reviewer actually wants: "segment-group-1
+    was put back into destination_groups", not two long lists to compare by eye.
+    Any other field gets `before` / `after` only.
+
+    Uses the same normalization as is_unchanged, so a field reported here is
+    exactly a field that made the object count as changed. A missing `live`
+    means a create: there is nothing to diff against, so the result is empty.
+    """
+    if not isinstance(payload, dict) or not isinstance(live, dict):
+        return {}
+    before_all, after_all = _strip(live), _strip(payload)
+    out: Dict[str, Dict[str, Any]] = {}
+    for field in sorted(set(before_all) | set(after_all)):
+        before, after = before_all.get(field), after_all.get(field)
+        if before == after:
+            continue
+        if _is_scalar_list(before) and _is_scalar_list(after):
+            b, a = list(before or []), list(after or [])
+            added = [x for x in a if x not in b]
+            removed = [x for x in b if x not in a]
+            if not added and not removed:
+                continue
+            out[field] = {"before": b, "after": a, "added": added, "removed": removed}
+        else:
+            out[field] = {"before": before, "after": after}
+    return out

@@ -75,6 +75,9 @@ STATUS_BUCKETS = {
     "dry_run": "planned",
     "skipped": "skipped",
     "no_change": "no_change",
+    # Skip-unchanged (the push default): the target already held identical
+    # content, so nothing was sent. Counted, never shown as a change.
+    "skipped_unchanged": "unchanged",
     "failed": "failed",
     "error": "failed",
 }
@@ -254,6 +257,12 @@ def payload_lines(r: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _clip(v: Any, limit: int = 80) -> str:
+    """One-line rendering of a field value for a before/after line."""
+    s = json.dumps(v, sort_keys=True, default=str) if not isinstance(v, str) else v
+    return s if len(s) <= limit else s[:limit - 3] + "..."
+
+
 def audit_lines(r: Dict[str, Any]) -> List[str]:
     """The concrete before/after for one row: what actually moved.
 
@@ -279,15 +288,26 @@ def audit_lines(r: Dict[str, Any]) -> List[str]:
         out.append(f"- Target-only group refs kept ({len(kept)}): "
                    f"{_vals([_short(x) for x in kept])}")
 
-    # amend-refs records a per-field before/after/added structure.
+    # Per-field delta: recorded by amend-refs, and by every plain push that
+    # writes over an existing object. Removals first, because a lost reference
+    # is the direction that stops a rule matching.
     pfd = r.get("per_field_diff") or {}
-    for field, d in (pfd.items() if isinstance(pfd, dict) else []):
-        if not isinstance(d, dict):
-            continue
+    fields = [(f, d) for f, d in (pfd.items() if isinstance(pfd, dict) else [])
+              if isinstance(d, dict)]
+    for field, d in fields:
+        lost = d.get("removed") or []
+        if lost:
+            out.append(f"- `{field}` LOST ({len(lost)}): {_vals([_short(x) for x in lost])}")
+    for field, d in fields:
         gained = d.get("added") or []
         if gained:
             out.append(f"- `{field}` gained ({len(gained)}): "
                        f"{_vals([_short(x) for x in gained])}")
+    for field, d in fields:
+        if "added" in d or "removed" in d:
+            continue
+        before, after = d.get("before"), d.get("after")
+        out.append(f"- `{field}`: `{_clip(before)}` -> `{_clip(after)}`")
     csv_added = r.get("csv_added_values") or []
     if csv_added:
         out.append(f"- CSV-mapped values added ({len(csv_added)}): {_vals(csv_added)}")
@@ -591,7 +611,7 @@ def main() -> int:
         if r.get("exists_on_target") is False or str(r.get("status", "")).endswith("_put"):
             return "created"
         if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")
-                or r.get("refs_removed_total")):
+                or r.get("refs_removed_total") or r.get("per_field_diff")):
             return "changed"
         # Nothing observed, and nothing was checked: say so. Calling this
         # "rewritten" asserts the object already existed, which is a claim the
@@ -641,7 +661,8 @@ def main() -> int:
     md += ["## What changed", ""]
     if not (created or changed or failed or unknown):
         md += [f"**Nothing{' would be' if not is_apply else ''} changed.** "
-               f"{len(rewritten)} object(s) {past} pushed over existing, identical content.", ""]
+               + (f"{len(rewritten)} object(s) {past} pushed over existing content with no "
+                  "recorded delta." if rewritten else ""), ""]
     else:
         rows_out = [
             ["Created" if is_apply else "Would create", f"**{len(created)}**"],
@@ -703,6 +724,10 @@ def main() -> int:
     md += [f"- IPs added: **{ips_added}**   removed: **{ips_removed}**   "
            f"rule refs added: **{refs_added}**"
            + (f"   target-only refs kept: **{refs_kept}**" if refs_kept else ""), ""]
+    same = [r for r in rows if r["bucket"] == "unchanged"]
+    if same:
+        md += [f"- Already identical on the target, so skipped with nothing sent: "
+               f"**{len(same)}** object(s).", ""]
     if refs_lost:
         # A clone push that drops target-only group refs deletes exactly the
         # sibling references that keep rules matching literal IPs. Never let
@@ -729,9 +754,10 @@ def main() -> int:
         caveats.append(f"{len(unmeasured)} group row(s) have an unmeasured IP delta: that "
                        "pass ran without `--diff-target`, so the delta is unknown, not zero.")
     if opaque:
-        caveats.append(f"{len(opaque)} non-group object(s) are listed as no measurable change. "
-                       "Only groups expose an IP diff, so a policy, rule or service whose "
-                       "payload differs would look identical here.")
+        caveats.append(f"{len(opaque)} non-group object(s) were pushed with no recorded "
+                       "delta. Identical objects are skipped by default and differing ones "
+                       "record what changed, so this happens only when the target was not "
+                       "read (`--no-diff-target`) or the push was forced (`--force-push`).")
     # Rows whose create-ness was never checked are reported as `unknown` and
     # called out above the fold, so no caveat is needed for them here.
     if caveats:

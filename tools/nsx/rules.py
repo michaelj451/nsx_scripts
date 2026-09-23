@@ -66,7 +66,7 @@ import yaml
 from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
-from nsx.push_skip import is_unchanged, SKIPPED_STATUS
+from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -623,6 +623,20 @@ def cmd_push(args: argparse.Namespace) -> int:
                          "nothing sent to NSX", i, total, ok, failed, skipped, f"{policy_id}/{rid}")
                 rows.append(row)
                 continue
+
+            # --- WHAT THIS PUSH CHANGES --------------------------------------
+            # Past the skip, the target copy differs from what is being sent.
+            # Record how, field by field, so the run report can show it: a push
+            # over an existing object is otherwise opaque, and "pushed" says
+            # nothing about whether a reference was put back or taken away.
+            _live = (baseline.get(f"{policy_id}::{rid}") or {}).get("payload")
+            if _live:
+                _pfd = field_diff(rule, _live)
+                if _pfd:
+                    row["per_field_diff"] = _pfd
+                    row["refs_added_total"] = sum(
+                        len(d.get("added") or []) for f, d in _pfd.items()
+                        if f in MERGEABLE_REF_FIELDS)
 
             if not args.apply:
                 row["status"] = "dry_run"

@@ -8,7 +8,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
-from nsx.push_skip import is_unchanged, content_key, VOLATILE_KEYS  # noqa: E402
+from nsx.push_skip import is_unchanged, content_key, field_diff, VOLATILE_KEYS  # noqa: E402
 
 
 class SkipUnchangedTests(unittest.TestCase):
@@ -70,6 +70,47 @@ class SkipUnchangedTests(unittest.TestCase):
         for k in ("_revision", "_create_time", "realization_id", "rule_id",
                   "_parent_policy_id", "_self", "children"):
             self.assertIn(k, VOLATILE_KEYS)
+
+
+
+class FieldDiffTests(unittest.TestCase):
+    """What the run report shows for a push over an existing object."""
+
+    def test_ref_put_back_is_reported_as_added(self):
+        # The 2026-09-23 case: a group ref removed on lm2 by hand, restored by
+        # the lm1 push. The report said "identical content"; it must say added.
+        live = {"id": "r", "destination_groups": ["/g/lm2-group-only"]}
+        sent = {"id": "r", "destination_groups": ["/g/lm2-group-only", "/g/segment-group-1"]}
+        d = field_diff(sent, live)
+        self.assertEqual(d["destination_groups"]["added"], ["/g/segment-group-1"])
+        self.assertEqual(d["destination_groups"]["removed"], [])
+
+    def test_ref_taken_away_is_reported_as_removed(self):
+        d = field_diff({"id": "r", "scope": ["/g/a"]}, {"id": "r", "scope": ["/g/a", "/g/b"]})
+        self.assertEqual(d["scope"]["removed"], ["/g/b"])
+
+    def test_scalar_field_gets_before_and_after(self):
+        d = field_diff({"id": "r", "action": "DROP"}, {"id": "r", "action": "ALLOW"})
+        self.assertEqual(d, {"action": {"before": "ALLOW", "after": "DROP"}})
+
+    def test_metadata_and_order_never_show_up_as_changes(self):
+        live = {"id": "r", "rule_id": 6132, "_revision": 4, "scope": ["/g/b", "/g/a"]}
+        sent = {"id": "r", "rule_id": 11244, "_parent_policy_id": "p", "scope": ["/g/a", "/g/b"]}
+        self.assertEqual(field_diff(sent, live), {})
+
+    def test_create_has_no_diff(self):
+        self.assertEqual(field_diff({"id": "r", "action": "ALLOW"}, None), {})
+
+    def test_diff_is_empty_exactly_when_unchanged(self):
+        # The two must agree, or a skipped object could report changes and a
+        # pushed one could report none.
+        cases = [
+            ({"id": "r", "action": "ALLOW"}, {"id": "r", "action": "ALLOW", "_revision": 2}),
+            ({"id": "r", "action": "DROP"}, {"id": "r", "action": "ALLOW"}),
+            ({"id": "r", "scope": ["/g/a"]}, {"id": "r", "scope": ["/g/a", "/g/b"]}),
+        ]
+        for sent, live in cases:
+            self.assertEqual(field_diff(sent, live) == {}, is_unchanged(sent, live), (sent, live))
 
 
 if __name__ == "__main__":
