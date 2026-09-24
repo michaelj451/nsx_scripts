@@ -263,6 +263,25 @@ run it after applying C.
 
 Preview first, always. The dry run takes no `--apply`; add it to execute.
 
+**Every rollback writes a report**, preview and apply alike:
+`$R/report/<phase>/rollback_dryrun/rollback_report.md` and
+`$R/report/<phase>/rollback_apply/rollback_report.md` (plus a `.json` beside each).
+Read the preview's report before applying. It says:
+
+- **which apply it undoes**: the baseline timestamp per class, and how many older
+  applies stay stacked underneath. One rollback undoes one apply; run it again,
+  preview first, to go further back
+- **what happens to each object, by display name** (rules also show their
+  policy): *revert* (changed back), *recreate* (gone, comes back), *delete*
+  (the undone apply created it), or *unchanged*
+- **exactly what a revert changes**, with anything the rollback REMOVES listed
+  first: group refs, and for groups any IPs the undone push had added
+
+A restore whose target already matches the baseline is skipped and listed as
+unchanged, the same rule pushes follow; `--force-push` on the revert tools
+writes it anyway. An apply that stops early or fails is flagged at the top, and
+its baseline is left unconsumed so the next rollback retries it.
+
 ```powershell
 # C first
 wf --phase c --rollback

@@ -117,8 +117,9 @@ def display(name: Optional[str], ident: str, ambiguous_names: set = frozenset())
 
 def target_ref_names(client: Any, domain_id: str = "default") -> Dict[str, str]:
     """{path: display_name} for every group and service a rule on the target
-    can reference: the domain's groups, the services, and on a federated LM the
-    GM-owned objects under /global-infra. Read-only; a failed lookup just
+    can reference, plus the domain's policies (so a rule row can name the
+    policy it sits in): the domain's groups, services and policies, and on a
+    federated LM the GM-owned objects under /global-infra. Read-only; a failed lookup just
     leaves those names out, and the report falls back to the id for them."""
     out: Dict[str, str] = {}
 
@@ -127,7 +128,8 @@ def target_ref_names(client: Any, domain_id: str = "default") -> Dict[str, str]:
             if isinstance(o, dict) and o.get("path") and o.get("display_name"):
                 out[o["path"]] = o["display_name"]
 
-    for fetch in (lambda: client.list_groups(domain_id), lambda: client.list_services()):
+    for fetch in (lambda: client.list_groups(domain_id), lambda: client.list_services(),
+                  lambda: client.list_security_policies(domain_id)):
         try:
             take(fetch())
         except Exception:
@@ -145,3 +147,9 @@ def target_ref_names(client: Any, domain_id: str = "default") -> Dict[str, str]:
 def names_for(paths: Iterable[str], mapping: Dict[str, str]) -> Dict[str, str]:
     """The subset of `mapping` a single report row needs."""
     return {p: mapping[p] for p in paths if isinstance(p, str) and p in mapping}
+
+
+def policy_name_by_id(ref_names: Dict[str, str]) -> Dict[str, str]:
+    """{policy_id: display_name} from a target_ref_names() result."""
+    return {path.rsplit("/", 1)[-1]: name for path, name in ref_names.items()
+            if "/security-policies/" in path}

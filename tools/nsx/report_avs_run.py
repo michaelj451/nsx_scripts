@@ -161,6 +161,19 @@ def table(headers: List[str], body: List[List[str]]) -> List[str]:
     return out
 
 
+RULE_KINDS = ("rule", "rule-amend")
+
+
+def policy_of(row: Dict[str, Any]) -> str:
+    """The policy a rule row belongs to, by display name. Rules are only
+    unambiguous inside their policy, and the same rule name can appear in more
+    than one, so every rule table carries this next to the rule name."""
+    pid = row.get("policy_id")
+    if not pid:
+        return ""
+    return NAMES.label(f"/security-policies/{pid}")
+
+
 def name_of(row: Dict[str, Any]) -> str:
     """What a reviewer recognises. NSX ids are frequently UUIDs or truncated
     slugs, so the display name is what appears in the UI and in a change
@@ -509,6 +522,10 @@ def load_rows(root: Path, since: Optional[datetime],
                 "refs_preserved": r.get("refs_preserved"),
                 "per_field_diff": r.get("per_field_diff"),
                 "ref_names": r.get("ref_names"),
+                # The policy a rule sits in: its id, and the display name the
+                # push tool resolved (the bundle's policy file, else the target).
+                "policy_id": r.get("policy_id"),
+                "policy_display_name": r.get("policy_display_name"),
                 "csv_added_values": r.get("csv_added_values"),
                 # The exact YAML the push sends. For a CREATED object this is
                 # the only record of what it actually is: no diff exists,
@@ -567,6 +584,8 @@ def main() -> int:
                   {"group": "groups", "service": "services", "policy": "security-policies",
                    "rule": "rules"}.get(r.get("kind"), ""))
         NAMES.add_mapping(r.get("ref_names"))
+        if r.get("policy_id"):
+            NAMES.add(None, r["policy_id"], r.get("policy_display_name"), "security-policies")
 
     # Is this an apply report? Two independent signals, either of which is
     # sufficient: a row that was actually written, or a push tool that recorded
@@ -715,11 +734,18 @@ def main() -> int:
             if not hits:
                 continue
             md += [f"### {KIND_LABEL[kind]} ({len(hits)})", ""]
-            md += table(["Phase", "Name", "Verdict", "IPs +/-", "Refs +"],
-                        [[r["phase"], name_of(r), r["verdict"], ip_cell(r),
-                          str(r["refs_added_total"] or "")]
-                         for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
-                                                             name_of(x)))]) + [""]
+            if kind in RULE_KINDS:
+                md += table(["Phase", "Name", "Policy", "Verdict", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), policy_of(r), r["verdict"], ip_cell(r),
+                              str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
+                                                                 policy_of(x), name_of(x)))]) + [""]
+            else:
+                md += table(["Phase", "Name", "Verdict", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), r["verdict"], ip_cell(r),
+                              str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
+                                                                 name_of(x)))]) + [""]
 
     # An address with no CSV mapping never reaches the sibling, so no push row
     # can report it. Surfaced above the fold because a dropped address is a
@@ -803,7 +829,9 @@ def main() -> int:
                 continue
             md += [f"### {KIND_LABEL[kind]}", ""]
             for r in sorted(hits, key=lambda x: (x["phase"], name_of(x))):
-                md += [f"**{name_of(r)}** ({r['verdict']}, {r['phase']}, `{r['status']}`)", ""]
+                where = (f" in policy **{policy_of(r)}**"
+                         if r["kind"] in RULE_KINDS and policy_of(r) else "")
+                md += [f"**{name_of(r)}**{where} ({r['verdict']}, {r['phase']}, `{r['status']}`)", ""]
                 md += audit_lines(r)
                 md += [""]
 
@@ -819,10 +847,17 @@ def main() -> int:
             v = collections.Counter(r["verdict"] for r in hits)
             tally = ", ".join(f"{n} {k}" for k, n in sorted(v.items()))
             md += [f"### {KIND_LABEL[kind]} ({len(hits)}: {tally})", ""]
-            md += table(["Phase", "Name", "Verdict", "Status", "IPs +/-", "Refs +"],
-                        [[r["phase"], name_of(r), r["verdict"], str(r["status"]),
-                          ip_cell(r), str(r["refs_added_total"] or "")]
-                         for r in sorted(hits, key=lambda x: (x["phase"], name_of(x)))]) + [""]
+            if kind in RULE_KINDS:
+                md += table(["Phase", "Name", "Policy", "Verdict", "Status", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), policy_of(r), r["verdict"], str(r["status"]),
+                              ip_cell(r), str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["phase"], policy_of(x),
+                                                                 name_of(x)))]) + [""]
+            else:
+                md += table(["Phase", "Name", "Verdict", "Status", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), r["verdict"], str(r["status"]),
+                              ip_cell(r), str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["phase"], name_of(x)))]) + [""]
         # Anything whose class is not in KIND_ORDER still has to appear.
         rest = [r for r in detail if r["kind"] not in KIND_ORDER]
         if rest:

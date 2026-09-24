@@ -103,6 +103,22 @@ class RunReportRenderingTests(unittest.TestCase):
         self.assertIn("destination_groups: ip-address-group-10.10.2.0-24", joined)
         self.assertNotIn("a8b5ed22", joined)
 
+    def test_policy_of_uses_policy_display_name(self):
+        # Start_Policy's display name is "test-policy-1": the rule table must
+        # show the name, never the id.
+        self.rar.NAMES.add(None, "Start_Policy", "test-policy-1", "security-policies")
+        self.assertEqual(self.rar.policy_of({"policy_id": "Start_Policy"}), "test-policy-1")
+
+    def test_policy_of_is_blank_for_non_rule_rows(self):
+        self.assertEqual(self.rar.policy_of({}), "")
+
+    def test_rule_policy_id_does_not_collide_with_a_group_of_the_same_id(self):
+        # A policy and a group can share an id; the policy column must still
+        # resolve to the policy's name.
+        self.rar.NAMES.add(G + "shared", "shared", "a-group")
+        self.rar.NAMES.add(None, "shared", "a-policy", "security-policies")
+        self.assertEqual(self.rar.policy_of({"policy_id": "shared"}), "a-policy")
+
 
 if __name__ == "__main__":
     unittest.main()

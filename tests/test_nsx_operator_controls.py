@@ -1,6 +1,7 @@
 """Offline tests for live output and incremental NSX apply checkpoints."""
 import argparse
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -83,7 +84,8 @@ class PushTests(unittest.TestCase):
         self.root = Path(temp.name).resolve()
 
     def run_tool(self, name, *, answers=("x",), count=4, apply=True, fail_first=False,
-                 action="push", eof=False, conflict_on_put=False, restore=False):
+                 action="push", eof=False, conflict_on_put=False, restore=False,
+                 identical_baseline=False, extra_args=()):
         mod = TOOLS[name]
         root = self.root / f"{name}_{action}"
         data, reports = root / "data", root / "reports"
@@ -147,11 +149,18 @@ class PushTests(unittest.TestCase):
             argv += ["--sibling-map", str(smap)]
         else:
             baseline = reports / "baselines/test_target_baseline.json"
-            dump(baseline, current if restore else {})
+            base = copy.deepcopy(current)
+            if not identical_baseline:
+                # The target has drifted from the baseline since the push, so
+                # every restore is a real change (skip-unchanged does not apply).
+                for v in base.values():
+                    (v["payload"] if "payload" in v else v)["description"] = "as before the push"
+            dump(baseline, base if restore else {})
             if name == "groups":
                 argv += ["--scope", "all", "--allow-delete"]
         if apply:
             argv += ["--apply"]
+        argv += list(extra_args)
         helper = f"_capture_target_{name}"
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(mod, "NsxPolicyClient", Client))
@@ -244,6 +253,26 @@ class PushTests(unittest.TestCase):
                     self.assertEqual(prompts, [1])
                     self.assertTrue(report["baseline_file"].endswith(".reverted"))
                     self.assertTrue(Path(report["baseline_file"]).is_file())
+
+    def test_revert_skips_restores_that_are_already_identical(self):
+        # Restoring content the target already holds changes nothing, so no
+        # write is sent; the revert still completes and consumes its baseline.
+        # --force-push writes them anyway.
+        for name in TOOLS:
+            with self.subTest(name=name, force=False):
+                rc, writes, prompts, report, reports = self.run_tool(
+                    name, action="revert", restore=True, identical_baseline=True)
+                self.assertEqual(rc, 0)
+                self.assertEqual(writes, [])
+                self.assertTrue(report["baseline_file"].endswith(".reverted"))
+                plan = json.loads(next(reports.glob("revert_plan_*.json")).read_text())
+                self.assertTrue(all(r["status"] == "skipped_unchanged" for r in plan["rows"]))
+            with self.subTest(name=name, force=True):
+                rc, writes, prompts, report, _ = self.run_tool(
+                    name, action="revert", restore=True, identical_baseline=True,
+                    answers=("10",), extra_args=("--force-push",))
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(writes), 4)
 
     def test_revert_stop_retains_baseline(self):
         for name in TOOLS:

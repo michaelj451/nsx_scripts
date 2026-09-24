@@ -51,6 +51,7 @@ from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
+from nsx import revert_plan  # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -745,6 +746,28 @@ def cmd_revert(args: argparse.Namespace) -> int:
     rows: List[Dict[str, Any]] = []
     restored_ok = restored_failed = deleted_ok = deleted_failed = 0
 
+    # --- rollback report: this revert, object by object ----------------------
+    _plan_rows, _to_write = revert_plan.build(
+        'service',
+        restores=[{"key": i, "id": i, "baseline": p, "current": current.get(i)}
+                  for i, p in to_restore],
+        deletes=[{"key": i, "id": i, "current": current.get(i)} for i in to_delete],
+        force=getattr(args, "force_push", False))
+    to_restore = [(i, p) for i, p in to_restore if i in _to_write]
+    _plan_target = {"alias": args.target, "host": target_host,
+                    "domain_id": getattr(args, "domain_id", None)}
+    _skipped_same = sum(1 for _r in _plan_rows if _r["status"] == "skipped_unchanged")
+    if _skipped_same:
+        log.info("  %d restore(s) skipped: the target already matches the baseline "
+                 "(--force-push to write them anyway)", _skipped_same)
+    if not args.apply:
+        for _r in _plan_rows:
+            if _r["status"] == "planned":
+                _r["status"] = "dry_run"
+        _pp = revert_plan.write(reports_dir, 'service', _plan_rows, apply=False,
+                                target=_plan_target, baseline_file=baseline_path)
+        log.info("Revert plan: %s", _pp)
+
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
         for sid, _ in to_restore:
@@ -830,6 +853,10 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
+    revert_plan.settle(_plan_rows, rows, key_of=lambda e: e.get("id"))
+    _pp = revert_plan.write(reports_dir, 'service', _plan_rows, apply=True,
+                            target=_plan_target, baseline_file=baseline_path)
+    log.info("Revert plan: %s", _pp)
     revert_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     (reports_dir / f"revert_summary_{revert_ts}.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -907,6 +934,10 @@ def main() -> int:
                     help="NSX manager to revert ON.")
     pr.add_argument("--federation-global", action="store_true",
                     help="Target is a Global Manager.")
+    pr.add_argument("--force-push", action="store_true",
+        help="Restore every baseline object even when the target already "
+             "matches it. Default is to skip those: restoring identical "
+             "content only bumps _revision and re-realizes.")
     pr.add_argument("--apply", action="store_true", default=False,
                     help="Actually perform the revert. Without this, runs as dry-run.")
     pr.add_argument("--reports-dir", default=None,

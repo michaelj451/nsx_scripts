@@ -475,9 +475,9 @@ def main() -> int:
 
     # The report is generated HERE, in the same invocation that ran the steps,
     # which is what makes it impossible to forget and impossible to attribute
-    # to the wrong mode. Only a push produces push-report rows to aggregate:
-    # verify writes its own report, and a revert writes revert summaries that
-    # this aggregator does not read.
+    # to the wrong mode. A push aggregates push-report rows; a rollback
+    # aggregates the revert plans each revert step writes (in both modes);
+    # verify writes its own report.
     rep = {"ok": True}
     if action == "push":
         report_cmd = [PY, "tools/nsx/report_avs_run.py", "--out-dir", str(out_dir),
@@ -485,6 +485,21 @@ def main() -> int:
                       "--label", f"WF-{args.phase.upper()} {mode.upper()}: "
                                  f"{args.source} to {args.target}"]
         for r in dict.fromkeys(roots):
+            report_cmd += ["--report-root", r]
+        rep = run_step("report", report_cmd, log_dir)
+    elif action == "rollback":
+        # Each revert wrote its plan into the reports dir it was pointed at.
+        rb_roots = []
+        for st in steps:
+            c = st["cmd"]
+            if "--reports-dir" in c:
+                rb_roots.append(c[c.index("--reports-dir") + 1])
+        report_cmd = [PY, "tools/nsx/report_rollback.py", "--out-dir", str(out_dir),
+                      "--since", since,
+                      "--label", f"WF-{args.phase.upper()} ROLLBACK "
+                                 f"{'APPLY' if args.apply else 'DRY RUN'}: "
+                                 f"{args.source} to {args.target}"]
+        for r in dict.fromkeys(rb_roots):
             report_cmd += ["--report-root", r]
         rep = run_step("report", report_cmd, log_dir)
 
@@ -509,6 +524,8 @@ def main() -> int:
              f"  FAILED: {failed}" if failed else "")
     if action == "push":
         log.info("Report: %s", out_dir / "avs_run_report.md")
+    elif action == "rollback":
+        log.info("Report: %s", out_dir / "rollback_report.md")
     elif action == "verify":
         log.info("Report: %s", out_dir)
     log.info("=" * 70)

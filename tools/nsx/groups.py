@@ -71,6 +71,7 @@ from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 from nsx.push_skip import is_unchanged, SKIPPED_STATUS
+from nsx import revert_plan  # noqa: E402
 
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1607,6 +1608,39 @@ def cmd_revert(args: argparse.Namespace) -> int:
     log.info("Plan: restore=%d  delete=%d  blocked_deletes=%d  (scope=%s)",
              len(to_restore), len(to_delete), len(deletes_blocked), args.scope)
 
+    # --- rollback report: this revert, object by object ----------------------
+    _gone = already_gone if pushed_ids is not None else []
+    _plan_rows, _to_write = revert_plan.build(
+        'group',
+        restores=[{"key": i, "id": i, "baseline": p, "current": current.get(i)}
+                  for i, p in to_restore],
+        deletes=[{"key": i, "id": i, "current": current.get(i)} for i in to_delete],
+        blocked=[{"key": i, "id": i, "current": current.get(i)} for i in deletes_blocked],
+        already_gone=[{"key": i, "id": i, "current": None} for i in _gone],
+        force=getattr(args, "force_push", False))
+    # A group restore can take IPs AWAY (it undoes an additive push), so the
+    # IP delta is recorded for the report to put first.
+    for _r in _plan_rows:
+        if _r["action"] == "restore" and _r.get("restore_kind") == "revert":
+            _before = _extract_ip_entries(current.get(_r["key"]) or {})
+            _after = _extract_ip_entries(baseline.get(_r["key"]) or {})
+            _r["ips_removed"] = [x for x in _before if x not in _after]
+            _r["ips_added"] = [x for x in _after if x not in _before]
+    to_restore = [(i, p) for i, p in to_restore if i in _to_write]
+    _plan_target = {"alias": args.target, "host": target_host,
+                    "domain_id": getattr(args, "domain_id", None)}
+    _skipped_same = sum(1 for _r in _plan_rows if _r["status"] == "skipped_unchanged")
+    if _skipped_same:
+        log.info("  %d restore(s) skipped: the target already matches the baseline "
+                 "(--force-push to write them anyway)", _skipped_same)
+    if not args.apply:
+        for _r in _plan_rows:
+            if _r["status"] == "planned":
+                _r["status"] = "dry_run"
+        _pp = revert_plan.write(reports_dir, 'group', _plan_rows, apply=False,
+                                target=_plan_target, baseline_file=baseline_path)
+        log.info("Revert plan: %s", _pp)
+
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
         for gid, _ in to_restore: log.info("[DRY restore] %s", gid)
@@ -1684,6 +1718,10 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
+    revert_plan.settle(_plan_rows, rows, key_of=lambda e: e.get("id"))
+    _pp = revert_plan.write(reports_dir, 'group', _plan_rows, apply=True,
+                            target=_plan_target, baseline_file=baseline_path)
+    log.info("Revert plan: %s", _pp)
     revert_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     (reports_dir / f"revert_summary_{revert_ts}.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -1863,6 +1901,10 @@ def main() -> int:
     pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pr.add_argument("--domain-id", default="default")
     pr.add_argument("--federation-global", action="store_true")
+    pr.add_argument("--force-push", action="store_true",
+        help="Restore every baseline object even when the target already "
+             "matches it. Default is to skip those: restoring identical "
+             "content only bumps _revision and re-realizes.")
     pr.add_argument("--apply", action="store_true", default=False,
                     help="Actually revert. Without this, runs as dry-run.")
     pr.add_argument("--reports-dir", default=None,
