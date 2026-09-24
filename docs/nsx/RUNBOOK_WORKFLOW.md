@@ -46,7 +46,6 @@ the target. The [PowerShell run card](RUN_AC_LM2_PS.md) includes both stages.
 | `d2a` | WF-D siblings, the only mandatory WF-D window | `$CSV` |
 | `d2b` | WF-D pure-IP in-place remap | `$CSV` |
 | `d3` | WF-D rule amendment | `d2a` applied |
-| `d5` | WF-D forced strip of tag-side originals, the only step that removes IPs | a stripped bundle |
 
 WF-D is deliberately **one change window per invocation**: 2a, 2b, 3 and 5 are
 separately approved and spaced by how much risk you will absorb at a time.
@@ -213,15 +212,13 @@ wf --phase d2a --verify
 
 wf --phase d2b --csv-remap $CSV --apply
 wf --phase d3 --apply
-wf --phase d5 --apply
 ```
 
-Only `d2a` is required to call a run "WF-D applied". `d2b`, `d3` and `d5` are
+Only `d2a` is required to call a run "WF-D applied". `d2b` and `d3` are
 independent, deferrable and separately revertible, and they consume bundles an
 earlier window produced: each refuses rather than rebuilding if one is missing,
 because a rebuild could hand a different payload to a target whose siblings are
-already live. `d5` needs a build without `--no-stripped-originals`
-(RUNBOOK_D step 5a) and is the only step that removes IPs.
+already live. No phase removes an IP.
 
 For an in-place WF-D run, set `T=$S` in step 0. The driver warns that source
 and target match, which is the supported in-place mode.
@@ -243,11 +240,22 @@ Every push run writes `avs_run_report.md` (operator-facing) and
 
 A verdict of `created` means the object was not on the target beforehand, which
 the push knows because it reads the target first. `changed` means it existed
-and something measurable moved. `rewritten` means it existed and nothing
-measurable moved, which for a non-group object is not a promise that its
-payload is identical: only groups expose an IP diff. `unknown` appears only
-when a run was told not to read the target (`--no-diff-target`), and means
-exactly that: nobody checked.
+and something measurable moved. `unknown` appears only when a run was told not
+to read the target (`--no-diff-target`), and means exactly that: nobody checked.
+
+**Objects the target already holds identically are skipped, not pushed.** That
+is the default. The push compares the payload against the live object with
+NSX-managed metadata set aside (`_revision`, timestamps, the per-manager
+`rule_id`, the toolkit's own `_parent_policy_id`) and treats reference lists
+such as `scope` and `source_groups` as sets, because NSX returns them in
+arbitrary order. When nothing meaningful differs the row is
+`skipped_unchanged` and no API write is made, so no `_revision` bumps and no
+realization cycle. A re-run of a workflow that is already applied touches
+nothing.
+
+`--force-push` turns the skip off and writes every object, for the case where
+the write itself is the point, such as forcing a re-realization after an
+NSX-side problem.
 
 Three things the report will shout about, because each one costs traffic:
 
@@ -282,7 +290,7 @@ not checked. The WF-D phases run
 | Phase | Checks |
 |---|---|
 | `a` | V1 object parity against the capture, V6 target membership resolves |
-| `c` | V1 object parity, V2 siblings exist, V3 sibling IPs equal the source's captured effective IPs, V4 originals stripped, V5 rules reference original OR sibling, V6 target membership resolves |
+| `c` | V1 object parity, V2 siblings exist, V3 sibling IPs equal the source's captured effective IPs, V5 rules reference original OR sibling, V6 target membership resolves |
 | `d*` | G1 nothing deleted, G2 no IP removed, G3 criteria intact, S1/S2 siblings exist and typed `IPAddress`, R1 amend completeness, R2 rules still present |
 
 A verification runs V1 and V6 even if a C preview already created a sibling map.
@@ -296,6 +304,25 @@ Review `$R/report/<phase>/verify/verify_avs_run.json`.
 
 ## 6) Rollback
 
+**Every rollback writes a report**, preview and apply alike:
+`$R/report/<phase>/rollback_dryrun/rollback_report.md` and
+`$R/report/<phase>/rollback_apply/rollback_report.md` (plus a `.json` beside each).
+Read the preview's report before applying. It says:
+
+- **which apply it undoes**: the baseline timestamp per class, and how many older
+  applies stay stacked underneath. One rollback undoes one apply; run it again,
+  preview first, to go further back
+- **what happens to each object, by display name** (rules also show their
+  policy): *revert* (changed back), *recreate* (gone, comes back), *delete*
+  (the undone apply created it), or *unchanged*
+- **exactly what a revert changes**, with anything the rollback REMOVES listed
+  first: group refs, and for groups any IPs the undone push had added
+
+A restore whose target already matches the baseline is skipped and listed as
+unchanged, the same rule pushes follow; `--force-push` on the revert tools
+writes it anyway. An apply that stops early or fails is flagged at the top, and
+its baseline is left unconsumed so the next rollback retries it.
+
 Preview first, always:
 
 ```bash
@@ -306,11 +333,10 @@ wf --phase c --rollback --apply
 | Phase | Reverts, in order |
 |---|---|
 | `a` | rules, policies, groups, services |
-| `c` | amend-refs, stripped originals, siblings |
+| `c` | amend-refs, then siblings |
 | `d2a` | siblings |
 | `d2b` | pure-IP remap |
 | `d3` | amend-refs |
-| `d5` | stripped originals |
 
 Roll back **C before A**: NSX refuses to delete a group a rule still
 references.
@@ -343,13 +369,12 @@ $R/
 │   ├── avs_run_report.md           operator-facing
 │   └── avs_run_report.json         every row, with verdicts
 ├── nsx_sibling_groups/$SH/         built by phase c / d2a
-├── nsx_stripped_groups/$SH/
 └── nsx_pure_ip_remap/$SH/
 ```
 
-Keep `$R` distinct per run: each run's siblings, stripped originals, push
-reports and baselines live in their own tree, so a later rollback cannot pick
-up an older run's baseline.
+Keep `$R` distinct per run: each run's siblings, push reports and baselines
+live in their own tree, so a later rollback cannot pick up an older run's
+baseline.
 
 ---
 
@@ -358,7 +383,7 @@ up an older run's baseline.
 | Flag | Purpose |
 |---|---|
 | `--source` / `--target` | Manager aliases. The same alias for both is the supported in-place mode, and warns |
-| `--phase` | `a`, `c`, `d2a`, `d2b`, `d3`, `d5` |
+| `--phase` | `a`, `c`, `d2a`, `d2b`, `d3` |
 | `--apply` | Write. Default is a dry run |
 | `--verify` | Read-only check instead of pushing |
 | `--rollback` | Undo the phase. Combine with `--apply` to write |
@@ -381,11 +406,6 @@ preserves group refs that exist only on the target, so WF-C / WF-D sibling refs
 survive a re-clone. This is the default; `rules.py push --replace-refs` opts
 back into overwriting them. Verified on lm2 2026-09-11: a WF-A re-run kept all
 14 sibling refs, shown in the report as `target-only refs kept: 14`.
-
-**A re-run also re-adds IPs that C stripped.** WF-A pushes the raw export, so a
-tag-side original that C stripped comes back with its static IPs, and C's strip
-step removes them again on the next C run. Visible in the report as a positive
-IP delta on those groups.
 
 **Interactive checkpoints work through the driver.** Child scripts inherit
 your terminal input and their prompts stream live. Input loss or `x` stops

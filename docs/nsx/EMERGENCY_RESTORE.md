@@ -185,11 +185,20 @@ python tools/nsx/rules.py push --target $S \
 Only do this when that tree matches the backup point; check the rule ids and
 payloads between the two trees first.
 
-**A restore can legitimately need to REMOVE IPs**, when the backup predates a
-later addition. `groups.py push` refuses any row that would drop an IP and
-marks it a contract violation. That refusal is the additive contract working.
-Read the per-row diff, and only then re-run that one class with
-`--intentional-ip-removal`.
+**A restore cannot remove an IP, and that can block it.** If the backup
+predates a later IP addition, restoring that group would have to drop the newer
+address. `groups.py push` refuses any row whose diff shows a removal, marks it
+`failed_contract_violation`, and sends nothing to NSX for that group. There is
+no override: the additive-only contract is absolute and the old
+`--intentional-ip-removal` flag no longer exists.
+
+The other classes still restore normally; only the offending group rows are
+refused. To finish the job on those groups you have to remove the newer
+addresses yourself, in the NSX UI or API, and then re-run the groups push so
+the payload and the target agree. Read the per-row diff in the push report
+first: the addresses it lists as removals are exactly the ones added since the
+backup, and deleting them is a deliberate act that belongs to you, not to a
+tool.
 
 ---
 

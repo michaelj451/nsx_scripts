@@ -18,7 +18,7 @@ per-phase revert available.
 
 | Concern | WF-C (lab) | WF-D (live prod) |
 |---|---|---|
-| Strips IPs from tagged-side originals | Yes (step 4 with `--intentional-ip-removal`) | **Optional, separate change window with `--intentional-ip-removal`** (Phase 2). Default flow never strips. |
+| Strips IPs from tagged-side originals | No longer offered by either workflow | Never. The originals keep their IPs; the sibling carries the mapped equivalents alongside them |
 | Amends live rules to OR-reference siblings | Yes (step 5) | **Optional, separate change window.** Strict-additive — never removes refs. |
 | Pure-IP groups | Skipped | **NOT decomposed into siblings.** Instead emitted to a separate `nsx_pure_ip_remap/<host>/groups/` bundle and pushed back with `--csv-remap` so mapped IPs are added in place. No sibling, no empty group. |
 | Pure-segment groups | Skipped | **Skipped** (unchanged). |
@@ -26,7 +26,7 @@ per-phase revert available.
 | Source of IPs in the sibling | Same IPs as original (no remap) | **CSV-mapped IPs only** — the prod IPs stay on the original. |
 | Post-push validation | None built in | **`validate_wf_d.py`** runs G1/G2/G3/S1/S2/R1/R2 checks against the live target. |
 
-### The end state on lm1 after WF-D (default — no Phase 2)
+### The end state on lm1 after WF-D
 
 ```text
 BEFORE:                             AFTER:
@@ -71,19 +71,19 @@ change window. No groups are ever deleted.
 
 1. **Groups are never deleted by any push command** — only `groups.py revert` against a "didn't-exist" baseline can DELETE a group.
 2. **Rules are never deleted** by any push or amend command.
-3. **IPs are never removed** from any existing group unless `--intentional-ip-removal` is explicitly passed in the optional Phase 2 step.
+3. **IPs are never removed** from any existing group. There is no flag, phase or option that removes one.
 4. **Rule refs are never removed** by `amend-refs` — it is strict-additive and only appends sibling refs.
 5. **Segment-related groups are never touched** — any group containing a `PathExpression` (at any depth) is skipped entirely.
 
 | Constraint | How WF-D enforces it |
 |---|---|
 | **No groups are EVER deleted** | Push uses CREATE / PUT-on-new-ID or PATCH only. No DELETE operations are issued by any push command. The only deletion path is `groups.py revert` against the baseline (which captures "group did not exist") — and that's an operator-initiated explicit step. |
-| **No IPs are removed from any group during the default flow** | The strict-additive contract on `groups.py push` rejects any row that would remove an IP. Phase 2 is the **only** flow that can remove IPs, and it requires `--intentional-ip-removal` — an explicit force flag that gates an opt-in, separate change window. |
+| **No IPs are removed from any group, ever** | The strict-additive contract on `groups.py push` rejects any row that would remove an IP, and there is no override. |
 | **No tags altered on any VM or group** | No tagging operation in this workflow. VM tags + group object-level `tags:` metadata untouched. |
 | **No rules modified unless `amend-refs` runs** | Rule amendment is its own change-controlled phase. When it runs, the default behavior is strict-additive — appends sibling refs to `source_groups` and `destination_groups` only, never removes anything. |
 | **No segment paths modified, no segment-related groups touched** | Any group containing a `PathExpression` (at any depth) is skipped entirely. Pure-segment, tag+segment, and tag+segment+IP hybrids ALL skip. WF-D operates exclusively on non-segment groups. |
 | **Every change is revertible** | Each push captures its own baseline. LIFO revert in reverse order restores any intermediate state. |
-| **Strict-additive contract enforced** | `groups.py push` runs without `--intentional-ip-removal` in the default flow. Any row that would remove an IP is rejected. |
+| **Strict-additive contract enforced** | Any row whose diff would remove an IP is rejected before anything reaches NSX. |
 | **Dry-run is the default** | Every push command starts without `--apply`. The operator reviews the diff, then re-runs with `--apply`. |
 | **Post-push validator confirms the contracts held** | `validate_wf_d.py` checks G1/G2/G3/S1/S2/R1/R2 against the live target after each push window. CRITICAL findings = the contract was violated. |
 
@@ -95,11 +95,10 @@ change window. No groups are ever deleted.
 | 2b (pure-IP remap) | Existing pure-IP groups get mapped IPs added (`csv_total_added_values` rows in the report). No IP is ever removed. |
 | 3 (amend-refs) | Existing rules get sibling refs appended to `source_groups`/`destination_groups`. No ref is ever removed. |
 | 4 (validator) | Read-only — no NSX writes. |
-| 5 (Phase 2 forced strip) | IPs are removed from tag-side originals whose siblings exist. **Only path with removal**, gated by `--intentional-ip-removal`. |
 
 ---
 
-## Pipeline (7 phases — phase 2a is the only mandatory one)
+## Pipeline (6 phases — phase 2a is the only mandatory one)
 
 ```text
 0)  capture_nsx_state.py --source nsx-lm1                              (read-only, GET-only)
@@ -107,8 +106,7 @@ change window. No groups are ever deleted.
         ↓
 1)  build_sibling_groups.py --source nsx-lm1 \                         (offline transform)
         --csv-remap data/nonprod_map.csv \
-        --skip-segment-groups \
-        --no-stripped-originals
+        --skip-segment-groups
         produces nsx_sibling_groups/<host>/groups/                     (siblings for tag+IP mixed groups)
                  nsx_sibling_groups/<host>/sibling_map.json
                  nsx_pure_ip_remap/<host>/groups/                      (NEW — pure-IP groups for in-place remap)
@@ -130,10 +128,6 @@ change window. No groups are ever deleted.
         --target nsx-lm1 \
         --baseline nsx_sibling_groups/<host>/push_report/baselines/<ts>_target_baseline.json \
         --sibling-map nsx_sibling_groups/<host>/sibling_map.json
-        ↓
-5)  groups.py push --intentional-ip-removal                            (OPTIONAL, FORCED, separate window)
-        --target nsx-lm1 \
-        --groups-dir nsx_stripped_groups/<host>/groups
 ```
 
 Only **2a** is strictly required to call this run "WF-D applied." Every
@@ -151,7 +145,7 @@ window.
 | [tools/nsx/capture_nsx_state.py](../../tools/nsx/capture_nsx_state.py) | 0 | Pre-flight capture + auto-IP-report + flat-export bundles |
 | [tools/nsx/report_groups_with_ips.py](../../tools/nsx/report_groups_with_ips.py) | 0 | CSV coverage analysis (auto-fires from capture) |
 | [tools/nsx/build_sibling_groups.py](../../tools/nsx/build_sibling_groups.py) | 1 | Offline transform — emits siblings + pure-IP remap bundle |
-| [tools/nsx/groups.py](../../tools/nsx/groups.py) `push` | 2a, 2b, 5 | Push siblings (2a) / pure-IP remap with `--csv-remap` (2b) / forced strip with `--intentional-ip-removal` (5) |
+| [tools/nsx/groups.py](../../tools/nsx/groups.py) `push` | 2a, 2b | Push siblings (2a) / pure-IP remap with `--csv-remap` (2b) |
 | [tools/nsx/rules.py](../../tools/nsx/rules.py) `amend-refs` | 3 | Append sibling refs to rules' source/destination groups (strict-additive) |
 | [tools/nsx/validate_wf_d.py](../../tools/nsx/validate_wf_d.py) | 4 | Post-push validator — G1/G2/G3/S1/S2/R1/R2 checks against live target |
 
@@ -161,7 +155,6 @@ window.
 |---|---|
 | `--csv-remap <path>` | Apply CSV mapping to each collected IP. Sibling's `IPAddressExpression.ip_addresses` carries the MAPPED values only. Pure-IP groups emitted to remap bundle (not decomposed). |
 | `--skip-segment-groups` | Skip any group with a `PathExpression` anywhere. Recorded in `reports/skipped_segments.json`. |
-| `--no-stripped-originals` | Skip writing the `nsx_stripped_groups/...` bundle entirely (default in WF-D). Add Phase 2 by rebuilding without this flag. |
 | `--copy-manual-ips` | **On by default.** Copy the group's own manually entered IPAddressExpression entries into the sibling verbatim, alongside the mapped values. `--no-copy-manual-ips` emits mapped values only. |
 | `--skip-uncovered` | If a group has ANY IP without a CSV mapping, skip the group entirely. Default: emit a partial sibling with the mapped IPs plus any copied manual ones, and surface the uncovered addresses in `sibling_map.json` and the run report. |
 | `--include-pure-ip` | **Deprecated, ignored.** Pure-IP groups now always go to the `nsx_pure_ip_remap/` bundle instead of producing siblings. |
@@ -174,7 +167,7 @@ window.
 |---|---|
 | `data/nonprod_map.csv` | Populated with all IP mappings in scope. Coverage verified via the IP report (no `groups_partially_covered_by_csv` or `groups_uncovered_by_csv` for in-scope groups). |
 | `nsx_capture/nsx-lm1.lab.local/` | Fresh capture taken **on the day of the push** (re-capture is free, eliminates source-drift risk). |
-| `tools/nsx/build_sibling_groups.py` | Updated with the WF-D flags above (`--csv-remap`, `--include-pure-ip`, `--no-stripped-originals`). |
+| `tools/nsx/build_sibling_groups.py` | Updated with the WF-D flags above (`--csv-remap`, `--include-pure-ip`). |
 | Operator credentials | NSX manager creds with policy/write permissions on lm1. |
 | Change window | Off-peak preferred. The push is strict-additive (only CREATE operations), but each create triggers an effective-member recompute. |
 | Rollback rehearsed | Step 3 revert tested against a lab-equivalent state first. |
@@ -214,7 +207,7 @@ defaults to `OBJECT_APPENDIX`, so a WF-D build has to pass `--appendix` itself.
 python tools/nsx/build_sibling_groups.py --source nsx-lm1 \
   --appendix "$OBJECT_APPENDIX_AVS" \
   --csv-remap data/nonprod_map.csv \
-  --skip-segment-groups --no-stripped-originals
+  --skip-segment-groups
 ```
 
 **Do not change either suffix between runs against the same target.** A changed
@@ -281,7 +274,6 @@ python tools/nsx/build_sibling_groups.py \
   --source nsx-lm1 \
   --csv-remap data/nonprod_map.csv \
   --skip-segment-groups \
-  --no-stripped-originals
 ```
 
 Outputs:
@@ -302,9 +294,8 @@ nsx_pure_ip_remap/nsx-lm1.lab.local/
 └── push_report/                 ← created by step 2b
 ```
 
-No `nsx_stripped_groups/...` directory is created (the
-`--no-stripped-originals` flag suppresses it; remove the flag if you
-plan to run Phase 2 in step 5).
+No `nsx_stripped_groups/...` directory is created: this tool no longer
+produces one.
 
 ### What goes where, by group shape
 
@@ -513,7 +504,7 @@ Checks run:
 | Code | Confirms |
 |---|---|
 | **G1** | No customer group present in the baseline was deleted |
-| **G2** | No IP present in any baseline group was removed (or, with `--phase-2-applied`, only tag-side originals were stripped and their siblings carry the mapped values) |
+| **G2** | No IP present in any baseline group was removed. Absolute: nothing in the toolkit removes one |
 | **G3** | Every Condition / PathExpression in baseline groups is still present |
 | **S1** | Every (original, sibling) pair from `sibling_map.json` exists on the target |
 | **S2** | Every sibling carries `group_type: [IPAddress]` |
@@ -522,72 +513,9 @@ Checks run:
 
 Exit code: `0` = all pass; `1` = at least one CRITICAL finding.
 
-Re-run after each step (2a / 2b / 3 / 5) for full coverage. After step
-5, add `--phase-2-applied` so the validator downgrades the expected
-IP-removal findings on tag-side originals from CRITICAL to INFO.
-
----
-
-## Step 5 — Phase 2 forced strip (OPTIONAL, FORCED, separate change window)
-
-> ⚠️ **The only flow that REMOVES IPs from existing groups.** Gated by
-> `--intentional-ip-removal`. Use only when:
->
-> 1. Steps 2a + 3 have been applied and validated
-> 2. You have CAB approval to strip IPs from tag-side originals so
->    enforcement migrates fully to the sibling groups
-> 3. The siblings have been observed matching expected traffic in
->    production for some validation period
->
-> **Groups themselves are never deleted by this step.** Only
-> `IPAddressExpression` entries inside existing tag-side originals are
-> removed. The groups stay (Condition-only afterward).
-
-### 5a. Rebuild the bundle WITH stripped originals
-
-The default WF-D build uses `--no-stripped-originals`. For Phase 2,
-rebuild without that flag so `nsx_stripped_groups/<host>/groups/` is
-produced:
-
-```bash
-setopt interactive_comments 2>/dev/null || true
-
-python tools/nsx/build_sibling_groups.py \
-  --source nsx-lm1 \
-  --csv-remap data/nonprod_map.csv \
-  --skip-segment-groups
-  # NOTE: --no-stripped-originals deliberately OMITTED
-```
-
-### 5b. Push stripped originals — REQUIRES `--intentional-ip-removal`
-
-```bash
-setopt interactive_comments 2>/dev/null || true
-
-# Dry-run
-python tools/nsx/groups.py push --target nsx-lm1 \
-  --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups \
-  --intentional-ip-removal
-
-# Apply
-python tools/nsx/groups.py push --target nsx-lm1 \
-  --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups \
-  --intentional-ip-removal \
-  --apply
-```
-
-Without `--intentional-ip-removal`, every row is rejected as a
-`contract_violation`. The flag must be passed explicitly.
-
-### 5c. Re-validate with Phase-2 awareness
-
-```bash
-python tools/nsx/validate_wf_d.py \
-  --target nsx-lm1 \
-  --baseline nsx_sibling_groups/nsx-lm1.lab.local/push_report/baselines/<ts>_target_baseline.json \
-  --sibling-map nsx_sibling_groups/nsx-lm1.lab.local/sibling_map.json \
-  --phase-2-applied
-```
+Re-run after each step (2a / 2b / 3) for full coverage. G2 is absolute: any
+IP that disappears from a group is a CRITICAL finding, because no phase of
+this workflow removes one.
 
 ---
 
@@ -599,10 +527,6 @@ sibling — NSX 409s on DELETE for groups still referenced by rules).
 
 ```bash
 setopt interactive_comments 2>/dev/null || true
-
-# Phase 5 revert (restores IPs to tag-side originals)
-python tools/nsx/groups.py revert --target nsx-lm1 \
-  --reports-dir nsx_stripped_groups/nsx-lm1.lab.local/push_report --apply
 
 # Phase 3 revert (restores rules to pre-amend state — removes sibling refs)
 python tools/nsx/rules.py revert --target nsx-lm1 \
@@ -676,7 +600,6 @@ want different.
 | `group_type` on siblings | `[IPAddress]` (consistent with WF-C) | — |
 | Rule amendment (step 3) | **Optional, separate change window** — strict-additive | Skip; rules continue to reference originals only |
 | Empty-groups handling | Reported in `empty_groups.json`; no sibling, no remap entry | — |
-| Phase 2 forced strip (step 5) | **Optional, FORCED, separate change window** — requires `--intentional-ip-removal` | Skip; tag-side originals keep their IPs alongside the new siblings |
 | Post-push validator (step 4) | **Recommended** after each change window | Skip (not recommended — leaves contract violations undetected) |
 
 ---
@@ -747,6 +670,10 @@ python tools/nsx/build_sibling_groups.py --source nsx-lm1 \
   --label nsx-lm3.lab.local
 ```
 
+> Note: this lab log also predates the removal of the Phase 2 IP strip. Any
+> `nsx_stripped_groups/` bundle or stripped-original count below is a record of
+> what the tool did then; it no longer produces either.
+>
 > Note: this lab test predates the 2026-06-09 pure-IP-remap split — at the time, `--include-pure-ip` was used and one of the 7 siblings was `ip-address-group_sibling`. The current build produces 6 siblings + a 4-entry pure-IP remap bundle (see "End-to-end re-validation on lm3" row in the Status table above for the updated counts).
 
 Result: 7 siblings written, 0 stripped (suppressed), 1 segment skipped

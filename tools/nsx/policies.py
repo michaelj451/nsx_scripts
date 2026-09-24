@@ -68,6 +68,8 @@ import yaml
 from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
+from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
+from nsx import revert_plan  # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -464,6 +466,30 @@ def cmd_push(args: argparse.Namespace) -> int:
                 policy_rows.append(row)
                 continue
 
+            # --- SKIP-UNCHANGED (default) ------------------------------------
+            # Target already holds identical content: an identical PUT would
+            # only bump _revision and re-realize. Decided before the
+            # dry-run/apply fork so the preview matches the apply.
+            if not args.force_push and is_unchanged(policy, baseline.get(policy_id)):
+                row["status"] = SKIPPED_STATUS
+                row["skipped_reason"] = "target content already identical"
+                pol_skipped += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
+                         "nothing sent to NSX", pi, len(policy_dirs), pol_ok, pol_failed, pol_skipped, policy_id)
+                policy_rows.append(row)
+                continue
+
+            # --- WHAT THIS PUSH CHANGES --------------------------------------
+            # Past the skip, the target copy differs from what is being sent.
+            # Record how, field by field, so the run report can show it: a push
+            # over an existing object is otherwise opaque, and "pushed" says
+            # nothing about whether a reference was put back or taken away.
+            _live = baseline.get(policy_id)
+            if _live:
+                _pfd = field_diff(policy, _live)
+                if _pfd:
+                    row["per_field_diff"] = _pfd
+
             if not args.apply:
                 row["status"] = "dry_run"
                 pol_dry += 1
@@ -675,6 +701,28 @@ def cmd_revert(args: argparse.Namespace) -> int:
     to_delete = [pid for pid in current.keys() if pid not in baseline]
     log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
 
+    # --- rollback report: this revert, object by object ----------------------
+    _plan_rows, _to_write = revert_plan.build(
+        'policy',
+        restores=[{"key": i, "id": i, "baseline": p, "current": current.get(i)}
+                  for i, p in to_restore],
+        deletes=[{"key": i, "id": i, "current": current.get(i)} for i in to_delete],
+        force=getattr(args, "force_push", False))
+    to_restore = [(i, p) for i, p in to_restore if i in _to_write]
+    _plan_target = {"alias": args.target, "host": target_host,
+                    "domain_id": getattr(args, "domain_id", None)}
+    _skipped_same = sum(1 for _r in _plan_rows if _r["status"] == "skipped_unchanged")
+    if _skipped_same:
+        log.info("  %d restore(s) skipped: the target already matches the baseline "
+                 "(--force-push to write them anyway)", _skipped_same)
+    if not args.apply:
+        for _r in _plan_rows:
+            if _r["status"] == "planned":
+                _r["status"] = "dry_run"
+        _pp = revert_plan.write(reports_dir, 'policy', _plan_rows, apply=False,
+                                target=_plan_target, baseline_file=baseline_path)
+        log.info("Revert plan: %s", _pp)
+
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
         for pid, _ in to_restore: log.info("[DRY restore] %s", pid)
@@ -748,6 +796,10 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
+    revert_plan.settle(_plan_rows, rows, key_of=lambda e: e.get("id"))
+    _pp = revert_plan.write(reports_dir, 'policy', _plan_rows, apply=True,
+                            target=_plan_target, baseline_file=baseline_path)
+    log.info("Revert plan: %s", _pp)
     revert_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     (reports_dir / f"revert_summary_{revert_ts}.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -789,6 +841,10 @@ def main() -> int:
                     help="Directory containing <policy-slug>/policy.yaml + rules/*.yaml subtrees.")
     pp.add_argument("--domain-id", default="default")
     pp.add_argument("--federation-global", action="store_true")
+    pp.add_argument("--force-push", action="store_true",
+                    help="Push every object even when the target already holds identical "
+                         "content. Default is to skip those: an identical PUT only bumps "
+                         "_revision and re-realizes.")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,
@@ -804,6 +860,10 @@ def main() -> int:
     pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pr.add_argument("--domain-id", default="default")
     pr.add_argument("--federation-global", action="store_true")
+    pr.add_argument("--force-push", action="store_true",
+        help="Restore every baseline object even when the target already "
+             "matches it. Default is to skip those: restoring identical "
+             "content only bumps _revision and re-realizes.")
     pr.add_argument("--apply", action="store_true", default=False,
                     help="Actually revert. Without this, runs as dry-run.")
     pr.add_argument("--reports-dir", default=None,

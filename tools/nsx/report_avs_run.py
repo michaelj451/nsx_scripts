@@ -24,7 +24,6 @@ USAGE:
         --report-root nsx_policies_export/nsx-lm1.lab.local \\
         --report-root nsx_rules_export/nsx-lm1.lab.local \\
         --report-root nsx_avs_runs/v2/nsx_sibling_groups/nsx-lm1.lab.local \\
-        --report-root nsx_avs_runs/v2/nsx_stripped_groups/nsx-lm1.lab.local \\
         --out-dir nsx_avs_runs/v2/report
 
     # Only rows from this run (skip older baselines in the same bundle)
@@ -53,7 +52,13 @@ except ImportError:                                   # pragma: no cover
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
+from nsx.names import NameMap  # noqa: E402
+
 log = logging.getLogger("report_avs_run")
+
+# Display names for every object and reference this report mentions. Filled in
+# main() from the bundles and push rows, before anything is rendered.
+NAMES = NameMap()
 
 # Report basenames a push tool can leave behind, mapped to the object class.
 REPORT_FILES = {
@@ -76,6 +81,9 @@ STATUS_BUCKETS = {
     "dry_run": "planned",
     "skipped": "skipped",
     "no_change": "no_change",
+    # Skip-unchanged (the push default): the target already held identical
+    # content, so nothing was sent. Counted, never shown as a change.
+    "skipped_unchanged": "unchanged",
     "failed": "failed",
     "error": "failed",
 }
@@ -86,17 +94,17 @@ def bucket_for(status: Optional[str]) -> str:
 
 
 # Which workflow step a bundle belongs to. Without this the same object id shows
-# up twice with no way to tell the WF-A push from the WF-C stripped push, which
+# up twice with no way to tell the WF-A push from the WF-C sibling push, which
 # reads like a duplicate-row bug.
 #
-# WF-C and WF-D push from the SAME bundle directories (nsx_sibling_groups,
-# nsx_stripped_groups), so the path alone cannot say which one ran. --workflow
-# supplies what the path cannot. Without it the labels stay on WF-C, which is
-# what every report before this flag existed already said.
+# WF-C and WF-D push from the SAME bundle directory (nsx_sibling_groups), so
+# the path alone cannot say which one ran. --workflow supplies what the path
+# cannot. Without it the labels stay on WF-C, which is what every report before
+# this flag existed already said.
 WF_STEP_LABELS = {
-    "c": {"siblings": "C3 siblings", "stripped": "C4 stripped",
+    "c": {"siblings": "C3 siblings",
           "pure_ip": "C pure-ip", "amend": "C5 amend-refs"},
-    "d": {"siblings": "D2a siblings", "stripped": "D5 stripped",
+    "d": {"siblings": "D2a siblings",
           "pure_ip": "D2b pure-ip", "amend": "D3 amend-refs"},
 }
 
@@ -108,8 +116,6 @@ def phase_for(bundle: str, report: str, workflow: Optional[str] = None) -> str:
         return steps["amend"]
     if "nsx_sibling_groups" in b:
         return steps["siblings"]
-    if "nsx_stripped_groups" in b:
-        return steps["stripped"]
     if "nsx_pure_ip_remap" in b:
         return steps["pure_ip"]
     if "nsx_services_export" in b:
@@ -155,6 +161,19 @@ def table(headers: List[str], body: List[List[str]]) -> List[str]:
     return out
 
 
+RULE_KINDS = ("rule", "rule-amend")
+
+
+def policy_of(row: Dict[str, Any]) -> str:
+    """The policy a rule row belongs to, by display name. Rules are only
+    unambiguous inside their policy, and the same rule name can appear in more
+    than one, so every rule table carries this next to the rule name."""
+    pid = row.get("policy_id")
+    if not pid:
+        return ""
+    return NAMES.label(f"/security-policies/{pid}")
+
+
 def name_of(row: Dict[str, Any]) -> str:
     """What a reviewer recognises. NSX ids are frequently UUIDs or truncated
     slugs, so the display name is what appears in the UI and in a change
@@ -178,9 +197,18 @@ def _vals(items: Optional[List[Any]]) -> str:
 
 
 def _short(path: str) -> str:
-    """Group paths are long and repetitive; the id is what a reviewer reads."""
+    """A reference as a reviewer should read it: the object's display name.
+
+    Paths are long and repetitive, and the id at the end of one is often an
+    opaque token (`vm1` is "vm-group-1", a UUID is "ip-address-group-..."). The
+    id is added only when the display name is shared by more than one object.
+    Push rows record target-only refs as "<field>:<path>"; those keep the field.
+    """
     s = str(path)
-    return s.rsplit("/", 1)[-1] if s.startswith("/") else s
+    if ":/" in s:
+        field, ref = s.split(":", 1)
+        return f"{field}: {NAMES.label(ref)}"
+    return NAMES.label(s) if s.startswith("/") else s
 
 
 def payload_lines(r: Dict[str, Any]) -> List[str]:
@@ -257,6 +285,12 @@ def payload_lines(r: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _clip(v: Any, limit: int = 80) -> str:
+    """One-line rendering of a field value for a before/after line."""
+    s = json.dumps(v, sort_keys=True, default=str) if not isinstance(v, str) else v
+    return s if len(s) <= limit else s[:limit - 3] + "..."
+
+
 def audit_lines(r: Dict[str, Any]) -> List[str]:
     """The concrete before/after for one row: what actually moved.
 
@@ -282,15 +316,26 @@ def audit_lines(r: Dict[str, Any]) -> List[str]:
         out.append(f"- Target-only group refs kept ({len(kept)}): "
                    f"{_vals([_short(x) for x in kept])}")
 
-    # amend-refs records a per-field before/after/added structure.
+    # Per-field delta: recorded by amend-refs, and by every plain push that
+    # writes over an existing object. Removals first, because a lost reference
+    # is the direction that stops a rule matching.
     pfd = r.get("per_field_diff") or {}
-    for field, d in (pfd.items() if isinstance(pfd, dict) else []):
-        if not isinstance(d, dict):
-            continue
+    fields = [(f, d) for f, d in (pfd.items() if isinstance(pfd, dict) else [])
+              if isinstance(d, dict)]
+    for field, d in fields:
+        lost = d.get("removed") or []
+        if lost:
+            out.append(f"- `{field}` LOST ({len(lost)}): {_vals([_short(x) for x in lost])}")
+    for field, d in fields:
         gained = d.get("added") or []
         if gained:
             out.append(f"- `{field}` gained ({len(gained)}): "
                        f"{_vals([_short(x) for x in gained])}")
+    for field, d in fields:
+        if "added" in d or "removed" in d:
+            continue
+        before, after = d.get("before"), d.get("after")
+        out.append(f"- `{field}`: `{_clip(before)}` -> `{_clip(after)}`")
     csv_added = r.get("csv_added_values") or []
     if csv_added:
         out.append(f"- CSV-mapped values added ({len(csv_added)}): {_vals(csv_added)}")
@@ -476,6 +521,11 @@ def load_rows(root: Path, since: Optional[datetime],
                 "ips_after": r.get("ips_after"),
                 "refs_preserved": r.get("refs_preserved"),
                 "per_field_diff": r.get("per_field_diff"),
+                "ref_names": r.get("ref_names"),
+                # The policy a rule sits in: its id, and the display name the
+                # push tool resolved (the bundle's policy file, else the target).
+                "policy_id": r.get("policy_id"),
+                "policy_display_name": r.get("policy_display_name"),
                 "csv_added_values": r.get("csv_added_values"),
                 # The exact YAML the push sends. For a CREATED object this is
                 # the only record of what it actually is: no diff exists,
@@ -526,6 +576,16 @@ def main() -> int:
         root_path = Path(root).expanduser()
         rows.extend(load_rows(root_path, since, args.workflow))
         modes |= load_modes(root_path, since)
+        NAMES.add_bundle(root_path)
+    # The rows themselves name the objects they push, and the push tools record
+    # display names for target-side references no bundle on this side holds.
+    for r in rows:
+        NAMES.add(None, r.get("id"), r.get("display_name"),
+                  {"group": "groups", "service": "services", "policy": "security-policies",
+                   "rule": "rules"}.get(r.get("kind"), ""))
+        NAMES.add_mapping(r.get("ref_names"))
+        if r.get("policy_id"):
+            NAMES.add(None, r["policy_id"], r.get("policy_display_name"), "security-policies")
 
     # Is this an apply report? Two independent signals, either of which is
     # sufficient: a row that was actually written, or a push tool that recorded
@@ -594,7 +654,7 @@ def main() -> int:
         if r.get("exists_on_target") is False or str(r.get("status", "")).endswith("_put"):
             return "created"
         if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")
-                or r.get("refs_removed_total")):
+                or r.get("refs_removed_total") or r.get("per_field_diff")):
             return "changed"
         # Nothing observed, and nothing was checked: say so. Calling this
         # "rewritten" asserts the object already existed, which is a claim the
@@ -644,7 +704,8 @@ def main() -> int:
     md += ["## What changed", ""]
     if not (created or changed or failed or unknown):
         md += [f"**Nothing{' would be' if not is_apply else ''} changed.** "
-               f"{len(rewritten)} object(s) {past} pushed over existing, identical content.", ""]
+               + (f"{len(rewritten)} object(s) {past} pushed over existing content with no "
+                  "recorded delta." if rewritten else ""), ""]
     else:
         rows_out = [
             ["Created" if is_apply else "Would create", f"**{len(created)}**"],
@@ -673,11 +734,18 @@ def main() -> int:
             if not hits:
                 continue
             md += [f"### {KIND_LABEL[kind]} ({len(hits)})", ""]
-            md += table(["Phase", "Name", "Verdict", "IPs +/-", "Refs +"],
-                        [[r["phase"], name_of(r), r["verdict"], ip_cell(r),
-                          str(r["refs_added_total"] or "")]
-                         for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
-                                                             name_of(x)))]) + [""]
+            if kind in RULE_KINDS:
+                md += table(["Phase", "Name", "Policy", "Verdict", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), policy_of(r), r["verdict"], ip_cell(r),
+                              str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
+                                                                 policy_of(x), name_of(x)))]) + [""]
+            else:
+                md += table(["Phase", "Name", "Verdict", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), r["verdict"], ip_cell(r),
+                              str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["verdict"], x["phase"],
+                                                                 name_of(x)))]) + [""]
 
     # An address with no CSV mapping never reaches the sibling, so no push row
     # can report it. Surfaced above the fold because a dropped address is a
@@ -706,6 +774,10 @@ def main() -> int:
     md += [f"- IPs added: **{ips_added}**   removed: **{ips_removed}**   "
            f"rule refs added: **{refs_added}**"
            + (f"   target-only refs kept: **{refs_kept}**" if refs_kept else ""), ""]
+    same = [r for r in rows if r["bucket"] == "unchanged"]
+    if same:
+        md += [f"- Already identical on the target, so skipped with nothing sent: "
+               f"**{len(same)}** object(s).", ""]
     if refs_lost:
         # A clone push that drops target-only group refs deletes exactly the
         # sibling references that keep rules matching literal IPs. Never let
@@ -732,9 +804,10 @@ def main() -> int:
         caveats.append(f"{len(unmeasured)} group row(s) have an unmeasured IP delta: that "
                        "pass ran without `--diff-target`, so the delta is unknown, not zero.")
     if opaque:
-        caveats.append(f"{len(opaque)} non-group object(s) are listed as no measurable change. "
-                       "Only groups expose an IP diff, so a policy, rule or service whose "
-                       "payload differs would look identical here.")
+        caveats.append(f"{len(opaque)} non-group object(s) were pushed with no recorded "
+                       "delta. Identical objects are skipped by default and differing ones "
+                       "record what changed, so this happens only when the target was not "
+                       "read (`--no-diff-target`) or the push was forced (`--force-push`).")
     # Rows whose create-ness was never checked are reported as `unknown` and
     # called out above the fold, so no caveat is needed for them here.
     if caveats:
@@ -756,7 +829,9 @@ def main() -> int:
                 continue
             md += [f"### {KIND_LABEL[kind]}", ""]
             for r in sorted(hits, key=lambda x: (x["phase"], name_of(x))):
-                md += [f"**{name_of(r)}** ({r['verdict']}, {r['phase']}, `{r['status']}`)", ""]
+                where = (f" in policy **{policy_of(r)}**"
+                         if r["kind"] in RULE_KINDS and policy_of(r) else "")
+                md += [f"**{name_of(r)}**{where} ({r['verdict']}, {r['phase']}, `{r['status']}`)", ""]
                 md += audit_lines(r)
                 md += [""]
 
@@ -764,7 +839,7 @@ def main() -> int:
     if detail:
         md += ["## Appendix: every object touched", "",
                f"{len(detail)} row(s). An object appears once per phase that touches it, so a "
-               "group in both the WF-A push and the WF-C stripped push is listed twice.", ""]
+               "group in both the WF-A push and a later sibling push is listed twice.", ""]
         for kind in KIND_ORDER:
             hits = [r for r in detail if r["kind"] == kind]
             if not hits:
@@ -772,10 +847,17 @@ def main() -> int:
             v = collections.Counter(r["verdict"] for r in hits)
             tally = ", ".join(f"{n} {k}" for k, n in sorted(v.items()))
             md += [f"### {KIND_LABEL[kind]} ({len(hits)}: {tally})", ""]
-            md += table(["Phase", "Name", "Verdict", "Status", "IPs +/-", "Refs +"],
-                        [[r["phase"], name_of(r), r["verdict"], str(r["status"]),
-                          ip_cell(r), str(r["refs_added_total"] or "")]
-                         for r in sorted(hits, key=lambda x: (x["phase"], name_of(x)))]) + [""]
+            if kind in RULE_KINDS:
+                md += table(["Phase", "Name", "Policy", "Verdict", "Status", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), policy_of(r), r["verdict"], str(r["status"]),
+                              ip_cell(r), str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["phase"], policy_of(x),
+                                                                 name_of(x)))]) + [""]
+            else:
+                md += table(["Phase", "Name", "Verdict", "Status", "IPs +/-", "Refs +"],
+                            [[r["phase"], name_of(r), r["verdict"], str(r["status"]),
+                              ip_cell(r), str(r["refs_added_total"] or "")]
+                             for r in sorted(hits, key=lambda x: (x["phase"], name_of(x)))]) + [""]
         # Anything whose class is not in KIND_ORDER still has to appear.
         rest = [r for r in detail if r["kind"] not in KIND_ORDER]
         if rest:

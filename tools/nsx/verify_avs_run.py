@@ -11,14 +11,13 @@ Answers the only question that matters after the pushes: does the target now
 resolve to the same address space the source did, with the tag criteria and the
 IPs living in separate objects?
 
-Six checks, all GET-only:
+Five checks, all GET-only:
 
   V1  every source object exists on the target
       (services, groups, policies, rules; default sections excluded)
   V2  every sibling in sibling_map.json exists on the target
   V3  each sibling's IPs match the SOURCE group's effective IPs exactly
       (source of truth: .../groups/<id>/members/ip-addresses)
-  V4  each stripped original on the target carries NO IPAddressExpression
   V5  every rule that referenced an original also references its sibling
   V6  target group membership resolves (no unrealized groups left behind)
 
@@ -67,11 +66,6 @@ def ips_of(group: Dict[str, Any]) -> List[str]:
         for ip in e.get("ip_addresses", []) or []:
             out.add(str(ip))
     return sorted(out)
-
-
-def has_ip_expression(group: Dict[str, Any]) -> bool:
-    return any((e or {}).get("resource_type") == "IPAddressExpression"
-               for e in group.get("expression", []) or [])
 
 
 def main() -> int:
@@ -133,8 +127,14 @@ def main() -> int:
 
     checks: List[Dict[str, Any]] = []
 
-    def record(check: str, subject: str, ok: bool, detail: str = "") -> None:
-        checks.append({"check": check, "subject": subject, "ok": bool(ok), "detail": detail})
+    def record(check: str, subject: str, ok: bool, detail: str = "",
+               subject_id: str = "") -> None:
+        # `subject` is what a person reads: display names. `subject_id` keeps
+        # the NSX id for anything that needs to act on the result.
+        entry = {"check": check, "subject": subject, "ok": bool(ok), "detail": detail}
+        if subject_id and subject_id != subject:
+            entry["subject_id"] = subject_id
+        checks.append(entry)
         log.log(logging.INFO if ok else logging.ERROR,
                 "  %-4s %-42s %s%s", check, subject[:42], "OK" if ok else "FAIL",
                 f"  {detail}" if detail else "")
@@ -142,66 +142,75 @@ def main() -> int:
     # ---- V1: object parity -------------------------------------------------
     if not args.skip_object_parity:
         log.info("V1 object parity (source -> target)")
-        s_groups = {g["id"] for g in src.list_groups(domain_id=D) if not g.get("_system_owned")}
+        s_group_objs = [g for g in src.list_groups(domain_id=D) if not g.get("_system_owned")]
+        name_of = {g["id"]: g.get("display_name") or g["id"] for g in s_group_objs}
+        s_groups = set(name_of)
         t_groups = {g["id"] for g in tgt.list_groups(domain_id=D) if not g.get("_system_owned")}
-        missing = sorted(s_groups - t_groups)
+        missing = sorted(name_of[i] for i in s_groups - t_groups)
         record("V1", "groups", not missing, f"missing: {missing}" if missing else
                f"{len(s_groups)} present")
 
-        s_svc = {s["id"] for s in src.list_services() if not s.get("_system_owned")}
+        s_svc_objs = [s for s in src.list_services() if not s.get("_system_owned")]
+        svc_name = {s["id"]: s.get("display_name") or s["id"] for s in s_svc_objs}
+        s_svc = set(svc_name)
         t_svc = {s["id"] for s in tgt.list_services() if not s.get("_system_owned")}
-        missing = sorted(s_svc - t_svc)
+        missing = sorted(svc_name[i] for i in s_svc - t_svc)
         record("V1", "services", not missing, f"missing: {missing}" if missing else
                f"{len(s_svc)} present")
 
-        s_pol = {p["id"] for p in src.list_security_policies(domain_id=D)
-                 if not p.get("_system_owned") and p["id"] not in DEFAULT_SECTIONS}
+        pol_name = {p["id"]: p.get("display_name") or p["id"]
+                    for p in src.list_security_policies(domain_id=D)
+                    if not p.get("_system_owned") and p["id"] not in DEFAULT_SECTIONS}
+        s_pol = set(pol_name)
         t_pol = {p["id"] for p in tgt.list_security_policies(domain_id=D)
                  if not p.get("_system_owned") and p["id"] not in DEFAULT_SECTIONS}
-        missing = sorted(s_pol - t_pol)
+        missing = sorted(pol_name[i] for i in s_pol - t_pol)
         record("V1", "policies", not missing, f"missing: {missing}" if missing else
                f"{len(s_pol)} present")
 
         missing_rules = []
         for pid in sorted(s_pol & t_pol):
-            s_r = {r["id"] for r in src.list_security_rules(security_policy_id=pid, domain_id=D)}
+            rule_name = {r["id"]: r.get("display_name") or r["id"]
+                         for r in src.list_security_rules(security_policy_id=pid, domain_id=D)}
             t_r = {r["id"] for r in tgt.list_security_rules(security_policy_id=pid, domain_id=D)}
-            missing_rules += [f"{pid}/{r}" for r in sorted(s_r - t_r)]
+            missing_rules += [f"{pol_name[pid]}/{rule_name[r]}"
+                              for r in sorted(set(rule_name) - t_r)]
         record("V1", "rules", not missing_rules,
                f"missing: {missing_rules}" if missing_rules else "all present")
 
-    # ---- V2 / V3 / V4: siblings -------------------------------------------
-    log.info("V2 sibling exists / V3 IPs match source truth / V4 original stripped")
+    # ---- V2 / V3: siblings -------------------------------------------------
+    # The tag-side originals keep their IPs: this toolkit never removes one.
+    # Membership is the union of the original and its sibling, so there is
+    # nothing to assert about the original's address list here.
+    log.info("V2 sibling exists / V3 IPs match source truth")
     for e in entries:
         sib_id, orig_id = e["sibling_id"], e["original_id"]
+        sib_name = e.get("sibling_display_name") or sib_id
         try:
             sib = tgt.get_group(group_id=sib_id, domain_id=D)
         except NsxApiError as exc:
-            record("V2", sib_id, False, f"not on target: {exc}")
+            record("V2", sib_name, False,
+                   f"not on target (HTTP {getattr(exc, 'status_code', '?')})", sib_id)
             continue
-        record("V2", sib_id, True, f"{len(ips_of(sib))} ips")
+        record("V2", sib_name, True, f"{len(ips_of(sib))} ips", sib_id)
 
         try:
             truth = sorted(src.get_group_effective_ips(orig_id, domain_id=D))
         except (NsxApiError, ValueError) as exc:
-            record("V3", sib_id, False, f"source truth unavailable: {exc}")
+            record("V3", sib_name, False,
+                   f"source truth unavailable (HTTP {getattr(exc, 'status_code', '?')})", sib_id)
             truth = None
         if truth is not None:
             got = ips_of(sib)
             extra, missing = sorted(set(got) - set(truth)), sorted(set(truth) - set(got))
-            record("V3", sib_id, not missing and not extra,
-                   "" if not (missing or extra) else f"missing={missing} extra={extra}")
-
-        try:
-            orig = tgt.get_group(group_id=orig_id, domain_id=D)
-            record("V4", orig_id, not has_ip_expression(orig),
-                   "" if not has_ip_expression(orig) else f"still has {ips_of(orig)}")
-        except NsxApiError as exc:
-            record("V4", orig_id, False, f"original missing on target: {exc}")
+            record("V3", sib_name, not missing and not extra,
+                   "" if not (missing or extra) else f"missing={missing} extra={extra}", sib_id)
 
     # ---- V5: rules reference the sibling alongside the original ------------
     log.info("V5 rule references")
     by_orig = {e["original_id"]: e["sibling_id"] for e in entries}
+    sib_label = {e["sibling_id"]: e.get("sibling_display_name") or e["sibling_id"]
+                 for e in entries}
     for pol in tgt.list_security_policies(domain_id=D):
         if pol.get("_system_owned") or pol["id"] in DEFAULT_SECTIONS:
             continue
@@ -214,8 +223,12 @@ def main() -> int:
                     if not sib:
                         continue
                     want = f"/infra/domains/{D}/groups/{sib}"
-                    record("V5", f"{pol['id']}/{rule['id']}.{field}", want in refs,
-                           "" if want in refs else f"missing {sib}")
+                    record("V5",
+                           f"{pol.get('display_name') or pol['id']}/"
+                           f"{rule.get('display_name') or rule['id']}.{field}",
+                           want in refs,
+                           "" if want in refs else f"missing {sib_label.get(sib, sib)}",
+                           f"{pol['id']}/{rule['id']}.{field}")
 
     # ---- V6: target membership realizes ------------------------------------
     log.info("V6 target membership realizes")
@@ -226,7 +239,7 @@ def main() -> int:
         try:
             tgt.get_group_effective_ips(g["id"], domain_id=D, realize_attempts=1)
         except NsxApiError:
-            unrealized.append(g["id"])
+            unrealized.append(g.get("display_name") or g["id"])
     record("V6", "all target groups", not unrealized,
            f"unrealized: {unrealized}" if unrealized else
            "every group resolves")

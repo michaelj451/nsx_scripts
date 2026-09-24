@@ -23,10 +23,10 @@ revertible and carries different risk.
 | `d2a` | Create the `_avs_ips` sibling groups | **yes** | no |
 | `d2b` | Add mapped IPs to pure-IP groups in place | no | no |
 | `d3` | Amend rules to reference the siblings alongside the originals | no | no |
-| `d5` | Strip IPs out of the tag-side originals | no | **yes** |
 
-Only `d2a` is required to call a run "WF-D applied". Run `d5` last, and only
-once `d2a` and `d3` are applied, validated and the strip is approved.
+Only `d2a` is required to call a run "WF-D applied". **No phase removes an
+IP.** The tag-side originals keep their addresses and their tag criteria;
+the siblings carry the CSV-mapped equivalents alongside them.
 
 ---
 
@@ -180,7 +180,7 @@ $m.map | ForEach-Object { "  {0,-30} {1} ips" -f $_.sibling_id, $_.ips_source.Co
 | Manual addresses copied verbatim | expected and listed per group. These are the group's own IPAddressExpression entries, carried across unmapped |
 | `Failed` | 0 |
 
-The baseline this apply captures is what `d5` and the validator read later:
+The baseline this apply captures is what the validator reads later:
 
 ```
 $R/nsx_sibling_groups/nsx-lm1.lab.local/push_report/baselines/<ts>_target_baseline.json
@@ -242,85 +242,15 @@ python tools/nsx/validate_wf_d.py --target $S `
   --sibling-map "$R/nsx_sibling_groups/$SH/sibling_map.json"
 ```
 
-Add `--phase-2-applied` after step 5 has run, and `--rules-baseline <path>` for
-the R2 check.
+Add `--rules-baseline <path>` for the R2 check.
 
 ---
 
-## 5) Forced strip (optional, last, removes IPs)
-
-**This is the only step that takes IPs away from a group**, and it is gated
-behind `--intentional-ip-removal`, which the driver passes for this phase. Run
-it only after `d2a` and `d3` are applied and validated, and the strip is
-approved.
-
-### 5a. Rebuild the bundle with stripped originals
-
-`d2a` builds with `--no-stripped-originals`, so the stripped bundle does not
-exist yet and `d5` refuses rather than rebuilding one. Produce it deliberately:
-
-```powershell
-python tools/nsx/build_sibling_groups.py `
-  --source $S `
-  --output-base $R `
-  --domain-id default `
-  --appendix $env:OBJECT_APPENDIX_AVS `
-  --csv-remap $CSV `
-  --skip-segment-groups
-```
-
-> **`--output-base $R` is what makes this work with the driver.** RUNBOOK_D's
-> step 5a omits it, because it documents the standalone path, which writes to
-> the repo-root `nsx_stripped_groups\`. The driver looks inside the run dir, so
-> without `--output-base` it still reports the bundle missing. Note also that
-> this rebuilds the sibling bundle alongside the stripped one, which is why it
-> belongs before the strip window and not between a dry run and its apply.
-
-Confirm both halves were written:
-
-```powershell
-$blog = Get-ChildItem "$env:NSX_LOG_DIR/build_sibling_groups_*.log" |
-  Sort-Object LastWriteTime | Select-Object -Last 1
-Select-String -Path $blog -Pattern "files seen|siblings written|stripped originals|skipped: empty IPs|errors  " |
-  ForEach-Object { ($_.Line -split "__main__: ")[-1] }
-```
-
-`stripped originals` must be non-zero, and `files seen` must equal
-`siblings written + skipped: no Condition + skipped: empty IPs`.
-
-### 5b. Push the stripped originals
-
-```powershell
-wf --phase d5
-Get-Content "$R/report/d5/dryrun/avs_run_report.md"
-wf --phase d5 --apply
-```
-
-Read the audit block carefully. Removals print **first and in capitals**. Every
-address listed there stops being matched by that group the moment this applies,
-so each one must already be covered by a sibling that the rules reference, which
-is what `d3` was for.
-
-### 5c. Re-validate with phase-2 awareness
-
-```powershell
-python tools/nsx/validate_wf_d.py --target $S `
-  --baseline $BASE `
-  --sibling-map "$R/nsx_sibling_groups/$SH/sibling_map.json" `
-  --phase-2-applied
-```
-
----
-
-## 6) Rollback, reverse order (LIFO)
+## 5) Rollback, reverse order (LIFO)
 
 Preview first, always. Run only the windows you actually applied.
 
 ```powershell
-# 5: restore IPs to the tag-side originals
-wf --phase d5 --rollback
-wf --phase d5 --rollback --apply
-
 # 3: remove sibling refs from rules
 wf --phase d3 --rollback
 wf --phase d3 --rollback --apply
@@ -350,7 +280,6 @@ Against `nsx-lm1` holding 13 groups / 5 policies / 15 rules / 4 services, with
 | `d2a` | 7 created | +30 | `_avs_ips` siblings for `network-group-0/1/2/8`, `super-nested-group`, `vm-group-1/2`. 3 manually entered addresses copied verbatim |
 | `d2b` | 1 changed | +1 | `ip-address-group`; 5 further groups had nothing to add |
 | `d3` | 10 changed | n/a | 16 sibling references added across 10 rules |
-| `d5` | 2 changed | **-3** | `network-group-0` (-1), `super-nested-group` (-2) |
 
 All four reported `Failed: 0`. The 7 siblings match the figure the runbook
 records for a correct `--live-query` capture on this source; 1 sibling would
@@ -372,7 +301,7 @@ Open a new tab or window and they are gone; re-run the env block first.
 
 ## If something goes wrong
 
-Roll back as in section 6. If the baselines are gone, restore from the bundle
+Roll back as in section 5. If the baselines are gone, restore from the bundle
 taken in the preconditions and follow
 [EMERGENCY_RESTORE_PS.md](EMERGENCY_RESTORE_PS.md). Read its rules caveat first:
 backup bundles do not carry `_parent_policy_id`, so restoring rules straight from
@@ -398,7 +327,6 @@ $S   = "nsx-lm1"
 $T   = "nsx-lm1"
 $SH  = "nsx-lm1.lab.local"
 $R   = "nsx_avs_runs/${S}_to_${T}"
-$D5R = "$R/d5_preview"
 $CSV = "data/nonprod_map.csv"
 $Appendix = "_avs_ips"
 New-Item -ItemType Directory -Force -Path $R | Out-Null
@@ -420,25 +348,6 @@ if ($LASTEXITCODE -eq 0) {
 if ($LASTEXITCODE -eq 0) {
     wf --phase d3 --no-capture
 }
-
-if ($LASTEXITCODE -eq 0) {
-    & $Python tools/nsx/build_sibling_groups.py `
-        --source $S `
-        --output-base $D5R `
-        --domain-id default `
-        --appendix $Appendix `
-        --csv-remap $CSV `
-        --skip-segment-groups
-}
-
-if ($LASTEXITCODE -eq 0) {
-    & $Python tools/nsx/run_workflow.py `
-        --source $S `
-        --target $T `
-        --run-dir $D5R `
-        --appendix $Appendix `
-        --phase d5 --no-capture
-}
 ```
 
 This previews **Workflow D in place on LM1**, proceeding only when the previous command succeeds. **No NSX configuration changes are applied.**
@@ -446,13 +355,12 @@ This previews **Workflow D in place on LM1**, proceeding only when the previous 
 - **`d2a`** captures LM1 automatically with `--live-query`, builds the mapped siblings, and previews their creation or update.
 - **`d2b`** previews mapped IP additions to pure-IP groups.
 - **`d3`** previews sibling-reference additions to the rules currently on LM1.
-- **`d5`** previews IP removal from tag-side originals. Its extra local build writes under `$D5R`, preserving the earlier bundles and reports under `$R`.
 
 This block sets the same variables as section 0, including `$SH` and
 `$env:NSX_LOG_DIR`, and `$R` is the same stable run directory
-(`nsx_avs_runs/nsx-lm1_to_nsx-lm1`). The review gates in sections 1, 2a and 5a
-and the rollback commands in section 6 therefore work in this session without
-redefining anything. Do not swap `$R` for a timestamped directory: section 6
+(`nsx_avs_runs/nsx-lm1_to_nsx-lm1`). The review gates in sections 1 and 2a
+and the rollback commands in section 5 therefore work in this session without
+redefining anything. Do not swap `$R` for a timestamped directory: section 5
 pops the revert baselines from the run dir, and a per-run name hides them.
 
 All four use the same source capture. The CSV and suffix match this run card: `data/nonprod_map.csv` and `_avs_ips`.
@@ -463,7 +371,6 @@ Reports:
 "$R/report/d2a/dryrun/avs_run_report.md"
 "$R/report/d2b/dryrun/avs_run_report.md"
 "$R/report/d3/dryrun/avs_run_report.md"
-"$D5R/report/d5/dryrun/avs_run_report.md"
 ```
 
-Each preview compares against LM1's current live state; preceding dry runs do not change that state. The `d5` preview does not establish that its removals are safe to apply. Applying `d5` still requires `d2a` and `d3` to be applied and validated, as described in section 5.
+Each preview compares against LM1's current live state; preceding dry runs do not change that state. No phase removes an IP, so the tag-side originals keep their addresses throughout.

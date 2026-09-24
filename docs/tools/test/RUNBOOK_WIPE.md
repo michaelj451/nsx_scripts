@@ -14,6 +14,21 @@ Two modes:
 **Dry-run is the default.** `--apply` is required to write. Every run captures
 `pre_wipe_state.json` before deleting.
 
+**An apply asks twice before it deletes anything.** After the plan is built, it
+prints how many rules, policies, groups and services it is about to destroy,
+then requires:
+
+1. the manager's full **hostname**, typed exactly (for example
+   `nsx-gm1.lab.local`). The alias you passed as `--target` is not accepted:
+   typing that back is an echo of the command line, not a deliberate check.
+2. the word **`WIPE`**, exactly, in capitals. `yes`, `y` and `wipe` are refused.
+
+Any mismatch aborts with exit code 3 before the first DELETE, and writes
+`wipe_aborted.json` next to `pre_wipe_state.json` as the record. A closed or
+non-interactive stdin counts as a refusal too, so the wipe cannot be driven by
+a script, a pipe or an automation agent. There is deliberately no flag that
+skips this. A dry run never prompts, because it deletes nothing.
+
 ---
 
 ## 1. Read this before a full wipe

@@ -70,6 +70,8 @@ from nsx.cli_bootstrap import init_cli
 from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
+from nsx.push_skip import is_unchanged, SKIPPED_STATUS
+from nsx import revert_plan  # noqa: E402
 
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -881,16 +883,6 @@ def cmd_push(args: argparse.Namespace) -> int:
     # Validate / load CSV remap if requested
     csv_mapping = None
     csv_invalid_rows: List[Dict[str, Any]] = []
-    # --- INTENTIONAL-IP-REMOVAL × CSV-REMAP rejection ------------------------
-    # These two flags model opposite intents and must never coexist:
-    #   --csv-remap                = strict-additive, never remove
-    #   --intentional-ip-removal   = decomposition, removal is expected
-    if args.intentional_ip_removal and args.csv_remap:
-        raise SystemExit(
-            "--intentional-ip-removal cannot be combined with --csv-remap. "
-            "CSV remap is strict-additive by design (never removes IPs), while "
-            "--intentional-ip-removal explicitly allows removal. Pick one workflow."
-        )
     if args.csv_remap:
         # --- ADDITIVE-ONLY CONTRACT (CSV remap) ----------------------------
         # CSV remap is strict-additive by design. Refuse --mapped-only;
@@ -1128,6 +1120,23 @@ def cmd_push(args: argparse.Namespace) -> int:
                 row["ips_added"]       = ips_added
                 row["ips_removed"]     = ips_removed
 
+            # --- SKIP-UNCHANGED (default) ------------------------------------
+            # The target already holds this content. A PUT would bump
+            # _revision and re-realize for no behavioural gain, and would
+            # overwrite whatever is there with something identical. Decided
+            # before the dry-run/apply fork so the preview matches the apply.
+            unchanged = (have_baseline and not args.force_push
+                         and is_unchanged(obj, baseline_dict.get(gid)))
+            if unchanged:
+                row["status"] = SKIPPED_STATUS
+                row["skipped_reason"] = "target content already identical"
+                skipped += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
+                         "nothing sent to NSX", i, len(files), ok, failed, skipped,
+                         group_name)
+                rows.append(row)
+                continue
+
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -1143,9 +1152,10 @@ def cmd_push(args: argparse.Namespace) -> int:
                 # Surface a would-be contract violation now rather than at apply
                 # time. The row is not failed: a dry run reports, it does not
                 # decide.
-                if ips_removed and not args.intentional_ip_removal:
+                if ips_removed:
                     log.warning("[%d/%d] %s WOULD REMOVE %d IP(s) on apply: %s. "
-                                "Re-run with --intentional-ip-removal if that is the intent.",
+                                "This push is refused on apply: the additive-only "
+                                "contract is absolute and has no override.",
                                 i, len(files), group_name, len(ips_removed), ips_removed)
                 rows.append(row)
                 continue
@@ -1163,7 +1173,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             # drift between the source bundle and the target — e.g. someone
             # added IPs to the target after the bundle was captured. The fix
             # is to re-capture so source and target match before remapping.
-            if ips_removed and not args.intentional_ip_removal:
+            if ips_removed:
                 if csv_mapping is not None:
                     contract_violation_msg = (
                         f"ADDITIVE-ONLY contract violated: pushing this group "
@@ -1176,11 +1186,10 @@ def cmd_push(args: argparse.Namespace) -> int:
                     contract_violation_msg = (
                         f"IP removal blocked: pushing this group would REMOVE "
                         f"{len(ips_removed)} IP(s) from the target ({ips_removed}). "
-                        f"If this is the decomposition workflow (stripping IPs out of "
-                        f"tagged groups into siblings), re-run with "
-                        f"--intentional-ip-removal. Otherwise the YAML you're pushing "
-                        f"is out of sync with the target — re-export from the target "
-                        f"and re-build before pushing."
+                        f"This tool never removes an IP from a group: the "
+                        f"additive-only contract is absolute. The YAML you are "
+                        f"pushing is out of sync with the target. Re-export from "
+                        f"the target and re-build before pushing."
                     )
                 row["status"] = "failed_contract_violation"
                 row["error"] = contract_violation_msg
@@ -1190,11 +1199,6 @@ def cmd_push(args: argparse.Namespace) -> int:
                           i, len(files), ok, failed, skipped, gid, contract_violation_msg)
                 rows.append(row)
                 continue   # skip the put/patch entirely — nothing reaches NSX for this group
-
-            # Operator opted in to removal: log loudly so it shows up in the audit trail.
-            if ips_removed and args.intentional_ip_removal:
-                log.warning("[%d/%d] %s — INTENTIONAL IP REMOVAL: %d IP(s) %s",
-                            i, len(files), gid, len(ips_removed), ips_removed)
 
             # --- ZERO-IMPACT RERUN GUARD (CSV remap) -------------------------
             # The remap contract is "idempotently ADD IPs". When the diff
@@ -1476,22 +1480,11 @@ def cmd_push(args: argparse.Namespace) -> int:
     # additive-only contract was violated. Fail loudly and exit non-zero.
     total_ips_removed_count = sum(len(r.get("ips_removed", []) or []) for r in rows)
     contract_violations = sum(1 for r in rows if r.get("status") == "failed_contract_violation")
-    # Contract status interpretation:
-    #   --csv-remap                : must have 0 removed and 0 violations
-    #   --intentional-ip-removal   : violations must be 0; removals are expected and recorded
-    #   neither flag               : a remove on a per-row diff is a violation (same as csv-remap path)
-    contract_ok = (contract_violations == 0) and (
-        (csv_mapping is not None and total_ips_removed_count == 0)
-        or args.intentional_ip_removal
-        or (csv_mapping is None and total_ips_removed_count == 0)
-    )
-    if args.intentional_ip_removal:
-        log.warning("INTENTIONAL-IP-REMOVAL mode: %d IP(s) removed across %d row(s) "
-                    "(decomposition workflow). Contract: %s.",
-                    total_ips_removed_count,
-                    sum(1 for r in rows if r.get("ips_removed")),
-                    "pass" if contract_violations == 0 else "violated")
-    elif csv_mapping is not None or any(r.get("ips_removed") for r in rows):
+    # Contract status: this tool never removes an IP from a group, under any
+    # flag. Any row whose diff shows a removal is a violation and was refused
+    # before it reached NSX.
+    contract_ok = (contract_violations == 0) and (total_ips_removed_count == 0)
+    if csv_mapping is not None or any(r.get("ips_removed") for r in rows):
         if contract_ok:
             log.info("ADDITIVE-ONLY contract: PASS — 0 IPs removed across %d row(s).", len(rows))
         else:
@@ -1500,11 +1493,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                       total_ips_removed_count, contract_violations)
     summary["totals"]["contract_violations"]      = contract_violations
     summary["totals"]["total_ips_removed"]        = total_ips_removed_count
-    summary["totals"]["intentional_ip_removal"]   = bool(args.intentional_ip_removal)
-    summary["totals"]["additive_only_contract"]   = (
-        "n/a (intentional-ip-removal)" if args.intentional_ip_removal
-        else ("pass" if contract_ok else "violated")
-    )
+    summary["totals"]["additive_only_contract"]   = ("pass" if contract_ok else "violated")
     # Markdown report (CSV remap runs only), in the audit-report style.
     if csv_mapping is not None:
         md_path = _write_remap_markdown(reports_dir, summary, rows)
@@ -1619,6 +1608,39 @@ def cmd_revert(args: argparse.Namespace) -> int:
     log.info("Plan: restore=%d  delete=%d  blocked_deletes=%d  (scope=%s)",
              len(to_restore), len(to_delete), len(deletes_blocked), args.scope)
 
+    # --- rollback report: this revert, object by object ----------------------
+    _gone = already_gone if pushed_ids is not None else []
+    _plan_rows, _to_write = revert_plan.build(
+        'group',
+        restores=[{"key": i, "id": i, "baseline": p, "current": current.get(i)}
+                  for i, p in to_restore],
+        deletes=[{"key": i, "id": i, "current": current.get(i)} for i in to_delete],
+        blocked=[{"key": i, "id": i, "current": current.get(i)} for i in deletes_blocked],
+        already_gone=[{"key": i, "id": i, "current": None} for i in _gone],
+        force=getattr(args, "force_push", False))
+    # A group restore can take IPs AWAY (it undoes an additive push), so the
+    # IP delta is recorded for the report to put first.
+    for _r in _plan_rows:
+        if _r["action"] == "restore" and _r.get("restore_kind") == "revert":
+            _before = _extract_ip_entries(current.get(_r["key"]) or {})
+            _after = _extract_ip_entries(baseline.get(_r["key"]) or {})
+            _r["ips_removed"] = [x for x in _before if x not in _after]
+            _r["ips_added"] = [x for x in _after if x not in _before]
+    to_restore = [(i, p) for i, p in to_restore if i in _to_write]
+    _plan_target = {"alias": args.target, "host": target_host,
+                    "domain_id": getattr(args, "domain_id", None)}
+    _skipped_same = sum(1 for _r in _plan_rows if _r["status"] == "skipped_unchanged")
+    if _skipped_same:
+        log.info("  %d restore(s) skipped: the target already matches the baseline "
+                 "(--force-push to write them anyway)", _skipped_same)
+    if not args.apply:
+        for _r in _plan_rows:
+            if _r["status"] == "planned":
+                _r["status"] = "dry_run"
+        _pp = revert_plan.write(reports_dir, 'group', _plan_rows, apply=False,
+                                target=_plan_target, baseline_file=baseline_path)
+        log.info("Revert plan: %s", _pp)
+
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
         for gid, _ in to_restore: log.info("[DRY restore] %s", gid)
@@ -1696,6 +1718,10 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
+    revert_plan.settle(_plan_rows, rows, key_of=lambda e: e.get("id"))
+    _pp = revert_plan.write(reports_dir, 'group', _plan_rows, apply=True,
+                            target=_plan_target, baseline_file=baseline_path)
+    log.info("Revert plan: %s", _pp)
     revert_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     (reports_dir / f"revert_summary_{revert_ts}.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -1855,13 +1881,11 @@ def main() -> int:
     pp.add_argument("--batch-size", type=int, choices=[1], default=1,
                     help="Apply always starts with 1. Increase the batch size at a checkpoint "
                          "by entering a positive number; Enter=continue, n=reset, x=stop.")
-    pp.add_argument("--intentional-ip-removal", action="store_true",
-                    help="Allow this push to REMOVE IPs from groups on the target. Required for "
-                         "the decomposition workflow (e.g. pushing the stripped-original bundle "
-                         "from build_sibling_groups.py, which has IPAddressExpression entries "
-                         "removed). Without this flag, any per-row diff showing removed IPs is "
-                         "refused and marked as a contract failure. Cannot be combined with "
-                         "--csv-remap (those workflows have opposite intents).")
+    pp.add_argument("--force-push", action="store_true",
+                    help="Push every object even when the target already holds identical "
+                         "content. Default is to skip those: an identical PUT only bumps "
+                         "_revision and re-realizes. Use this when the write itself is the "
+                         "point, e.g. forcing re-realization after an NSX-side problem.")
     pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
                     help="DRY RUN: make one read-only pass over the target so every row "
                          "reports ips_before/ips_after/ips_added/ips_removed and whether the "
@@ -1877,6 +1901,10 @@ def main() -> int:
     pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pr.add_argument("--domain-id", default="default")
     pr.add_argument("--federation-global", action="store_true")
+    pr.add_argument("--force-push", action="store_true",
+        help="Restore every baseline object even when the target already "
+             "matches it. Default is to skip those: restoring identical "
+             "content only bumps _revision and re-realizes.")
     pr.add_argument("--apply", action="store_true", default=False,
                     help="Actually revert. Without this, runs as dry-run.")
     pr.add_argument("--reports-dir", default=None,

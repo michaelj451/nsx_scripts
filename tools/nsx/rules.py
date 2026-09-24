@@ -66,6 +66,9 @@ import yaml
 from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
+from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
+from nsx import revert_plan  # noqa: E402
+from nsx.names import target_ref_names, names_for, policy_name_by_id
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -543,6 +546,32 @@ def cmd_push(args: argparse.Namespace) -> int:
             # nothing to revert.
             log.info("  Target has %d customer rule(s) (read-only, no baseline written)",
                      len(baseline))
+    # Display names for every group / service a rule here can reference, so the
+    # run report names them instead of printing ids. Target-only objects (the
+    # ones no bundle on the source side knows about) exist only here.
+    ref_name_map = target_ref_names(client, args.domain_id) if client else {}
+    target_policy_names = policy_name_by_id(ref_name_map)
+    policy_names: Dict[str, str] = {}
+
+    def _policy_display_name(pid: str, rule_file: Path) -> str:
+        """The display name of the policy this rule is pushed into. The bundle's
+        own policy file wins, because it is what the policy push lands (and on a
+        fresh clone the policy is not on the target yet); the target is the
+        fallback; the id is the last resort."""
+        if pid not in policy_names:
+            name = None
+            for fn in ("policy.yaml", "policy.yml", "policy.json"):
+                pf = Path(rule_file).parent.parent / fn
+                if pf.is_file():
+                    try:
+                        doc = _load_file(pf)
+                        if isinstance(doc, dict) and doc.get("id") == pid:
+                            name = doc.get("display_name")
+                    except Exception:
+                        pass
+                    break
+            policy_names[pid] = name or target_policy_names.get(pid) or pid
+        return policy_names[pid]
 
     rows: List[Dict[str, Any]] = []
     ok = failed = skipped = dry_run_count = 0
@@ -561,6 +590,7 @@ def cmd_push(args: argparse.Namespace) -> int:
             rule = _sanitize(rule)
             rid = rule.get("id")
             row["policy_id"] = policy_id
+            row["policy_display_name"] = _policy_display_name(policy_id, rule_file)
             row["id"] = rid
             row["display_name"] = rule.get("display_name")
 
@@ -608,6 +638,40 @@ def cmd_push(args: argparse.Namespace) -> int:
                     log.warning("[%d/%d] %s/%s: cannot merge, ANY cannot mix with "
                                 "concrete paths: %s", i, total, policy_id, rid,
                                 "; ".join(mrep["conflicts"]))
+
+            # --- SKIP-UNCHANGED (default) ------------------------------------
+            # Target already holds identical content: an identical PUT would
+            # only bump _revision and re-realize. Decided before the
+            # dry-run/apply fork so the preview matches the apply.
+            if not args.force_push and is_unchanged(
+                    rule, (baseline.get(f"{policy_id}::{rid}") or {}).get("payload")):
+                row["status"] = SKIPPED_STATUS
+                row["skipped_reason"] = "target content already identical"
+                skipped += 1
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
+                         "nothing sent to NSX", i, total, ok, failed, skipped, f"{policy_id}/{rid}")
+                rows.append(row)
+                continue
+
+            # --- WHAT THIS PUSH CHANGES --------------------------------------
+            # Past the skip, the target copy differs from what is being sent.
+            # Record how, field by field, so the run report can show it: a push
+            # over an existing object is otherwise opaque, and "pushed" says
+            # nothing about whether a reference was put back or taken away.
+            _live = (baseline.get(f"{policy_id}::{rid}") or {}).get("payload")
+            if _live:
+                _pfd = field_diff(rule, _live)
+                if _pfd:
+                    row["per_field_diff"] = _pfd
+                    row["refs_added_total"] = sum(
+                        len(d.get("added") or []) for f, d in _pfd.items()
+                        if f in MERGEABLE_REF_FIELDS)
+            _paths = [v for src in (rule, _live or {})
+                      for f in (*MERGEABLE_REF_FIELDS, "services", "profiles")
+                      for v in (src.get(f) or []) if isinstance(v, str) and v.startswith("/")]
+            _names = names_for(_paths, ref_name_map)
+            if _names:
+                row["ref_names"] = _names
 
             if not args.apply:
                 row["status"] = "dry_run"
@@ -845,6 +909,42 @@ def cmd_revert(args: argparse.Namespace) -> int:
     to_delete = [(k, current[k]) for k in current.keys() if k not in baseline]
     log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
 
+    # --- rollback report: this revert, object by object ----------------------
+    _ref = target_ref_names(client, args.domain_id)
+    _pol = policy_name_by_id(_ref)
+    _plan_rows, _to_write = revert_plan.build(
+        'rule',
+        restores=[{"key": k, "id": v["rule_id"], "policy_id": v["policy_id"],
+                   "policy_display_name": _pol.get(v["policy_id"]),
+                   "baseline": v["payload"],
+                   "current": (current.get(k) or {}).get("payload")}
+                  for k, v in to_restore],
+        deletes=[{"key": k, "id": v["rule_id"], "policy_id": v["policy_id"],
+                  "policy_display_name": _pol.get(v["policy_id"]),
+                  "current": v.get("payload")} for k, v in to_delete],
+        force=getattr(args, "force_push", False))
+    for _r in _plan_rows:
+        _paths = [x for d in (_r.get("per_field_diff") or {}).values()
+                  for side in ("before", "after") for x in (d.get(side) or [])
+                  if isinstance(x, str) and x.startswith("/")]
+        _names = names_for(_paths, _ref)
+        if _names:
+            _r["ref_names"] = _names
+    to_restore = [(k, v) for k, v in to_restore if k in _to_write]
+    _plan_target = {"alias": args.target, "host": target_host,
+                    "domain_id": getattr(args, "domain_id", None)}
+    _skipped_same = sum(1 for _r in _plan_rows if _r["status"] == "skipped_unchanged")
+    if _skipped_same:
+        log.info("  %d restore(s) skipped: the target already matches the baseline "
+                 "(--force-push to write them anyway)", _skipped_same)
+    if not args.apply:
+        for _r in _plan_rows:
+            if _r["status"] == "planned":
+                _r["status"] = "dry_run"
+        _pp = revert_plan.write(reports_dir, 'rule', _plan_rows, apply=False,
+                                target=_plan_target, baseline_file=baseline_path)
+        log.info("Revert plan: %s", _pp)
+
     if not args.apply:
         log.info("DRY-RUN — no NSX writes. Add --apply to execute.")
         for key, _ in to_restore: log.info("[DRY restore] %s", key)
@@ -925,6 +1025,10 @@ def cmd_revert(args: argparse.Namespace) -> int:
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
+    revert_plan.settle(_plan_rows, rows, key_of=lambda e: f"{e.get('policy_id')}::{e.get('rule_id')}")
+    _pp = revert_plan.write(reports_dir, 'rule', _plan_rows, apply=True,
+                            target=_plan_target, baseline_file=baseline_path)
+    log.info("Revert plan: %s", _pp)
     revert_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     (reports_dir / f"revert_summary_{revert_ts}.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -1021,6 +1125,22 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
         baseline = _capture_target_rules(client, domain_id)
         log.info("  Live target has %d customer rule(s).", len(baseline))
 
+    # Display names for the report: both halves of every pair from the sibling
+    # map (the siblings may not exist on the target yet), then the target's own
+    # objects for everything else a rule references.
+    ref_name_map = target_ref_names(client, domain_id) if client else {}
+    _by_id = {}
+    for e in sibling_doc.get("map", []) or []:
+        _by_id[e.get("original_id")] = e.get("original_display_name")
+        _by_id[e.get("sibling_id")] = e.get("sibling_display_name")
+    for _orig, _sib in pair_map.items():
+        for _path in (_orig, _sib):
+            _nm = _by_id.get(_path.rsplit("/", 1)[-1])
+            if _nm:
+                ref_name_map.setdefault(_path, _nm)
+
+    amend_policy_names = policy_name_by_id(ref_name_map)
+
     rows: List[Dict[str, Any]] = []
     ok = no_change = failed = 0
 
@@ -1030,6 +1150,7 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
         rule = entry["payload"]
         row: Dict[str, Any] = {
             "policy_id": pid, "rule_id": rid,
+            "policy_display_name": amend_policy_names.get(pid) or pid,
             "display_name": rule.get("display_name"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -1057,6 +1178,11 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
                     "after":  current + to_add,
                     "added":  to_add,
                 }
+
+        _names = names_for([v for d in per_field_diff.values() for v in d.get("after") or []],
+                           ref_name_map)
+        if _names:
+            row["ref_names"] = _names
 
         if not per_field_diff:
             no_change += 1
@@ -1183,6 +1309,10 @@ def main() -> int:
                          "Typically nsx_rules_export/<host>/security-policies/")
     pp.add_argument("--domain-id", default="default")
     pp.add_argument("--federation-global", action="store_true")
+    pp.add_argument("--force-push", action="store_true",
+                    help="Push every object even when the target already holds identical "
+                         "content. Default is to skip those: an identical PUT only bumps "
+                         "_revision and re-realizes.")
     pp.add_argument("--apply", action="store_true", default=False,
                     help="Actually push. Without this, runs as dry-run.")
     pp.add_argument("--reports-dir", default=None,
@@ -1204,6 +1334,10 @@ def main() -> int:
     pr.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     pr.add_argument("--domain-id", default="default")
     pr.add_argument("--federation-global", action="store_true")
+    pr.add_argument("--force-push", action="store_true",
+        help="Restore every baseline object even when the target already "
+             "matches it. Default is to skip those: restoring identical "
+             "content only bumps _revision and re-realizes.")
     pr.add_argument("--apply", action="store_true", default=False,
                     help="Actually revert. Without this, runs as dry-run.")
     pr.add_argument("--reports-dir", default=None,

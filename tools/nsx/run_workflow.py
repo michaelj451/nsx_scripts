@@ -17,7 +17,7 @@ only thing that changes per command is the verb:
 Use a function, not a variable: W="python ..." followed by $W --phase a works
 in bash but fails in zsh, which does not word-split an unquoted parameter.
 
-Phases: a (WF-A Part 1 clone), c (WF-C decomposition), and d2a / d2b / d3 / d5
+Phases: a (WF-A Part 1 clone), c (WF-C decomposition), and d2a / d2b / d3
 (one WF-D change window each; d2a and d2b need --csv-remap). Reports land under
 <run-dir>/report/<phase>/<mode>, so no two invocations overwrite each other.
 See docs/nsx/RUNBOOK_WORKFLOW.md.
@@ -129,25 +129,25 @@ def phase_a_steps(src_host: str, target: str, apply: bool) -> List[Dict[str, Any
 
 
 def phase_c_steps(src_host: str, target: str, apply: bool,
-                  sib: Path, strip: Path, tgt_host: str) -> List[Dict[str, Any]]:
-    """WF-C: push siblings, strip the originals, amend the rules."""
+                  sib: Path, tgt_host: str) -> List[Dict[str, Any]]:
+    """WF-C: push the IP-only siblings, then amend the rules to use them.
+
+    Nothing here removes an IP. The tag-side originals keep their addresses;
+    rules reference the original AND the sibling, so membership is the union.
+    """
     a = ["--apply"] if apply else []
     d: List[str] = []
     return [
         {"label": "c3_siblings", "roots": [str(sib)],
          "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
                  "--groups-dir", str(sib / "groups")] + d + a},
-        {"label": "c4_stripped", "roots": [str(strip)],
-         "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                 "--groups-dir", str(strip / "groups"),
-                 "--intentional-ip-removal"] + d + a},
         {"label": "c5_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
          "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
                  "--sibling-map", str(sib / "sibling_map.json")] + a},
     ]
 
 
-def phase_d_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
+def phase_d_steps(phase: str, target: str, apply: bool, sib: Path,
                   pure_ip: Path, tgt_host: str, csv: str) -> List[Dict[str, Any]]:
     """WF-D: exactly ONE change window per invocation.
 
@@ -167,15 +167,9 @@ def phase_d_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
                  "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
                          "--groups-dir", str(pure_ip / "groups"),
                          "--csv-remap", csv] + d + a}]
-    if phase == "d3":
-        return [{"label": "d3_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
-                 "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
-                         "--sibling-map", str(sib / "sibling_map.json")] + a}]
-    # d5: the only WF-D step that removes IPs from existing groups.
-    return [{"label": "d5_stripped", "roots": [str(strip)],
-             "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                     "--groups-dir", str(strip / "groups"),
-                     "--intentional-ip-removal"] + d + a}]
+    return [{"label": "d3_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
+             "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
+                     "--sibling-map", str(sib / "sibling_map.json")] + a}]
 
 
 def verify_steps(phase: str, source: str, target: str, sib: Path,
@@ -207,14 +201,10 @@ def verify_steps(phase: str, source: str, target: str, sib: Path,
     cmd = [PY, "tools/nsx/validate_wf_d.py", "--target", target,
            "--baseline", str(baselines[-1]), "--sibling-map", str(smap),
            "--output-base", str(run_dir)]
-    if phase == "d5":
-        # After the forced strip, IP removal on tag-side originals is the
-        # intended outcome, not a contract violation.
-        cmd += ["--phase-2-applied"]
     return [{"label": f"{phase}_validate", "roots": [], "cmd": cmd}]
 
 
-def rollback_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
+def rollback_steps(phase: str, target: str, apply: bool, sib: Path,
                    pure_ip: Path, src_host: str, tgt_host: str) -> List[Dict[str, Any]]:
     """Undo one phase, in reverse dependency order.
 
@@ -250,8 +240,6 @@ def rollback_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
         return [
             {"label": "c5_amend_revert", "roots": [],
              "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")},
-            {"label": "c4_stripped_revert", "roots": [],
-             "cmd": groups_revert(strip / "push_report")},
             {"label": "c3_siblings_revert", "roots": [],
              "cmd": groups_revert(sib / "push_report", allow_delete=True)},
         ]
@@ -261,11 +249,8 @@ def rollback_steps(phase: str, target: str, apply: bool, sib: Path, strip: Path,
     if phase == "d2b":
         return [{"label": "d2b_pure_ip_revert", "roots": [],
                  "cmd": groups_revert(pure_ip / "push_report", allow_delete=True)}]
-    if phase == "d3":
-        return [{"label": "d3_amend_revert", "roots": [],
-                 "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")}]
-    return [{"label": "d5_stripped_revert", "roots": [],
-             "cmd": groups_revert(strip / "push_report")}]
+    return [{"label": "d3_amend_revert", "roots": [],
+             "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")}]
 
 
 def main() -> int:
@@ -276,10 +261,10 @@ def main() -> int:
     p.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
     p.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     p.add_argument("--phase", required=True,
-                   choices=["a", "c", "d2a", "d2b", "d3", "d5"],
+                   choices=["a", "c", "d2a", "d2b", "d3"],
                    help="a = WF-A Part 1 clone; c = WF-C sibling decomposition; "
-                        "d2a/d2b/d3/d5 = one WF-D change window each "
-                        "(siblings / pure-IP remap / amend-refs / forced strip).")
+                        "d2a/d2b/d3 = one WF-D change window each "
+                        "(siblings / pure-IP remap / amend-refs).")
     p.add_argument("--csv-remap", default=None, metavar="PATH",
                    help="CSV subnet map. Required for WF-D phases d2a (the build "
                         "maps sibling IPs through it) and d2b.")
@@ -384,7 +369,6 @@ def main() -> int:
     log.info("=" * 70)
 
     sib = run_dir / "nsx_sibling_groups" / src_host
-    strip = run_dir / "nsx_stripped_groups" / src_host
     pure_ip = run_dir / "nsx_pure_ip_remap" / src_host
     wf = "d" if args.phase.startswith("d") else args.phase
     out_dir = run_dir / "report" / args.phase / mode
@@ -416,7 +400,7 @@ def main() -> int:
                       "is missing under %s. Run the phase first.", args.phase, sib)
             return 2
     elif args.rollback:
-        steps = rollback_steps(args.phase, args.target, args.apply, sib, strip,
+        steps = rollback_steps(args.phase, args.target, args.apply, sib,
                                pure_ip, src_host, tgt_host)
         if not args.apply:
             log.info("Rollback DRY RUN: each revert prints its plan and writes nothing.")
@@ -450,33 +434,30 @@ def main() -> int:
                 build += ["--appendix", args.appendix]
             if args.phase == "d2a":
                 # WF-D's build: map the IPs through the CSV, never touch a group
-                # carrying a PathExpression, and do not write the stripped
-                # bundle (phase d5 rebuilds it deliberately, in its own window).
-                build += ["--csv-remap", args.csv_remap, "--skip-segment-groups",
-                          "--no-stripped-originals"]
+                # carrying a PathExpression.
+                build += ["--csv-remap", args.csv_remap, "--skip-segment-groups"]
             # Step numbers follow the runbooks: WF-C step 2, WF-D step 1.
             build_label = "c2_build_siblings" if args.phase == "c" else "d1_build_siblings"
             rec = run_step(build_label, build, log_dir)
             if not rec["ok"]:
                 log.error("Sibling build failed; nothing pushed.")
                 return 1
-        steps = phase_c_steps(src_host, args.target, args.apply, sib, strip, tgt_host) \
+        steps = phase_c_steps(src_host, args.target, args.apply, sib, tgt_host) \
             if args.phase == "c" else \
-            phase_d_steps(args.phase, args.target, args.apply, sib, strip, pure_ip,
+            phase_d_steps(args.phase, args.target, args.apply, sib, pure_ip,
                           tgt_host, args.csv_remap)
     else:
-        # d2b / d3 / d5 consume bundles an earlier window produced. Rebuilding
+        # d2b / d3 consume bundles an earlier window produced. Rebuilding
         # here could hand a different payload to a target whose siblings are
         # already live, so a missing bundle is an error, never a rebuild.
-        needed = {"d2b": pure_ip / "groups", "d3": sib / "sibling_map.json",
-                  "d5": strip / "groups"}[args.phase]
+        needed = {"d2b": pure_ip / "groups",
+                  "d3": sib / "sibling_map.json"}[args.phase]
         if not needed.exists():
             log.error("%s needs %s, which does not exist. Phase d2a builds the "
-                      "sibling and pure-IP bundles; d5 needs a build WITHOUT "
-                      "--no-stripped-originals (RUNBOOK_D step 5a).",
+                      "sibling and pure-IP bundles; run it first.",
                       args.phase, needed)
             return 2
-        steps = phase_d_steps(args.phase, args.target, args.apply, sib, strip,
+        steps = phase_d_steps(args.phase, args.target, args.apply, sib,
                               pure_ip, tgt_host, args.csv_remap)
 
     records, roots = [], []
@@ -494,9 +475,9 @@ def main() -> int:
 
     # The report is generated HERE, in the same invocation that ran the steps,
     # which is what makes it impossible to forget and impossible to attribute
-    # to the wrong mode. Only a push produces push-report rows to aggregate:
-    # verify writes its own report, and a revert writes revert summaries that
-    # this aggregator does not read.
+    # to the wrong mode. A push aggregates push-report rows; a rollback
+    # aggregates the revert plans each revert step writes (in both modes);
+    # verify writes its own report.
     rep = {"ok": True}
     if action == "push":
         report_cmd = [PY, "tools/nsx/report_avs_run.py", "--out-dir", str(out_dir),
@@ -504,6 +485,21 @@ def main() -> int:
                       "--label", f"WF-{args.phase.upper()} {mode.upper()}: "
                                  f"{args.source} to {args.target}"]
         for r in dict.fromkeys(roots):
+            report_cmd += ["--report-root", r]
+        rep = run_step("report", report_cmd, log_dir)
+    elif action == "rollback":
+        # Each revert wrote its plan into the reports dir it was pointed at.
+        rb_roots = []
+        for st in steps:
+            c = st["cmd"]
+            if "--reports-dir" in c:
+                rb_roots.append(c[c.index("--reports-dir") + 1])
+        report_cmd = [PY, "tools/nsx/report_rollback.py", "--out-dir", str(out_dir),
+                      "--since", since,
+                      "--label", f"WF-{args.phase.upper()} ROLLBACK "
+                                 f"{'APPLY' if args.apply else 'DRY RUN'}: "
+                                 f"{args.source} to {args.target}"]
+        for r in dict.fromkeys(rb_roots):
             report_cmd += ["--report-root", r]
         rep = run_step("report", report_cmd, log_dir)
 
@@ -528,6 +524,8 @@ def main() -> int:
              f"  FAILED: {failed}" if failed else "")
     if action == "push":
         log.info("Report: %s", out_dir / "avs_run_report.md")
+    elif action == "rollback":
+        log.info("Report: %s", out_dir / "rollback_report.md")
     elif action == "verify":
         log.info("Report: %s", out_dir)
     log.info("=" * 70)

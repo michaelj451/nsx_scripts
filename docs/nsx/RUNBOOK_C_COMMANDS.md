@@ -70,7 +70,7 @@ grep "Summary:" $NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log | t
 #   groups_errors:     0        non-zero means unrealized groups: wait, re-run
 ```
 
-## 2. Transform: build siblings + stripped originals (offline)
+## 2. Transform: build the IP-only siblings (offline)
 
 ```bash
 setopt interactive_comments 2>/dev/null || true
@@ -87,7 +87,6 @@ python tools/nsx/build_sibling_groups.py \
 
 Produces:
 - `nsx_sibling_groups/<host>/groups/` — new IP-only sibling groups
-- `nsx_stripped_groups/<host>/groups/` — originals with IPAddressExpression entries removed
 - `nsx_sibling_groups/<host>/sibling_map.json` — used by step 5
 
 ## 3. Push siblings → target (additive, new groups)
@@ -111,18 +110,7 @@ python tools/nsx/groups.py push --target nsx-lm2 \
   --apply
 ```
 
-## 4. Push stripped originals → target (--intentional-ip-removal)
-
-```bash
-python tools/nsx/groups.py push --target nsx-lm2 \
-  --groups-dir nsx_stripped_groups/nsx-lm1.lab.local/groups \
-  --intentional-ip-removal \
-  --apply
-```
-
-`--batch-size` defaults to **1** here (step through every removal). Bump higher at any prompt.
-
-## 5. Amend rules to reference siblings alongside originals
+## 4. Amend rules to reference siblings alongside originals
 
 ```bash
 python tools/nsx/rules.py amend-refs --target nsx-lm2 \
@@ -139,13 +127,9 @@ Strict-additive — never removes a ref. Same prompt vocabulary as `groups.py pu
 ```bash
 setopt interactive_comments 2>/dev/null || true
 
-# 5. amend-refs revert
+# 4. amend-refs revert
 python tools/nsx/rules.py revert --target nsx-lm2 \
   --reports-dir nsx_rules_export/nsx-lm2.lab.local/push_report --apply
-
-# 4. stripped-originals revert
-python tools/nsx/groups.py revert --target nsx-lm2 \
-  --reports-dir nsx_stripped_groups/nsx-lm1.lab.local/push_report --apply
 
 # 3. siblings revert
 python tools/nsx/groups.py revert --target nsx-lm2 \

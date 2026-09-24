@@ -20,14 +20,12 @@ Phases:
    policies, rules)
 3. **WF-D additive** — build mapped-IP siblings, dry-run, apply (groups stay untouched)
 4. **(separate change window)** Amend rules to reference siblings alongside originals — strict additive, never removes
-5. **(optional, FORCED separate change window)** Phase 2 — move IPs from originals to siblings via `--intentional-ip-removal`
 6. **Revert** any phase via a single command per phase
 
 **Contracts the toolkit enforces:**
 
 - **Rules amend is strict additive.** Sibling refs are appended; existing refs are never removed; rules themselves are never deleted.
 - **Groups are never deleted by any push command.** Group deletion happens only via `groups.py revert` against a baseline that captured "group did not exist." There is no other DELETE path in any push tool.
-- **IP removal from group payloads requires `--intentional-ip-removal`.** The strict-additive contract rejects any row that would remove an IP. The flag is the explicit force gate.
 
 > **WF-D end state.** Tag groups on the target carry only their
 > `Condition` (zero IPs); the new `*_sibling` groups carry only the
@@ -190,8 +188,7 @@ python tools/nsx/groups.py push --target $DST \
 python tools/nsx/build_sibling_groups.py \
   --source $SRC \
   --csv-remap data/nonprod_map.csv \
-  --skip-segment-groups \
-  --no-stripped-originals \
+  --skip-segment-groups
   --label $SRC_HOST
 ```
 
@@ -222,7 +219,7 @@ To label the bundle by the **target** manager instead of the source:
 python tools/nsx/build_sibling_groups.py \
   --source $SRC \
   --csv-remap data/nonprod_map.csv \
-  --skip-segment-groups --no-stripped-originals \
+  --skip-segment-groups \
   --label $DST.lab.local
 ```
 
@@ -340,7 +337,6 @@ python tools/nsx/validate_wf_d.py \
   --sibling-map nsx_sibling_groups/$SRC_HOST/sibling_map.json
 ```
 
-Add `--phase-2-applied` after step 7 has run, so the validator downgrades
 the expected IP-removal findings on tag-side originals from CRITICAL to
 INFO. Add `--rules-baseline <path>` to also check that no rule was deleted.
 
@@ -349,7 +345,7 @@ Checks run (CRITICAL fails the validation):
 | Code | What it confirms |
 |---|---|
 | **G1** | No customer group present in the baseline was deleted. |
-| **G2** | No IP present in any baseline group was removed (or, with `--phase-2-applied`, only tag-side originals had IPs removed and the corresponding sibling holds the mapped values). |
+| **G2** | No IP present in any baseline group was removed. Absolute: nothing in the toolkit removes one. |
 | **G3** | Every `Condition` and `PathExpression` in baseline groups is still present (no tag-match or segment-ref silently dropped). |
 | **S1** | Every (original, sibling) pair in `sibling_map.json` exists on the target. |
 | **S2** | Every sibling carries `group_type: [IPAddress]`. |
@@ -358,85 +354,6 @@ Checks run (CRITICAL fails the validation):
 
 Exit code: `0` = all checks pass; `1` = at least one CRITICAL finding.
 Report at `$NSX_LOG_DIR/wf_d_validation/<target-host>/validation_report.json`.
-
----
-
-## 7. (optional, FORCED, separate change window) Phase 2 — move IPs from originals to siblings
-
-> ⚠️  **This is the only flow in the toolkit that REMOVES IPs from
-> existing groups.** It is gated behind an explicit `--intentional-ip-removal`
-> force flag. The strict-additive contract is **deliberately overridden**
-> for this one push. Use only when:
->
-> 1. WF-D additive (steps 4–5) has been applied and validated
-> 2. amend-refs (step 6) has been applied and rules are matching via siblings
-> 3. You have CAB approval to strip IPs from the tag-side originals so that
->    enforcement migrates fully to the sibling groups
->
-> **Groups are never deleted by this step.** Only `IPAddressExpression`
-> entries inside existing group payloads are removed. The groups
-> themselves stay (Condition-only after the strip). To delete a group,
-> use `groups.py revert` against a baseline that captured "group did
-> not exist" — that is the **only** path the toolkit offers to delete
-> a group.
-
-### 7a. Rebuild the bundle WITH stripped originals
-
-The default WF-D build uses `--no-stripped-originals` to suppress the
-strip bundle. For Phase 2, rebuild **without** that flag so
-`nsx_stripped_groups/<host>/groups/` is produced:
-
-```bash
-setopt interactive_comments 2>/dev/null || true
-
-python tools/nsx/build_sibling_groups.py \
-  --source $SRC \
-  --csv-remap data/nonprod_map.csv \
-  --include-pure-ip \
-  --skip-segment-groups \
-  --label $SRC_HOST
-  # NOTE: --no-stripped-originals deliberately OMITTED so the stripped
-  # bundle is produced alongside the sibling bundle.
-```
-
-### 7b. Push the stripped originals — REQUIRES `--intentional-ip-removal`
-
-```bash
-setopt interactive_comments 2>/dev/null || true
-
-# DRY RUN first — confirm the per-row IP-removal counts look right
-python tools/nsx/groups.py push --target $DST \
-  --groups-dir nsx_stripped_groups/$SRC_HOST/groups \
-  --intentional-ip-removal
-
-# Then apply
-python tools/nsx/groups.py push --target $DST \
-  --groups-dir nsx_stripped_groups/$SRC_HOST/groups \
-  --intentional-ip-removal \
-  --apply
-```
-
-Without `--intentional-ip-removal`, every row would be rejected as a
-`contract_violation` — that is the strict-additive contract refusing
-the push. The flag must be passed explicitly to override it.
-
-### 7c. Net effect
-
-| Object | Before Phase 2 | After Phase 2 |
-|---|---|---|
-| Tag-side original (`vm1`) | `Condition + IPAddressExpression([10.6.0.101, ...])` (mixed if Parts 2+3 had run, or already Condition-only from Part 1) | `Condition` only — IPs removed |
-| Sibling (`vm1_sibling`) | `IPAddressExpression([10.7.0.101, ...])` (mapped IPs) | unchanged — still holds mapped IPs |
-| Rules referencing `vm1` | match via tag + (optionally via sibling if amend-refs ran) | match via tag (members empty if no realized) + sibling IPs |
-| Group `vm1` itself | exists | **still exists** — only its IP entries were stripped |
-
-### 7d. Revert Phase 2 — single command
-
-```bash
-python tools/nsx/groups.py revert --target $DST \
-  --reports-dir nsx_stripped_groups/$SRC_HOST/push_report --apply
-```
-
-Restores the pre-Phase-2 IP content to the originals.
 
 ---
 

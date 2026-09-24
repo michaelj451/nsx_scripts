@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
+from nsx.names import ambiguous, display  # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
 from nsx.md_utils import align_markdown_tables               # noqa: E402
@@ -361,6 +362,7 @@ def write_markdown(out: Path, target: str, correlation: Dict[str, Any],
                  "for complex groups).\n")
     lines.append("| Group | Expression kind | # Tag conds | Tag conditions | # Matching VMs | Matching VMs |")
     lines.append("|---|---|---:|---|---:|---|")
+    _amb = ambiguous((gid, gi.get("display_name")) for gid, gi in by_group.items())
     for gid, gi in sorted(by_group.items(), key=lambda kv: kv[1]["display_name"]):
         if not gi["tag_conditions"]:
             continue
@@ -369,7 +371,7 @@ def write_markdown(out: Path, target: str, correlation: Dict[str, Any],
         vms = gi["matching_vms"] if gi["expression_kind"] == "simple_tag_or" else gi["live_vm_members"]
         vm_names = [v["display_name"] for v in vms]
         vm_cell = ", ".join(vm_names[:6]) + (f" (+{len(vm_names)-6} more)" if len(vm_names) > 6 else "") or "(none)"
-        lines.append(f"| `{gid}` ({gi['display_name']}) | {gi['expression_kind']} | "
+        lines.append(f"| {display(gi.get('display_name'), gid, _amb)} | {gi['expression_kind']} | "
                      f"{len(gi['tag_conditions'])} | {cond_cell} | "
                      f"{len(vms)} | {vm_cell} |")
     lines.append("")
@@ -395,7 +397,7 @@ def write_markdown(out: Path, target: str, correlation: Dict[str, Any],
         lines.append("| Group | Tag condition |")
         lines.append("|---|---|")
         for oc in correlation["orphan_conditions"]:
-            lines.append(f"| `{oc['group_id']}` ({oc['group_display']}) | "
+            lines.append(f"| {display(oc.get('group_display'), oc['group_id'], _amb)} | "
                          f"`{_md_escape_tag(oc['tag_key'])}` |")
         lines.append("")
 
