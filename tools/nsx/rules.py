@@ -67,6 +67,7 @@ from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
+from nsx.names import target_ref_names, names_for
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -544,6 +545,10 @@ def cmd_push(args: argparse.Namespace) -> int:
             # nothing to revert.
             log.info("  Target has %d customer rule(s) (read-only, no baseline written)",
                      len(baseline))
+    # Display names for every group / service a rule here can reference, so the
+    # run report names them instead of printing ids. Target-only objects (the
+    # ones no bundle on the source side knows about) exist only here.
+    ref_name_map = target_ref_names(client, args.domain_id) if client else {}
 
     rows: List[Dict[str, Any]] = []
     ok = failed = skipped = dry_run_count = 0
@@ -637,6 +642,12 @@ def cmd_push(args: argparse.Namespace) -> int:
                     row["refs_added_total"] = sum(
                         len(d.get("added") or []) for f, d in _pfd.items()
                         if f in MERGEABLE_REF_FIELDS)
+            _paths = [v for src in (rule, _live or {})
+                      for f in (*MERGEABLE_REF_FIELDS, "services", "profiles")
+                      for v in (src.get(f) or []) if isinstance(v, str) and v.startswith("/")]
+            _names = names_for(_paths, ref_name_map)
+            if _names:
+                row["ref_names"] = _names
 
             if not args.apply:
                 row["status"] = "dry_run"
@@ -1050,6 +1061,20 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
         baseline = _capture_target_rules(client, domain_id)
         log.info("  Live target has %d customer rule(s).", len(baseline))
 
+    # Display names for the report: both halves of every pair from the sibling
+    # map (the siblings may not exist on the target yet), then the target's own
+    # objects for everything else a rule references.
+    ref_name_map = target_ref_names(client, domain_id) if client else {}
+    _by_id = {}
+    for e in sibling_doc.get("map", []) or []:
+        _by_id[e.get("original_id")] = e.get("original_display_name")
+        _by_id[e.get("sibling_id")] = e.get("sibling_display_name")
+    for _orig, _sib in pair_map.items():
+        for _path in (_orig, _sib):
+            _nm = _by_id.get(_path.rsplit("/", 1)[-1])
+            if _nm:
+                ref_name_map.setdefault(_path, _nm)
+
     rows: List[Dict[str, Any]] = []
     ok = no_change = failed = 0
 
@@ -1086,6 +1111,11 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
                     "after":  current + to_add,
                     "added":  to_add,
                 }
+
+        _names = names_for([v for d in per_field_diff.values() for v in d.get("after") or []],
+                           ref_name_map)
+        if _names:
+            row["ref_names"] = _names
 
         if not per_field_diff:
             no_change += 1

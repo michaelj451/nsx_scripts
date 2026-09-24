@@ -223,14 +223,30 @@ class RenderAndLoadTests(unittest.TestCase):
         self.assertIn("10.6.0.52-10.6.0.53", md)  # by design in 3
         self.assertNotIn(EM_DASH, md)
 
-    def test_render_shows_display_name_when_it_differs(self):
+    def test_render_shows_display_name_not_id(self):
+        # Reports name groups by display name; the NSX id (often a UUID) is
+        # never shown on its own.
         fwd, rev, invalid, csv = _tables()
         g = _group("a8b5ed22-0000", [_ipx("10.6.0.101")])
         g["display_name"] = "friendly-name"
         rows = audit.audit_groups({"a8b5ed22-0000": g}, fwd, rev)
         md = audit.render_markdown(rows, audit.summarize(rows), label="lab", source_desc="test",
                                    domain_id="default", csv_path=csv, csv_rows=len(fwd.rows), csv_invalid=invalid)
-        self.assertIn("| friendly-name | `a8b5ed22-0000` |", " ".join(md.split()))
+        flat = " ".join(md.split())
+        self.assertIn("| friendly-name |", flat)
+        self.assertNotIn("a8b5ed22-0000", md)
+
+    def test_render_adds_id_only_when_display_name_is_shared(self):
+        # Display names are not unique in NSX. When two groups share one, the id
+        # is the only thing that tells them apart, so it is shown for both.
+        fwd, rev, invalid, csv = _tables()
+        a = _group("id-aaa", [_ipx("10.6.0.101")]); a["display_name"] = "web"
+        b = _group("id-bbb", [_ipx("10.6.0.102")]); b["display_name"] = "web"
+        rows = audit.audit_groups({"id-aaa": a, "id-bbb": b}, fwd, rev)
+        md = audit.render_markdown(rows, audit.summarize(rows), label="lab", source_desc="test",
+                                   domain_id="default", csv_path=csv, csv_rows=len(fwd.rows), csv_invalid=invalid)
+        self.assertIn("web (id-aaa)", md)
+        self.assertIn("web (id-bbb)", md)
 
     def test_render_clean(self):
         fwd, rev, invalid, csv = _tables()

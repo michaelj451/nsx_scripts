@@ -52,7 +52,13 @@ except ImportError:                                   # pragma: no cover
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "app"))
 
+from nsx.names import NameMap  # noqa: E402
+
 log = logging.getLogger("report_avs_run")
+
+# Display names for every object and reference this report mentions. Filled in
+# main() from the bundles and push rows, before anything is rendered.
+NAMES = NameMap()
 
 # Report basenames a push tool can leave behind, mapped to the object class.
 REPORT_FILES = {
@@ -178,9 +184,18 @@ def _vals(items: Optional[List[Any]]) -> str:
 
 
 def _short(path: str) -> str:
-    """Group paths are long and repetitive; the id is what a reviewer reads."""
+    """A reference as a reviewer should read it: the object's display name.
+
+    Paths are long and repetitive, and the id at the end of one is often an
+    opaque token (`vm1` is "vm-group-1", a UUID is "ip-address-group-..."). The
+    id is added only when the display name is shared by more than one object.
+    Push rows record target-only refs as "<field>:<path>"; those keep the field.
+    """
     s = str(path)
-    return s.rsplit("/", 1)[-1] if s.startswith("/") else s
+    if ":/" in s:
+        field, ref = s.split(":", 1)
+        return f"{field}: {NAMES.label(ref)}"
+    return NAMES.label(s) if s.startswith("/") else s
 
 
 def payload_lines(r: Dict[str, Any]) -> List[str]:
@@ -493,6 +508,7 @@ def load_rows(root: Path, since: Optional[datetime],
                 "ips_after": r.get("ips_after"),
                 "refs_preserved": r.get("refs_preserved"),
                 "per_field_diff": r.get("per_field_diff"),
+                "ref_names": r.get("ref_names"),
                 "csv_added_values": r.get("csv_added_values"),
                 # The exact YAML the push sends. For a CREATED object this is
                 # the only record of what it actually is: no diff exists,
@@ -543,6 +559,14 @@ def main() -> int:
         root_path = Path(root).expanduser()
         rows.extend(load_rows(root_path, since, args.workflow))
         modes |= load_modes(root_path, since)
+        NAMES.add_bundle(root_path)
+    # The rows themselves name the objects they push, and the push tools record
+    # display names for target-side references no bundle on this side holds.
+    for r in rows:
+        NAMES.add(None, r.get("id"), r.get("display_name"),
+                  {"group": "groups", "service": "services", "policy": "security-policies",
+                   "rule": "rules"}.get(r.get("kind"), ""))
+        NAMES.add_mapping(r.get("ref_names"))
 
     # Is this an apply report? Two independent signals, either of which is
     # sufficient: a row that was actually written, or a push tool that recorded

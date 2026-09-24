@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "app"))
 from nsx.cli_bootstrap import init_cli            # noqa: E402
+from nsx.names import ambiguous, display  # noqa: E402
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.report_paths import report_run_dir, reports_root   # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient            # noqa: E402
@@ -297,6 +298,10 @@ def write_markdown(out: Path, target: str, domains: List[str],
                 site_ids.append(sid)
 
     lines.append("## All groups (sorted by VM members DESC)\n")
+    _amb = ambiguous((r.get("id"), r.get("display_name")) for r in records)
+    def _lbl(r):
+        return display(r.get("display_name"), r.get("id", ""), _amb)
+
     lines.append("Each row shows the composition of the group and how many "
                  "VMs currently evaluate as members.\n")
     lines.append("- **VMs**: live evaluated VM members (from tag conditions, path expressions, etc.)")
@@ -304,23 +309,23 @@ def write_markdown(out: Path, target: str, domains: List[str],
     lines.append("- **Segments**: number of segment paths the group references")
     lines.append("- **IPs**: number of IP addresses / CIDRs the group has listed via `IPAddressExpression`\n")
     if site_ids:
-        hdr = ("| Class | Domain | Group ID | Display | VMs total | " +
+        hdr = ("| Class | Domain | Group | VMs total | " +
                " | ".join(f"VMs @ {s}" for s in site_ids) +
                " | Tag conds | Segments | IPs |")
-        sep = "|---|---|---|---|---:|" + "".join("---:|" for _ in site_ids) + "---:|---:|---:|"
+        sep = "|---|---|---|---:|" + "".join("---:|" for _ in site_ids) + "---:|---:|---:|"
     else:
-        hdr = "| Class | Domain | Group ID | Display | VMs | Tag conds | Segments | IPs |"
-        sep = "|---|---|---|---|---:|---:|---:|---:|"
+        hdr = "| Class | Domain | Group | VMs | Tag conds | Segments | IPs |"
+        sep = "|---|---|---|---:|---:|---:|---:|"
     lines.append(hdr)
     lines.append(sep)
     for r in sorted(records, key=lambda r: (-(r.get("vm_count") or 0),
                                              r.get("domain_id", ""),
-                                             r.get("id", ""))):
+                                             _lbl(r))):
         cinfo = r.get("classification") or {}
         n_tag = len(cinfo.get("tag_conditions") or [])
         n_seg = len(cinfo.get("segment_paths") or [])
         n_ip  = len(cinfo.get("ip_ranges") or [])
-        row = f"| {r['class']} | {r['domain_id']} | `{r['id']}` | {r.get('display_name','')} | {r.get('vm_count', 'n/a')} |"
+        row = f"| {r['class']} | {r['domain_id']} | {_lbl(r)} | {r.get('vm_count', 'n/a')} |"
         for sid in site_ids:
             v = (r.get("per_site_counts") or {}).get(sid)
             row += f" {v if v is not None else 'n/a'} |"
@@ -334,8 +339,8 @@ def write_markdown(out: Path, target: str, domains: List[str],
     lines.append(f"## Tag-based groups only ({len(tag_records)})\n")
     lines.append("Groups whose membership is populated (at least partially) "
                  "by VM tag conditions. VM count is the live evaluated total.\n")
-    lines.append("| Group ID | Display | VMs | # Tag conds | Tag conditions |")
-    lines.append("|---|---|---:|---:|---|")
+    lines.append("| Group | VMs | # Tag conds | Tag conditions |")
+    lines.append("|---|---:|---:|---|")
     for r in sorted(tag_records, key=lambda r: -(r.get("vm_count") or 0)):
         tag_conds = r.get("classification", {}).get("tag_conditions") or []
         # NSX stores the Tag condition value as "scope|tag" in a single
@@ -347,7 +352,7 @@ def write_markdown(out: Path, target: str, domains: List[str],
             for t in tag_conds
         ]
         lines.append(
-            f"| `{r['id']}` | {r.get('display_name','')} | "
+            f"| {_lbl(r)} | "
             f"{r.get('vm_count', 'n/a')} | {len(tag_conds)} | "
             f"{'; '.join(tag_parts) or ''} |"
         )
@@ -357,13 +362,13 @@ def write_markdown(out: Path, target: str, domains: List[str],
     seg_records = [r for r in records if (r.get("classification") or {}).get("segment_paths")]
     if seg_records:
         lines.append(f"## Groups with segment references ({len(seg_records)})\n")
-        lines.append("| Group ID | Display | VMs | # Segments | Segment paths |")
-        lines.append("|---|---|---:|---:|---|")
+        lines.append("| Group | VMs | # Segments | Segment paths |")
+        lines.append("|---|---:|---:|---|")
         for r in sorted(seg_records, key=lambda r: -(r.get("vm_count") or 0)):
             paths = (r.get("classification") or {}).get("segment_paths") or []
             short_paths = [p.rsplit("/", 1)[-1] for p in paths]
             lines.append(
-                f"| `{r['id']}` | {r.get('display_name','')} | "
+                f"| {_lbl(r)} | "
                 f"{r.get('vm_count', 'n/a')} | {len(paths)} | "
                 f"{', '.join(short_paths)} |"
             )
@@ -373,13 +378,13 @@ def write_markdown(out: Path, target: str, domains: List[str],
     ip_records = [r for r in records if (r.get("classification") or {}).get("ip_ranges")]
     if ip_records:
         lines.append(f"## Groups with IP address / CIDR entries ({len(ip_records)})\n")
-        lines.append("| Group ID | Display | # IPs | Sample IPs |")
-        lines.append("|---|---|---:|---|")
+        lines.append("| Group | # IPs | Sample IPs |")
+        lines.append("|---|---:|---|")
         for r in sorted(ip_records, key=lambda r: -len((r.get("classification") or {}).get("ip_ranges") or [])):
             ips = (r.get("classification") or {}).get("ip_ranges") or []
             preview = ", ".join(ips[:5]) + (f" ... (+{len(ips)-5} more)" if len(ips) > 5 else "")
             lines.append(
-                f"| `{r['id']}` | {r.get('display_name','')} | "
+                f"| {_lbl(r)} | "
                 f"{len(ips)} | {preview} |"
             )
         lines.append("")
