@@ -195,6 +195,44 @@ def _ip_diff(before: List[str], after: List[str]) -> Tuple[List[str], List[str]]
     return added, removed
 
 
+def _keep_target_ips(payload: Dict[str, Any], target: Dict[str, Any]) -> List[str]:
+    """Make `payload` a superset of the IPs `target` already holds (the push
+    sends the union). Mutates `payload`; returns the entries it carried over,
+    in the form the target holds them.
+
+    The payload's first IPAddressExpression takes them. A payload with none
+    gets one, reusing the target's expression id (and the id of the OR that
+    precedes it) so an otherwise identical group still compares unchanged.
+    """
+    have = {_canonical_ip_token(ip) for ip in _extract_ip_entries(payload)}
+    keep = [ip for ip in _extract_ip_entries(target) if _canonical_ip_token(ip) not in have]
+    if not keep:
+        return []
+    expr = payload.get("expression")
+    if not isinstance(expr, list):
+        expr = payload["expression"] = []
+    for e in expr:
+        if isinstance(e, dict) and e.get("resource_type") == "IPAddressExpression":
+            e["ip_addresses"] = list(e.get("ip_addresses") or []) + keep
+            return keep
+    t_expr = [e for e in (target.get("expression") or []) if isinstance(e, dict)]
+    t_ip = [i for i, e in enumerate(t_expr) if e.get("resource_type") == "IPAddressExpression"]
+    new_ip: Dict[str, Any] = {"resource_type": "IPAddressExpression", "ip_addresses": keep}
+    conj: Dict[str, Any] = {"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"}
+    if len(t_ip) == 1:
+        idx = t_ip[0]
+        if t_expr[idx].get("id"):
+            new_ip["id"] = t_expr[idx]["id"]
+        prev = t_expr[idx - 1] if idx > 0 else {}
+        if prev.get("resource_type") == "ConjunctionOperator" and prev.get("id"):
+            conj["id"] = prev["id"]
+    if expr:
+        # NSX joins an IP expression to other member criteria with OR only.
+        expr.append(conj)
+    expr.append(new_ip)
+    return keep
+
+
 def _format_entries(entries: List[str], *, max_items: int = 6) -> str:
     """Compact one-line representation. Truncates with '... +N more' for long lists."""
     if not entries:
@@ -319,6 +357,8 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
     L.append(f"| Groups | {t['files_seen']} seen: {t['ok']} written, {t.get('dry_run', 0)} dry-run, "
              f"{t['skipped']} skipped ({t.get('csv_no_change_skipped', 0)} no-change), {t['failed']} failed |")
     L.append(f"| IPs {'added' if apply_mode else 'to add'} | {ips_added_total} (removed: {t.get('total_ips_removed', 0)}) |")
+    if t.get("total_ips_kept_from_target"):
+        L.append(f"| IPs kept (on target, not in source) | {t['total_ips_kept_from_target']} |")
     L.append(f"| Already remapped | {t.get('csv_already_mapped_pairs', 0)} pair(s) detected |")
     L.append(f"| Additive-only contract | **{contract}** |")
     L.append(f"| **Result** | **{result}** |")
@@ -970,6 +1010,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_csv_no_change = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
+    total_ips_kept = 0
 
     for i, f in enumerate(files, start=1):
         row = {
@@ -1110,6 +1151,20 @@ def cmd_push(args: argparse.Namespace) -> int:
                 # IPs), so record it explicitly: it is what lets a dry run report
                 # "would create" instead of guessing from the IP delta.
                 row["exists_on_target"] = gid in baseline_dict
+                # --- PUSH THE UNION ------------------------------------------
+                # IPs the target already holds that the source no longer
+                # reports (a powered-off VM, a re-captured group) go back into
+                # the payload. Without this, one such IP would block the whole
+                # group and its NEW IPs would never land. Recorded as "kept" so
+                # a stale address stays visible instead of silently carried.
+                if gid in baseline_dict:
+                    kept = _keep_target_ips(obj, baseline_dict[gid])
+                    if kept:
+                        row["ips_kept_from_target"] = kept
+                        total_ips_kept += len(kept)
+                        log.info("[%d/%d] %s: keeping %d IP(s) already on the target "
+                                 "but not in the source: %s", i, len(files), group_name,
+                                 len(kept), _format_entries(kept))
                 before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
                 after_ips  = _extract_ip_entries(obj)
                 ips_added, ips_removed = _ip_diff(before_ips, after_ips)
@@ -1166,13 +1221,12 @@ def cmd_push(args: argparse.Namespace) -> int:
             row["_payload"] = obj
 
             # --- ADDITIVE-ONLY CONTRACT ENFORCEMENT --------------------------
-            # When CSV remap is in play, the run must never remove an IP from
-            # any group. If a per-row diff shows IPs would be removed, refuse
-            # to push that group, mark it failed, and let the end-of-run
-            # assertion fail the overall exit code. The most likely cause is
-            # drift between the source bundle and the target — e.g. someone
-            # added IPs to the target after the bundle was captured. The fix
-            # is to re-capture so source and target match before remapping.
+            # The run must never remove an IP from any group. The union push
+            # above makes every payload a superset of the target, so target
+            # drift no longer lands here; this stays as the backstop. If a
+            # per-row diff still shows IPs would be removed, refuse to push
+            # that group, mark it failed, and let the end-of-run assertion
+            # fail the overall exit code.
             if ips_removed:
                 if csv_mapping is not None:
                     contract_violation_msg = (
@@ -1493,6 +1547,12 @@ def cmd_push(args: argparse.Namespace) -> int:
                       total_ips_removed_count, contract_violations)
     summary["totals"]["contract_violations"]      = contract_violations
     summary["totals"]["total_ips_removed"]        = total_ips_removed_count
+    # Already on the target, absent from the source, carried into the push.
+    summary["totals"]["total_ips_kept_from_target"] = total_ips_kept
+    if total_ips_kept:
+        log.info("Kept %d IP(s) already on the target but not in the source "
+                 "(pushed as the union; per-row list in ips_kept_from_target).",
+                 total_ips_kept)
     summary["totals"]["additive_only_contract"]   = ("pass" if contract_ok else "violated")
     # Markdown report (CSV remap runs only), in the audit-report style.
     if csv_mapping is not None:

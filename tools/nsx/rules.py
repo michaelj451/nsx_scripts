@@ -1068,6 +1068,14 @@ def _build_path_pair_map(sibling_map_doc: Dict[str, Any], domain_id: str) -> Dic
     return pairs
 
 
+def _missing_siblings(client: NsxPolicyClient, domain_id: str,
+                      pair_map: Dict[str, str]) -> List[str]:
+    """Ids of the siblings in `pair_map` that the target does not hold. A rule
+    cannot reference a group that does not exist: NSX rejects the update."""
+    present = {g.get("id") for g in client.list_groups(domain_id=domain_id)}
+    return sorted({s.rsplit("/", 1)[-1] for s in pair_map.values()} - present)
+
+
 def cmd_amend_refs(args: argparse.Namespace) -> int:
     """For every customer rule on --target, append sibling-group paths
     alongside any matching original-group path in the rule's match-criteria
@@ -1124,6 +1132,23 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
         log.info("Listing target rules (dry-run, no baseline written) ...")
         baseline = _capture_target_rules(client, domain_id)
         log.info("  Live target has %d customer rule(s).", len(baseline))
+
+    # A sibling the target does not hold would make NSX reject the rule update.
+    # An apply adds only the siblings that exist when it runs. A dry run still
+    # previews them all, because before the phase that creates them has been
+    # applied that is the normal state, but names the missing ones per rule.
+    missing_siblings = _missing_siblings(client, domain_id, pair_map)
+    if missing_siblings:
+        if args.apply:
+            pair_map = {o: s for o, s in pair_map.items()
+                        if s.rsplit("/", 1)[-1] not in missing_siblings}
+            log.warning("%d sibling group(s) are not on the target and will NOT be "
+                        "added to any rule: %s", len(missing_siblings),
+                        ", ".join(missing_siblings))
+        else:
+            log.warning("%d sibling group(s) are not on the target yet; an apply adds "
+                        "only the siblings that exist when it runs: %s",
+                        len(missing_siblings), ", ".join(missing_siblings))
 
     # Display names for the report: both halves of every pair from the sibling
     # map (the siblings may not exist on the target yet), then the target's own
@@ -1183,6 +1208,11 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
                            ref_name_map)
         if _names:
             row["ref_names"] = _names
+        # Only reachable on a dry run: an apply dropped these pairs above.
+        pending = sorted({s.rsplit("/", 1)[-1] for d in per_field_diff.values()
+                          for s in d["added"]} & set(missing_siblings))
+        if pending:
+            row["siblings_not_on_target"] = pending
 
         if not per_field_diff:
             no_change += 1
@@ -1254,6 +1284,9 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
             **batch.totals(),
         },
         "interactive_decisions": batch.decisions,
+        # Siblings the target did not hold: skipped on an apply, previewed
+        # (and flagged per rule) on a dry run.
+        "siblings_not_on_target": missing_siblings,
         "baseline_file": str(baseline_path) if baseline_path else None,
         "log_file": str(log_file),
         "errors_log": str(errors_log),

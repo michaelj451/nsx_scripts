@@ -135,10 +135,11 @@ matched the backup bundle exactly with NSX metadata stripped.
 
 Notes:
 
-- A restore push can legitimately need to REMOVE IPs (the backup predates a
-  later addition). `groups.py push` refuses those rows, and there is no
+- A restore push never removes an IP. If the backup predates a later IP
+  addition, `groups.py push` sends the union: the group is restored and the
+  newer address stays, listed as kept in the push report. There is no
   override: the additive contract is absolute. See EMERGENCY_RESTORE.md for
-  what to do when that blocks a restore.
+  removing such an address by hand.
 - For a GM target add `--federation-global` to each push.
 - VM tags restore via `tools/vm_tags/` (`build_hostname_tag_plan.py` /
   `push_hostname_tags.py`) if ever needed; the inventory in the bundle is the

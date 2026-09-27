@@ -42,5 +42,6 @@ python tools/nsx/policies.py push --target nsx-lm1 `
 ```
 
 Same safety notes as the main runbook: every apply captures a baseline,
-group deletes stay blocked without `--allow-delete`, and a restore that would
-remove IPs is refused outright, with no override.
+group deletes stay blocked without `--allow-delete`, and a restore never
+removes an IP: the push sends the union, so addresses added since the backup
+stay and are listed as kept. There is no override.

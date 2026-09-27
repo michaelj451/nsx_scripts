@@ -336,8 +336,8 @@ failed, so it gates a pipeline.
 
 Add `--workflow d` on a WF-D run. WF-C and WF-D push from the same bundle
 directories, so the path alone cannot say which ran, and the flag is what picks
-the phase labels (`D2a siblings` / `D2b pure-ip` / `D3 amend-refs` instead of
-WF-C's). It defaults to the WF-C labels.
+the phase labels (`D2a siblings` / `D3 amend-refs` instead of WF-C's) and the
+WF-D report layout. It defaults to the WF-C labels.
 `run_workflow.py` passes it for you.
 
 The report's mode banner comes from each push tool's own `summary.json`
@@ -515,12 +515,13 @@ decomposed correctly; group-to-group references did not.
 rather than by re-evaluating criteria, even the mixed shape lands exactly right.
 
 **The gap is group-to-group references.** A group whose only expression is a
-`PathExpression` at another group has no `Condition`, so it gets no sibling,
-and no `IPAddressExpression`, so it misses the `pure_ip_remap` bundle too. It
-lands in **no output bundle at all**. On the source it resolves fine and
-transitively (a 3-level chain returned exactly the leaf group's IPs), but on a
-target with no VM inventory the chain evaluates to nothing and rules using it
-silently stop matching. Detection script and remediation:
+`PathExpression` at another group has no `Condition`, so WF-C gives it no
+sibling, and it lands in **no output bundle at all**. (WF-D does give it an
+`_avs_ips` sibling: its build needs no Condition, and a path to another group
+is not a segment.) On the source it resolves fine and transitively (a 3-level
+chain returned exactly the leaf group's IPs), but on a target with no VM
+inventory the chain evaluates to nothing and rules using it silently stop
+matching. Detection script and remediation:
 [NSX_TOOLKIT_GAPS.md](../reference/NSX_TOOLKIT_GAPS.md) section 2.0c.
 
 A group-ref **alongside** a Condition is safe: the Condition makes it eligible
@@ -595,7 +596,7 @@ New objects all created on the target: `avs2-new-service`,
 `avs2-new-tag-group`, `avs2-new-ip-group`, `avs2-new-policy`, `avs2-rule-1/2`,
 plus the sibling `avs2-new-tag-group_np_ips` with 3 IPs.
 
-Of 14 groups: 7 got siblings, 7 had no tag Condition (pure-IP, routed to the
-`pure_ip_remap` bundle). `super-nested-group` carries a `NestedExpression` and
+Of 14 groups: 7 got siblings, 7 had no tag Condition (IP-only groups, which
+WF-C does not decompose). `super-nested-group` carries a `NestedExpression` and
 `build_sibling_groups.py` recursed into it correctly, building the sibling
 while leaving the nested structure intact in the stripped original.

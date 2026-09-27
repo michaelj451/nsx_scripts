@@ -139,7 +139,9 @@ Measured on the same bundle and target, 2026-09-09:
 target, populates `ips_before` / `ips_after` / `ips_added` / `ips_removed` on
 every dry-run row, makes the summary total truthful, and logs
 `WOULD REMOVE n IP(s) on apply` for any group that would lose IPs, which the
-apply then refuses outright. It is opt-in, so a plain dry run stays fully
+apply then refuses outright. (Since 2026-09-26 the push sends the union, so an
+IP only the target holds is kept and listed as `ips_kept_from_target`; the
+warning and refusal remain as a backstop.) It is opt-in, so a plain dry run stays fully
 offline and no existing behaviour changes. Ignored with `--apply`, which
 always captures a baseline and diffs against it.
 
@@ -165,10 +167,14 @@ See [RUNBOOK_AVS.md](../nsx/RUNBOOK_AVS.md) Phase 4.
 ### 2.0c Group-to-group references produce NO sibling and vanish on the target
 
 A group whose membership comes only from a `PathExpression` pointing at another
-**group** (not a segment) is dropped by `build_sibling_groups.py`. It has no
-`Condition`, so it is counted in `skipped_no_condition`; it has no
-`IPAddressExpression`, so it does not reach the `pure_ip_remap` bundle either.
-It appears in no output bundle at all.
+**group** (not a segment) is dropped by WF-C's `build_sibling_groups.py` run. It
+has no `Condition`, so it is counted in `skipped_no_condition`, and it appears
+in no output bundle at all.
+
+**WF-D closes this.** Its build (`--csv-remap`) needs no Condition, and a path
+to another group does not make a group segment-based, so D2a gives such a group
+an `_avs_ips` sibling holding the CSV-mapped equivalents of its effective IPs.
+The rest of this section applies to WF-C.
 
 On the source that group resolves correctly, and transitively:
 

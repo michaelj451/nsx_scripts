@@ -552,7 +552,8 @@ def main() -> None:
                 changed_rows.append(row)
                 change_log.write(json.dumps(row, sort_keys=True) + "\n")
 
-                log.info("Updated group %s: %d IPs added", group_name, len(added_ips))
+                log.info("Updated group %s: %d IPs added to file %s (local copy only, no NSX change)",
+                         group_name, len(added_ips), out_file.name)
 
             except Exception as e:
                 groups_errors += 1

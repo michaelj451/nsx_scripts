@@ -168,6 +168,9 @@ class PushTests(unittest.TestCase):
             # Read-only display-name lookup for the run report (rules only).
             if hasattr(mod, "target_ref_names"):
                 stack.enter_context(patch.object(mod, "target_ref_names", return_value={}))
+            # Read-only sibling-presence check (rules amend-refs): all present.
+            if hasattr(mod, "_missing_siblings"):
+                stack.enter_context(patch.object(mod, "_missing_siblings", return_value=[]))
             stack.enter_context(patch.object(mod, "_setup_logging", setup_logging))
             stack.enter_context(patch.object(mod, "resolve_manager", return_value="lm2.test"))
             stack.enter_context(patch.object(mod, "init_cli"))

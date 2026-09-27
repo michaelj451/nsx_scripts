@@ -112,28 +112,31 @@ python tools/nsx/groups.py push --target $DST `
 
 ---
 
-## 4. WF-D — build mapped-IP siblings + pure-IP remap bundle (offline)
+## 4. WF-D: build mapped-IP siblings (offline)
 
 ```powershell
 python tools/nsx/build_sibling_groups.py `
   --source $SRC `
   --csv-remap data/nonprod_map.csv `
-  --skip-segment-groups
+  --skip-segment-groups `
   --label $SRC_HOST
 ```
 
-> `--include-pure-ip` is **deprecated**. Pure-IP groups are no longer
-> decomposed into siblings (that left an empty original after the
-> Phase-2 strip). They are written to a separate `nsx_pure_ip_remap\<host>\groups\`
-> bundle for in-place CSV-remap push (step 5b).
+> Every group that is not segment-based and has at least one IP with a CSV
+> mapping gets a sibling holding only the mapped IPs: tag-based, IP-only, or
+> nesting other groups by path. Originals are never modified. Hand-typed IPs
+> are not copied; they stay on the original, which every rule keeps
+> referencing.
 
 Outputs:
-- `nsx_sibling_groups\$SRC_HOST\groups\` — IP-only siblings for
-  tag-based mixed groups only
-- `nsx_sibling_groups\$SRC_HOST\sibling_map.json` — per-row audit
-- `nsx_pure_ip_remap\$SRC_HOST\groups\` — **NEW** — pure-IP groups
-  ready for in-place CSV-remap push
+- `nsx_sibling_groups\$SRC_HOST\groups\`: IP-only siblings carrying the
+  CSV-mapped IPs
+- `nsx_sibling_groups\$SRC_HOST\sibling_map.json`: per-row audit, plus
+  `no_sibling` listing every group without a sibling and why
 - `reports\skipped_segments.json` / `reports\empty_groups.json`
+
+No `nsx_pure_ip_remap\` bundle is produced any more; an old one is left in
+place and nothing reads it.
 
 ---
 
@@ -146,21 +149,6 @@ python tools/nsx/groups.py push --target $DST `
   --groups-dir nsx_sibling_groups/$SRC_HOST/groups
 python tools/nsx/groups.py push --target $DST `
   --groups-dir nsx_sibling_groups/$SRC_HOST/groups --apply
-```
-
-### 5b. Pure-IP remap (**OPTIONAL** — separate change window)
-
-> Optional. Skip if your CSV doesn't cover pure-IP groups' IPs, or if
-> you want to land siblings first and run the pure-IP remap later.
-> Strict-additive: adds mapped IPs alongside existing IPs; removes nothing.
-
-```powershell
-python tools/nsx/groups.py push --target $DST `
-  --groups-dir nsx_pure_ip_remap/$SRC_HOST/groups `
-  --csv-remap data/nonprod_map.csv
-python tools/nsx/groups.py push --target $DST `
-  --groups-dir nsx_pure_ip_remap/$SRC_HOST/groups `
-  --csv-remap data/nonprod_map.csv --apply
 ```
 
 ---
@@ -178,6 +166,9 @@ python tools/nsx/rules.py amend-refs --target $DST `
 Appends sibling refs to `source_groups` and `destination_groups` of
 every rule that references an original. **Never removes any reference
 or rule.** Add `--include-scope` to also amend `scope` (default OFF).
+The apply adds only siblings already on the target; missing ones are skipped
+and listed in `amend_refs_summary.json` as `siblings_not_on_target`. The dry
+run flags them, which is normal before step 5a has been applied.
 
 ---
 
@@ -198,6 +189,13 @@ for full check descriptions.
 
 ## Revert
 
+### Revert rule amendment first (if step 6 was applied)
+
+```powershell
+python tools/nsx/rules.py revert --target $DST `
+  --reports-dir nsx_rules_export/$DST.lab.local/push_report --apply
+```
+
 ### Revert WF-D siblings (single step)
 
 ```powershell
@@ -205,12 +203,8 @@ python tools/nsx/groups.py revert --target $DST `
   --reports-dir nsx_sibling_groups/$SRC_HOST/push_report --apply
 ```
 
-### Revert rule amendment (if step 6 was applied)
-
-```powershell
-python tools/nsx/rules.py revert --target $DST `
-  --reports-dir nsx_rules_export/$DST.lab.local/push_report --apply
-```
+Run it after the rule amendment revert: NSX refuses to delete a group a
+rule still references.
 
 ### Revert the WF-A clone (LIFO, reverse order)
 

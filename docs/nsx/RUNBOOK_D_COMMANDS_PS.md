@@ -5,7 +5,7 @@ for explanations, or [RUNBOOK_D_COMMANDS.md](RUNBOOK_D_COMMANDS.md) for bash.
 
 > **Live production target.** Each push command starts as a dry-run.
 > Add `--apply` only after diff review. Each phase is a separate change
-> window; revert in reverse order (Phase 5 → 3 → 2b → 2a).
+> window; revert in reverse order (Phase 3, then 2a).
 > Line continuation in PowerShell is the backtick `` ` `` at end of line.
 
 ## Env
@@ -64,14 +64,14 @@ python tools/nsx/build_sibling_groups.py `
   --skip-segment-groups
 ```
 
-Manually entered IPs (the group's own IPAddressExpression entries) are
-copied into the sibling verbatim alongside the mapped values. Add
-`--no-copy-manual-ips` to emit mapped values only.
+Every group that is not segment-based and has at least one IP with a CSV
+mapping gets an `_avs_ips` sibling holding only the mapped IPs: tag-based,
+IP-only, or nesting other groups. Hand-typed IPs are not copied; they stay on
+the original, which every rule keeps referencing.
 
 Outputs:
-- `nsx_sibling_groups\nsx-lm1.lab.local\groups\` — siblings (for tag+IP mixed groups)
-- `nsx_sibling_groups\nsx-lm1.lab.local\sibling_map.json` — audit + input for amend-refs and validator
-- `nsx_pure_ip_remap\nsx-lm1.lab.local\groups\` — pure-IP groups (for step 2b)
+- `nsx_sibling_groups\nsx-lm1.lab.local\groups\`: the `_avs_ips` siblings
+- `nsx_sibling_groups\nsx-lm1.lab.local\sibling_map.json`: audit + input for amend-refs and validator; `no_sibling` lists each group without a sibling and why
 
 (Optional) skip any group with even one CSV-uncovered IP:
 
@@ -103,24 +103,6 @@ Baseline auto-captured at `nsx_sibling_groups\nsx-lm1.lab.local\push_report\base
 
 ---
 
-## 2b. Pure-IP remap (OPTIONAL — separate change window)
-
-```powershell
-# Dry-run
-python tools/nsx/groups.py push --target nsx-lm1 `
-  --groups-dir nsx_pure_ip_remap/nsx-lm1.lab.local/groups `
-  --csv-remap data/nonprod_map.csv
-
-# Apply
-python tools/nsx/groups.py push --target nsx-lm1 `
-  --groups-dir nsx_pure_ip_remap/nsx-lm1.lab.local/groups `
-  --csv-remap data/nonprod_map.csv --apply
-```
-
-Strict-additive: adds mapped IPs alongside existing IPs; never removes anything.
-
----
-
 ## 3. Amend rules to reference siblings (OPTIONAL — separate change window)
 
 ```powershell
@@ -134,7 +116,7 @@ python tools/nsx/rules.py amend-refs --target nsx-lm1 `
   --apply
 ```
 
-Strict-additive — appends sibling refs to `source_groups`/`destination_groups` only. Add `--include-scope` to also amend scope.
+Strict-additive: appends sibling refs to `source_groups`/`destination_groups` only. Add `--include-scope` to also amend scope. An apply adds only siblings already on the target; missing ones are skipped and listed in `amend_refs_summary.json` as `siblings_not_on_target`. A dry run flags them, which is normal before 2a is applied.
 
 ---
 
@@ -159,10 +141,6 @@ Revert in reverse to avoid dangling rule refs (NSX 409s on DELETE if rules still
 # 3 — remove sibling refs from rules
 python tools/nsx/rules.py revert --target nsx-lm1 `
   --reports-dir nsx_rules_export/nsx-lm1.lab.local/push_report --apply
-
-# 2b — remove mapped IPs from pure-IP groups
-python tools/nsx/groups.py revert --target nsx-lm1 `
-  --reports-dir nsx_pure_ip_remap/nsx-lm1.lab.local/push_report --apply
 
 # 2a — delete the *_sibling groups
 python tools/nsx/groups.py revert --target nsx-lm1 `
