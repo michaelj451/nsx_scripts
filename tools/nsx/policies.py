@@ -70,6 +70,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
 from nsx import revert_plan  # noqa: E402
+from nsx import baseline_meta  # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
 
@@ -412,6 +413,9 @@ def cmd_push(args: argparse.Namespace) -> int:
         baseline = _capture_target_policies(client, args.domain_id)
         if args.apply:
             baseline_path = _append_baseline(reports_dir, baseline)
+            baseline_meta.write_meta(baseline_path, target_host=target_host, step="policies.push",
+                                     domain_id=args.domain_id,
+                                     federation_global=args.federation_global)
             log.info("  Baseline: %d customer policy/policies → %s", len(baseline), baseline_path)
         else:
             # Read-only: a baseline file is a revert artifact, and a dry run has
@@ -690,6 +694,13 @@ def cmd_revert(args: argparse.Namespace) -> int:
         )
 
     log.info("Using baseline: %s", baseline_path)
+    # The baseline must have been taken from THIS manager. Checked before the
+    # target is even read, so a refusal sends nothing.
+    why = baseline_meta.refuse_reason(baseline_path, target_host,
+                                      explicit=bool(args.from_baseline))
+    if why:
+        log.error("REFUSED: %s Nothing was sent.", why)
+        return 2
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
     log.info("  Baseline contains %d customer policy/policies", len(baseline))
 

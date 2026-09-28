@@ -68,6 +68,7 @@ from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
 from nsx import revert_plan  # noqa: E402
+from nsx import baseline_meta  # noqa: E402
 from nsx.names import target_ref_names, names_for, policy_name_by_id
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 
@@ -333,6 +334,30 @@ def _mark_baseline_reverted(path: Path) -> None:
     path.rename(path.with_suffix(".json.reverted"))
 
 
+# Which rules a push CREATED ("<policy>::<rule>" keys that were not on the
+# target when its baseline was taken). A rollback deletes only these: a rule
+# the baseline lacks but this push did not create was put there by something
+# else, and deleting it is never a rollback's call. Same file naming as the
+# groups tool's pushed-ids record.
+def _pushed_ids_path(baseline_path: Path) -> Path:
+    name = baseline_path.name.split("_target_baseline", 1)[0]
+    return baseline_path.with_name(f"{name}_pushed_ids.json")
+
+
+def _write_pushed_ids(baseline_path: Path, pushed_ids: List[str]) -> Path:
+    p = _pushed_ids_path(baseline_path)
+    p.write_text(json.dumps(sorted(pushed_ids), indent=2), encoding="utf-8")
+    return p
+
+
+def _read_pushed_ids(baseline_path: Path) -> List[str] | None:
+    """The created-rules record, or None when the push predates it."""
+    p = _pushed_ids_path(baseline_path)
+    if not p.is_file():
+        return None
+    return list(json.loads(p.read_text(encoding="utf-8")))
+
+
 # =============================================================================
 # export
 # =============================================================================
@@ -535,17 +560,32 @@ def cmd_push(args: argparse.Namespace) -> int:
                              federation_global=args.federation_global) if need_target else None
     baseline_path = None
     baseline: Dict[str, Dict[str, Any]] = {}
+    pushed_ids: List[str] = []
     if need_target:
         log.info("Capturing target baseline (current customer rules on %s) ...", target_host)
         baseline = _capture_target_rules(client, args.domain_id)
         if args.apply:
             baseline_path = _append_baseline(reports_dir, baseline)
+            baseline_meta.write_meta(baseline_path, target_host=target_host, step="rules.push",
+                                     domain_id=args.domain_id,
+                                     federation_global=args.federation_global)
+            _write_pushed_ids(baseline_path, pushed_ids)
             log.info("  Baseline: %d rule(s) across customer policies → %s", len(baseline), baseline_path)
         else:
             # Read-only: a baseline file is a revert artifact, and a dry run has
             # nothing to revert.
             log.info("  Target has %d customer rule(s) (read-only, no baseline written)",
                      len(baseline))
+
+    def _note_created(policy_id: str, rid: str) -> None:
+        """Record a rule this push wrote that the baseline did not hold, so
+        its rollback may delete it. Rewritten after every write, so a run that
+        stops part-way leaves a complete record for what it did do."""
+        key = f"{policy_id}::{rid}"
+        if baseline_path is not None and key not in baseline and key not in pushed_ids:
+            pushed_ids.append(key)
+            _write_pushed_ids(baseline_path, pushed_ids)
+
     # Display names for every group / service a rule here can reference, so the
     # run report names them instead of printing ids. Target-only objects (the
     # ones no bundle on the source side knows about) exist only here.
@@ -698,6 +738,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                     row["status"] = "success_patch"
                 else:
                     raise
+            _note_created(policy_id, rid)
 
             batch.record(row)
             ok += 1
@@ -779,6 +820,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                         row["status"] = "success_patch_retry"
                     else:
                         raise
+                _note_created(policy_id, rid)
                 row["retry_round"] = retry_round
                 row.pop("error", None)
                 row.pop("error_type", None)
@@ -898,6 +940,13 @@ def cmd_revert(args: argparse.Namespace) -> int:
         )
 
     log.info("Using baseline: %s", baseline_path)
+    # The baseline must have been taken from THIS manager. Checked before the
+    # target is even read, so a refusal sends nothing.
+    why = baseline_meta.refuse_reason(baseline_path, target_host,
+                                      explicit=bool(args.from_baseline))
+    if why:
+        log.error("REFUSED: %s Nothing was sent.", why)
+        return 2
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
     log.info("  Baseline contains %d rule(s)", len(baseline))
 
@@ -906,8 +955,24 @@ def cmd_revert(args: argparse.Namespace) -> int:
     log.info("  Currently %d rule(s) on target", len(current))
 
     to_restore = [(k, v) for k, v in baseline.items()]
-    to_delete = [(k, current[k]) for k in current.keys() if k not in baseline]
-    log.info("Plan: restore=%d  delete=%d", len(to_restore), len(to_delete))
+    # Delete only what the matching push CREATED. A rule the baseline lacks but
+    # that push did not create was put there by something else (another
+    # workflow, an operator), and a rollback never takes it away: it is listed
+    # as blocked. With no created-rules record (a push from before it existed)
+    # every such delete is blocked.
+    created = _read_pushed_ids(baseline_path)
+    missing_from_baseline = [(k, current[k]) for k in current.keys() if k not in baseline]
+    to_delete = [(k, v) for k, v in missing_from_baseline if created is not None and k in created]
+    deletes_blocked = [(k, v) for k, v in missing_from_baseline if created is None or k not in created]
+    if created is None:
+        log.warning("  No created-rules record for this baseline: %d rule(s) not in it are "
+                    "left alone (blocked), not deleted.", len(deletes_blocked))
+    elif deletes_blocked:
+        log.warning("  %d rule(s) not in the baseline were not created by that push; "
+                    "left alone (blocked): %s", len(deletes_blocked),
+                    ", ".join(k for k, _ in deletes_blocked))
+    log.info("Plan: restore=%d  delete=%d  blocked=%d",
+             len(to_restore), len(to_delete), len(deletes_blocked))
 
     # --- rollback report: this revert, object by object ----------------------
     _ref = target_ref_names(client, args.domain_id)
@@ -922,6 +987,9 @@ def cmd_revert(args: argparse.Namespace) -> int:
         deletes=[{"key": k, "id": v["rule_id"], "policy_id": v["policy_id"],
                   "policy_display_name": _pol.get(v["policy_id"]),
                   "current": v.get("payload")} for k, v in to_delete],
+        blocked=[{"key": k, "id": v["rule_id"], "policy_id": v["policy_id"],
+                  "policy_display_name": _pol.get(v["policy_id"]),
+                  "current": v.get("payload")} for k, v in deletes_blocked],
         force=getattr(args, "force_push", False))
     for _r in _plan_rows:
         _paths = [x for d in (_r.get("per_field_diff") or {}).values()
@@ -1021,7 +1089,10 @@ def cmd_revert(args: argparse.Namespace) -> int:
             **batch.totals(),
             "restored_ok": restored_ok, "restored_failed": restored_failed,
             "deleted_ok": deleted_ok, "deleted_failed": deleted_failed,
+            "deletes_blocked": len(deletes_blocked),
         },
+        # Not in the baseline and not created by the matching push: left alone.
+        "deletes_blocked": [k for k, _ in deletes_blocked],
         "log_file": str(log_file),
         "errors_log": str(errors_log),
     }
@@ -1125,6 +1196,11 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
         log.info("Capturing target baseline (current customer rules on %s) ...", target_host)
         baseline = _capture_target_rules(client, domain_id)
         baseline_path = _append_baseline(reports_dir, baseline)
+        baseline_meta.write_meta(baseline_path, target_host=target_host, step="rules.amend-refs",
+                                 domain_id=domain_id, federation_global=args.federation_global)
+        # amend-refs only edits rules that exist, so it creates none: an empty
+        # created-rules record means its rollback can never delete a rule.
+        _write_pushed_ids(baseline_path, [])
         log.info("  Baseline: %d rule(s) across customer policies → %s", len(baseline), baseline_path)
     else:
         # Dry-run: still need to read the live target state.

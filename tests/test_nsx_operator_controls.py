@@ -156,6 +156,14 @@ class PushTests(unittest.TestCase):
                 for v in base.values():
                     (v["payload"] if "payload" in v else v)["description"] = "as before the push"
             dump(baseline, base if restore else {})
+            # What an apply writes beside every baseline: the manager it came
+            # from. A rollback refuses a baseline without it (unless named).
+            dump(reports / "baselines/test_target_meta.json",
+                 {"target_host": "lm2.test", "step": f"{name}.push"})
+            if name == "rules" and not restore:
+                # The rules this push created: the only ones its rollback may
+                # delete (a rules push records them since 2026-09-28).
+                dump(reports / "baselines/test_pushed_ids.json", sorted(current))
             if name == "groups":
                 argv += ["--scope", "all", "--allow-delete"]
         if apply:

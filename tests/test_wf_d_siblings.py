@@ -205,6 +205,15 @@ class AmendRefsGuardTests(unittest.TestCase):
         added = [p for d in rows[0]["per_field_diff"].values() for p in d["added"]]
         self.assertTrue(any(p.endswith("/db_avs") for p in added))
 
+    def test_apply_records_its_manager_and_creates_no_rules(self):
+        from nsx import baseline_meta
+        self.amend(apply=True, present=["web_avs", "db_avs"])
+        b = next((self.root / "reports" / "baselines").glob("*_target_baseline.json"))
+        self.assertEqual(baseline_meta.read_meta(b)["target_host"], "lm2.test")
+        self.assertEqual(baseline_meta.read_meta(b)["step"], "rules.amend-refs")
+        created = b.with_name(b.name.replace("_target_baseline", "_pushed_ids"))
+        self.assertEqual(json.loads(created.read_text()), [])
+
     def test_all_present_flags_nothing(self):
         rc, rows, summary, patches = self.amend(apply=True, present=["web_avs", "db_avs"])
         self.assertEqual(summary["siblings_not_on_target"], [])

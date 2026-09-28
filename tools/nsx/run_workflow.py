@@ -131,8 +131,17 @@ def phase_a_steps(src_host: str, target: str, apply: bool) -> List[Dict[str, Any
     ]
 
 
+def amend_dir(run_dir: Path, tgt_host: str) -> Path:
+    """Where a run's rule amendment (C5 / D3) keeps its reports and revert
+    baselines. Inside the run directory, never nsx_rules_export/<host>/: that
+    is WF-A's rules folder, keyed by A's SOURCE host, and when a C/D target is
+    the same host (D runs in place on the A source) the two workflows' rules
+    baselines stacked in one folder, where a rollback takes the newest."""
+    return run_dir / "rules_amend" / tgt_host
+
+
 def phase_c_steps(src_host: str, target: str, apply: bool,
-                  sib: Path, tgt_host: str) -> List[Dict[str, Any]]:
+                  sib: Path, tgt_host: str, amend: Path) -> List[Dict[str, Any]]:
     """WF-C: push the IP-only siblings, then amend the rules to use them.
 
     Nothing here removes an IP. The tag-side originals keep their addresses;
@@ -144,14 +153,15 @@ def phase_c_steps(src_host: str, target: str, apply: bool,
         {"label": "c3_siblings", "roots": [str(sib)],
          "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
                  "--groups-dir", str(sib / "groups"), "--skip-no-ip-change"] + d + a},
-        {"label": "c5_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
+        {"label": "c5_amend_refs", "roots": [str(amend)],
          "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
-                 "--sibling-map", str(sib / "sibling_map.json")] + a},
+                 "--sibling-map", str(sib / "sibling_map.json"),
+                 "--reports-dir", str(amend / "push_report")] + a},
     ]
 
 
 def phase_d_steps(phase: str, target: str, apply: bool, sib: Path,
-                  tgt_host: str) -> List[Dict[str, Any]]:
+                  tgt_host: str, amend: Path) -> List[Dict[str, Any]]:
     """WF-D: exactly ONE change window per invocation.
 
     RUNBOOK_D's stance is that 2a (create the AVS siblings) and 3 (add them to
@@ -167,9 +177,10 @@ def phase_d_steps(phase: str, target: str, apply: bool, sib: Path,
         return [{"label": "d2a_siblings", "roots": [str(sib)],
                  "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
                          "--groups-dir", str(sib / "groups"), "--skip-no-ip-change"] + d + a}]
-    return [{"label": "d3_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
+    return [{"label": "d3_amend_refs", "roots": [str(amend)],
              "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
-                     "--sibling-map", str(sib / "sibling_map.json")] + a}]
+                     "--sibling-map", str(sib / "sibling_map.json"),
+                     "--reports-dir", str(amend / "push_report")] + a}]
 
 
 def verify_steps(phase: str, source: str, target: str, sib: Path,
@@ -205,7 +216,7 @@ def verify_steps(phase: str, source: str, target: str, sib: Path,
 
 
 def rollback_steps(phase: str, target: str, apply: bool, sib: Path,
-                   src_host: str, tgt_host: str) -> List[Dict[str, Any]]:
+                   src_host: str, tgt_host: str, amend: Path) -> List[Dict[str, Any]]:
     """Undo one phase, in reverse dependency order.
 
     `--allow-delete` is passed for the bundles whose push CREATED objects
@@ -239,7 +250,7 @@ def rollback_steps(phase: str, target: str, apply: bool, sib: Path,
     if phase == "c":
         return [
             {"label": "c5_amend_revert", "roots": [],
-             "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")},
+             "cmd": rules_revert(str(amend / "push_report"))},
             {"label": "c3_siblings_revert", "roots": [],
              "cmd": groups_revert(sib / "push_report", allow_delete=True)},
         ]
@@ -247,7 +258,7 @@ def rollback_steps(phase: str, target: str, apply: bool, sib: Path,
         return [{"label": "d2a_siblings_revert", "roots": [],
                  "cmd": groups_revert(sib / "push_report", allow_delete=True)}]
     return [{"label": "d3_amend_revert", "roots": [],
-             "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")}]
+             "cmd": rules_revert(str(amend / "push_report"))}]
 
 
 def main() -> int:
@@ -419,7 +430,7 @@ def main() -> int:
             return 2
     elif args.rollback:
         steps = rollback_steps(args.phase, args.target, args.apply, sib,
-                               src_host, tgt_host)
+                               src_host, tgt_host, amend_dir(run_dir, tgt_host))
         if not args.apply:
             log.info("Rollback DRY RUN: each revert prints its plan and writes nothing.")
     elif args.phase == "a":
@@ -464,9 +475,11 @@ def main() -> int:
             if not rec["ok"]:
                 log.error("Sibling build failed; nothing pushed.")
                 return 1
-        steps = phase_c_steps(src_host, args.target, args.apply, sib, tgt_host) \
+        steps = phase_c_steps(src_host, args.target, args.apply, sib, tgt_host,
+                              amend_dir(run_dir, tgt_host)) \
             if args.phase == "c" else \
-            phase_d_steps(args.phase, args.target, args.apply, sib, tgt_host)
+            phase_d_steps(args.phase, args.target, args.apply, sib, tgt_host,
+                          amend_dir(run_dir, tgt_host))
     else:
         # d3 consumes the sibling map an earlier window produced. Rebuilding
         # here could hand a different map to a target whose siblings are
@@ -476,7 +489,8 @@ def main() -> int:
             log.error("%s needs %s, which does not exist. Phase d2a builds the "
                       "sibling bundle; run it first.", args.phase, needed)
             return 2
-        steps = phase_d_steps(args.phase, args.target, args.apply, sib, tgt_host)
+        steps = phase_d_steps(args.phase, args.target, args.apply, sib, tgt_host,
+                              amend_dir(run_dir, tgt_host))
 
     records, roots = [], []
     for step in steps:

@@ -364,6 +364,26 @@ wf --phase c --rollback --apply
 Roll back **C before A**, and **`d3` before `d2a`**: NSX refuses to delete a
 group a rule still references.
 
+**A rollback only ever uses its own manager's baseline.** Every apply writes,
+beside each baseline, the manager it was taken from
+(`<ts>_target_meta.json`). Every rollback checks it before sending anything,
+and refuses (exit 2) a baseline from another manager, even one named with
+`--from-baseline`. A baseline with no record, from before 2026-09-28, is used
+only when you name it with `--from-baseline`. This matters because a rollback
+takes the newest baseline in its folder: WF-A's rules folder is keyed by A's
+source host, and before this check a D3 baseline for lm1 once sat in it on top
+of A's lm2 baseline.
+
+**C's and D3's rule amendments keep their baselines in the run directory**,
+`$R/rules_amend/<target-host>/push_report/`, not in `nsx_rules_export/`,
+which is WF-A's alone.
+
+**A rules rollback deletes only rules its push created.** A rules push records
+them (`<ts>_pushed_ids.json`, as groups already did). A rule the baseline lacks
+that the push did not create was put there by something else, so the rollback
+leaves it and lists it under `deletes_blocked`. An amend-refs rollback never
+deletes a rule: amend-refs creates none.
+
 > **`--allow-delete` is passed for you, and it matters.** Reverting a push that
 > CREATED groups has to delete them. Without the flag those groups are left in
 > place, listed under `deletes_blocked`, and the revert still exits 0, so a
@@ -392,6 +412,7 @@ $R/
 │   ├── avs_run_report.md           operator-facing
 │   └── avs_run_report.json         every row, with verdicts
 ├── capture/$SH/                    WF-D only: the d2a dry run's own capture
+├── rules_amend/$TH/push_report/    C5 / D3 rule amendments: reports + revert baselines
 └── nsx_sibling_groups/$SH/         built by phase c / d2a; a rebuild keeps its push_report/
 ```
 

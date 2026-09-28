@@ -72,6 +72,7 @@ from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 from nsx.push_skip import is_unchanged, SKIPPED_STATUS
 from nsx import revert_plan  # noqa: E402
+from nsx import baseline_meta  # noqa: E402
 
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -983,6 +984,9 @@ def cmd_push(args: argparse.Namespace) -> int:
         log.info("Capturing target baseline (current customer groups on %s) ...", target_host)
         baseline_dict = _capture_target_groups(client, args.domain_id)
         baseline_path = _append_baseline(reports_dir, baseline_dict)
+        baseline_meta.write_meta(baseline_path, target_host=target_host, step="groups.push",
+                                 domain_id=args.domain_id,
+                                 federation_global=args.federation_global)
         _write_pushed_ids(baseline_path, pushed_ids)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
     elif args.diff_target:
@@ -1620,6 +1624,13 @@ def cmd_revert(args: argparse.Namespace) -> int:
         )
 
     log.info("Using baseline: %s", baseline_path)
+    # The baseline must have been taken from THIS manager. Checked before the
+    # target is even read, so a refusal sends nothing.
+    why = baseline_meta.refuse_reason(baseline_path, target_host,
+                                      explicit=bool(args.from_baseline))
+    if why:
+        log.error("REFUSED: %s Nothing was sent.", why)
+        return 2
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
     log.info("  Baseline contains %d customer group(s)", len(baseline))
 
