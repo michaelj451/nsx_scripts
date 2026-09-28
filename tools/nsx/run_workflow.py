@@ -143,7 +143,7 @@ def phase_c_steps(src_host: str, target: str, apply: bool,
     return [
         {"label": "c3_siblings", "roots": [str(sib)],
          "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                 "--groups-dir", str(sib / "groups")] + d + a},
+                 "--groups-dir", str(sib / "groups"), "--skip-no-ip-change"] + d + a},
         {"label": "c5_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
          "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
                  "--sibling-map", str(sib / "sibling_map.json")] + a},
@@ -162,9 +162,11 @@ def phase_d_steps(phase: str, target: str, apply: bool, sib: Path,
     a = ["--apply"] if apply else []
     d: List[str] = []
     if phase == "d2a":
+        # A sibling's IPs are its only content: one whose IPs are already all
+        # on the target is skipped, not rewritten (see --skip-no-ip-change).
         return [{"label": "d2a_siblings", "roots": [str(sib)],
                  "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                         "--groups-dir", str(sib / "groups")] + d + a}]
+                         "--groups-dir", str(sib / "groups"), "--skip-no-ip-change"] + d + a}]
     return [{"label": "d3_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
              "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
                      "--sibling-map", str(sib / "sibling_map.json")] + a}]

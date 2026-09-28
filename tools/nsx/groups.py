@@ -1182,13 +1182,23 @@ def cmd_push(args: argparse.Namespace) -> int:
             # before the dry-run/apply fork so the preview matches the apply.
             unchanged = (have_baseline and not args.force_push
                          and is_unchanged(obj, baseline_dict.get(gid)))
-            if unchanged:
+            # IP-only sibling bundles (WF-C / WF-D): the IP set is the group's
+            # only content. The build still regenerates everything around it
+            # (its description carries the build time, and NSX adds ids and
+            # paths the build never has), so a group whose IPs are already all
+            # on the target would otherwise be rewritten, prompted for, and
+            # have its description changed on every run. Its IPs decide.
+            no_ip_change = (have_baseline and not args.force_push
+                            and args.skip_no_ip_change and gid in baseline_dict
+                            and not ips_added and not ips_removed)
+            if unchanged or no_ip_change:
                 row["status"] = SKIPPED_STATUS
-                row["skipped_reason"] = "target content already identical"
+                row["skipped_reason"] = ("target content already identical" if unchanged
+                                         else "no IP change on target")
                 skipped += 1
-                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
-                         "nothing sent to NSX", i, len(files), ok, failed, skipped,
-                         group_name)
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: %s; nothing sent to NSX",
+                         i, len(files), ok, failed, skipped, group_name,
+                         "unchanged on target" if unchanged else "no IP change on target")
                 rows.append(row)
                 continue
 
@@ -1946,6 +1956,12 @@ def main() -> int:
                          "content. Default is to skip those: an identical PUT only bumps "
                          "_revision and re-realizes. Use this when the write itself is the "
                          "point, e.g. forcing re-realization after an NSX-side problem.")
+    pp.add_argument("--skip-no-ip-change", action="store_true",
+                    help="For IP-only sibling bundles (WF-C / WF-D): skip a group that is "
+                         "already on the target when its IP set would not change, even if "
+                         "other fields differ (the build's timestamped description, ids and "
+                         "paths NSX adds). Nothing is sent, so nothing on the target changes. "
+                         "The workflow driver passes this for the sibling pushes.")
     pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
                     help="DRY RUN: make one read-only pass over the target so every row "
                          "reports ips_before/ips_after/ips_added/ips_removed and whether the "

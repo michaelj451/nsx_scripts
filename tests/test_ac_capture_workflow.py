@@ -205,6 +205,20 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(stale.exists())
 
+    def test_sibling_pushes_skip_groups_whose_ips_do_not_change(self):
+        for phase, flags, label in (("c", (), "c3_siblings"),
+                                    ("d2a", ("--csv-remap", "map.csv"), "d2a_siblings")):
+            for mode in ((), ("--apply",)):
+                with self.subTest(phase=phase, mode=mode):
+                    if mode:
+                        smap = self.run / "nsx_sibling_groups" / "lm1.test" / "sibling_map.json"
+                        smap.parent.mkdir(parents=True, exist_ok=True)
+                        if not smap.exists():
+                            smap.write_text('{"map": []}')
+                    rc, commands = self.run_workflow(phase, *flags, *mode)
+                    self.assertEqual(rc, 0)
+                    self.assertIn("--skip-no-ip-change", dict(commands)[label])
+
     def test_d3_never_captures(self):
         smap = self.run / "nsx_sibling_groups" / "lm1.test" / "sibling_map.json"
         smap.parent.mkdir(parents=True, exist_ok=True)

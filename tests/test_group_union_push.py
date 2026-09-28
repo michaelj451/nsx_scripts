@@ -87,7 +87,7 @@ class UnionPushTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
 
-    def push(self, payloads, target, *, apply):
+    def push(self, payloads, target, *, apply, extra=()):
         data, reports = self.root / "data", self.root / "reports"
         data.mkdir(parents=True, exist_ok=True)
         reports.mkdir(parents=True, exist_ok=True)
@@ -110,7 +110,7 @@ class UnionPushTests(unittest.TestCase):
             return directory / "test.log", directory / "errors.log"
 
         argv = ["groups", "push", "--target", "nsx-lm2", "--reports-dir", str(reports),
-                "--groups-dir", str(data)] + (["--apply"] if apply else [])
+                "--groups-dir", str(data)] + (["--apply"] if apply else []) + list(extra)
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(groups, "NsxPolicyClient", Client))
             stack.enter_context(patch.object(groups, "_capture_target_groups",
@@ -170,6 +170,53 @@ class UnionPushTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("ips_kept_from_target", rows["sib"])
         self.assertFalse(rows["sib"]["exists_on_target"])
+
+
+class SkipNoIpChangeTests(UnionPushTests):
+    """--skip-no-ip-change (the driver passes it for C3 / D2a): a sibling whose
+    IPs are already all on the target is not sent, whatever else differs. The
+    build regenerates the description with its build time on every run, so
+    without this every sibling was rewritten, prompted for and re-described."""
+
+    ON_TARGET = {"sib": dict(group("sib", ip_expr(["10.16.0.1", "10.16.0.2"], eid="nsx-id")),
+                             description="generated 2026-09-27T22:01:50Z")}
+    SAME_IPS = dict(group("sib", ip_expr(["10.16.0.2", "10.16.0.1"])),
+                    description="generated 2026-09-28T17:41:28Z")
+
+    def test_same_ips_new_description_is_not_sent(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                rc, rows, summary, writes = self.push([self.SAME_IPS], self.ON_TARGET,
+                                                      apply=apply, extra=["--skip-no-ip-change"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(writes, [])
+                self.assertEqual(rows["sib"]["status"], groups.SKIPPED_STATUS)
+                self.assertEqual(rows["sib"]["skipped_reason"], "no IP change on target")
+
+    def test_a_new_ip_is_still_sent(self):
+        grows = dict(group("sib", ip_expr(["10.16.0.1", "10.16.0.2", "10.16.0.3"])),
+                     description="generated 2026-09-28T17:41:28Z")
+        rc, rows, summary, writes = self.push([grows], self.ON_TARGET, apply=True,
+                                              extra=["--skip-no-ip-change"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(rows["sib"]["ips_added"], ["10.16.0.3"])
+
+    def test_a_new_group_is_created(self):
+        rc, rows, summary, writes = self.push([self.SAME_IPS], {}, apply=True,
+                                              extra=["--skip-no-ip-change"])
+        self.assertEqual(len(writes), 1)
+
+    def test_without_the_flag_the_description_alone_forces_a_write(self):
+        # Why the flag exists: the plain content comparison sees the new
+        # description and the ids / paths NSX adds, and rewrites the group.
+        rc, rows, summary, writes = self.push([self.SAME_IPS], self.ON_TARGET, apply=True)
+        self.assertEqual(len(writes), 1)
+
+    def test_force_push_overrides_it(self):
+        rc, rows, summary, writes = self.push([self.SAME_IPS], self.ON_TARGET, apply=True,
+                                              extra=["--skip-no-ip-change", "--force-push"])
+        self.assertEqual(len(writes), 1)
 
 
 if __name__ == "__main__":

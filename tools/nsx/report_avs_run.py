@@ -589,7 +589,9 @@ def _d_group_result(r: Dict[str, Any], is_apply: bool) -> str:
     n = len(r.get("ips_added") or [])
     if n:
         return f"added {n} IP(s)" if is_apply else f"would add {n} IP(s)"
-    return "no change"
+    # Sent although its IPs did not change: only happens without
+    # --skip-no-ip-change, or with --force-push. Never call it "up to date".
+    return "re-sent, no IP change" if is_apply else "would be re-sent, no IP change"
 
 
 def render_wf_d(label: str, header: str, rows: List[Dict[str, Any]],
@@ -618,7 +620,8 @@ def _render_d2a(groups: List[Dict[str, Any]], no_sibling: List[Dict[str, Any]],
     results = [_d_group_result(r, is_apply) for r in groups]
     created = sum(1 for x in results if x in ("created", "would create"))
     added = sum(1 for x in results if "IP(s)" in x)
-    current = sum(1 for x in results if x in ("already up to date", "no change"))
+    current = sum(1 for x in results if x == "already up to date")
+    resent = sum(1 for x in results if "re-sent" in x)
     failed = sum(1 for x in results if "FAILED" in x)
     no_map = sum(len(unmapped(r)) for r in groups)
     kept_total = sum(len(r.get("ips_kept_from_target") or []) for r in groups)
@@ -629,7 +632,9 @@ def _render_d2a(groups: List[Dict[str, Any]], no_sibling: List[Dict[str, Any]],
     if added:
         summary.append([f"AVS groups {verb}given new IPs", f"**{added}**"])
     if current:
-        summary.append(["AVS groups already up to date", str(current)])
+        summary.append(["AVS groups already up to date (nothing sent)", str(current)])
+    if resent:
+        summary.append([f"AVS groups {verb}re-sent with no IP change", f"**{resent}**"])
     summary.append(["Failed", f"**{failed}**" if failed else "0"])
     summary.append(["Groups with no AVS group", str(len(no_sibling))])
     summary.append(["Current IPs with no AVS mapping", str(no_map)])

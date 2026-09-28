@@ -228,6 +228,17 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("DROPPED", md)
         self.assertNotIn("Appendix", md)
 
+    def test_skipped_is_up_to_date_and_resent_is_not(self):
+        skipped = {"kind": "group", "bucket": "unchanged", "id": "a_avs", "display_name": "a_avs",
+                   "original_display_name": "a", "ips_after": ["10.16.0.1"], "ip_pairs": []}
+        resent = {"kind": "group", "bucket": "planned", "verdict": "rewritten", "id": "b_avs",
+                  "display_name": "b_avs", "original_display_name": "b", "ips_added": [],
+                  "ips_after": ["10.16.0.2"], "ip_pairs": []}
+        md = "\n".join(report.render_wf_d("WF-D2A DRYRUN", "**DRY RUN**", [skipped, resent], [], False))
+        self.assertRegex(md, r"AVS groups already up to date \(nothing sent\)\s+\|\s+1\s")
+        self.assertIn("would be re-sent, no IP change", md)
+        self.assertRegex(md, r"AVS groups would be re-sent with no IP change\s+\|\s+\*\*1\*\*")
+
     def test_d3_layout_is_one_row_per_rule(self):
         g = "/infra/domains/default/groups/"
         rows = [{"kind": "rule-amend", "bucket": "planned", "display_name": "r1",
