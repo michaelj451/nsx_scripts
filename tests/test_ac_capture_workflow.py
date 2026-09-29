@@ -120,9 +120,15 @@ class CaptureTests(unittest.TestCase):
     def run_workflow(self, phase, *flags):
         commands = []
 
+        outer = self
+
         def run_step(label, cmd, log_dir):
             log_dir.mkdir(parents=True, exist_ok=True)
             commands.append((label, cmd))
+            # A D capture lands where --output-dir points: stand in for it with
+            # a copy of the fixture capture so the gate sees a real bundle.
+            if label == "d0_capture":
+                shutil.copytree(outer.capture, Path(cmd[cmd.index("--output-dir") + 1]))
             return {"label": label, "cmd": cmd, "rc": 0, "ok": True, "log": "test"}
 
         argv = ["run_workflow.py", "--source", "nsx-lm1", "--target", "nsx-lm2",
@@ -171,11 +177,57 @@ class CaptureTests(unittest.TestCase):
     def test_d_keeps_default_capture_and_no_capture_override(self):
         rc, commands = self.run_workflow("d2a", "--csv-remap", "map.csv")
         self.assertEqual(rc, 0)
-        self.assertEqual(commands[0][0], "a0_capture")
+        self.assertEqual(commands[0][0], "d0_capture")
         self.assertNotIn("--quiet", commands[0][1])
         rc, commands = self.run_workflow("d2a", "--csv-remap", "map.csv", "--no-capture")
         self.assertEqual(rc, 0)
         self.assertEqual(commands[0][0], "d1_build_siblings")
+
+    def test_d_captures_into_its_run_dir_and_never_touches_the_ac_capture(self):
+        marker = self.capture / "ac_marker.txt"
+        marker.write_text("A/C source data")
+        rc, commands = self.run_workflow("d2a", "--csv-remap", "map.csv")
+        self.assertEqual(rc, 0)
+        label, cap = commands[0]
+        d_capture = str(self.run / "capture" / "lm1.test")
+        self.assertEqual(cap[cap.index("--output-dir") + 1], d_capture)
+        self.assertIn("--no-flat-exports", cap)
+        build = dict(commands)["d1_build_siblings"]
+        self.assertEqual(build[build.index("--capture") + 1], d_capture)
+        self.assertNotIn("--source", build)
+        self.assertTrue(marker.exists(), "a D run touched the A/C capture")
+
+    def test_d_recapture_clears_the_previous_d_capture(self):
+        stale = self.run / "capture" / "lm1.test" / "groups_additive" / "stale.yaml"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("id: deleted-on-source")
+        rc, _ = self.run_workflow("d2a", "--csv-remap", "map.csv")
+        self.assertEqual(rc, 0)
+        self.assertFalse(stale.exists())
+
+    def test_sibling_pushes_skip_groups_whose_ips_do_not_change(self):
+        for phase, flags, label in (("c", (), "c3_siblings"),
+                                    ("d2a", ("--csv-remap", "map.csv"), "d2a_siblings")):
+            for mode in ((), ("--apply",)):
+                with self.subTest(phase=phase, mode=mode):
+                    if mode:
+                        smap = self.run / "nsx_sibling_groups" / "lm1.test" / "sibling_map.json"
+                        smap.parent.mkdir(parents=True, exist_ok=True)
+                        if not smap.exists():
+                            smap.write_text('{"map": []}')
+                    rc, commands = self.run_workflow(phase, *flags, *mode)
+                    self.assertEqual(rc, 0)
+                    self.assertIn("--skip-no-ip-change", dict(commands)[label])
+
+    def test_d3_never_captures(self):
+        smap = self.run / "nsx_sibling_groups" / "lm1.test" / "sibling_map.json"
+        smap.parent.mkdir(parents=True, exist_ok=True)
+        smap.write_text('{"map": []}')
+        for flags in ((), ("--capture",)):
+            with self.subTest(flags=flags):
+                rc, commands = self.run_workflow("d3", *flags)
+                self.assertEqual(rc, 0)
+                self.assertFalse(any("capture_nsx_state.py" in " ".join(c) for _, c in commands))
 
     def run_verify(self, ips=None, missing_rule=False):
         outer = self

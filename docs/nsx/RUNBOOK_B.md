@@ -265,7 +265,7 @@ python tools/nsx/groups.py push --target nsx-lm1 \
 Three independent guard rails make destruction by CSV remap operationally impossible:
 
 1. **CLI rejection** — `--mapped-only` combined with `--csv-remap` exits non-zero before any NSX call.
-2. **Per-row contract check** — if a row's diff shows `ips_removed > 0`, that group is **never** PATCHed. Marked `failed_contract_violation` with a clear error.
+2. **Union, then per-row contract check:** the push first merges every IP the group already holds on the target into the payload, so a target that drifted since the capture keeps its addresses (listed per row as `ips_kept_from_target`). If a row's diff still shows `ips_removed > 0`, that group is **never** PATCHed. Marked `failed_contract_violation` with a clear error.
 3. **End-of-run assertion** — the total `ips_removed` across all rows must be `0`. If anything slipped, exit code is non-zero and the log emits `ADDITIVE-ONLY contract: VIOLATED — N IP(s) removed across M violating row(s).`
 
 The `summary.json` always carries:

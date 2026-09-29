@@ -16,8 +16,9 @@ Five checks, all GET-only:
   V1  every source object exists on the target
       (services, groups, policies, rules; default sections excluded)
   V2  every sibling in sibling_map.json exists on the target
-  V3  each sibling's IPs match the SOURCE group's effective IPs exactly
-      (source of truth: .../groups/<id>/members/ip-addresses)
+  V3  each sibling carries every IP the SOURCE group resolves to
+      (source of truth: .../groups/<id>/members/ip-addresses). Extra IPs
+      pass and are listed: the push keeps what an earlier run landed (union)
   V5  every rule that referenced an original also references its sibling
   V6  target group membership resolves (no unrealized groups left behind)
 
@@ -203,8 +204,17 @@ def main() -> int:
         if truth is not None:
             got = ips_of(sib)
             extra, missing = sorted(set(got) - set(truth)), sorted(set(truth) - set(got))
-            record("V3", sib_name, not missing and not extra,
-                   "" if not (missing or extra) else f"missing={missing} extra={extra}", sib_id)
+            # Missing fails: a source address the sibling does not carry is a
+            # workload that stops matching. Extra passes: the push sends the
+            # union, so an address an earlier run landed stays when the source
+            # stops reporting it (typically a powered-off VM). Listed, not hidden.
+            if missing:
+                detail = f"missing={missing}" + (f" extra={extra}" if extra else "")
+            elif extra:
+                detail = f"kept from earlier runs, not in source now: {extra}"
+            else:
+                detail = ""
+            record("V3", sib_name, not missing, detail, sib_id)
 
     # ---- V5: rules reference the sibling alongside the original ------------
     log.info("V5 rule references")

@@ -44,12 +44,12 @@ the target. The [PowerShell run card](RUN_AC_LM2_PS.md) includes both stages.
 | `a` | WF-A Part 1: services, groups (segments stripped), policies, rules | a capture |
 | `c` | WF-C: push siblings, strip originals, amend rules | a capture |
 | `d2a` | WF-D siblings, the only mandatory WF-D window | `$CSV` |
-| `d2b` | WF-D pure-IP in-place remap | `$CSV` |
 | `d3` | WF-D rule amendment | `d2a` applied |
 
-WF-D is deliberately **one change window per invocation**: 2a, 2b, 3 and 5 are
+WF-D is deliberately **one change window per invocation**: 2a and 3 are
 separately approved and spaced by how much risk you will absorb at a time.
-There is no `--phase d` that chains them.
+There is no `--phase d` that chains them. The former `--phase d2b` is retired
+and no longer accepted: IP-only groups now get a sibling in `d2a`.
 
 Background: [RUNBOOK_A.md](RUNBOOK_A.md), [RUNBOOK_C.md](RUNBOOK_C.md),
 [RUNBOOK_D.md](RUNBOOK_D.md), [RUNBOOK_AVS.md](RUNBOOK_AVS.md).
@@ -103,8 +103,10 @@ wf --help | head -3
 
 ## 1) Capture (read-only, source side)
 
-A/C require a separate capture with the source credentials. WF-D still captures
-before dry runs by default; `--no-capture` disables that for D.
+A/C require a separate capture with the source credentials. WF-D captures for
+itself on the `d2a` dry run only, into `<run-dir>/capture/<host>/` with no flat
+exports, so it never replaces the capture A/C read; `d3` never captures, and
+`--no-capture` makes `d2a` reuse the saved one.
 For the source capture, **`--live-query` is mandatory**:
 it is what splices each group's effective IPs into `groups_additive/`, the tree
 WF-C and WF-D build siblings from. Without it every tag-only group looks empty,
@@ -185,8 +187,9 @@ wf --phase c --verify
 ```
 
 The dry run rebuilds the sibling bundle from the saved source capture without
-contacting the source; the apply never rebuilds. Check the build counters
-before approving:
+contacting the source; the apply never rebuilds. A rebuild (here or in `d2a`)
+keeps the bundle's `push_report/`, so an earlier apply's revert baselines
+survive it. Check the build counters before approving:
 
 ```bash
 python -c "
@@ -210,15 +213,22 @@ wf --phase d2a --csv-remap $CSV
 wf --phase d2a --csv-remap $CSV --apply
 wf --phase d2a --verify
 
-wf --phase d2b --csv-remap $CSV --apply
+wf --phase d3
 wf --phase d3 --apply
 ```
 
-Only `d2a` is required to call a run "WF-D applied". `d2b` and `d3` are
-independent, deferrable and separately revertible, and they consume bundles an
-earlier window produced: each refuses rather than rebuilding if one is missing,
-because a rebuild could hand a different payload to a target whose siblings are
-already live. No phase removes an IP.
+`d2a` gives an `_avs_ips` sibling, holding only the CSV-mapped IPs, to every
+group that is not segment-based and has at least one mapped IP: tag-based,
+IP-only, or nesting other groups. Groups with no members, no mapped IP, or a
+segment member get none, and are listed with the reason in the report.
+
+Only `d2a` is required to call a run "WF-D applied". `d3` is independent,
+deferrable and separately revertible, and it consumes the sibling map an
+earlier window produced: it refuses rather than rebuilding if the map is
+missing, because a rebuild could hand a different payload to a target whose
+siblings are already live. An apply adds only the siblings already on the
+target; a dry run flags any that are not there yet. No phase removes an IP,
+and no phase modifies an existing group.
 
 For an in-place WF-D run, set `T=$S` in step 0. The driver warns that source
 and target match, which is the supported in-place mode.
@@ -229,7 +239,8 @@ and target match, which is the supported in-place mode.
 
 Every push run writes `avs_run_report.md` (operator-facing) and
 `avs_run_report.json` (every row, with verdicts) into
-`$R/report/<phase>/<mode>/`. Four sections, in this order:
+`$R/report/<phase>/<mode>/`. A WF-A or WF-C report has four sections, in this
+order (WF-D has its own layout, [below](#the-wf-d-report)):
 
 | Section | Answers |
 |---|---|
@@ -257,19 +268,32 @@ nothing.
 the write itself is the point, such as forcing a re-realization after an
 NSX-side problem.
 
-Three things the report will shout about, because each one costs traffic:
+Two things the report will shout about, because each one costs traffic:
 
 - **Group references removed.** A clone push that drops a target-only sibling
   reference gets a warning block plus a per-rule table. Should never appear:
   the rules push merges those by default.
-- **Addresses dropped for having no CSV mapping** (WF-D). A warning block plus
-  a per-sibling table of the lost addresses. Extend the CSV or rebuild with
-  `--skip-uncovered`.
 - **IPs removed** from any group, printed first in its audit block and in
   capitals.
 
-The WF-D report also notes how many manually entered addresses were copied into
-siblings verbatim, and lists them per group.
+### The WF-D report
+
+WF-D's report is laid out around original group, AVS group and rule instead.
+
+**D2a**: a Summary table, then:
+
+| Section | Shows |
+|---|---|
+| **AVS groups** | Original group, AVS group, Result, AVS IPs, No AVS mapping (count) |
+| **IP mapping** | One table per group: each Current IP and its AVS IP, or "no AVS mapping" |
+| **Groups with no AVS group** | Group, Reason, Current IPs, for every group that got no sibling |
+
+An IP with no AVS mapping stays on its original group, where the rule still
+matches it.
+
+**D3**: a Summary table and a **Rules to update** table (Policy, Rule, Source
+gains, Destination gains). Before `d2a` is applied, the dry run notes that the
+AVS groups are not on the target yet; an apply adds only those that are.
 
 ---
 
@@ -334,18 +358,37 @@ wf --phase c --rollback --apply
 |---|---|
 | `a` | rules, policies, groups, services |
 | `c` | amend-refs, then siblings |
-| `d2a` | siblings |
-| `d2b` | pure-IP remap |
 | `d3` | amend-refs |
+| `d2a` | siblings (deletes the ones it created) |
 
-Roll back **C before A**: NSX refuses to delete a group a rule still
-references.
+Roll back **C before A**, and **`d3` before `d2a`**: NSX refuses to delete a
+group a rule still references.
+
+**A rollback only ever uses its own manager's baseline.** Every apply writes,
+beside each baseline, the manager it was taken from
+(`<ts>_target_meta.json`). Every rollback checks it before sending anything,
+and refuses (exit 2) a baseline from another manager, even one named with
+`--from-baseline`. A baseline with no record, from before 2026-09-28, is used
+only when you name it with `--from-baseline`. This matters because a rollback
+takes the newest baseline in its folder: WF-A's rules folder is keyed by A's
+source host, and before this check a D3 baseline for lm1 once sat in it on top
+of A's lm2 baseline.
+
+**C's and D3's rule amendments keep their baselines in the run directory**,
+`$R/rules_amend/<target-host>/push_report/`, not in `nsx_rules_export/`,
+which is WF-A's alone.
+
+**A rules rollback deletes only rules its push created.** A rules push records
+them (`<ts>_pushed_ids.json`, as groups already did). A rule the baseline lacks
+that the push did not create was put there by something else, so the rollback
+leaves it and lists it under `deletes_blocked`. An amend-refs rollback never
+deletes a rule: amend-refs creates none.
 
 > **`--allow-delete` is passed for you, and it matters.** Reverting a push that
 > CREATED groups has to delete them. Without the flag those groups are left in
 > place, listed under `deletes_blocked`, and the revert still exits 0, so a
 > forgotten flag gives a silent half-rollback. The driver passes it only for
-> bundles whose push created objects (siblings, pure-IP); a revert that merely
+> bundles whose push created objects (the clone, the siblings); a revert that merely
 > restores payloads never gets it.
 
 Confirm nothing was blocked:
@@ -368,8 +411,9 @@ $R/
 ├── report/<phase>/<mode>/          scoped by BOTH, so nothing overwrites
 │   ├── avs_run_report.md           operator-facing
 │   └── avs_run_report.json         every row, with verdicts
-├── nsx_sibling_groups/$SH/         built by phase c / d2a
-└── nsx_pure_ip_remap/$SH/
+├── capture/$SH/                    WF-D only: the d2a dry run's own capture
+├── rules_amend/$TH/push_report/    C5 / D3 rule amendments: reports + revert baselines
+└── nsx_sibling_groups/$SH/         built by phase c / d2a; a rebuild keeps its push_report/
 ```
 
 Keep `$R` distinct per run: each run's siblings, push reports and baselines
@@ -383,13 +427,13 @@ baseline.
 | Flag | Purpose |
 |---|---|
 | `--source` / `--target` | Manager aliases. The same alias for both is the supported in-place mode, and warns |
-| `--phase` | `a`, `c`, `d2a`, `d2b`, `d3` |
+| `--phase` | `a`, `c`, `d2a`, `d3` |
 | `--apply` | Write. Default is a dry run |
 | `--verify` | Read-only check instead of pushing |
 | `--rollback` | Undo the phase. Combine with `--apply` to write |
-| `--csv-remap` | Required for `d2a` / `d2b`. Not needed for verify or rollback |
+| `--csv-remap` | Required for `d2a`. Not needed for `d3`, verify or rollback |
 | `--run-dir` | Default `nsx_avs_runs/<source>_to_<target>` |
-| `--capture` / `--no-capture` | D captures before dry runs by default; `--no-capture` reuses saved data. A/C require a separate capture and reject `--capture`; `--no-capture` is accepted but unnecessary for A/C |
+| `--capture` / `--no-capture` | The `d2a` dry run captures by default, into `<run-dir>/capture/<host>/`; `--no-capture` reuses that saved capture. `d3` never captures. A/C require a separate capture and reject `--capture`; `--no-capture` is accepted but unnecessary for A/C |
 | `--appendix` | Sibling suffix. Default: `OBJECT_APPENDIX` (`_np_ips`) for phase `c`, `OBJECT_APPENDIX_AVS` (`_avs_ips`) for the `d*` phases. The driver picks per phase and refuses if WF-D would share WF-C's suffix. **Do not change either between runs**: a different suffix creates a second, parallel sibling set rather than renaming anything |
 | `--domain-id` | Default `default` |
 | `--continue-on-error` | Keep going after a failed step. Default is to stop, so a broken push does not cascade into the next dependency level |

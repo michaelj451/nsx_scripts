@@ -17,8 +17,8 @@ only thing that changes per command is the verb:
 Use a function, not a variable: W="python ..." followed by $W --phase a works
 in bash but fails in zsh, which does not word-split an unquoted parameter.
 
-Phases: a (WF-A Part 1 clone), c (WF-C decomposition), and d2a / d2b / d3
-(one WF-D change window each; d2a and d2b need --csv-remap). Reports land under
+Phases: a (WF-A Part 1 clone), c (WF-C decomposition), and d2a / d3
+(one WF-D change window each; d2a needs --csv-remap). Reports land under
 <run-dir>/report/<phase>/<mode>, so no two invocations overwrite each other.
 See docs/nsx/RUNBOOK_WORKFLOW.md.
 
@@ -45,8 +45,10 @@ contact only the target; verification compares it with the saved source capture.
 C rebuilds siblings from that capture on each dry run, never on apply. Keep the
 capture and its flat exports unchanged until the run is finished.
 
-WF-D still re-captures before a dry run by default; --no-capture reuses its saved
-capture. No phase captures on apply.
+WF-D captures for itself, on the d2a dry run only (d3 reads the d2a sibling map
+and the live rules, not a capture), into <run-dir>/capture/<host>/ with no flat
+exports, so it never replaces the capture A/C read. --no-capture reuses the
+saved one. No phase captures on apply.
 
 WHAT IT DOES NOT DO
 
@@ -62,6 +64,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,8 +131,17 @@ def phase_a_steps(src_host: str, target: str, apply: bool) -> List[Dict[str, Any
     ]
 
 
+def amend_dir(run_dir: Path, tgt_host: str) -> Path:
+    """Where a run's rule amendment (C5 / D3) keeps its reports and revert
+    baselines. Inside the run directory, never nsx_rules_export/<host>/: that
+    is WF-A's rules folder, keyed by A's SOURCE host, and when a C/D target is
+    the same host (D runs in place on the A source) the two workflows' rules
+    baselines stacked in one folder, where a rollback takes the newest."""
+    return run_dir / "rules_amend" / tgt_host
+
+
 def phase_c_steps(src_host: str, target: str, apply: bool,
-                  sib: Path, tgt_host: str) -> List[Dict[str, Any]]:
+                  sib: Path, tgt_host: str, amend: Path) -> List[Dict[str, Any]]:
     """WF-C: push the IP-only siblings, then amend the rules to use them.
 
     Nothing here removes an IP. The tag-side originals keep their addresses;
@@ -140,36 +152,35 @@ def phase_c_steps(src_host: str, target: str, apply: bool,
     return [
         {"label": "c3_siblings", "roots": [str(sib)],
          "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                 "--groups-dir", str(sib / "groups")] + d + a},
-        {"label": "c5_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
+                 "--groups-dir", str(sib / "groups"), "--skip-no-ip-change"] + d + a},
+        {"label": "c5_amend_refs", "roots": [str(amend)],
          "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
-                 "--sibling-map", str(sib / "sibling_map.json")] + a},
+                 "--sibling-map", str(sib / "sibling_map.json"),
+                 "--reports-dir", str(amend / "push_report")] + a},
     ]
 
 
 def phase_d_steps(phase: str, target: str, apply: bool, sib: Path,
-                  pure_ip: Path, tgt_host: str, csv: str) -> List[Dict[str, Any]]:
+                  tgt_host: str, amend: Path) -> List[Dict[str, Any]]:
     """WF-D: exactly ONE change window per invocation.
 
-    RUNBOOK_D's entire stance is that 2a, 2b, 3 and 5 are separately approved
-    windows, spaced days or weeks apart by how much risk the operator will
-    absorb at a time. Chaining them here would quietly undo that, so each is
-    its own --phase and the driver refuses to run more than the one asked for.
+    RUNBOOK_D's stance is that 2a (create the AVS siblings) and 3 (add them to
+    the rules) are separately approved windows: 2a changes nothing that
+    enforces traffic, 3 does. Chaining them here would quietly undo that, so
+    each is its own --phase and the driver runs only the one asked for.
     """
     a = ["--apply"] if apply else []
     d: List[str] = []
     if phase == "d2a":
+        # A sibling's IPs are its only content: one whose IPs are already all
+        # on the target is skipped, not rewritten (see --skip-no-ip-change).
         return [{"label": "d2a_siblings", "roots": [str(sib)],
                  "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                         "--groups-dir", str(sib / "groups")] + d + a}]
-    if phase == "d2b":
-        return [{"label": "d2b_pure_ip", "roots": [str(pure_ip)],
-                 "cmd": [PY, "tools/nsx/groups.py", "push", "--target", target,
-                         "--groups-dir", str(pure_ip / "groups"),
-                         "--csv-remap", csv] + d + a}]
-    return [{"label": "d3_amend_refs", "roots": [f"nsx_rules_export/{tgt_host}"],
+                         "--groups-dir", str(sib / "groups"), "--skip-no-ip-change"] + d + a}]
+    return [{"label": "d3_amend_refs", "roots": [str(amend)],
              "cmd": [PY, "tools/nsx/rules.py", "amend-refs", "--target", target,
-                     "--sibling-map", str(sib / "sibling_map.json")] + a}]
+                     "--sibling-map", str(sib / "sibling_map.json"),
+                     "--reports-dir", str(amend / "push_report")] + a}]
 
 
 def verify_steps(phase: str, source: str, target: str, sib: Path,
@@ -205,11 +216,11 @@ def verify_steps(phase: str, source: str, target: str, sib: Path,
 
 
 def rollback_steps(phase: str, target: str, apply: bool, sib: Path,
-                   pure_ip: Path, src_host: str, tgt_host: str) -> List[Dict[str, Any]]:
+                   src_host: str, tgt_host: str, amend: Path) -> List[Dict[str, Any]]:
     """Undo one phase, in reverse dependency order.
 
     `--allow-delete` is passed for the bundles whose push CREATED objects
-    (siblings, pure-IP). Without it those groups are left behind, listed under
+    (the WF-A clone, the siblings). Without it those groups are left behind, listed under
     `deletes_blocked`, and the revert still exits 0, so a forgotten flag gives a
     silent half-rollback. Reverting a push that only updated existing objects
     never needs it, so it is not passed there.
@@ -239,18 +250,15 @@ def rollback_steps(phase: str, target: str, apply: bool, sib: Path,
     if phase == "c":
         return [
             {"label": "c5_amend_revert", "roots": [],
-             "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")},
+             "cmd": rules_revert(str(amend / "push_report"))},
             {"label": "c3_siblings_revert", "roots": [],
              "cmd": groups_revert(sib / "push_report", allow_delete=True)},
         ]
     if phase == "d2a":
         return [{"label": "d2a_siblings_revert", "roots": [],
                  "cmd": groups_revert(sib / "push_report", allow_delete=True)}]
-    if phase == "d2b":
-        return [{"label": "d2b_pure_ip_revert", "roots": [],
-                 "cmd": groups_revert(pure_ip / "push_report", allow_delete=True)}]
     return [{"label": "d3_amend_revert", "roots": [],
-             "cmd": rules_revert(f"nsx_rules_export/{tgt_host}/push_report")}]
+             "cmd": rules_revert(str(amend / "push_report"))}]
 
 
 def main() -> int:
@@ -261,13 +269,13 @@ def main() -> int:
     p.add_argument("--source", required=True, choices=NSX_MANAGER_CHOICES)
     p.add_argument("--target", required=True, choices=NSX_MANAGER_CHOICES)
     p.add_argument("--phase", required=True,
-                   choices=["a", "c", "d2a", "d2b", "d3"],
+                   choices=["a", "c", "d2a", "d3"],
                    help="a = WF-A Part 1 clone; c = WF-C sibling decomposition; "
-                        "d2a/d2b/d3 = one WF-D change window each "
-                        "(siblings / pure-IP remap / amend-refs).")
+                        "d2a/d3 = one WF-D change window each "
+                        "(create the AVS siblings / add them to the rules).")
     p.add_argument("--csv-remap", default=None, metavar="PATH",
-                   help="CSV subnet map. Required for WF-D phases d2a (the build "
-                        "maps sibling IPs through it) and d2b.")
+                   help="CSV subnet map. Required for WF-D phase d2a (the build "
+                        "maps sibling IPs through it).")
     p.add_argument("--apply", action="store_true",
                    help="Write to the target. Default is a dry run.")
     p.add_argument("--verify", action="store_true",
@@ -286,7 +294,8 @@ def main() -> int:
                         "the CSV-REMAPPED ones, so a shared suffix would merge mapped "
                         "addresses into the source-IP siblings.")
     p.add_argument("--capture", action=argparse.BooleanOptionalAction, default=None,
-                   help="WF-D only: re-capture before a dry run (default on for D). "
+                   help="d2a only: re-capture the source before the dry run, into "
+                        "<run-dir>/capture/ (default on for d2a). d3 never captures. "
                         "A/C require a separate source capture and never contact the "
                         "source. --no-capture is accepted for all phases.")
     p.add_argument("--continue-on-error", action="store_true",
@@ -305,8 +314,15 @@ def main() -> int:
                   "python tools/nsx/capture_nsx_state.py --source %s --live-query. "
                   "Then switch credentials to the target and run this phase.", args.source)
         return 2
+    # Only the D2a dry run captures: it is the one D step whose build reads the
+    # source's current membership. D3 reads the D2a sibling map and the live
+    # rules, never a capture, so capturing there only re-reads the manager.
+    if args.phase == "d3" and args.capture:
+        log.warning("d3 does not use a capture (it reads the d2a sibling map and "
+                    "the live rules); --capture ignored.")
+        args.capture = False
     if args.capture is None:
-        args.capture = args.phase.startswith("d")
+        args.capture = args.phase == "d2a"
 
     # Refuse before creating anything, so a rejected invocation leaves no
     # half-made run directory behind to be mistaken for a real run.
@@ -315,7 +331,7 @@ def main() -> int:
         return 2
     # --csv-remap only shapes a push. Verify and rollback consume what an
     # earlier push already produced.
-    if args.phase in ("d2a", "d2b") and not args.csv_remap \
+    if args.phase == "d2a" and not args.csv_remap \
             and not (args.verify or args.rollback):
         log.error("--csv-remap is required for %s: WF-D siblings carry the "
                   "MAPPED addresses, not the source ones.", args.phase)
@@ -369,20 +385,33 @@ def main() -> int:
     log.info("=" * 70)
 
     sib = run_dir / "nsx_sibling_groups" / src_host
-    pure_ip = run_dir / "nsx_pure_ip_remap" / src_host
     wf = "d" if args.phase.startswith("d") else args.phase
     out_dir = run_dir / "report" / args.phase / mode
 
-    capture = REPO_ROOT / "nsx_capture" / src_host
+    # A/C read the operator's separate source capture (nsx_capture/<host> and
+    # the flat exports beside it). WF-D captures for itself, into its own run
+    # directory and without flat exports, so a D run can never replace the
+    # source data an A/C run was previewed from. The run directory then also
+    # holds the exact capture its build used.
+    capture = (run_dir / "capture" / src_host) if wf == "d" \
+        else REPO_ROOT / "nsx_capture" / src_host
     # Only WF-D can capture here. A/C run after the manual credential switch.
     if action == "push" and not args.apply and args.capture:
-        rec = run_step("a0_capture", [PY, "tools/nsx/capture_nsx_state.py",
+        # capture_nsx_state leaves a custom --output-dir alone, so clear it
+        # here: a group deleted on the source must not survive into the build.
+        if capture.exists():
+            shutil.rmtree(capture)
+        rec = run_step("d0_capture", [PY, "tools/nsx/capture_nsx_state.py",
                                       "--source", args.source, "--live-query",
-                                      "--domain-id", args.domain_id], log_dir)
+                                      "--domain-id", args.domain_id,
+                                      "--output-dir", str(capture),
+                                      "--no-flat-exports"], log_dir)
         if not rec["ok"]:
             log.error("Capture failed; nothing pushed.")
             return 1
-    if (action == "push" and not args.apply and args.capture) or \
+    # Gate every build input: the A/C capture, and the D2a capture whether
+    # this run took it or reuses the previous one (--no-capture).
+    if (action == "push" and not args.apply and args.phase == "d2a") or \
             (args.phase in ("a", "c") and action != "rollback"):
         why = check_capture_gate(capture, src_host, args.domain_id)
         if why:
@@ -401,7 +430,7 @@ def main() -> int:
             return 2
     elif args.rollback:
         steps = rollback_steps(args.phase, args.target, args.apply, sib,
-                               pure_ip, src_host, tgt_host)
+                               src_host, tgt_host, amend_dir(run_dir, tgt_host))
         if not args.apply:
             log.info("Rollback DRY RUN: each revert prints its plan and writes nothing.")
     elif args.phase == "a":
@@ -418,9 +447,10 @@ def main() -> int:
     elif args.phase in ("c", "d2a"):
         # Rebuild from the saved capture on EVERY dry run. This is offline;
         # --source identifies a local directory, not a source API connection.
-        # build_sibling_groups rmtrees its own output dirs, so this leaves
-        # nothing behind from a previous build. An apply never rebuilds, so it
-        # pushes exactly what its dry run previewed.
+        # build_sibling_groups clears its own output, so nothing from a previous
+        # build survives except push_report/, where an earlier apply keeps its
+        # revert baseline. An apply never rebuilds, so it pushes exactly what
+        # its dry run previewed.
         if args.apply:
             if not (sib / "sibling_map.json").exists():
                 log.error("No sibling bundle at %s. Run the dry run first so the "
@@ -428,7 +458,10 @@ def main() -> int:
                 return 2
             log.info("Using the bundle the dry run previewed: %s", sib)
         else:
-            build = [PY, "tools/nsx/build_sibling_groups.py", "--source", args.source,
+            # C builds from the operator's shared capture, D from its own.
+            src_arg = ["--capture", str(capture), "--label", src_host] if wf == "d" \
+                else ["--source", args.source]
+            build = [PY, "tools/nsx/build_sibling_groups.py", *src_arg,
                      "--output-base", str(run_dir), "--domain-id", args.domain_id]
             if args.appendix:
                 build += ["--appendix", args.appendix]
@@ -442,23 +475,22 @@ def main() -> int:
             if not rec["ok"]:
                 log.error("Sibling build failed; nothing pushed.")
                 return 1
-        steps = phase_c_steps(src_host, args.target, args.apply, sib, tgt_host) \
+        steps = phase_c_steps(src_host, args.target, args.apply, sib, tgt_host,
+                              amend_dir(run_dir, tgt_host)) \
             if args.phase == "c" else \
-            phase_d_steps(args.phase, args.target, args.apply, sib, pure_ip,
-                          tgt_host, args.csv_remap)
+            phase_d_steps(args.phase, args.target, args.apply, sib, tgt_host,
+                          amend_dir(run_dir, tgt_host))
     else:
-        # d2b / d3 consume bundles an earlier window produced. Rebuilding
-        # here could hand a different payload to a target whose siblings are
-        # already live, so a missing bundle is an error, never a rebuild.
-        needed = {"d2b": pure_ip / "groups",
-                  "d3": sib / "sibling_map.json"}[args.phase]
+        # d3 consumes the sibling map an earlier window produced. Rebuilding
+        # here could hand a different map to a target whose siblings are
+        # already live, so a missing map is an error, never a rebuild.
+        needed = sib / "sibling_map.json"
         if not needed.exists():
             log.error("%s needs %s, which does not exist. Phase d2a builds the "
-                      "sibling and pure-IP bundles; run it first.",
-                      args.phase, needed)
+                      "sibling bundle; run it first.", args.phase, needed)
             return 2
-        steps = phase_d_steps(args.phase, args.target, args.apply, sib,
-                              pure_ip, tgt_host, args.csv_remap)
+        steps = phase_d_steps(args.phase, args.target, args.apply, sib, tgt_host,
+                              amend_dir(run_dir, tgt_host))
 
     records, roots = [], []
     for step in steps:

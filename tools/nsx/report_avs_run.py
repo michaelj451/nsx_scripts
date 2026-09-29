@@ -5,7 +5,8 @@ One consolidated "what did this run change?" report for an AVS / WF-A / WF-C /
 WF-D sequence, built entirely from the per-tool push reports already on disk.
 
 WF-C and WF-D push from the same bundle directories, so pass --workflow d on a
-WF-D run to get its phase labels (D2a / D2b / D3 / D5) instead of WF-C's.
+WF-D run to get its phase labels (D2a / D3) and its own report layout (original
+group -> AVS group -> IP mapping -> rules) instead of WF-C's.
 
 Offline: reads JSON, contacts no NSX manager. Pair it with
 verify_avs_run.py, which is the live check.
@@ -75,6 +76,11 @@ STATUS_BUCKETS = {
     "success": "applied",
     "success_patch": "applied",
     "success_put": "applied",
+    # Written on the push's retry pass: the first attempt failed (typically a
+    # nested group pushed before the group it references existed) and the
+    # retry succeeded. Uncounted, a WF-A report said 74 created when 76 were.
+    "success_put_retry": "applied",
+    "success_patch_retry": "applied",
     "changed": "applied",
     "created": "applied",
     "updated": "applied",
@@ -303,6 +309,10 @@ def audit_lines(r: Dict[str, Any]) -> List[str]:
         out.append(f"- IPs REMOVED ({len(removed)}): {_vals(removed)}")
     if added:
         out.append(f"- IPs added ({len(added)}): {_vals(added)}")
+    kept_ips = r.get("ips_kept_from_target") or []
+    if kept_ips:
+        out.append(f"- IPs kept, already on the target but not in the source "
+                   f"({len(kept_ips)}): {_vals(kept_ips)}")
     before, after = r.get("ips_before"), r.get("ips_after")
     if (removed or added) and before is not None and after is not None:
         out.append(f"- IPs before ({len(before)}) -> after ({len(after)})")
@@ -433,6 +443,18 @@ def load_sibling_map(root: Path) -> Dict[str, Dict[str, Any]]:
             if isinstance(e, dict) and e.get("sibling_id")}
 
 
+def load_no_sibling(root: Path) -> List[Dict[str, Any]]:
+    """Groups the build gave no sibling, with the reason, or [] if none."""
+    f = root / "sibling_map.json"
+    if not f.is_file():
+        return []
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    return [e for e in (data.get("no_sibling") or []) if isinstance(e, dict)]
+
+
 def load_rows(root: Path, since: Optional[datetime],
               workflow: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every row from every recognised report file under <root>/push_report."""
@@ -503,6 +525,9 @@ def load_rows(root: Path, since: Optional[datetime],
                 "reason": r.get("reason"),
                 "ips_added": r.get("ips_added"),
                 "ips_removed": r.get("ips_removed"),
+                # On the target, absent from the source, pushed back as part of
+                # the union. Not a change; listed so a stale address is visible.
+                "ips_kept_from_target": r.get("ips_kept_from_target"),
                 "refs_added_total": r.get("refs_added_total"),
                 # Group refs that existed only on the target. Preserved means a
                 # push kept WF-C/WF-D sibling refs instead of clobbering them;
@@ -535,9 +560,206 @@ def load_rows(root: Path, since: Optional[datetime],
                 # CSV mapping, and which hand-entered ones were copied verbatim.
                 "ips_uncovered": (smap.get(str(r.get("id"))) or {}).get("ips_uncovered"),
                 "ips_manual_copied": (smap.get(str(r.get("id"))) or {}).get("ips_manual_copied"),
+                # WF-D: the group a sibling was built from, and what each of
+                # its current addresses mapped to ([[ip, [mapped...]], ...]).
+                "original_display_name": (smap.get(str(r.get("id"))) or {}).get("original_display_name"),
+                "ip_pairs": (smap.get(str(r.get("id"))) or {}).get("ip_pairs"),
+                # amend-refs dry run: siblings a rule would gain that the target
+                # does not hold yet (an apply skips them).
+                "siblings_not_on_target": r.get("siblings_not_on_target"),
                 "timestamp": ts,
             })
     return rows
+
+
+# ---- WF-D report --------------------------------------------------------------
+# WF-D answers three questions, and the report is laid out around them: which
+# AVS group does each original group get (D2a), what did each current address
+# map to, and which rules pick the AVS groups up (D3). One row per object, one
+# row per address, no repeated sections.
+
+def _few(items: List[Any], n: int = 5) -> str:
+    items = [str(x) for x in items or []]
+    shown = ", ".join(f"`{x}`" for x in items[:n])
+    return shown + (f" +{len(items) - n} more" if len(items) > n else "")
+
+
+def _d_group_result(r: Dict[str, Any], is_apply: bool) -> str:
+    if r["bucket"] == "failed":
+        return "**FAILED**"
+    if r["bucket"] == "unchanged":
+        return "already up to date"
+    if r.get("verdict") == "created":
+        return "created" if is_apply else "would create"
+    n = len(r.get("ips_added") or [])
+    if n:
+        return f"added {n} IP(s)" if is_apply else f"would add {n} IP(s)"
+    # Sent although its IPs did not change: only happens without
+    # --skip-no-ip-change, or with --force-push. Never call it "up to date".
+    return "re-sent, no IP change" if is_apply else "would be re-sent, no IP change"
+
+
+def render_wf_d(label: str, header: str, rows: List[Dict[str, Any]],
+                no_sibling: List[Dict[str, Any]], is_apply: bool) -> List[str]:
+    md = [f"# {label}", "", header, ""]
+    groups = [r for r in rows if r["kind"] == "group"]
+    amends = [r for r in rows if r["kind"] == "rule-amend"]
+    if groups or no_sibling:
+        md += _render_d2a(groups, no_sibling, is_apply)
+    if amends:
+        md += _render_d3(amends, is_apply)
+    if not (groups or no_sibling or amends):
+        md += ["Nothing was pushed in this window.", ""]
+    return md
+
+
+def _render_d2a(groups: List[Dict[str, Any]], no_sibling: List[Dict[str, Any]],
+                is_apply: bool) -> List[str]:
+    def orig_name(r: Dict[str, Any]) -> str:
+        return str(r.get("original_display_name") or name_of(r))
+
+    def unmapped(r: Dict[str, Any]) -> List[str]:
+        return [ip for ip, mapped in (r.get("ip_pairs") or []) if not mapped]
+
+    groups = sorted(groups, key=orig_name)
+    results = [_d_group_result(r, is_apply) for r in groups]
+    created = sum(1 for x in results if x in ("created", "would create"))
+    added = sum(1 for x in results if "IP(s)" in x)
+    current = sum(1 for x in results if x == "already up to date")
+    resent = sum(1 for x in results if "re-sent" in x)
+    failed = sum(1 for x in results if "FAILED" in x)
+    no_map = sum(len(unmapped(r)) for r in groups)
+    kept_total = sum(len(r.get("ips_kept_from_target") or []) for r in groups)
+    verb = "" if is_apply else "would be "
+
+    md = ["## Summary", ""]
+    summary = [[f"AVS groups {verb}created", f"**{created}**"]]
+    if added:
+        summary.append([f"AVS groups {verb}given new IPs", f"**{added}**"])
+    if current:
+        summary.append(["AVS groups already up to date (nothing sent)", str(current)])
+    if resent:
+        summary.append([f"AVS groups {verb}re-sent with no IP change", f"**{resent}**"])
+    summary.append(["Failed", f"**{failed}**" if failed else "0"])
+    summary.append(["Groups with no AVS group", str(len(no_sibling))])
+    summary.append(["Current IPs with no AVS mapping", str(no_map)])
+    if kept_total:
+        summary.append(["IPs kept (on target, not in capture)", str(kept_total)])
+    md += table(["Item", "Count"], summary) + [""]
+    md += ["Existing groups and rules are not changed in this phase. Rules start "
+           "using the AVS groups in D3. An IP with no AVS mapping stays on its "
+           "original group, where the rule still matches it.", ""]
+
+    if groups:
+        md += ["## AVS groups", ""]
+        head = ["Original group", "AVS group", "Result", "AVS IPs", "No AVS mapping"]
+        if kept_total:
+            head.append("Kept")
+        body = []
+        for r, res in zip(groups, results):
+            line = [orig_name(r), name_of(r), res,
+                    str(len(r.get("ips_after") or [])), str(len(unmapped(r)) or "")]
+            if kept_total:
+                line.append(str(len(r.get("ips_kept_from_target") or []) or ""))
+            body.append(line)
+        md += table(head, body) + [""]
+
+        fails = [r for r in groups if r["bucket"] == "failed"]
+        if fails:
+            md += ["## Failures", ""]
+            md += table(["AVS group", "Error"],
+                        [[name_of(r), str(r.get("reason") or "")[:160]] for r in fails]) + [""]
+
+        md += ["## IP mapping", "",
+               "What each current IP maps to in its AVS group.", ""]
+        for r in groups:
+            pairs = r.get("ip_pairs") or []
+            kept = r.get("ips_kept_from_target") or []
+            if not (pairs or kept):
+                continue
+            md += [f"### {orig_name(r)} -> {name_of(r)}", ""]
+            lines = [[f"`{ip}`", ", ".join(f"`{m}`" for m in mapped)]
+                     for ip, mapped in pairs if mapped]
+            lines += [[f"`{ip}`", "no AVS mapping"] for ip, mapped in pairs if not mapped]
+            lines += [["(not in capture)", f"`{ip}` kept, already on target"] for ip in kept]
+            more = len(lines) - AUDIT_CAP
+            md += table(["Current IP", "AVS IP"], lines[:AUDIT_CAP])
+            if more > 0:
+                md += ["", f"... and {more} more; the full list is in avs_run_report.json."]
+            md += [""]
+
+    if no_sibling:
+        md += ["## Groups with no AVS group", ""]
+        md += table(["Group", "Reason", "Current IPs"],
+                    [[str(e.get("original_display_name") or e.get("original_id")),
+                      str(e.get("reason") or e.get("reason_code") or ""),
+                      (f"{len(e.get('ips_source') or [])}: {_few(e.get('ips_source'))}"
+                       if e.get("ips_source") else "none")]
+                     for e in sorted(no_sibling, key=lambda e: str(
+                         e.get("original_display_name") or e.get("original_id")))]) + [""]
+    return md
+
+
+def _render_d3(amends: List[Dict[str, Any]], is_apply: bool) -> List[str]:
+    changed = [r for r in amends if r["bucket"] in ("applied", "planned")
+               and r.get("per_field_diff")]
+    failed = [r for r in amends if r["bucket"] == "failed"]
+    nothing = len(amends) - len(changed) - len(failed)
+    refs = sum(r.get("refs_added_total") or 0 for r in changed)
+    pending = sorted({s for r in changed for s in (r.get("siblings_not_on_target") or [])})
+    verb = "" if is_apply else "would be "
+
+    md = ["## Summary", ""]
+    summary = [[f"Rules {verb}updated", f"**{len(changed)}**"],
+               [f"AVS group references {verb}added", f"**{refs}**"],
+               ["Rules with nothing to add", str(nothing)],
+               ["Failed", f"**{len(failed)}**" if failed else "0"]]
+    if pending:
+        summary.append(["AVS groups not on the target yet", f"**{len(pending)}**"])
+    md += table(["Item", "Count"], summary) + [""]
+    md += ["Nothing is removed from any rule: each AVS group is added next to the "
+           "original group it came from.", ""]
+    # Before D2a is applied NONE of them exist, and marking every cell says
+    # nothing the banner does not. Mark per cell only when some are missing.
+    referenced = {p.rsplit("/", 1)[-1] for r in changed
+                  for d in (r.get("per_field_diff") or {}).values() for p in d.get("added") or []}
+    mark_cells = bool(pending) and set(pending) != referenced
+    if pending and not mark_cells:
+        md += [f"> **None of the {len(pending)} AVS groups below exist on the target "
+               "yet.** Apply D2a first: an apply adds only the AVS groups that exist "
+               "when it runs.", ""]
+    elif pending:
+        md += [f"> **{len(pending)} AVS group(s) are not on the target yet.** Apply "
+               "D2a first: an apply adds only the AVS groups that exist when it runs. "
+               "They are marked *(not on target yet)* below.", ""]
+
+    if changed:
+        fields = ["source_groups", "destination_groups"]
+        if any("scope" in (r.get("per_field_diff") or {}) for r in changed):
+            fields.append("scope")
+        titles = {"source_groups": "Source gains", "destination_groups": "Destination gains",
+                  "scope": "Applied To gains"}
+
+        def cell(r: Dict[str, Any], field: str) -> str:
+            miss = set(r.get("siblings_not_on_target") or []) if mark_cells else set()
+            names = []
+            for path in ((r.get("per_field_diff") or {}).get(field) or {}).get("added") or []:
+                nm = _short(path)
+                if path.rsplit("/", 1)[-1] in miss:
+                    nm += " *(not on target yet)*"
+                names.append(nm)
+            return ", ".join(names)
+
+        md += ["## Rules updated" if is_apply else "## Rules to update", ""]
+        md += table(["Policy", "Rule"] + [titles[f] for f in fields],
+                    [[policy_of(r), name_of(r)] + [cell(r, f) for f in fields]
+                     for r in sorted(changed, key=lambda x: (policy_of(x), name_of(x)))]) + [""]
+    if failed:
+        md += ["## Failures", ""]
+        md += table(["Policy", "Rule", "Error"],
+                    [[policy_of(r), name_of(r), str(r.get("reason") or "")[:160]]
+                     for r in failed]) + [""]
+    return md
 
 
 def main() -> int:
@@ -572,11 +794,13 @@ def main() -> int:
 
     rows: List[Dict[str, Any]] = []
     modes: set = set()
+    no_sibling: List[Dict[str, Any]] = []
     for root in args.report_root:
         root_path = Path(root).expanduser()
         rows.extend(load_rows(root_path, since, args.workflow))
         modes |= load_modes(root_path, since)
         NAMES.add_bundle(root_path)
+        no_sibling.extend(load_no_sibling(root_path))
     # The rows themselves name the objects they push, and the push tools record
     # display names for target-side references no bundle on this side holds.
     for r in rows:
@@ -617,6 +841,7 @@ def main() -> int:
 
     ips_added = sum(len(r["ips_added"] or []) for r in rows)
     ips_removed = sum(len(r["ips_removed"] or []) for r in rows)
+    ips_kept = sum(len(r.get("ips_kept_from_target") or []) for r in rows)
     refs_added = sum(r["refs_added_total"] or 0 for r in rows)
     failed = [r for r in rows if r["bucket"] == "failed"]
 
@@ -651,7 +876,8 @@ def main() -> int:
     def verdict(r: Dict[str, Any]) -> str:
         if r["bucket"] == "failed":
             return "failed"
-        if r.get("exists_on_target") is False or str(r.get("status", "")).endswith("_put"):
+        if r.get("exists_on_target") is False or \
+                str(r.get("status", "")).endswith(("_put", "_put_retry")):
             return "created"
         if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")
                 or r.get("refs_removed_total") or r.get("per_field_diff")):
@@ -681,6 +907,7 @@ def main() -> int:
         "totals_by_kind": totals,
         "ips_added_total": ips_added,
         "ips_removed_total": ips_removed,
+        "ips_kept_total": ips_kept,
         "refs_added_total": refs_added,
         "failed_count": len(failed),
         "rows": rows,
@@ -772,8 +999,24 @@ def main() -> int:
     refs_kept = sum(r.get("refs_preserved_total") or 0 for r in rows)
     refs_lost = sum(r.get("refs_removed_total") or 0 for r in rows)
     md += [f"- IPs added: **{ips_added}**   removed: **{ips_removed}**   "
-           f"rule refs added: **{refs_added}**"
+           + (f"kept from target: **{ips_kept}**   " if ips_kept else "")
+           + f"rule refs added: **{refs_added}**"
            + (f"   target-only refs kept: **{refs_kept}**" if refs_kept else ""), ""]
+    # Every row, not just the changed ones: a group whose union already equals
+    # the target is skipped as unchanged, and its kept addresses are exactly
+    # the ones a reviewer should look at (a powered-off, re-addressed or
+    # decommissioned VM). Nothing removes them; that is a manual decision.
+    kept_rows = [r for r in rows if r.get("ips_kept_from_target")]
+    if kept_rows:
+        md += [f"### IPs kept on the target ({ips_kept})", "",
+               "Already on the target, not in the source capture, so the push sends "
+               "the union and keeps them. Usually a VM that was powered off at capture "
+               "time; check any you do not expect. Nothing here is ever removed "
+               "automatically.", ""]
+        md += table(["Name", "Kept", "IPs"],
+                    [[name_of(r), str(len(r["ips_kept_from_target"])),
+                      _vals(r["ips_kept_from_target"])]
+                     for r in sorted(kept_rows, key=name_of)]) + [""]
     same = [r for r in rows if r["bucket"] == "unchanged"]
     if same:
         md += [f"- Already identical on the target, so skipped with nothing sent: "
@@ -866,6 +1109,10 @@ def main() -> int:
                         [[r["phase"], r["kind"], name_of(r), r["verdict"], str(r["status"])]
                          for r in sorted(rest, key=lambda x: (x["phase"], name_of(x)))]) + [""]
 
+    # WF-D gets its own layout, built around original group -> AVS group ->
+    # rule. The generic one above stays for A and C.
+    if args.workflow == "d":
+        md = render_wf_d(args.label, md[2], rows, no_sibling, is_apply)
     (out_dir / "avs_run_report.md").write_text("\n".join(md), encoding="utf-8")
 
     log.info("Rows: %d  applied=%d failed=%d  ips +%d/-%d  refs +%d",

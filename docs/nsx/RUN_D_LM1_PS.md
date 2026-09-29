@@ -21,12 +21,13 @@ revertible and carries different risk.
 | Phase | Does | Required | Removes IPs |
 |---|---|---|---|
 | `d2a` | Create the `_avs_ips` sibling groups | **yes** | no |
-| `d2b` | Add mapped IPs to pure-IP groups in place | no | no |
 | `d3` | Amend rules to reference the siblings alongside the originals | no | no |
 
 Only `d2a` is required to call a run "WF-D applied". **No phase removes an
-IP.** The tag-side originals keep their addresses and their tag criteria;
-the siblings carry the CSV-mapped equivalents alongside them.
+IP, and no phase modifies an existing group.** The originals keep their
+addresses and their criteria; the siblings carry the CSV-mapped equivalents
+alongside them. The former `d2b` (mapped IPs added in place to IP-only groups)
+is retired: those groups now get a sibling in `d2a`.
 
 ---
 
@@ -95,29 +96,26 @@ mode, not a mistake.
 
 ---
 
-## 1) Capture the source (read-only)
+## 1) Capture (automatic, read-only)
+
+You do not run a capture for D. The `d2a` dry run captures lm1 itself, with
+`--live-query`, into `$R/capture/$SH/`. It writes no flat exports and never
+touches `nsx_capture/$SH/` or the `nsx_*_export/$SH/` trees, so it cannot
+replace the source data an A/C run reads, and the run directory keeps the exact
+capture its build used. `d3` never captures (it reads the d2a sibling map and
+the live rules). `--no-capture` on `d2a` reuses the saved capture. No apply
+captures.
 
 Capture logs stream live with no quiet mode. Every apply and rollback starts at
 one object; Enter continues, a positive number increases the next batch, `n`
 resets to one, and `x` stops. Lost input stops the run. Dry runs never prompt.
 
-**`--live-query` is mandatory.** Without it every tag-only group looks empty, the
-build produces siblings only for groups that already held static IPs, and
-nothing errors. Measured on lm1: 1 sibling without it, 7 with it.
+### The gate: check all five fields yourself, after the d2a dry run
 
 ```powershell
-python tools/nsx/capture_nsx_state.py --source $S --live-query --ip-report-csv $CSV
-```
-
-### The gate: check all five fields yourself
-
-```powershell
-$glog = Get-ChildItem "$env:NSX_LOG_DIR/build_group_ip_additive_from_live_members_*.log" |
-  Sort-Object LastWriteTime | Select-Object -Last 1
-$line = (Select-String -Path $glog -Pattern "Summary:" | Select-Object -Last 1).Line
-foreach ($k in "ip_source","effective_ip_queries","groups_changed","ips_added_total","groups_errors") {
-  if ($line -match "${k}.: ([^,}]+)") { "{0,-20} {1}" -f $k, $Matches[1].Trim() }
-}
+Get-Content "$R/capture/$SH/groups_additive/domains/default/groups/manifest.json" |
+  ConvertFrom-Json |
+  Select-Object ip_source, effective_ip_queries, groups_changed, ips_added_total, groups_errors
 ```
 
 | Field | Required |
@@ -130,22 +128,16 @@ foreach ($k in "ip_source","effective_ip_queries","groups_changed","ips_added_to
 
 The driver checks capture success, source/domain identity, effective IP mode,
 zero group errors and a successful effective-IP query for every processed group.
-The optional VM index can now be empty. Review the change counts yourself;
-zero additions can mean those IPs were already present in the export.
-The explicit `--ip-report-csv` above enables the optional coverage report.
+Review the change counts yourself; zero additions can mean those IPs were
+already present in the export. What the CSV does and does not cover is in the
+d2a report itself: the "No AVS mapping" column, the per-group IP mapping and
+"Groups with no AVS group".
 
-Then review what the CSV does and does not cover:
-
-```powershell
-Get-Content "$env:NSX_LOG_DIR/groups_ip_report/$SH/summary.json"
-Get-Content "$env:NSX_LOG_DIR/groups_ip_report/$SH/empty_groups.json"
-```
-
-Optional drift check against the last export:
+Optional drift check before an apply, against the capture the dry run used:
 
 ```powershell
 python tools/nsx/compare_group_ips.py `
-  --reference "nsx_groups_export/$SH/groups" --target $S
+  --reference "$R/capture/$SH/nsx_export/$SH/domains/default/groups" --target $S
 ```
 
 ---
@@ -176,8 +168,8 @@ $m.map | ForEach-Object { "  {0,-30} {1} ips" -f $_.sibling_id, $_.ips_source.Co
 |---|---|
 | `appendix` | `_avs_ips`. `_np_ips` means the suffix fell back to WF-C's and the run must be rebuilt |
 | Every sibling | non-zero IP count |
-| "Addresses dropped for having no CSV mapping" | absent. If present, extend the CSV or rebuild with `--skip-uncovered` |
-| Manual addresses copied verbatim | expected and listed per group. These are the group's own IPAddressExpression entries, carried across unmapped |
+| "No AVS mapping" column and IP mapping tables | reviewed. An unmapped IP (hand-typed ones included) stays on the original, where the rule still matches it; extend the CSV only if it needs an AVS counterpart |
+| "Groups with no AVS group" | every group without a sibling accounted for, with its reason: no members, no CSV mapping, or segment-based |
 | `Failed` | 0 |
 
 The baseline this apply captures is what the validator reads later:
@@ -187,18 +179,6 @@ $R/nsx_sibling_groups/nsx-lm1.lab.local/push_report/baselines/<ts>_target_baseli
 ```
 
 Keep it.
-
----
-
-## 2b) Pure-IP remap (optional, separate window)
-
-Strict-additive: adds mapped IPs alongside existing ones, never removes.
-
-```powershell
-wf --phase d2b --csv-remap $CSV
-Get-Content "$R/report/d2b/dryrun/avs_run_report.md"
-wf --phase d2b --csv-remap $CSV --apply
-```
 
 ---
 
@@ -215,6 +195,10 @@ wf --phase d3 --apply
 ```
 
 No `--csv-remap` is needed here: `d3` consumes the sibling map `d2a` produced.
+The apply adds only the siblings that exist on the target when it runs; any
+missing one is skipped and listed in `amend_refs_summary.json` as
+`siblings_not_on_target`. The dry run previews them all and flags the missing
+ones, which is normal before `d2a` has been applied.
 
 ---
 
@@ -255,10 +239,6 @@ Preview first, always. Run only the windows you actually applied.
 wf --phase d3 --rollback
 wf --phase d3 --rollback --apply
 
-# 2b: remove mapped IPs from pure-IP groups
-wf --phase d2b --rollback
-wf --phase d2b --rollback --apply
-
 # 2a: delete the sibling groups
 wf --phase d2a --rollback
 wf --phase d2a --rollback --apply
@@ -277,13 +257,17 @@ Against `nsx-lm1` holding 13 groups / 5 policies / 15 rules / 4 services, with
 
 | Phase | Objects | IPs | Detail |
 |---|---:|---:|---|
-| `d2a` | 7 created | +30 | `_avs_ips` siblings for `network-group-0/1/2/8`, `super-nested-group`, `vm-group-1/2`. 3 manually entered addresses copied verbatim |
-| `d2b` | 1 changed | +1 | `ip-address-group`; 5 further groups had nothing to add |
+| `d2a` | 7 created | +30 | `_avs_ips` siblings for `network-group-0/1/2/8`, `super-nested-group`, `vm-group-1/2` |
 | `d3` | 10 changed | n/a | 16 sibling references added across 10 rules |
 
-All four reported `Failed: 0`. The 7 siblings match the figure the runbook
+Both reported `Failed: 0`. The 7 siblings matched the figure the runbook
 records for a correct `--live-query` capture on this source; 1 sibling would
-mean the capture was wrong.
+have meant the capture was wrong.
+
+This run predates the retirement of `d2b`. Then, the +30 included 3 hand-typed
+addresses copied verbatim, and `ip-address-group` got its mapped IP in place
+(+1) instead of a sibling. The current build also gives IP-only and
+group-nesting groups a sibling, so expect more than 7 `_avs_ips` groups here.
 
 ---
 
@@ -342,19 +326,14 @@ function wf {
 wf --phase d2a --csv-remap $CSV
 
 if ($LASTEXITCODE -eq 0) {
-    wf --phase d2b --csv-remap $CSV --no-capture
-}
-
-if ($LASTEXITCODE -eq 0) {
-    wf --phase d3 --no-capture
+    wf --phase d3
 }
 ```
 
 This previews **Workflow D in place on LM1**, proceeding only when the previous command succeeds. **No NSX configuration changes are applied.**
 
 - **`d2a`** captures LM1 automatically with `--live-query`, builds the mapped siblings, and previews their creation or update.
-- **`d2b`** previews mapped IP additions to pure-IP groups.
-- **`d3`** previews sibling-reference additions to the rules currently on LM1.
+- **`d3`** previews sibling-reference additions to the rules currently on LM1. Until `d2a` is applied, it flags every AVS group as not on the target yet; that is expected.
 
 This block sets the same variables as section 0, including `$SH` and
 `$env:NSX_LOG_DIR`, and `$R` is the same stable run directory
@@ -363,13 +342,12 @@ and the rollback commands in section 5 therefore work in this session without
 redefining anything. Do not swap `$R` for a timestamped directory: section 5
 pops the revert baselines from the run dir, and a per-run name hides them.
 
-All four use the same source capture. The CSV and suffix match this run card: `data/nonprod_map.csv` and `_avs_ips`.
+Both use the same source capture. The CSV and suffix match this run card: `data/nonprod_map.csv` and `_avs_ips`.
 
 Reports:
 
 ```powershell
 "$R/report/d2a/dryrun/avs_run_report.md"
-"$R/report/d2b/dryrun/avs_run_report.md"
 "$R/report/d3/dryrun/avs_run_report.md"
 ```
 

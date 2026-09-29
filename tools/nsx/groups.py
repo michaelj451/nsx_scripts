@@ -72,6 +72,7 @@ from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 from nsx.push_skip import is_unchanged, SKIPPED_STATUS
 from nsx import revert_plan  # noqa: E402
+from nsx import baseline_meta  # noqa: E402
 
 # Allow importing sibling tools (CSV remap logic lives in nsx_group_ip_remap_offline.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -193,6 +194,44 @@ def _ip_diff(before: List[str], after: List[str]) -> Tuple[List[str], List[str]]
     added = sorted(v for c, v in after_by_canon.items() if c not in before_by_canon)
     removed = sorted(v for c, v in before_by_canon.items() if c not in after_by_canon)
     return added, removed
+
+
+def _keep_target_ips(payload: Dict[str, Any], target: Dict[str, Any]) -> List[str]:
+    """Make `payload` a superset of the IPs `target` already holds (the push
+    sends the union). Mutates `payload`; returns the entries it carried over,
+    in the form the target holds them.
+
+    The payload's first IPAddressExpression takes them. A payload with none
+    gets one, reusing the target's expression id (and the id of the OR that
+    precedes it) so an otherwise identical group still compares unchanged.
+    """
+    have = {_canonical_ip_token(ip) for ip in _extract_ip_entries(payload)}
+    keep = [ip for ip in _extract_ip_entries(target) if _canonical_ip_token(ip) not in have]
+    if not keep:
+        return []
+    expr = payload.get("expression")
+    if not isinstance(expr, list):
+        expr = payload["expression"] = []
+    for e in expr:
+        if isinstance(e, dict) and e.get("resource_type") == "IPAddressExpression":
+            e["ip_addresses"] = list(e.get("ip_addresses") or []) + keep
+            return keep
+    t_expr = [e for e in (target.get("expression") or []) if isinstance(e, dict)]
+    t_ip = [i for i, e in enumerate(t_expr) if e.get("resource_type") == "IPAddressExpression"]
+    new_ip: Dict[str, Any] = {"resource_type": "IPAddressExpression", "ip_addresses": keep}
+    conj: Dict[str, Any] = {"resource_type": "ConjunctionOperator", "conjunction_operator": "OR"}
+    if len(t_ip) == 1:
+        idx = t_ip[0]
+        if t_expr[idx].get("id"):
+            new_ip["id"] = t_expr[idx]["id"]
+        prev = t_expr[idx - 1] if idx > 0 else {}
+        if prev.get("resource_type") == "ConjunctionOperator" and prev.get("id"):
+            conj["id"] = prev["id"]
+    if expr:
+        # NSX joins an IP expression to other member criteria with OR only.
+        expr.append(conj)
+    expr.append(new_ip)
+    return keep
 
 
 def _format_entries(entries: List[str], *, max_items: int = 6) -> str:
@@ -319,6 +358,8 @@ def _write_remap_markdown(reports_dir: Path, summary: Dict[str, Any],
     L.append(f"| Groups | {t['files_seen']} seen: {t['ok']} written, {t.get('dry_run', 0)} dry-run, "
              f"{t['skipped']} skipped ({t.get('csv_no_change_skipped', 0)} no-change), {t['failed']} failed |")
     L.append(f"| IPs {'added' if apply_mode else 'to add'} | {ips_added_total} (removed: {t.get('total_ips_removed', 0)}) |")
+    if t.get("total_ips_kept_from_target"):
+        L.append(f"| IPs kept (on target, not in source) | {t['total_ips_kept_from_target']} |")
     L.append(f"| Already remapped | {t.get('csv_already_mapped_pairs', 0)} pair(s) detected |")
     L.append(f"| Additive-only contract | **{contract}** |")
     L.append(f"| **Result** | **{result}** |")
@@ -943,6 +984,9 @@ def cmd_push(args: argparse.Namespace) -> int:
         log.info("Capturing target baseline (current customer groups on %s) ...", target_host)
         baseline_dict = _capture_target_groups(client, args.domain_id)
         baseline_path = _append_baseline(reports_dir, baseline_dict)
+        baseline_meta.write_meta(baseline_path, target_host=target_host, step="groups.push",
+                                 domain_id=args.domain_id,
+                                 federation_global=args.federation_global)
         _write_pushed_ids(baseline_path, pushed_ids)
         log.info("  Baseline: %d customer group(s) → %s", len(baseline_dict), baseline_path)
     elif args.diff_target:
@@ -970,6 +1014,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     total_csv_no_change = 0
     total_fabric_stripped = 0
     total_fabric_groups_affected = 0
+    total_ips_kept = 0
 
     for i, f in enumerate(files, start=1):
         row = {
@@ -1110,6 +1155,20 @@ def cmd_push(args: argparse.Namespace) -> int:
                 # IPs), so record it explicitly: it is what lets a dry run report
                 # "would create" instead of guessing from the IP delta.
                 row["exists_on_target"] = gid in baseline_dict
+                # --- PUSH THE UNION ------------------------------------------
+                # IPs the target already holds that the source no longer
+                # reports (a powered-off VM, a re-captured group) go back into
+                # the payload. Without this, one such IP would block the whole
+                # group and its NEW IPs would never land. Recorded as "kept" so
+                # a stale address stays visible instead of silently carried.
+                if gid in baseline_dict:
+                    kept = _keep_target_ips(obj, baseline_dict[gid])
+                    if kept:
+                        row["ips_kept_from_target"] = kept
+                        total_ips_kept += len(kept)
+                        log.info("[%d/%d] %s: keeping %d IP(s) already on the target "
+                                 "but not in the source: %s", i, len(files), group_name,
+                                 len(kept), _format_entries(kept))
                 before_ips = _extract_ip_entries(baseline_dict.get(gid, {}))
                 after_ips  = _extract_ip_entries(obj)
                 ips_added, ips_removed = _ip_diff(before_ips, after_ips)
@@ -1127,13 +1186,23 @@ def cmd_push(args: argparse.Namespace) -> int:
             # before the dry-run/apply fork so the preview matches the apply.
             unchanged = (have_baseline and not args.force_push
                          and is_unchanged(obj, baseline_dict.get(gid)))
-            if unchanged:
+            # IP-only sibling bundles (WF-C / WF-D): the IP set is the group's
+            # only content. The build still regenerates everything around it
+            # (its description carries the build time, and NSX adds ids and
+            # paths the build never has), so a group whose IPs are already all
+            # on the target would otherwise be rewritten, prompted for, and
+            # have its description changed on every run. Its IPs decide.
+            no_ip_change = (have_baseline and not args.force_push
+                            and args.skip_no_ip_change and gid in baseline_dict
+                            and not ips_added and not ips_removed)
+            if unchanged or no_ip_change:
                 row["status"] = SKIPPED_STATUS
-                row["skipped_reason"] = "target content already identical"
+                row["skipped_reason"] = ("target content already identical" if unchanged
+                                         else "no IP change on target")
                 skipped += 1
-                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: unchanged on target; "
-                         "nothing sent to NSX", i, len(files), ok, failed, skipped,
-                         group_name)
+                log.info("[%d/%d  ok=%d fail=%d skip=%d] %s: %s; nothing sent to NSX",
+                         i, len(files), ok, failed, skipped, group_name,
+                         "unchanged on target" if unchanged else "no IP change on target")
                 rows.append(row)
                 continue
 
@@ -1166,13 +1235,12 @@ def cmd_push(args: argparse.Namespace) -> int:
             row["_payload"] = obj
 
             # --- ADDITIVE-ONLY CONTRACT ENFORCEMENT --------------------------
-            # When CSV remap is in play, the run must never remove an IP from
-            # any group. If a per-row diff shows IPs would be removed, refuse
-            # to push that group, mark it failed, and let the end-of-run
-            # assertion fail the overall exit code. The most likely cause is
-            # drift between the source bundle and the target — e.g. someone
-            # added IPs to the target after the bundle was captured. The fix
-            # is to re-capture so source and target match before remapping.
+            # The run must never remove an IP from any group. The union push
+            # above makes every payload a superset of the target, so target
+            # drift no longer lands here; this stays as the backstop. If a
+            # per-row diff still shows IPs would be removed, refuse to push
+            # that group, mark it failed, and let the end-of-run assertion
+            # fail the overall exit code.
             if ips_removed:
                 if csv_mapping is not None:
                     contract_violation_msg = (
@@ -1493,6 +1561,12 @@ def cmd_push(args: argparse.Namespace) -> int:
                       total_ips_removed_count, contract_violations)
     summary["totals"]["contract_violations"]      = contract_violations
     summary["totals"]["total_ips_removed"]        = total_ips_removed_count
+    # Already on the target, absent from the source, carried into the push.
+    summary["totals"]["total_ips_kept_from_target"] = total_ips_kept
+    if total_ips_kept:
+        log.info("Kept %d IP(s) already on the target but not in the source "
+                 "(pushed as the union; per-row list in ips_kept_from_target).",
+                 total_ips_kept)
     summary["totals"]["additive_only_contract"]   = ("pass" if contract_ok else "violated")
     # Markdown report (CSV remap runs only), in the audit-report style.
     if csv_mapping is not None:
@@ -1550,6 +1624,13 @@ def cmd_revert(args: argparse.Namespace) -> int:
         )
 
     log.info("Using baseline: %s", baseline_path)
+    # The baseline must have been taken from THIS manager. Checked before the
+    # target is even read, so a refusal sends nothing.
+    why = baseline_meta.refuse_reason(baseline_path, target_host,
+                                      explicit=bool(args.from_baseline))
+    if why:
+        log.error("REFUSED: %s Nothing was sent.", why)
+        return 2
     baseline: Dict[str, Dict[str, Any]] = json.loads(baseline_path.read_text(encoding="utf-8"))
     log.info("  Baseline contains %d customer group(s)", len(baseline))
 
@@ -1886,6 +1967,12 @@ def main() -> int:
                          "content. Default is to skip those: an identical PUT only bumps "
                          "_revision and re-realizes. Use this when the write itself is the "
                          "point, e.g. forcing re-realization after an NSX-side problem.")
+    pp.add_argument("--skip-no-ip-change", action="store_true",
+                    help="For IP-only sibling bundles (WF-C / WF-D): skip a group that is "
+                         "already on the target when its IP set would not change, even if "
+                         "other fields differ (the build's timestamped description, ids and "
+                         "paths NSX adds). Nothing is sent, so nothing on the target changes. "
+                         "The workflow driver passes this for the sibling pushes.")
     pp.add_argument("--diff-target", action=argparse.BooleanOptionalAction, default=True,
                     help="DRY RUN: make one read-only pass over the target so every row "
                          "reports ips_before/ips_after/ips_added/ips_removed and whether the "
