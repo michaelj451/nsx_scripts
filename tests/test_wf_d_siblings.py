@@ -248,6 +248,12 @@ class ReportTests(unittest.TestCase):
         self.assertIn("would be re-sent, no IP change", md)
         self.assertRegex(md, r"AVS groups would be re-sent with no IP change\s+\|\s+\*\*1\*\*")
 
+    def test_retry_successes_count_as_applied(self):
+        # A nested group pushed before the group it references fails once and
+        # lands on the retry pass. A WF-A report said 74 created when 76 were.
+        for status in ("success_put_retry", "success_patch_retry"):
+            self.assertEqual(report.bucket_for(status), "applied")
+
     def test_d3_layout_is_one_row_per_rule(self):
         g = "/infra/domains/default/groups/"
         rows = [{"kind": "rule-amend", "bucket": "planned", "display_name": "r1",

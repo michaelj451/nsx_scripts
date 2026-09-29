@@ -76,6 +76,11 @@ STATUS_BUCKETS = {
     "success": "applied",
     "success_patch": "applied",
     "success_put": "applied",
+    # Written on the push's retry pass: the first attempt failed (typically a
+    # nested group pushed before the group it references existed) and the
+    # retry succeeded. Uncounted, a WF-A report said 74 created when 76 were.
+    "success_put_retry": "applied",
+    "success_patch_retry": "applied",
     "changed": "applied",
     "created": "applied",
     "updated": "applied",
@@ -871,7 +876,8 @@ def main() -> int:
     def verdict(r: Dict[str, Any]) -> str:
         if r["bucket"] == "failed":
             return "failed"
-        if r.get("exists_on_target") is False or str(r.get("status", "")).endswith("_put"):
+        if r.get("exists_on_target") is False or \
+                str(r.get("status", "")).endswith(("_put", "_put_retry")):
             return "created"
         if (r.get("ips_added") or r.get("ips_removed") or r.get("refs_added_total")
                 or r.get("refs_removed_total") or r.get("per_field_diff")):
