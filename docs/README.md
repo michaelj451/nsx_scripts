@@ -75,7 +75,7 @@ than raw log lines.
 | [RUNBOOK_INFO_GATHER.md](nsx/RUNBOOK_INFO_GATHER.md) / [ps](nsx/RUNBOOK_INFO_GATHER_PS.md) | One-session, read-only evidence pack: VM rule membership, group membership, 30-day rule hit counts, hostname tag dry run, IP remap dry run; LM and GM blocks for every step, variable-driven paths |
 | [RUNBOOK_REPORTS.md](nsx/RUNBOOK_REPORTS.md) / [ps](nsx/RUNBOOK_REPORTS_PS.md) | The report tools under `tools/reports/`, plus the IP remap audit pointer |
 | [RUNBOOK_RULES_USAGE.md](nsx/RUNBOOK_RULES_USAGE.md) / [ps](nsx/RUNBOOK_RULES_USAGE_PS.md) | Rule hit-count / usage report, diff mode, federation notes |
-| [RUNBOOK_VM_RULE_MEMBERSHIP.md](nsx/RUNBOOK_VM_RULE_MEMBERSHIP.md) / [ps](nsx/RUNBOOK_VM_RULE_MEMBERSHIP_PS.md) | Given VM names: every DFW rule they participate in and why |
+| [RUNBOOK_VM_RULE_MEMBERSHIP.md](nsx/RUNBOOK_VM_RULE_MEMBERSHIP.md) / [ps](nsx/RUNBOOK_VM_RULE_MEMBERSHIP_PS.md) | Given VM names and/or IPs: every DFW rule they participate in and why. Live, or offline from `capture_vm_rule_data.py` snapshots (LM or GM, timestamped history like backups, zero NSX calls per lookup) |
 | IP remap audit | Lives in [RUNBOOK_B.md](nsx/RUNBOOK_B.md) section B.4: `audit_ip_remap.py`, gaps first, exit 1 on gaps, cron-safe |
 
 ## Palo Alto

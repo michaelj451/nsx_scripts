@@ -50,8 +50,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
-import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,12 +61,14 @@ sys.path.insert(0, str(REPO_ROOT / "app"))
 from nsx.streaming import stream_command
 from nsx.cli_bootstrap import init_cli                     # noqa: E402
 from nsx.nsx_constants import nsx_log_dir, resolve_manager  # noqa: E402
+from nsx.bundle_history import (                        # noqa: E402
+    prune_old_bundles as prune_old_backups, update_latest_symlink,
+)
 
 log = logging.getLogger(__name__)
 
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-TS_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
 
 
 def _utc_now_iso() -> str:
@@ -133,37 +133,10 @@ def plan_steps(
     return steps
 
 
-def prune_old_backups(host_dir: Path, retain: int) -> List[str]:
-    """Delete the oldest timestamped bundles beyond `retain`. retain<=0 keeps
-    everything. The `latest` symlink and non-timestamp entries are never touched.
-    Returns the names removed."""
-    if retain <= 0 or not host_dir.exists():
-        return []
-    ts_dirs = sorted(
-        d for d in host_dir.iterdir()
-        if d.is_dir() and not d.is_symlink() and TS_DIR_RE.match(d.name)
-    )
-    removed: List[str] = []
-    for d in ts_dirs[:-retain] if len(ts_dirs) > retain else []:
-        shutil.rmtree(d)
-        removed.append(d.name)
-    return removed
-
-
 def write_manifest(bundle: Path, manifest: Dict[str, Any]) -> Path:
     path = bundle / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
-
-
-def update_latest_symlink(host_dir: Path, bundle: Path) -> None:
-    link = host_dir / "latest"
-    try:
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(bundle.name)
-    except OSError as exc:   # e.g. filesystems without symlink support
-        log.warning("Could not update %s: %s", link, exc)
 
 
 # =============================================================================
