@@ -258,7 +258,9 @@ class NoLocalManagerSessionsInGmMode(unittest.TestCase):
         for rel in ("tools/reports/report_groups_usage.py",
                     "tools/reports/report_rules_usage.py",
                     "tools/reports/report_vms_in_rules.py",
-                    "tools/reports/report_tag_map.py"):
+                    "tools/reports/report_tag_map.py",
+                    "app/nsx/vm_rule_data.py",
+                    "tools/nsx/capture_vm_rule_data.py"):
             src = (REPO_ROOT / rel).read_text(encoding="utf-8")
             self.assertNotIn("NsxPolicyClient(nsxmanager=sid", src, rel)
             self.assertNotIn("site_clients", src, rel)
