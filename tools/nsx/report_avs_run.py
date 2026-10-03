@@ -146,24 +146,46 @@ KIND_LABEL = {"service": "Services", "group": "Groups", "policy": "Policies",
               "rule": "Rules", "rule-amend": "Rule reference amendments"}
 
 
+CELL_LIMIT = 50
+
+
+def _cut(cell: str) -> str:
+    """Shorten a cell to CELL_LIMIT characters, ending in '...'. A code span
+    cut in half is closed so the rest of the row still renders."""
+    if len(cell) <= CELL_LIMIT:
+        return cell
+    cut = cell[:CELL_LIMIT - 3].rstrip(", ")
+    if cut.count("`") % 2:
+        cut += "`"
+    return cut + "..."
+
+
 def table(headers: List[str], body: List[List[str]]) -> List[str]:
     """Render a markdown table with every column padded to a fixed width.
 
     Markdown renders either way, but these reports are read as plain text in a
     terminal and pasted into change records, where a ragged table is hard to
-    scan. Padding costs nothing and makes the columns line up.
+    scan. Padding makes the columns line up. A cell over CELL_LIMIT characters
+    is cut short, so one long rule name or group list cannot stretch every row
+    (on nsx-ws1 a D3 table reached 240 columns); the full value is in
+    avs_run_report.json, and a note under the table says so.
     """
     if not body:
         return []
     cols = len(headers)
-    grid = [[("" if c is None else str(c)) for c in (r + [""] * (cols - len(r)))[:cols]]
+    full = [[("" if c is None else str(c)) for c in (r + [""] * (cols - len(r)))[:cols]]
             for r in body]
+    grid = [[_cut(c) for c in r] for r in full]
+    cut_any = grid != full
     width = [max(len(headers[i]), max((len(r[i]) for r in grid), default=0))
              for i in range(cols)]
     out = ["| " + " | ".join(h.ljust(width[i]) for i, h in enumerate(headers)) + " |",
            "|" + "|".join("-" * (width[i] + 2) for i in range(cols)) + "|"]
     for r in grid:
         out.append("| " + " | ".join(c.ljust(width[i]) for i, c in enumerate(r)) + " |")
+    if cut_any:
+        out += ["", f"Values over {CELL_LIMIT} characters are cut short (...); the full "
+                    "values are in avs_run_report.json."]
     return out
 
 

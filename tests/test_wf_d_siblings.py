@@ -265,6 +265,32 @@ class ReportTests(unittest.TestCase):
         self.assertIn("None of the 1 AVS groups below exist on the target yet", md)
         self.assertNotIn("(not on target yet)*", md)
 
+    def test_long_cells_are_cut_and_columns_line_up(self):
+        # Seen on nsx-ws1: one 70-character rule name and three groups in one
+        # cell padded every D3 row to 240 columns. Cells are now cut at 50
+        # characters, and every row is still padded so the columns line up.
+        narrow = report.table(["Item", "Count"], [["Rules updated", "26"], ["Failed", "0"]])
+        self.assertEqual(narrow[2], "| Rules updated | 26    |")
+        long_rule = "this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on"
+        wide = report.table(["Policy", "Rule", "Source gains"],
+                            [["p1", "r1", "a_avs_ips"],
+                             ["test-infrastructure-policy", long_rule,
+                              "seed-tag-net-10-6-0_avs_ips, seed-tag-net-10-6-1_avs_ips"]])
+        rows = wide[:4]
+        self.assertEqual(len({len(ln) for ln in rows}), 1, "\n".join(rows))
+        self.assertEqual([i for i, ch in enumerate(rows[0]) if ch == "|"],
+                         [i for i, ch in enumerate(rows[3]) if ch == "|"])
+        # Cells over 50 characters are cut, and the table says where the rest is.
+        cells = [c.strip() for c in wide[3].strip("|").split("|")]
+        self.assertEqual(cells[1], long_rule[:47] + "...")
+        self.assertTrue(all(len(c) <= report.CELL_LIMIT for c in cells))
+        self.assertIn("full values are in avs_run_report.json", wide[-1])
+        self.assertNotIn("cut short", "\n".join(narrow))
+        # A code span cut in half is closed so the row still renders.
+        code = report._cut(", ".join(f"`10.6.0.{i}-10.6.0.{i + 1}`" for i in range(5)))
+        self.assertEqual(code.count("`") % 2, 0)
+        self.assertTrue(code.endswith("..."))
+
 
 if __name__ == "__main__":
     unittest.main()
