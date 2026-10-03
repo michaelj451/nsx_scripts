@@ -284,17 +284,15 @@ WF-D's report is laid out around original group, AVS group and rule instead.
 
 | Section | Shows |
 |---|---|
-| **AVS groups** | One block per original group: its AVS group and result, the AVS IP and "No AVS mapping" counts, and a table of each Current IP and its AVS IP, or "no AVS mapping" |
-| **Groups with no AVS group** | One line per group that got no sibling: reason and current IPs |
+| **AVS groups** | Original group, AVS group, Result, AVS IPs, No AVS mapping (count) |
+| **IP mapping** | One table per group: each Current IP and its AVS IP, or "no AVS mapping" |
+| **Groups with no AVS group** | Group, Reason, Current IPs, for every group that got no sibling |
 
 An IP with no AVS mapping stays on its original group, where the rule still
 matches it.
 
-The WF-D sections are blocks and lists, wrapped at 100 characters, so the
-report reads the same in an editor or `Get-Content` as in a Markdown preview.
-
-**D3**: a Summary table and a **Rules to update** section: one heading per
-policy, then each rule with its Source gains and Destination gains. Before `d2a` is applied, the dry run notes that the
+**D3**: a Summary table and a **Rules to update** table (Policy, Rule, Source
+gains, Destination gains). Before `d2a` is applied, the dry run notes that the
 AVS groups are not on the target yet; an apply adds only those that are.
 
 ---

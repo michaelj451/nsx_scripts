@@ -130,8 +130,8 @@ The driver checks capture success, source/domain identity, effective IP mode,
 zero group errors and a successful effective-IP query for every processed group.
 Review the change counts yourself; zero additions can mean those IPs were
 already present in the export. What the CSV does and does not cover is in the
-d2a report itself: each group's "No AVS mapping" count and IP mapping table,
-and "Groups with no AVS group".
+d2a report itself: the "No AVS mapping" column, the per-group IP mapping and
+"Groups with no AVS group".
 
 Optional drift check before an apply, against the capture the dry run used:
 
@@ -168,7 +168,7 @@ $m.map | ForEach-Object { "  {0,-30} {1} ips" -f $_.sibling_id, $_.ips_source.Co
 |---|---|
 | `appendix` | `_avs_ips`. `_np_ips` means the suffix fell back to WF-C's and the run must be rebuilt |
 | Every sibling | non-zero IP count |
-| "No AVS mapping" counts and IP mapping tables | reviewed. An unmapped IP (hand-typed ones included) stays on the original, where the rule still matches it; extend the CSV only if it needs an AVS counterpart |
+| "No AVS mapping" column and IP mapping tables | reviewed. An unmapped IP (hand-typed ones included) stays on the original, where the rule still matches it; extend the CSV only if it needs an AVS counterpart |
 | "Groups with no AVS group" | every group without a sibling accounted for, with its reason: no members, no CSV mapping, or segment-based |
 | `Failed` | 0 |
 
