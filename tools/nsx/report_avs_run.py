@@ -39,6 +39,7 @@ import collections
 import json
 import logging
 import sys
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -584,6 +585,20 @@ def _few(items: List[Any], n: int = 5) -> str:
     return shown + (f" +{len(items) - n} more" if len(items) > n else "")
 
 
+# The WF-D sections are blocks and lists, not wide tables: they are opened in
+# an editor or Get-Content as often as in a Markdown preview, and a padded
+# table as wide as its longest rule name and group list wraps into an
+# unreadable mess there. Every line is wrapped at this width.
+WRAP = 100
+
+
+def _wrapped(text: str, indent: str = "  ") -> List[str]:
+    """One list item, wrapped at WRAP with continuation lines indented so the
+    item still renders as one bullet."""
+    return textwrap.wrap(text, WRAP, subsequent_indent=indent,
+                         break_long_words=False, break_on_hyphens=False) or [text]
+
+
 def _d_group_result(r: Dict[str, Any], is_apply: bool) -> str:
     if r["bucket"] == "failed":
         return "**FAILED**"
@@ -646,57 +661,54 @@ def _render_d2a(groups: List[Dict[str, Any]], no_sibling: List[Dict[str, Any]],
     if kept_total:
         summary.append(["IPs kept (on target, not in capture)", str(kept_total)])
     md += table(["Item", "Count"], summary) + [""]
-    md += ["Existing groups and rules are not changed in this phase. Rules start "
-           "using the AVS groups in D3. An IP with no AVS mapping stays on its "
-           "original group, where the rule still matches it.", ""]
+    md += _wrapped("Existing groups and rules are not changed in this phase. Rules start "
+                   "using the AVS groups in D3. An IP with no AVS mapping stays on its "
+                   "original group, where the rule still matches it.", indent="") + [""]
+
+    fails = [r for r in groups if r["bucket"] == "failed"]
+    if fails:
+        md += ["## Failures", ""]
+        for r in fails:
+            md += _wrapped(f"- **{name_of(r)}**: {str(r.get('reason') or '')[:160]}")
+        md += [""]
 
     if groups:
-        md += ["## AVS groups", ""]
-        head = ["Original group", "AVS group", "Result", "AVS IPs", "No AVS mapping"]
-        if kept_total:
-            head.append("Kept")
-        body = []
+        md += ["## AVS groups", "",
+               "One block per original group: its AVS group, the result, and what each "
+               "current IP maps to.", ""]
         for r, res in zip(groups, results):
-            line = [orig_name(r), name_of(r), res,
-                    str(len(r.get("ips_after") or [])), str(len(unmapped(r)) or "")]
-            if kept_total:
-                line.append(str(len(r.get("ips_kept_from_target") or []) or ""))
-            body.append(line)
-        md += table(head, body) + [""]
-
-        fails = [r for r in groups if r["bucket"] == "failed"]
-        if fails:
-            md += ["## Failures", ""]
-            md += table(["AVS group", "Error"],
-                        [[name_of(r), str(r.get("reason") or "")[:160]] for r in fails]) + [""]
-
-        md += ["## IP mapping", "",
-               "What each current IP maps to in its AVS group.", ""]
-        for r in groups:
             pairs = r.get("ip_pairs") or []
             kept = r.get("ips_kept_from_target") or []
-            if not (pairs or kept):
-                continue
-            md += [f"### {orig_name(r)} -> {name_of(r)}", ""]
+            n_unmapped = len(unmapped(r))
+            md += [f"### {orig_name(r)}", ""]
+            md += _wrapped(f"- AVS group: `{name_of(r)}`, {res}")
+            counts = f"- AVS IPs: {len(r.get('ips_after') or [])}"
+            if n_unmapped:
+                counts += f". No AVS mapping: {n_unmapped} (they stay on the original group)"
+            if kept:
+                counts += f". Kept from the target: {len(kept)}"
+            md += _wrapped(counts) + [""]
             lines = [[f"`{ip}`", ", ".join(f"`{m}`" for m in mapped)]
                      for ip, mapped in pairs if mapped]
             lines += [[f"`{ip}`", "no AVS mapping"] for ip, mapped in pairs if not mapped]
             lines += [["(not in capture)", f"`{ip}` kept, already on target"] for ip in kept]
-            more = len(lines) - AUDIT_CAP
-            md += table(["Current IP", "AVS IP"], lines[:AUDIT_CAP])
-            if more > 0:
-                md += ["", f"... and {more} more; the full list is in avs_run_report.json."]
-            md += [""]
+            if lines:
+                more = len(lines) - AUDIT_CAP
+                md += table(["Current IP", "AVS IP"], lines[:AUDIT_CAP])
+                if more > 0:
+                    md += ["", f"... and {more} more; the full list is in avs_run_report.json."]
+                md += [""]
 
     if no_sibling:
         md += ["## Groups with no AVS group", ""]
-        md += table(["Group", "Reason", "Current IPs"],
-                    [[str(e.get("original_display_name") or e.get("original_id")),
-                      str(e.get("reason") or e.get("reason_code") or ""),
-                      (f"{len(e.get('ips_source') or [])}: {_few(e.get('ips_source'))}"
-                       if e.get("ips_source") else "none")]
-                     for e in sorted(no_sibling, key=lambda e: str(
-                         e.get("original_display_name") or e.get("original_id")))]) + [""]
+        for e in sorted(no_sibling, key=lambda e: str(
+                e.get("original_display_name") or e.get("original_id"))):
+            ips = e.get("ips_source") or []
+            current = f"{len(ips)}: {_few(ips)}" if ips else "none"
+            md += _wrapped(f"- **{e.get('original_display_name') or e.get('original_id')}**: "
+                           f"{e.get('reason') or e.get('reason_code') or ''}. "
+                           f"Current IPs {current}")
+        md += [""]
     return md
 
 
@@ -717,21 +729,21 @@ def _render_d3(amends: List[Dict[str, Any]], is_apply: bool) -> List[str]:
     if pending:
         summary.append(["AVS groups not on the target yet", f"**{len(pending)}**"])
     md += table(["Item", "Count"], summary) + [""]
-    md += ["Nothing is removed from any rule: each AVS group is added next to the "
-           "original group it came from.", ""]
+    md += _wrapped("Nothing is removed from any rule: each AVS group is added next to the "
+                   "original group it came from.", indent="") + [""]
     # Before D2a is applied NONE of them exist, and marking every cell says
     # nothing the banner does not. Mark per cell only when some are missing.
     referenced = {p.rsplit("/", 1)[-1] for r in changed
                   for d in (r.get("per_field_diff") or {}).values() for p in d.get("added") or []}
     mark_cells = bool(pending) and set(pending) != referenced
     if pending and not mark_cells:
-        md += [f"> **None of the {len(pending)} AVS groups below exist on the target "
-               "yet.** Apply D2a first: an apply adds only the AVS groups that exist "
-               "when it runs.", ""]
+        md += _wrapped(f"> **None of the {len(pending)} AVS groups below exist on the target "
+                       "yet.** Apply D2a first: an apply adds only the AVS groups that exist "
+                       "when it runs.", indent="> ") + [""]
     elif pending:
-        md += [f"> **{len(pending)} AVS group(s) are not on the target yet.** Apply "
-               "D2a first: an apply adds only the AVS groups that exist when it runs. "
-               "They are marked *(not on target yet)* below.", ""]
+        md += _wrapped(f"> **{len(pending)} AVS group(s) are not on the target yet.** Apply "
+                       "D2a first: an apply adds only the AVS groups that exist when it runs. "
+                       "They are marked *(not on target yet)* below.", indent="> ") + [""]
 
     if changed:
         fields = ["source_groups", "destination_groups"]
@@ -744,21 +756,30 @@ def _render_d3(amends: List[Dict[str, Any]], is_apply: bool) -> List[str]:
             miss = set(r.get("siblings_not_on_target") or []) if mark_cells else set()
             names = []
             for path in ((r.get("per_field_diff") or {}).get(field) or {}).get("added") or []:
-                nm = _short(path)
+                nm = f"`{_short(path)}`"
                 if path.rsplit("/", 1)[-1] in miss:
                     nm += " *(not on target yet)*"
                 names.append(nm)
             return ", ".join(names)
 
         md += ["## Rules updated" if is_apply else "## Rules to update", ""]
-        md += table(["Policy", "Rule"] + [titles[f] for f in fields],
-                    [[policy_of(r), name_of(r)] + [cell(r, f) for f in fields]
-                     for r in sorted(changed, key=lambda x: (policy_of(x), name_of(x)))]) + [""]
+        policy = None
+        for r in sorted(changed, key=lambda x: (policy_of(x), name_of(x))):
+            if policy_of(r) != policy:
+                policy = policy_of(r)
+                md += [f"### {policy}", ""]
+            md += [f"**{name_of(r)}**", ""]
+            for f in fields:
+                added = cell(r, f)
+                if added:
+                    md += _wrapped(f"- {titles[f]}: {added}")
+            md += [""]
     if failed:
         md += ["## Failures", ""]
-        md += table(["Policy", "Rule", "Error"],
-                    [[policy_of(r), name_of(r), str(r.get("reason") or "")[:160]]
-                     for r in failed]) + [""]
+        for r in failed:
+            md += _wrapped(f"- **{policy_of(r)} / {name_of(r)}**: "
+                           f"{str(r.get('reason') or '')[:160]}")
+        md += [""]
     return md
 
 

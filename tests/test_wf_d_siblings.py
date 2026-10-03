@@ -230,10 +230,11 @@ class ReportTests(unittest.TestCase):
         no_sib = [{"original_id": "public", "original_display_name": "public",
                    "reason": "no IP has a CSV mapping", "ips_source": ["8.8.8.8"]}]
         md = "\n".join(report.render_wf_d("WF-D2A DRYRUN", "**DRY RUN**", rows, no_sib, False))
-        self.assertIn("| web            | web_avs   | would create |", md)
-        self.assertIn("### web -> web_avs", md)
+        self.assertIn("### web\n\n- AVS group: `web_avs`, would create", md)
+        self.assertIn("- AVS IPs: 1. No AVS mapping: 1", md)
         self.assertIn("| `10.50.20.20` | no AVS mapping |", md)
         self.assertIn("## Groups with no AVS group", md)
+        self.assertIn("- **public**: no IP has a CSV mapping. Current IPs 1: `8.8.8.8`", md)
         self.assertNotIn("DROPPED", md)
         self.assertNotIn("Appendix", md)
 
@@ -264,6 +265,34 @@ class ReportTests(unittest.TestCase):
         self.assertIn("## Rules to update", md)
         self.assertIn("None of the 1 AVS groups below exist on the target yet", md)
         self.assertNotIn("(not on target yet)*", md)
+        self.assertIn("### p1\n\n**r1**\n\n- Source gains: `web_avs`", md)
+
+    def test_wf_d_report_lines_fit_an_editor(self):
+        # Seen on nsx-ws1: the D3 table was 240 columns wide (a 70-character
+        # rule name plus three groups in one cell) and wrapped into an
+        # unreadable mess in VS Code and Get-Content.
+        g = "/infra/domains/default/groups/"
+        long_rule = "this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on"
+        sibs = [f"seed-tag-net-10-6-{i}_avs_ips" for i in range(6)]
+        amends = [{"kind": "rule-amend", "bucket": "applied", "display_name": long_rule,
+                   "policy_id": "test-infrastructure-policy", "refs_added_total": 8,
+                   "per_field_diff": {"source_groups": {"added": [g + s for s in sibs]},
+                                      "destination_groups": {"added": [g + s for s in sibs[:2]]}}},
+                  {"kind": "rule-amend", "bucket": "failed", "display_name": long_rule,
+                   "policy_id": "p2",
+                   "reason": "HTTP 400 Bad Request: " + "the referenced group is not present " * 5}]
+        groups = [{"kind": "group", "bucket": "applied", "verdict": "created",
+                   "id": long_rule + "_avs_ips", "display_name": long_rule + "_avs_ips",
+                   "original_display_name": long_rule, "ips_after": ["10.7.0.1"],
+                   "ip_pairs": [["10.6.0.1", ["10.7.0.1"]], ["10.50.0.1", []]]}]
+        no_sib = [{"original_display_name": long_rule, "reason": "no IP has a CSV mapping",
+                   "ips_source": [f"10.2.{i}.0/24" for i in range(8)]}]
+        for rows, skipped in ((amends, []), (groups, no_sib)):
+            md = report.render_wf_d("WF-D APPLY", "**APPLY**", rows, skipped, True)
+            wide = [ln for ln in md if len(ln) > report.WRAP]
+            self.assertEqual(wide, [], "\n".join(wide))
+        self.assertIn("- Source gains: `seed-tag-net-10-6-0_avs_ips`",
+                      "\n".join(report.render_wf_d("WF-D3 APPLY", "**APPLY**", amends, [], True)))
 
 
 if __name__ == "__main__":
