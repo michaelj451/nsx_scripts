@@ -266,24 +266,27 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("(not on target yet)*", md)
 
     def test_long_cells_are_cut_and_columns_line_up(self):
-        # Seen on nsx-ws1: one 70-character rule name and three groups in one
-        # cell padded every D3 row to 240 columns. Cells are now cut at 50
-        # characters, and every row is still padded so the columns line up.
+        # Seen on nsx-ws1: one long rule name and three groups in one cell
+        # padded every D3 row to 240 columns. Cells are now cut at CELL_LIMIT
+        # (75) characters, and every row is still padded so the columns line up.
         narrow = report.table(["Item", "Count"], [["Rules updated", "26"], ["Failed", "0"]])
         self.assertEqual(narrow[2], "| Rules updated | 26    |")
-        long_rule = "this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on"
+        long_rule = "this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on" * 2
+        groups = ", ".join(f"seed-tag-net-10-6-{i}_avs_ips" for i in range(3))
         wide = report.table(["Policy", "Rule", "Source gains"],
                             [["p1", "r1", "a_avs_ips"],
-                             ["test-infrastructure-policy", long_rule,
-                              "seed-tag-net-10-6-0_avs_ips, seed-tag-net-10-6-1_avs_ips"]])
+                             ["test-infrastructure-policy", long_rule, groups]])
         rows = wide[:4]
         self.assertEqual(len({len(ln) for ln in rows}), 1, "\n".join(rows))
         self.assertEqual([i for i, ch in enumerate(rows[0]) if ch == "|"],
                          [i for i, ch in enumerate(rows[3]) if ch == "|"])
-        # Cells over 50 characters are cut, and the table says where the rest is.
+        # Long cells are cut, and the table says where the rest is.
         cells = [c.strip() for c in wide[3].strip("|").split("|")]
-        self.assertEqual(cells[1], long_rule[:47] + "...")
+        self.assertEqual(cells[1], long_rule[:report.CELL_LIMIT - 3] + "...")
+        self.assertTrue(cells[2].endswith("..."))
         self.assertTrue(all(len(c) <= report.CELL_LIMIT for c in cells))
+        # A value at or under the limit is left whole.
+        self.assertEqual(report._cut("x" * report.CELL_LIMIT), "x" * report.CELL_LIMIT)
         self.assertIn("full values are in avs_run_report.json", wide[-1])
         self.assertNotIn("cut short", "\n".join(narrow))
         # A code span cut in half is closed so the row still renders.
