@@ -265,10 +265,10 @@ class ReportTests(unittest.TestCase):
         self.assertIn("None of the 1 AVS groups below exist on the target yet", md)
         self.assertNotIn("(not on target yet)*", md)
 
-    def test_wide_tables_are_not_padded(self):
-        # Seen on nsx-ws1: padding stretched every D3 row to 240 columns (a
-        # 70-character rule name, three groups in one cell) and VS Code wrapped
-        # the table into an unreadable mess. Narrow tables still line up.
+    def test_long_cells_are_cut_and_columns_line_up(self):
+        # Seen on nsx-ws1: one 70-character rule name and three groups in one
+        # cell padded every D3 row to 240 columns. Cells are now cut at 50
+        # characters, and every row is still padded so the columns line up.
         narrow = report.table(["Item", "Count"], [["Rules updated", "26"], ["Failed", "0"]])
         self.assertEqual(narrow[2], "| Rules updated | 26    |")
         long_rule = "this_is_a_very_long_rule_name_that_goes_on_and_on_and_on_and_on_and_on"
@@ -276,12 +276,12 @@ class ReportTests(unittest.TestCase):
                             [["p1", "r1", "a_avs_ips"],
                              ["test-infrastructure-policy", long_rule,
                               "seed-tag-net-10-6-0_avs_ips, seed-tag-net-10-6-1_avs_ips"]])
-        self.assertEqual(wide[0], "| Policy | Rule | Source gains |")
-        self.assertEqual(wide[1], "|---|---|---|")
-        self.assertEqual(wide[2], "| p1 | r1 | a_avs_ips |")
-        self.assertLess(max(len(ln) for ln in wide[:3]), report.PAD_LIMIT)
+        rows = wide[:4]
+        self.assertEqual(len({len(ln) for ln in rows}), 1, "\n".join(rows))
+        self.assertEqual([i for i, ch in enumerate(rows[0]) if ch == "|"],
+                         [i for i, ch in enumerate(rows[3]) if ch == "|"])
         # Cells over 50 characters are cut, and the table says where the rest is.
-        cells = wide[3].strip("| ").split(" | ")
+        cells = [c.strip() for c in wide[3].strip("|").split("|")]
         self.assertEqual(cells[1], long_rule[:47] + "...")
         self.assertTrue(all(len(c) <= report.CELL_LIMIT for c in cells))
         self.assertIn("full values are in avs_run_report.json", wide[-1])

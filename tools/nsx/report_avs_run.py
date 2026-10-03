@@ -146,7 +146,6 @@ KIND_LABEL = {"service": "Services", "group": "Groups", "policy": "Policies",
               "rule": "Rules", "rule-amend": "Rule reference amendments"}
 
 
-PAD_LIMIT = 100
 CELL_LIMIT = 50
 
 
@@ -162,16 +161,13 @@ def _cut(cell: str) -> str:
 
 
 def table(headers: List[str], body: List[List[str]]) -> List[str]:
-    """Render a markdown table, its columns padded to a fixed width when that fits.
+    """Render a markdown table with every column padded to a fixed width.
 
     Markdown renders either way, but these reports are read as plain text in a
     terminal and pasted into change records, where a ragged table is hard to
-    scan, so a table that fits PAD_LIMIT columns is padded to line up. A wider
-    one is left unpadded: padding stretches every row to the longest cell (a
-    70-character rule name, three groups in one cell), and on nsx-ws1 a
-    240-column D3 table wrapped into an unreadable mess in VS Code. Unpadded,
-    only the row with the long cell is long. The preview renders both the same.
-    A cell over CELL_LIMIT characters is cut short; the full value is in
+    scan. Padding makes the columns line up. A cell over CELL_LIMIT characters
+    is cut short, so one long rule name or group list cannot stretch every row
+    (on nsx-ws1 a D3 table reached 240 columns); the full value is in
     avs_run_report.json, and a note under the table says so.
     """
     if not body:
@@ -183,10 +179,8 @@ def table(headers: List[str], body: List[List[str]]) -> List[str]:
     cut_any = grid != full
     width = [max(len(headers[i]), max((len(r[i]) for r in grid), default=0))
              for i in range(cols)]
-    if sum(width) + 3 * cols + 1 > PAD_LIMIT:
-        width = [0] * cols
     out = ["| " + " | ".join(h.ljust(width[i]) for i, h in enumerate(headers)) + " |",
-           "|" + "|".join("-" * max(width[i] + 2, 3) for i in range(cols)) + "|"]
+           "|" + "|".join("-" * (width[i] + 2) for i in range(cols)) + "|"]
     for r in grid:
         out.append("| " + " | ".join(c.ljust(width[i]) for i, c in enumerate(r)) + " |")
     if cut_any:
