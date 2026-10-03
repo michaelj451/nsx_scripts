@@ -146,7 +146,7 @@ KIND_LABEL = {"service": "Services", "group": "Groups", "policy": "Policies",
               "rule": "Rules", "rule-amend": "Rule reference amendments"}
 
 
-CELL_LIMIT = 50
+CELL_LIMIT = 75
 
 
 def _cut(cell: str) -> str:
