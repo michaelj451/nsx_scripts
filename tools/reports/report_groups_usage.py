@@ -57,7 +57,7 @@ from nsx.md_utils import align_markdown_tables               # noqa: E402
 
 log = logging.getLogger(__name__)
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
-                       "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+                       "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 CLASS_ORDER = ["TAG", "IP", "SEGMENT", "VM_PATH", "NESTED", "MIXED", "EMPTY"]

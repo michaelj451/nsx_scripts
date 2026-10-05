@@ -148,8 +148,10 @@ python tools/vm_tags/push_hostname_tags.py `
   --apply --batch-size 0
 ```
 
-Non-interactive stdin (piped input, cron) auto-approves each boundary
-and logs a warning. Batch size only counts successful applies. Skips
+Closed input (piped input, a scheduled task, Ctrl-C at a prompt) stops
+the run at that boundary and writes the manifest; it never approves the
+next batch. Use `--batch-size 0` for unattended runs. Batch size only
+counts successful applies. Skips
 (NOOP, RACE, MISSING) don't consume the batch slot.
 
 ---

@@ -1,0 +1,9 @@
+# Addresses already in use at nsx-lm3 (lab, verified read-only 2026-10-04).
+# One host, CIDR or range per line. Used by tools/multisite/plan_multisite.py
+# --in-use nsx-lm3=data/multisite_in_use_nsx-lm3.txt to flag mapped addresses
+# that would land on a machine that is already there.
+10.8.0.1      # t1-gateway-10.8.0.0
+10.8.1.1      # t1-gateway-10.8.1.0
+10.8.2.1      # t1-gateway-10.8.2.0
+10.8.0.101    # ubuntu22-speedtest-10.8.0.101 (moved from lm1, kept its IP)
+10.8.0.102    # ubuntu22-speedtest-10.8.0.102 (moved from lm1, kept its IP)

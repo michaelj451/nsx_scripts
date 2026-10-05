@@ -54,6 +54,12 @@ PowerShell variants are not transliterations: every inspection block was run
 under pwsh against real run artifacts, so the gates print parsed fields rather
 than raw log lines.
 
+## Multivendor rollout
+
+| Runbook | PowerShell | What it covers |
+|---|---|---|
+| [RUNBOOK_MULTIVENDOR_ROLLOUT.md](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md) | [ps](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md) | `nsx-lm1` VMs moving to **either** `nsx-lm2` or `nsx-lm3`, traffic between all three sites, and the Palo Alto `dg-5` firewall between them. Separate steps (A and C onto lm3, then each site's mapped addresses onto the others) through the existing driver, one two-column map per target (`data/subnet_map_lm2.csv`, `data/subnet_map_lm3.csv`). The Palo Alto track is separate and still being built |
+
 ## Backup (separate from capture on purpose)
 
 | Doc | Purpose |

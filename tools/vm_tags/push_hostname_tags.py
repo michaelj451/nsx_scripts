@@ -243,6 +243,9 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
       n / no             -> continue but RESET batch size to 1 (be conservative)
       <positive number>  -> continue at that new batch size
       x / exit / quit    -> stop processing cleanly (raise _InteractiveExit)
+      input closed       -> stop, never approve (EOF or Ctrl-C), same as
+                            app/nsx/apply_batch.ApplyBatch. Unattended
+                            runs use --batch-size 0, which never prompts.
     """
     prompt_text = (f"Applied {applied_count} VM tag update(s). "
                    f"Continue with current batch_size={current_batch_size}? "
@@ -252,10 +255,11 @@ def _prompt_batch_continue(applied_count: int, current_batch_size: int) -> int:
         log.info("PROMPT: %s", prompt_text)
         try:
             raw = input("\n" + prompt_text + " ")
-        except EOFError:
-            log.warning("OPERATOR RESPONSE: <EOF> (non-interactive stdin). "
-                        "Auto-approving (batch_size=%d).", current_batch_size)
-            return current_batch_size
+        except (EOFError, KeyboardInterrupt):
+            log.warning("OPERATOR RESPONSE: <input closed> after %d update(s). "
+                        "Stopping; no further writes. Use --batch-size 0 for an "
+                        "unattended run.", applied_count)
+            raise _InteractiveExit(f"Input closed after {applied_count} update(s).")
 
         # Log the RAW response before any parsing so typos, whitespace, and
         # empty-Enter are all captured verbatim in the audit log.
@@ -463,7 +467,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--manager",
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         required=True,
     )
     parser.add_argument(

@@ -67,7 +67,7 @@ from nsx_group_ip_remap_offline import (                      # noqa: E402
 
 log = logging.getLogger(__name__)
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 EXCLUDED_FILENAMES = {"manifest.json", "summary.json", "summary.txt"}
 MAX_INLINE = 8   # entries shown inline per group in the uncovered table
 

@@ -158,7 +158,7 @@ def write_summary(summary_path: Path, manifest: Dict[str, Any]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Read-only capture of an NSX manager's state into a self-contained bundle.")
-    p.add_argument("--source", required=True, choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+    p.add_argument("--source", required=True, choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
                    help="NSX manager to capture FROM (read-only).")
     p.add_argument("--domain-id", default="default", help="NSX domain to capture (default: default).")
     p.add_argument("--federation-global", action="store_true",

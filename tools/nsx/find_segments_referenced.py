@@ -584,7 +584,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-manager",
         default=None,
-        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         help=(
             "Optional: live NSX manager to fetch segment details from "
             "(subnets, VLANs, transport zone, etc.). If the call fails "

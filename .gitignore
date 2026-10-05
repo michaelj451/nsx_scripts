@@ -307,3 +307,8 @@ nsx_info_*.zip
 # README and manifests committed: a baseline that describes configuration it
 # does not contain. Re-include everything under nsx_baseline/.
 !nsx_baseline/**
+
+# Multi-site planner runs (tools/multisite/plan_multisite.py)
+nsx_multisite_runs/
+# NSX to Panorama mirror runs (tools/pan/nsx_pan_mirror.py)
+pan_mirror_runs/

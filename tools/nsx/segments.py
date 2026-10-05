@@ -78,7 +78,7 @@ STRIP_KEYS = {
 }
 
 EXCLUDED_FILENAMES = {"manifest.json", "summary.json", "summary.txt"}
-NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 
 # Matches /infra/segments/<id>, /global-infra/segments/<id>, and any
 # /ports/... sub-resource path under those.

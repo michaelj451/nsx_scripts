@@ -62,7 +62,7 @@ DEFAULT_BACKOFF_BASE = 2.0   # seconds; attempts wait 2, 4, 8 ... (capped)
 DEFAULT_BACKOFF_CAP  = 60.0  # seconds; never sleep longer than this between retries
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
-NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 
 
 def _has_special_chars(value: str) -> bool:

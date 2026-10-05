@@ -482,7 +482,7 @@ def main() -> int:
                      "Read-only against NSX.")
     )
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--source", choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+    src.add_argument("--source", choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
                      help="NSX manager alias whose CAPTURE bundle to read. Reads from "
                           "nsx_capture/<host>/groups_additive/... (captured-VM-IPs view).")
     src.add_argument("--capture", default=None,

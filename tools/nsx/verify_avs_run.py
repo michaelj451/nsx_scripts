@@ -56,7 +56,7 @@ from nsx.captured_source import CapturedSource                # noqa: E402
 log = logging.getLogger("verify_avs_run")
 
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
-                       "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+                       "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 DEFAULT_SECTIONS = {"default-layer2-section", "default-layer3-section"}
 
 

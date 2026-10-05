@@ -151,7 +151,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--manager",
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         required=True,
     )
     parser.add_argument("--plan-dir", required=True, help="Directory with eligible.json")

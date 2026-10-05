@@ -141,6 +141,9 @@ for an unattended run.
 
 Because prompts are on by default, **do not background or pipe this command**
 unless you pass `--batch-size 0`.
+If input closes at a prompt (piped, backgrounded, Ctrl-C), the run stops
+there and writes its manifest; it never approves the next batch. The
+revert tool behaves the same way.
 
 ---
 

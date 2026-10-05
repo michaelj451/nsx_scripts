@@ -202,7 +202,7 @@ def write_summary(summary_path: Path, manifest: Dict[str, Any]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Push a transformed capture bundle to a target NSX manager. Never touches the source manager.")
-    p.add_argument("--target", required=True, choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+    p.add_argument("--target", required=True, choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
                    help="NSX manager to push TO.")
     p.add_argument("--transformed", required=True,
                    help="Path to a transformed bundle (output of transform_capture.py).")

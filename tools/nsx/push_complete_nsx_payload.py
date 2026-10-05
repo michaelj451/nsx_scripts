@@ -469,6 +469,7 @@ def main() -> None:
             "nsx-lm3",
             "nsx-lm4",
             "nsx-lm5",
+            "nsx-lm6",
         ],
     )
     parser.add_argument(
