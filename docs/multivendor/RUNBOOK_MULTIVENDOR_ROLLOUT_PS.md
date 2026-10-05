@@ -187,12 +187,12 @@ Newest first: 6b, 6a, 5, 4, 3, 2.
 
 ## Palo Alto track (separate)
 
-Mirrors NSX exactly (see [STATUS.md](STATUS.md) for the mapping). Never commits.
+Only the sibling IP groups each NSX step creates, same names as on NSX (see [STATUS.md](STATUS.md)). Never commits.
 
 ```powershell
-# P1 plan: reads NSX only. Drop --groups to mirror every non-system group.
-python tools/pan/nsx_pan_mirror.py plan --source nsx-lm1 `
-  --groups seed-tag-net-10-6-0,ip-address-group,seed-nested-web
+# P1 plan: from the sibling bundle(s) of the NSX steps you ran (hostnames read-only from the source)
+python tools/pan/nsx_pan_mirror.py plan `
+  --bundle "$B/nsx-lm1_avs_ips" --bundle "$B/nsx-lm1_lm3_ips"
 $P = (Get-ChildItem "pan_mirror_runs/nsx-lm1.lab.local" -Directory | Where-Object Name -match '^\d{8}_\d{6}$' | Sort-Object Name | Select-Object -Last 1).FullName
 Get-Content "$P/plan.md"
 

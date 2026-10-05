@@ -1,8 +1,8 @@
 {
-  "model": "opus[1m]",
   "permissions": {
     "allow": [
-      "Bash(*)"
+      "Bash(*)",
+      "Bash(echo \"checkout rc=$?\")"
     ],
     "deny": [
       "Bash(stb harbor runsettings.:*)",
@@ -10,5 +10,6 @@
       "Bash(git commit)",
       "Bash(git commit:*)"
     ]
-  }
+  },
+  "model": "opus[1m]"
 }

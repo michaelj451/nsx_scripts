@@ -243,3 +243,74 @@ class PushRevertTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SiblingMirrorTests(unittest.TestCase):
+    """Mike, 2026-10-05: only the sibling IP groups go to the Palo, same names
+    as on NSX; addresses named <hostname>-<address>-<suffix>."""
+
+    def setUp(self):
+        from multisite.pan_mirror import build_sibling_mirror
+        self.build = build_sibling_mirror
+        self.vms = [vm("e1", "ax2001", "10.6.0.101"), vm("e2", "0e02", None),
+                    vm("e3", "dupA", "10.6.0.150"), vm("e4", "dupB", "10.6.0.150")]
+
+    @staticmethod
+    def mapped(appendix, *rows):
+        return {"path": f"b{appendix}", "sibling_map": {"appendix": appendix, "source_host": "lm1", "map": [
+            {"sibling_display_name": n, "original_display_name": n.rsplit(appendix, 1)[0],
+             "ip_pairs": pairs, "ips_sibling_mapped": [d for _, ds in pairs for d in ds]} for n, pairs in rows]}}
+
+    def test_mapped_view_names(self):
+        b = self.mapped("_avs_ips", ("web_avs_ips", [["10.6.0.101", ["10.7.0.101"]], ["10.6.1.0/24", ["10.7.1.0/24"]],
+                                                     ["10.6.0.99", ["10.7.0.99"]], ["10.6.0.5-10.6.0.9", []]]))
+        p = self.build([b], self.vms)
+        g = p["address_groups"][0]
+        self.assertEqual(g["name"], "web_avs_ips")
+        self.assertEqual(g["members"], ["ax2001-10.7.0.101-avs_ips", "10.7.1.0_24-avs_ips", "10.7.0.99-avs_ips"])
+        self.assertEqual(p["counts"]["named_by_hostname"], 1)
+        self.assertEqual(p["counts"]["dynamic_groups"], 0)
+        self.assertEqual(p["tags"], [])
+
+    def test_source_view_names_and_range(self):
+        b = {"path": "bnp", "sibling_map": {"appendix": "_np_ips", "map": [
+            {"sibling_display_name": "web_np_ips", "original_display_name": "web", "ips_sibling_mapped": None,
+             "ip_pairs": [], "ips_source": ["10.6.0.101", "10.21.1.10-10.21.1.12"]}]}}
+        p = self.build([b], self.vms)
+        self.assertEqual(p["address_groups"][0]["members"], ["ax2001-10.6.0.101-np_ips", "10.21.1.10-10.21.1.12-np_ips"])
+        a = {x["name"]: x for x in p["addresses"]}
+        self.assertEqual(a["10.21.1.10-10.21.1.12-np_ips"]["type"], "ip-range")
+        self.assertEqual(a["ax2001-10.6.0.101-np_ips"]["value"], "10.6.0.101/32")
+
+    def test_address_shared_by_two_vms_named_by_ip(self):
+        b = self.mapped("_avs_ips", ("g_avs_ips", [["10.6.0.150", ["10.7.0.150"]]]))
+        p = self.build([b], self.vms)
+        self.assertEqual(p["address_groups"][0]["members"], ["10.7.0.150-avs_ips"])
+        self.assertIn("address_shared_by_vms", [f["code"] for f in p["findings"]])
+
+    def test_same_sibling_in_two_bundles(self):
+        same = self.mapped("_lm3_ips", ("g_lm3_ips", [["10.6.0.101", ["10.8.0.101"]]]))
+        other = self.mapped("_lm3_ips", ("g_lm3_ips", [["10.6.0.101", ["10.8.0.201"]]]))
+        self.assertEqual(len(self.build([same, same], self.vms)["address_groups"]), 1)
+        codes = [f["code"] for f in self.build([same, other], self.vms)["findings"]]
+        self.assertIn("sibling_differs_between_bundles", codes)
+
+    def test_bundle_inconsistency_and_empty_sibling(self):
+        b = self.mapped("_avs_ips", ("g_avs_ips", [["10.6.0.101", ["10.7.0.101"]]]), ("empty_avs_ips", []))
+        b["sibling_map"]["map"][0]["ips_sibling_mapped"] = ["10.7.9.9"]
+        p = self.build([b], self.vms)
+        codes = [f["code"] for f in p["findings"]]
+        self.assertIn("bundle_inconsistent", codes)
+        self.assertIn("empty_group", codes)
+        self.assertEqual([g["name"] for g in p["address_groups"]], ["g_avs_ips"])
+
+    def test_rest_writes_are_addresses_then_static_groups(self):
+        b = self.mapped("_avs_ips", ("g_avs_ips", [["10.6.0.101", ["10.7.0.101"]]]))
+        w = self.build([b], self.vms)["writes"]
+        self.assertEqual([x["resource"] for x in w], ["Objects/Addresses", "Objects/AddressGroups"])
+        self.assertEqual(w[1]["entry"]["static"], {"member": ["ax2001-10.7.0.101-avs_ips"]})
+        self.assertNotIn("tag", w[0]["entry"])
+
+    def test_no_vm_lookup_names_everything_by_address(self):
+        b = self.mapped("_avs_ips", ("g_avs_ips", [["10.6.0.101", ["10.7.0.101"]]]))
+        self.assertEqual(self.build([b], [])["address_groups"][0]["members"], ["10.7.0.101-avs_ips"])

@@ -4,10 +4,13 @@
 Mirror NSX groups onto a Panorama device group exactly (same group type,
 membership and tags). Three separate commands; nothing here ever commits.
 
-  plan     READ-ONLY against NSX. Pulls the source manager's groups, VMs and
-           VM IPs, and writes the Panorama object plan (tags, address objects
-           named by VM hostname or by IP address, dynamic and static address
-           groups) plus the exact REST payload for every object.
+  plan     Reads the sibling bundle(s) an NSX step built (the IP groups the
+           workflows create and add to rules: <group>_np_ips, _avs_ips,
+           _lm3_ips) and, read-only, the source manager's VM hostnames. Writes
+           the Panorama plan: one static address group per sibling, same name
+           as on NSX, of address objects named <hostname>-<address>-<suffix>
+           (or <address>-<suffix> when no VM owns the address), plus the exact
+           REST payload for every object. No Panorama call.
   push     Against Panorama CANDIDATE config, through the REST API only (the
            XML API is not used). Dry run by default: checks which
            objects already exist and lists what it would create. --apply
@@ -20,9 +23,9 @@ membership and tags). Three separate commands; nothing here ever commits.
 Mapping rules: app/multisite/pan_mirror.py.
 
 USAGE
-    # 1. plan (NSX read-only); --groups limits it to a few groups + what they nest
-    python tools/pan/nsx_pan_mirror.py plan --source nsx-lm1 \\
-        --groups seed-tag-net-10-6-0,ip-address-group,seed-nested-web
+    # 1. plan from the sibling bundle(s) of the NSX steps (VM lookup is read-only)
+    python tools/pan/nsx_pan_mirror.py plan \\
+        --bundle nsx_avs_runs/rollout/nsx-lm1_avs_ips --bundle nsx_avs_runs/rollout/nsx-lm1_lm3_ips
 
     # 2. push: dry run, then apply (logs in as agent_user from .env)
     python tools/pan/nsx_pan_mirror.py push --plan <run>/plan.json
@@ -52,7 +55,7 @@ from common.logs import setup_logging                             # noqa: E402
 from common.md import align_markdown_tables, md_table             # noqa: E402
 from common.paths import repo_relative                            # noqa: E402
 from common.timeutil import run_ts, utc_now_iso                   # noqa: E402
-from multisite.pan_mirror import MirrorOptions, build_mirror      # noqa: E402
+from multisite.pan_mirror import MirrorOptions, build_sibling_mirror  # noqa: E402
 
 log = logging.getLogger("nsx_pan_mirror")
 OUT_BASE = REPO_ROOT / "pan_mirror_runs"
@@ -69,9 +72,17 @@ def render_plan_md(plan: Dict[str, Any], meta: Dict[str, Any]) -> str:
          f"Generated {meta['generated_at']}. Read-only: NSX was read, Panorama was not contacted.", "",
          "Objects are named by VM hostname (VM address objects) or by IP address (address "
          "entries), carry the VMs' NSX tags, and keep each NSX group's type.", ""]
-    L += md_table(["tags", "addresses", "dynamic groups", "static groups", "errors", "warnings"],
-                  [[c["tags"], c["addresses"], c["dynamic_groups"], c["static_groups"],
-                    c["errors"], c["warnings"]]], ["r"] * 6)
+    if plan.get("mode") == "siblings":
+        L[-2] = ("Sibling groups only: one static address group per NSX sibling, same name as on NSX. "
+                 "Address objects are named <hostname>-<address>-<suffix>, or <address>-<suffix> when no "
+                 "VM with a live address owns it (a powered-off VM reports no address).")
+        L += md_table(["sibling groups", "addresses", "named by hostname", "errors", "warnings"],
+                      [[c["static_groups"], c["addresses"], c.get("named_by_hostname", 0),
+                        c["errors"], c["warnings"]]], ["r"] * 5)
+    else:
+        L += md_table(["tags", "addresses", "dynamic groups", "static groups", "errors", "warnings"],
+                      [[c["tags"], c["addresses"], c["dynamic_groups"], c["static_groups"],
+                        c["errors"], c["warnings"]]], ["r"] * 6)
     L += ["", "## Address groups", ""]
     L += md_table(["name", "kind", "filter / members", "NSX group"],
                   [[g["name"], g["kind"] + (" (helper)" if g.get("helper_for") else "")
@@ -90,32 +101,56 @@ def render_plan_md(plan: Dict[str, Any], meta: Dict[str, Any]) -> str:
     return align_markdown_tables("\n".join(L)) + "\n"
 
 
-def cmd_plan(args: argparse.Namespace) -> int:
-    from nsx.cli_bootstrap import init_cli
-    from nsx.nsx_constants import resolve_manager
-    from nsx.nsx_policy_client import NsxPolicyClient
-    from nsx.vm_rule_data import attach_vm_ips
-    init_cli()
-    host = resolve_manager(args.source)
-    if not host:
-        log.error("Manager not defined for %s (set it in .env).", args.source)
-        return 2
-    run_dir = new_run_dir(Path(args.output_base) / host)
-    # init_cli() already logs to the console; add only the run log file here.
-    setup_logging("nsx_pan_mirror_plan", run_dir / "logs", run_ts=run_dir.name, console=False)
-    log.info("Reading %s (read-only): groups, VMs, VIF IPs", host)
-    client = NsxPolicyClient(host)
-    groups = client.list_groups(domain_id=args.domain_id)
-    vms = client.list_virtual_machines()
-    attach_vm_ips(client, vms)
-    write_json(run_dir / "nsx_source.json", {"groups": groups, "vms": vms})
+def _resolve_bundle(path: str) -> Path:
+    """A run dir, a nsx_sibling_groups/<host> dir, or a sibling_map.json."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return p.parent
+    if (p / "sibling_map.json").is_file():
+        return p
+    found = sorted(p.glob("nsx_sibling_groups/*/sibling_map.json"))
+    if len(found) == 1:
+        return found[0].parent
+    raise SystemExit(f"No single sibling bundle under {p} (found {len(found)}); pass the bundle folder.")
 
-    only = [g.strip() for g in args.groups.split(",") if g.strip()] if args.groups else None
-    opts = MirrorOptions(device_group=args.device_group, hostname_scope=args.hostname_scope,
-                         tag_format=args.tag_format)
-    plan = build_mirror(groups, vms, opts, only=only)
-    meta = {"source": args.source, "source_host": host, "generated_at": utc_now_iso(),
-            "groups_requested": only, "domain_id": args.domain_id}
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    bundles = []
+    for b in args.bundle:
+        d = _resolve_bundle(b)
+        bundles.append({"path": repo_relative(d), "sibling_map": read_json(d / "sibling_map.json")})
+    source_host = bundles[0]["sibling_map"].get("source_host") or "unknown-source"
+    run_dir = new_run_dir(Path(args.output_base) / source_host)
+    setup_logging("nsx_pan_mirror_plan", run_dir / "logs", run_ts=run_dir.name)
+    for b in bundles:
+        sm = b["sibling_map"]
+        log.info("Bundle %s: %d sibling group(s), suffix %s, from %s", b["path"], len(sm.get("map", [])),
+                 sm.get("appendix"), sm.get("source_host"))
+
+    vms: List[Dict[str, Any]] = []
+    vm_host = None
+    if not args.no_vm_lookup:
+        # Read-only: VM hostname tags and VIF addresses, to name objects
+        # <hostname>-<address>-<suffix>.
+        from nsx.cli_bootstrap import init_cli
+        from nsx.nsx_constants import resolve_manager
+        from nsx.nsx_policy_client import NsxPolicyClient
+        from nsx.vm_rule_data import attach_vm_ips
+        init_cli()
+        vm_host = resolve_manager(args.vm_source) if args.vm_source else source_host
+        if not vm_host:
+            log.error("Manager not defined for %s (set it in .env).", args.vm_source)
+            return 2
+        log.info("Reading VMs from %s (read-only) for hostnames", vm_host)
+        client = NsxPolicyClient(vm_host)
+        vms = client.list_virtual_machines()
+        attach_vm_ips(client, vms)
+        write_json(run_dir / "nsx_vms.json", vms)
+
+    opts = MirrorOptions(device_group=args.device_group, hostname_scope=args.hostname_scope)
+    plan = build_sibling_mirror(bundles, vms, opts)
+    meta = {"source": source_host, "vm_source": vm_host, "generated_at": utc_now_iso(),
+            "bundles": [b["path"] for b in bundles]}
     plan["meta"] = meta
     write_json(run_dir / "plan.json", plan)
     write_text(run_dir / "plan.md", render_plan_md(plan, meta))
@@ -348,14 +383,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog=__doc__.split("\n\n", 1)[1])
     sub = p.add_subparsers(dest="cmd", required=True)
-    pl = sub.add_parser("plan", help="Read NSX and write the Panorama object plan (read-only).")
-    pl.add_argument("--source", required=True, choices=NSX_CHOICES)
-    pl.add_argument("--domain-id", default="default")
-    pl.add_argument("--groups", help="Comma-separated NSX group names or ids (plus what they nest).")
+    pl = sub.add_parser("plan", help="Plan the Panorama objects for NSX sibling bundles (no Panorama call).")
+    pl.add_argument("--bundle", action="append", required=True,
+                    help="Sibling bundle of an NSX step (run dir, nsx_sibling_groups/<host> dir or "
+                         "sibling_map.json). Repeat for several steps.")
+    pl.add_argument("--vm-source", choices=NSX_CHOICES,
+                    help="Manager to read VM hostnames from (default: the bundle's source host).")
+    pl.add_argument("--no-vm-lookup", action="store_true",
+                    help="Skip the VM lookup: every object is named <address>-<suffix>.")
     pl.add_argument("--device-group", default="dg-5")
     pl.add_argument("--hostname-scope", default="hostname")
-    pl.add_argument("--tag-format", default="{scope}.{value}",
-                    help="Panorama tag name for an NSX scope|value tag (default {scope}.{value}).")
     pl.add_argument("--output-base", default=str(OUT_BASE))
     for name, hlp in (("push", "Create the plan's missing objects in candidate config (dry run default)."),
                       ("revert", "Delete exactly what a push apply created (dry run default).")):

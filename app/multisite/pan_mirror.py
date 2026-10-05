@@ -441,3 +441,143 @@ def rest_writes(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
                             else f"NSX group {g['nsx_group']}")
         add("address-group", e)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Siblings only (Mike, 2026-10-05): the Palo gets the IP groups the
+# workflows create and add to rules, with the same names as on NSX.
+# ---------------------------------------------------------------------------
+
+def _vm_ip_index(vms: List[Dict[str, Any]], opts: MirrorOptions) -> Tuple[Dict[str, List[Tuple[str, str]]], List[Dict[str, Any]]]:
+    """Current VM address -> [(hostname, vm display name)], for VMs that carry
+    the hostname tag. VMs without one are reported (every VM must have it)."""
+    index: Dict[str, List[Tuple[str, str]]] = {}
+    findings: List[Dict[str, Any]] = []
+    for vm in vms:
+        if vm.get("type") not in opts.vm_types:
+            continue
+        name = vm.get("display_name") or vm.get("external_id")
+        host = next((t.get("tag") for t in vm.get("tags") or []
+                     if t.get("scope") == opts.hostname_scope and t.get("tag")), None)
+        ips = [ip for ip in vm.get("ips") or [] if _usable_ip(ip)]
+        if not host:
+            if ips:
+                findings.append({"severity": "warning", "code": "vm_missing_hostname", "vm": name,
+                                 "detail": f"no NSX tag with scope {opts.hostname_scope!r}; its addresses "
+                                           f"are named by IP only"})
+            continue
+        for ip in ips:
+            index.setdefault(str(ipaddress.ip_address(ip)), []).append((host, name))
+    return index, findings
+
+
+def build_sibling_mirror(bundles: List[Dict[str, Any]], vms: List[Dict[str, Any]],
+                         opts: Optional[MirrorOptions] = None) -> Dict[str, Any]:
+    """Static address groups for the sibling groups of one or more NSX sibling
+    bundles (each {"path", "sibling_map"} from build_sibling_groups).
+
+    Group name: the NSX sibling's display name (<group>_np_ips, _avs_ips, ...).
+    Address object name (Mike, 2026-10-05): "<hostname>-<address>-<suffix>",
+    e.g. ax2001-10.6.0.101-np_ips, where the hostname is the VM that owns the
+    address (for a mapped address, the VM that owns the SOURCE address it was
+    mapped from) and the suffix is the bundle's sibling suffix without its
+    leading underscore. An address with no VM behind it (a subnet, a range, a
+    hand-typed IP) is "<address>-<suffix>", e.g. 10.7.1.0_24-avs_ips. No
+    tags, no dynamic groups. The same sibling from two bundles must hold the same
+    members, else it is an error.
+    """
+    opts = opts or MirrorOptions()
+    index, findings = _vm_ip_index(vms, opts)
+    addresses: Dict[str, Dict[str, Any]] = {}
+    groups: Dict[str, Dict[str, Any]] = {}
+
+    def host_of(src: str) -> Optional[Tuple[str, str]]:
+        try:
+            net = ipaddress.ip_network(src.strip(), strict=False)
+        except ValueError:
+            return None
+        if net.num_addresses != 1:
+            return None
+        owners = index.get(str(net.network_address), [])
+        if len(owners) > 1:
+            findings.append({"severity": "warning", "code": "address_shared_by_vms", "object": src,
+                             "detail": f"{src} is the address of {len(owners)} VMs "
+                                       f"({', '.join(n for _, n in owners)}); named by IP only"})
+            return None
+        return owners[0] if owners else None
+
+    def add_address(addr: str, src: str, group: str, suffix: str) -> Optional[str]:
+        o = ip_object(addr)
+        if o is None:
+            findings.append({"severity": "warning", "code": "bad_address", "group": group,
+                             "detail": f"{addr!r} is not an IP, CIDR or range; left out"})
+            return None
+        owner = host_of(src) if o["type"] == "ip-netmask" and o["value"].endswith(("/32", "/128")) else None
+        if owner:
+            name = safe_name(f"{owner[0]}-{o['name']}{suffix}")
+            desc = f"NSX VM {owner[1]}" + (f" (mapped from {src})" if src != addr else "")
+        else:
+            name, desc = safe_name(f"{o['name']}{suffix}"), (
+                f"NSX sibling address (mapped from {src})" if src != addr else "NSX sibling address")
+        prev = addresses.get(name)
+        if prev and prev["value"] != o["value"]:
+            findings.append({"severity": "error", "code": "name_clash", "object": name,
+                             "detail": f"{prev['value']} and {o['value']} would share the name {name!r}"})
+            return None
+        addresses.setdefault(name, {"name": name, "type": o["type"], "value": o["value"],
+                                    "tags": [], "description": desc, "source": "sibling"})
+        return name
+
+    for b in bundles:
+        smap = b["sibling_map"]
+        appendix = smap.get("appendix") or ""
+        suffix = f"-{appendix.lstrip('_')}" if appendix else ""
+        for row in smap.get("map", []):
+            gname = safe_name(row.get("sibling_display_name") or row.get("sibling_id"))
+            members: List[str] = []
+            mapped = row.get("ips_sibling_mapped")
+            if mapped is None:                       # source-address view (WF-C build)
+                pairs = [(ip, [ip]) for ip in row.get("ips_source") or []]
+            else:                                    # mapped view (WF-D build)
+                pairs = [(src, list(dst or [])) for src, dst in row.get("ip_pairs") or []]
+                flat = {d for _, ds in pairs for d in ds}
+                if flat != set(mapped):
+                    findings.append({"severity": "error", "code": "bundle_inconsistent", "group": gname,
+                                     "detail": "ip_pairs and ips_sibling_mapped disagree in the bundle"})
+            for src, dsts in pairs:
+                for d in dsts:
+                    n = add_address(d, src, gname, suffix)
+                    if n and n not in members:
+                        members.append(n)
+            entry = {"name": gname, "kind": "static", "members": members,
+                     "nsx_group": row.get("sibling_display_name"),
+                     "nsx_original": row.get("original_display_name"),
+                     "view": appendix, "bundle": b.get("path"), "helper_for": None}
+            prev = groups.get(gname)
+            if prev is None:
+                groups[gname] = entry
+            elif sorted(prev["members"]) != sorted(members):
+                findings.append({"severity": "error", "code": "sibling_differs_between_bundles",
+                                 "group": gname, "detail": f"{prev['bundle']} and {b.get('path')} hold "
+                                                           f"different members for {gname}"})
+        if not smap.get("map"):
+            findings.append({"severity": "warning", "code": "bundle_empty", "object": b.get("path"),
+                             "detail": "the bundle has no sibling groups"})
+
+    plan_groups = []
+    for g in groups.values():
+        if not g["members"]:
+            findings.append({"severity": "warning", "code": "empty_group", "group": g["name"],
+                             "detail": "no addresses; a Panorama static group needs a member, so it is skipped"})
+        else:
+            plan_groups.append(g)
+    plan = {"device_group": opts.device_group, "options": opts.__dict__.copy(), "mode": "siblings",
+            "tags": [], "addresses": list(addresses.values()), "address_groups": plan_groups,
+            "findings": findings}
+    plan["writes"] = rest_writes(plan)
+    plan["counts"] = {"tags": 0, "addresses": len(addresses), "dynamic_groups": 0,
+                      "static_groups": len(plan_groups),
+                      "named_by_hostname": sum(1 for a in addresses.values() if a["description"].startswith("NSX VM")),
+                      "errors": sum(f["severity"] == "error" for f in findings),
+                      "warnings": sum(f["severity"] == "warning" for f in findings)}
+    return plan

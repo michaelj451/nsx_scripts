@@ -21,7 +21,8 @@ Palo Alto device group `dg-5` on `pano4`, which sits between them.
 | 2026-10-04 | lm3 map keeps 10.6 to 10.8, accepting that 6 of lm1's 8 VMs land on lm3's six placeholder VMs (.101/.102) |
 | 2026-10-04 | New clean lm2 map; `nonprod_map.csv` left unchanged for the two-site runs |
 | 2026-10-04 | Every VM must have an NSX `hostname` tag; the Palo plan never falls back to the VM name |
-| 2026-10-04 | **Palo objects mirror NSX exactly**, replacing the earlier rule (hostname + asl_id tags, a security_group tag above 10 members). Tag-based NSX groups become dynamic address groups on the same tags; IP-based groups become static groups of the same addresses; nested groups nest the same way. Each VM address object is **named by the VM's hostname** and carries **the VM's NSX tags**; any other address object is **named by its IP address** |
+| 2026-10-04 | (Superseded 2026-10-05) **Palo objects mirror NSX exactly**, replacing the earlier rule (hostname + asl_id tags, a security_group tag above 10 members). Tag-based NSX groups become dynamic address groups on the same tags; IP-based groups become static groups of the same addresses; nested groups nest the same way. Each VM address object is **named by the VM's hostname** and carries **the VM's NSX tags**; any other address object is **named by its IP address** |
+| 2026-10-05 | **Palo scope: only the sibling IP groups** the workflows create and add to rules (`<group>_np_ips`, `_avs_ips`, `_lm3_ips`), with the same names as on NSX. Read from the NSX step's sibling bundle. Address objects named **`<hostname>-<address>-<suffix>`** (for example `ax2001-10.6.0.101-np_ips`), or `<address>-<suffix>` when no VM owns the address. No tags, no dynamic groups |
 
 ## Built (uncommitted, branch `nsx-lm3_palo-1`)
 
@@ -86,19 +87,22 @@ Left to Mike: hostname tags on lm1's `-old` and `-New` VMs (on the exclusion
 list on purpose), and removing the stale group tags on six leftover test groups
 on lm3.
 
-## Exact mirror: how NSX maps to Panorama
+## Palo Alto: what goes to dg-5
 
-| NSX | Panorama (device group dg-5) |
+Only the sibling IP groups that the NSX steps create and add to rules, read
+from that step's sibling bundle, so both sides come from the same data.
+
+| From the NSX sibling bundle | On Panorama (device group dg-5) |
 |---|---|
-| VM with an IP | address object named by the VM's `hostname` tag, carrying all of the VM's NSX tags |
-| IP address entry | address object named by the address (`10.6.0.50`, `10.6.1.0_24`, range `a-b`) |
-| tag `scope|value` | tag `scope.value` (format is a flag; accepted by pano4 on 2026-10-05) |
-| tag-only group (AND/OR, nesting) | dynamic address group with the same name and the same logic |
-| IP-only group, sibling groups (`_avs_ips` etc.) | static address group of the address objects |
-| group of groups | static address group of those groups |
-| VMs by external id | static address group of those VMs' objects |
-| tags and addresses in one group | static group holding a helper dynamic group `<name>-tags` (a Panorama group cannot be both kinds) |
-| segment paths, non-tag conditions, empty groups | not representable; reported as findings |
+| sibling group `<group>_np_ips` / `_avs_ips` / `_lm3_ips` | static address group, same name |
+| address owned by a VM (mapped addresses: the VM that owns the source address) | address object `<hostname>-<address>-<suffix>`, e.g. `ax2001-10.7.0.101-avs_ips` |
+| subnet, range, or address no VM owns | address object `<address>-<suffix>`, e.g. `10.7.1.0_24-avs_ips` |
+
+Hostnames come from the source manager's VMs (read-only). A powered-off VM
+reports no address, so its addresses fall back to `<address>-<suffix>`: on lm1
+today only `ax2001` is powered on. Power the VMs on before planning to get
+hostname names. Plan on the existing `_avs_ips` bundle (24 siblings on lm1):
+24 static groups, 26 addresses, 0 errors.
 
 ## Security finding (not fixed)
 
@@ -112,14 +116,14 @@ reports connection errors without the URL.
 | Piece | Notes |
 |---|---|
 | NSX steps 2 to 6 | Ready; start with the step 2 dry run (Workflow A onto lm3) |
-| Palo P1: object plan | **Built**: `tools/pan/nsx_pan_mirror.py plan` (engine `app/multisite/pan_mirror.py`). Read-only against NSX. On lm1 (all 56 non-system groups): 16 tags, 57 address objects, 17 dynamic + 40 static groups; 2 errors (the -old/-New VMs lack hostname tags), 5 VMs without IP (powered off). Sample run on 5 groups: `pan_mirror_runs/nsx-lm1.lab.local/latest/plan.md` |
-| Palo P2: push to `pano4` dg-5 | **Working, first live test passed 2026-10-05.** REST API only (the XML API is not allowed: Mike). `agentuser` can now create tags, addresses and address groups in dg-5 over REST (Mike added the permission); XML API config stays 403. Sample of 4 NSX groups (dynamic, static, nested, mixed): **24 objects created in candidate config, all 24 read back exactly as planned**, nothing committed. They are still in pano4's candidate config for review; undo: `python tools/pan/nsx_pan_mirror.py revert --manifest pan_mirror_runs/nsx-lm1.lab.local/20261005_114107/push_20261005_114131_apply.json --no-tls-verify --apply` (dry run confirmed it would delete exactly those 24). **If anyone commits on pano4 before the revert, these objects are committed too.** |
+| Palo P1: object plan | **Built, siblings only** (2026-10-05): `nsx_pan_mirror.py plan --bundle <NSX step run dir>`. On the existing lm1 `_avs_ips` bundle: 24 static groups, 26 addresses (1 named by hostname; the other VMs are powered off), 0 errors |
+| Palo P2: push to `pano4` dg-5 | **Working** (REST API only; XML API not allowed). First live test 2026-10-05 created 24 objects in candidate config, all read back exactly; **those 24 were reverted the same day** (independent read-back: all gone). Nothing is on pano4 from this work now. Lab runs need `--no-tls-verify` (PAN-OS default self-signed certificate) |
 | Palo P3: rules | After P2 |
 
 ## Open questions
 
-1. Settled 2026-10-04: exact mirror replaces the earlier Palo tag rule.
-2. Settled 2026-10-05: NSX `scope|value` becomes Panorama tag `scope.value`; pano4 accepts it.
+1. Settled 2026-10-05: the Palo gets only the sibling IP groups, named as on NSX, with `<hostname>-<address>-<suffix>` address objects.
+2. Settled 2026-10-05: tags are not used on the Palo for now (pano4 does accept `scope.value` tag names if they come back).
 3. Does lm2 to lm3 traffic cross `dg-5`, or only traffic to and from lm1? (Decides whether step 6 and its Palo rules are needed.)
 4. Keep or delete `data/multisite_map.csv`.
 

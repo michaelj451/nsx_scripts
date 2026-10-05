@@ -278,15 +278,17 @@ the driver handles the order.
 
 ## Palo Alto track (separate)
 
-Run on its own, never mixed into an NSX step. Palo objects mirror NSX
-exactly: VM objects named by hostname with the VM's NSX tags, address objects
-named by the address, dynamic groups for tag groups, static groups for address
-and nested groups. Mapping table: [STATUS.md](STATUS.md).
+Run on its own, never mixed into an NSX step. The Palo gets only the sibling
+IP groups each NSX step creates and adds to rules, with the same names as on
+NSX, read from that step's sibling bundle. Address objects are named
+`<hostname>-<address>-<suffix>` (or `<address>-<suffix>` when no VM owns the
+address). Details: [STATUS.md](STATUS.md).
 
 ```bash
-# P1 plan: reads NSX only. Drop --groups to mirror every non-system group.
-python tools/pan/nsx_pan_mirror.py plan --source nsx-lm1 \
-  --groups seed-tag-net-10-6-0,ip-address-group,seed-nested-web
+# P1 plan: from the sibling bundle(s) of the NSX steps you ran. Hostnames are
+# read from the source manager (read-only); power VMs on first.
+python tools/pan/nsx_pan_mirror.py plan \
+  --bundle $B/nsx-lm1_avs_ips --bundle $B/nsx-lm1_lm3_ips
 P=pan_mirror_runs/nsx-lm1.lab.local/latest
 cat $P/plan.md
 
@@ -307,7 +309,7 @@ first live push 2026-10-05 created 24 objects in dg-5, all read back exactly.**
 
 | Piece | What it does | Status |
 |---|---|---|
-| P1 Object plan | Exact mirror of NSX groups, VMs and tags (`nsx_pan_mirror.py plan`). Read only. | built |
+| P1 Object plan | Sibling IP groups only, same names as NSX (`nsx_pan_mirror.py plan --bundle`). No Panorama call. | built |
 | P2 Push to `pano4` dg-5 | Candidate configuration only (never commits), creates only missing objects, revert removes only what it created. You commit. | working (first live test 2026-10-05) |
 | P3 Rules | dg-5 rules that reference the dynamic groups | not built |
 
