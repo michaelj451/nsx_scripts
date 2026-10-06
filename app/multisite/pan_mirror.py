@@ -8,7 +8,8 @@ REST API (Objects/Tags, Objects/Addresses, Objects/AddressGroups).
 
 HOW EACH NSX PIECE MAPS
 
-  NSX                                   Panorama (in the device group)
+  NSX                                   Panorama (objects in shared by default,
+                                        see MirrorOptions.object_location)
   VM (with IP)                          address object NAMED BY ITS HOSTNAME
                                         (NSX `hostname` tag), carrying ALL of
                                         the VM's NSX tags
@@ -49,6 +50,10 @@ class MirrorOptions:
     tag_format: str = "{scope}.{value}"      # a tag with an empty scope is just "{value}"
     vm_types: Tuple[str, ...] = ("REGULAR",)
     include_system: bool = False
+    # Where address objects, address groups, services and service groups are
+    # created: "shared" (Mike, 2026-10-06: usable by every device group) or
+    # "device-group". Rules always go to device_group.
+    object_location: str = "shared"
 
 
 def safe_name(text: str, max_len: int = NAME_MAX) -> str:
@@ -411,17 +416,24 @@ RESOURCE = {"tag": "Objects/Tags", "address": "Objects/Addresses",
             "address-group": "Objects/AddressGroups"}
 
 
+def object_location(plan: Dict[str, Any]) -> str:
+    """"shared" or "device-group" for the plan's objects (plans written before
+    2026-10-06 carry no option: device group)."""
+    return (plan.get("options") or {}).get("object_location") or "device-group"
+
+
 def rest_writes(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Every object as {kind, name, resource, device_group, entry}, in creation
-    order: tags, addresses, then groups with members before holders. `entry`
-    is the exact JSON body element for POST <resource>?location=device-group
-    &device-group=<dg>&name=<name>."""
+    """Every object as {kind, name, resource, location, device_group, entry}, in
+    creation order: tags, addresses, then groups with members before holders.
+    `entry` is the exact JSON body element for POST <resource>?location=shared
+    &name=<name> (or location=device-group&device-group=<dg>&name=<name>)."""
     dg = plan["device_group"]
+    loc = object_location(plan)
     out: List[Dict[str, Any]] = []
 
     def add(kind: str, entry: Dict[str, Any]) -> None:
         out.append({"kind": kind, "name": entry["@name"], "resource": RESOURCE[kind],
-                    "device_group": dg, "entry": entry})
+                    "location": loc, "device_group": dg, "entry": entry})
 
     for t in plan["tags"]:
         add("tag", {"@name": t["name"], "comments": "mirrored from NSX"})

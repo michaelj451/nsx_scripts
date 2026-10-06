@@ -16,6 +16,7 @@ is different: it pins one workflow to named managers in this lab.
 | [NSX_TOOLKIT_GAPS.md](reference/NSX_TOOLKIT_GAPS.md) | Known gaps and manual-intervention items, with symptoms and fixes |
 | [QUICKREF_PS.md](reference/QUICKREF_PS.md) | Compact PowerShell quick reference for the most-used workflows |
 | [REPORTS_DATA_SOURCES.md](reference/REPORTS_DATA_SOURCES.md) | Which NSX endpoints feed each report tool |
+| [LAB_TOPOLOGY.md](reference/LAB_TOPOLOGY.md) | The lab's three NSX Local Managers and their Palo Alto BGP peers (palo7/palo8 under pano1): addressing, build order, known quirks, how to re-inventory |
 
 ## NSX change workflows
 
@@ -46,6 +47,7 @@ run has something to be compared against.
 |---|---|---|---|
 | [RUN_B_GM1_LM1.md](nsx/RUN_B_GM1_LM1.md) | [ps](nsx/RUN_B_GM1_LM1_PS.md) | **B**, in-place CSV subnet remap | `nsx-gm1` (federation surface, all three domains) and `nsx-lm1` (local surface). Both halves are required: the two group populations do not overlap |
 | [RUN_AC_LM2.md](nsx/RUN_AC_LM2.md) | [ps](nsx/RUN_AC_LM2_PS.md) | **A** then **C**, through `run_workflow.py` | source `nsx-lm1`, target `nsx-lm2` |
+| [RUN_AC_LM3.md](nsx/RUN_AC_LM3.md) | (none yet) | **A** to duplicate `nsx-lm2` (done 2026-10-06), then **A** then **C** from lm1 for every later update, through `run_workflow.py` | duplicate: source `nsx-lm2`; updates: source `nsx-lm1`; target `nsx-lm3` |
 | [RUN_D_LM1.md](nsx/RUN_D_LM1.md) | [ps](nsx/RUN_D_LM1_PS.md) | **D**, four separate change windows | `nsx-lm1` in place |
 
 Each card restates the capture gate in full, because the driver's own gate

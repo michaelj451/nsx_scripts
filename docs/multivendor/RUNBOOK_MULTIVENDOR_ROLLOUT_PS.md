@@ -196,6 +196,13 @@ python tools/pan/nsx_pan_mirror.py plan `
 $P = (Get-ChildItem "pan_mirror_runs/nsx-lm1.lab.local" -Directory | Where-Object Name -match '^\d{8}_\d{6}$' | Sort-Object Name | Select-Object -Last 1).FullName
 Get-Content "$P/plan.md"
 
+# P3 plan, objects AND rules: every view (the lm1-to-lm3 C step's _np_ips bundle plus
+# the _avs_ips and _lm3_ips bundles of steps 4 and 5). Reads lm1 read-only. Then
+# recompute $P as above; push and revert are the same commands as for P1.
+python tools/pan/nsx_pan_mirror.py plan-rules `
+  --bundle "nsx_avs_runs/nsx-lm1_to_nsx-lm3" `
+  --bundle "$B/nsx-lm1_avs_ips" --bundle "$B/nsx-lm1_lm3_ips"
+
 # P2 push: dry run, then apply to candidate config (logs in as agent_user)
 python tools/pan/nsx_pan_mirror.py push --plan "$P/plan.json" --no-tls-verify
 python tools/pan/nsx_pan_mirror.py push --plan "$P/plan.json" --no-tls-verify --apply
@@ -207,5 +214,10 @@ python tools/pan/nsx_pan_mirror.py revert --manifest $M --no-tls-verify --apply
 ```
 
 The run folder is found by name rather than through `latest`, because Windows
-often cannot create that symlink. Status: P1 and P2 working (REST API only); first
-live push 2026-10-05 created 24 objects in dg-5.
+often cannot create that symlink. Status: P1 and P2 working (REST API only; the
+first live push 2026-10-05 created 24 objects in dg-5, reverted the same day);
+P3 `plan-rules` built and pushed 2026-10-06: objects in `shared` (default
+`--object-location shared`) and 28 pre-rules in dg-5, candidate config only,
+once `agent_role` had REST write on service groups and pre-rules. Every push
+and revert writes a markdown report beside its manifest. Mapping and numbers:
+[STATUS.md](STATUS.md).

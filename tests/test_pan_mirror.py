@@ -210,6 +210,14 @@ class PushRevertTests(unittest.TestCase):
         self.assertTrue(self.tool.device_group_exists(FakePanorama(), "dg-5"))
         self.assertFalse(self.tool.device_group_exists(FakePanorama(device_groups=()), "dg-5"))
 
+    def test_rest_params_by_location(self):
+        P = self.tool.RestSession._params
+        self.assertEqual(P({"location": "shared", "name": "a", "device_group": "dg-5"}),
+                         {"location": "shared", "name": "a"})
+        self.assertEqual(P({"location": "device-group", "name": "a", "device_group": "dg-5"}),
+                         {"location": "device-group", "device-group": "dg-5", "name": "a"})
+        self.assertEqual(P({"name": "a", "device_group": "dg-5"})["location"], "device-group")  # old manifests
+
     def test_dry_run_writes_nothing(self):
         pan = FakePanorama()
         rows = self.tool.push_writes(pan, self.writes, apply=False)
@@ -310,6 +318,9 @@ class SiblingMirrorTests(unittest.TestCase):
         self.assertEqual([x["resource"] for x in w], ["Objects/Addresses", "Objects/AddressGroups"])
         self.assertEqual(w[1]["entry"]["static"], {"member": ["ax2001-10.7.0.101-avs_ips"]})
         self.assertNotIn("tag", w[0]["entry"])
+        self.assertEqual([x["location"] for x in w], ["shared", "shared"])     # Mike 2026-10-06: shared objects
+        w2 = self.build([b], self.vms, MirrorOptions(object_location="device-group"))["writes"]
+        self.assertEqual([x["location"] for x in w2], ["device-group", "device-group"])
 
     def test_no_vm_lookup_names_everything_by_address(self):
         b = self.mapped("_avs_ips", ("g_avs_ips", [["10.6.0.101", ["10.7.0.101"]]]))

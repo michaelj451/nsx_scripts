@@ -2,7 +2,9 @@
 
 VMs leave `nsx-lm1` one at a time for **either** `nsx-lm2` or `nsx-lm3`, and
 traffic must keep flowing between all three sites and through the Palo Alto
-device group `dg-5` that sits between them. This runbook breaks that into
+device group `dg-5` that stands in for the firewall between them (pano4 is not
+in the data path; it is treated as if it were, see
+[LAB_TOPOLOGY.md](../reference/LAB_TOPOLOGY.md)). This runbook breaks that into
 separate steps. Each step is its own dry run, apply, verify and rollback, and
 none depends on code beyond the existing, tested workflow driver
 (`tools/nsx/run_workflow.py`). The Palo Alto work is a separate track at the end.
@@ -10,8 +12,8 @@ none depends on code beyond the existing, tested workflow driver
 PowerShell variant: [RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md](RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md).
 Background: [RUNBOOK_WORKFLOW.md](../nsx/RUNBOOK_WORKFLOW.md) (the driver),
 [RUN_AC_LM2.md](../nsx/RUN_AC_LM2.md) (A and C onto lm2),
-[RUN_D_LM1.md](../nsx/RUN_D_LM1.md) (D on lm1). Design and reasoning:
-the "Three-Site Migration Design" note.
+[RUN_D_LM1.md](../nsx/RUN_D_LM1.md) (D on lm1). Decisions, status and reasoning:
+[STATUS.md](STATUS.md).
 
 ## Sites and roles
 
@@ -20,7 +22,7 @@ the "Three-Site Migration Design" note.
 | `nsx-lm1` | Source. Read only for steps 1 to 3; steps 4 and 5 add siblings to it | 10.6.0.0/16 |
 | `nsx-lm2` | Target site 2 (AVS) | 10.7.0.0/16 |
 | `nsx-lm3` | Target site 3 (new site) | 10.8.0.0/16 |
-| Panorama `pano4`, device group `dg-5` | Firewall between the managers | |
+| Panorama `pano4`, device group `dg-5` | Stand-in for the firewall between the managers (not in the data path; treated as if it were) | |
 
 ## The idea in one table
 
@@ -62,7 +64,7 @@ a revert baseline. Never point two steps at one run directory.
   lm2. Do not give mapped addresses to unrelated machines until the migration ends.
 - lm1 groups that still hold 10.8 addresses (left over from before the 10.8 VMs
   moved to lm3) show those addresses as **unmapped** in steps 4 to 6. Expected.
-- Every VM has `hostname` and `asl_id` NSX tags (needed by the Palo track).
+- Every VM has a `hostname` NSX tag (the Palo track names address objects by it).
 
 ---
 
@@ -282,15 +284,32 @@ Run on its own, never mixed into an NSX step. The Palo gets only the sibling
 IP groups each NSX step creates and adds to rules, with the same names as on
 NSX, read from that step's sibling bundle. Address objects are named
 `<hostname>-<address>-<suffix>` (or `<address>-<suffix>` when no VM owns the
-address). Details: [STATUS.md](STATUS.md).
+address). Objects are created in `shared` (`--object-location`, default
+`shared`); rules always in `--device-group`. Every push and revert writes a
+markdown report beside its manifest. Details: [STATUS.md](STATUS.md).
 
 ```bash
-# P1 plan: from the sibling bundle(s) of the NSX steps you ran. Hostnames are
-# read from the source manager (read-only); power VMs on first.
+# P1 plan, objects only: from the sibling bundle(s) of the NSX steps you ran.
+# Hostnames are read from the source manager (read-only); power VMs on first.
 python tools/pan/nsx_pan_mirror.py plan \
   --bundle $B/nsx-lm1_avs_ips --bundle $B/nsx-lm1_lm3_ips
 P=pan_mirror_runs/nsx-lm1.lab.local/latest
 cat $P/plan.md
+
+# P3 plan, objects AND rules: give it EVERY view (the _np_ips bundle of the lm1
+# to lm3 C step, plus the _avs_ips and _lm3_ips bundles of steps 4 and 5), so
+# each NSX group on a rule gets all its siblings. Reads lm1's policies, rules,
+# groups and services (read-only). Same $P and push/revert commands as P1.
+python tools/pan/nsx_pan_mirror.py plan-rules \
+  --bundle nsx_avs_runs/nsx-lm1_to_nsx-lm3 \
+  --bundle $B/nsx-lm1_avs_ips --bundle $B/nsx-lm1_lm3_ips
+cat $P/plan.md        # rules in push order, then skipped/narrowed, services, objects
+
+# Device group, security profile group and log forwarding profile come from
+# .env (PANORAMA_DEVICE_GROUP, PANORAMA_SECURITY_PROFILE_GROUP,
+# PANORAMA_LOG_FORWARDING_PROFILE); flags override, "none" switches one off.
+# Post-rulebase instead of pre, for chosen NSX rules, names suffixed -post:
+#   ... plan-rules <same --bundle flags> --rulebase post --nsx-rule seed-web-https --rule-suffix post
 
 # P2 push: dry run (reads Panorama only), then apply to CANDIDATE config.
 # REST API only. Logs in as agent_user from .env. Never commits; you review and commit.
@@ -304,13 +323,17 @@ python tools/pan/nsx_pan_mirror.py revert --manifest $P/push_<ts>_apply.json --n
 ```
 
 A plan with errors (for example a VM without a hostname tag) is refused by
-`push` unless you pass `--allow-plan-errors`. **Status: P1 and P2 working;
-first live push 2026-10-05 created 24 objects in dg-5, all read back exactly.**
+`push` unless you pass `--allow-plan-errors`. `push` never modifies an object
+that already exists; one whose content differs from the plan is flagged
+(`exists_differs`) and left alone. **Status: P1 and P2 working (first live
+push 2026-10-05 created 24 objects in dg-5, all read back exactly, then
+reverted); P3 pushed 2026-10-06: 28 pre-rules in dg-5 and 173 objects in
+shared, candidate config, read back identical, not committed.**
 
 | Piece | What it does | Status |
 |---|---|---|
 | P1 Object plan | Sibling IP groups only, same names as NSX (`nsx_pan_mirror.py plan --bundle`). No Panorama call. | built |
-| P2 Push to `pano4` dg-5 | Candidate configuration only (never commits), creates only missing objects, revert removes only what it created. You commit. | working (first live test 2026-10-05) |
-| P3 Rules | dg-5 rules that reference the dynamic groups | not built |
+| P2 Push to `pano4` | Candidate configuration only (never commits), creates only missing objects (`shared` for objects, `dg-5` for rules), revert removes only what it created. You commit. | working (first live test 2026-10-05, reverted the same day) |
+| P3 Rules | `plan-rules`: one pre-rulebase rule per NSX rule that uses a sibling group; each NSX group becomes all its sibling views, IP-only groups are mirrored as themselves, anything Panorama cannot match is left out (narrower, never wider). Zones any/any. Mapping: [STATUS.md](STATUS.md). | pushed 2026-10-06 (lm1: 28 rules, 69 groups, 87 addresses, 15 services, 2 service groups, 0 errors) into pano4 candidate config after `agent_role` gained REST write on service groups and pre-rules |
 
 Prerequisite: every VM carries an NSX `hostname` tag (no fallback to the VM name).
