@@ -20,6 +20,8 @@ nsx_lm1 = os.getenv("NSX_LM1")
 nsx_lm2 = os.getenv("NSX_LM2")
 nsx_lm3 = os.getenv("NSX_LM3")
 nsx_lm4 = os.getenv("NSX_LM4")
+nsx_lm5 = os.getenv("NSX_LM5")
+nsx_lm6 = os.getenv("NSX_LM6")
 nsx_gm1 = os.getenv("NSX_GM1")
 nsx_gm2 = os.getenv("NSX_GM2")
 nsx_username = os.getenv("NSX_USERNAME")
@@ -57,5 +59,7 @@ def resolve_manager(choice: str) -> str:
         "nsx-lm2": nsx_lm2,
         "nsx-lm3": nsx_lm3,
         "nsx-lm4": nsx_lm4,
+        "nsx-lm5": nsx_lm5,
+        "nsx-lm6": nsx_lm6,
     }
     return mapping[choice]

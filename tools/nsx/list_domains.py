@@ -40,7 +40,7 @@ from nsx.nsx_constants import resolve_manager     # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient  # noqa: E402
 
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
-                       "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+                       "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 
 
 def main() -> int:

@@ -90,7 +90,7 @@ STRIP_KEYS = {
 # NSX default policies that can't be deleted/replaced.
 SKIP_POLICIES = {"default-layer2-section", "default-layer3-section"}
 
-NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 
 
 def _setup_logging(reports_dir: Path, label: str) -> tuple[Path, Path]:

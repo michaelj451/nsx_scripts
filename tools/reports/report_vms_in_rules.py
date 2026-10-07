@@ -961,7 +961,7 @@ def main() -> None:
     parser.add_argument(
         "--manager",
         choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3",
-                 "nsx-lm4", "nsx-lm5"],
+                 "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         default=None,
         help="Manager to query live. Required unless --from-snapshot is given "
              "(the snapshot names its own manager).",

@@ -219,7 +219,7 @@ def main() -> None:
     parser.add_argument(
         "--source-manager",
         required=True,
-        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         help="Source manager. With --live-query, effective group IPs are captured from LMs. "
              "Global Managers have no VM inventory API, so a GM source "
              "automatically runs as --no-live-query (groups copied as-is, no VM IP enrichment).",

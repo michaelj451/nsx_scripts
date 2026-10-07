@@ -82,7 +82,7 @@ log = logging.getLogger("run_workflow")
 
 PY = sys.executable
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
-                       "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+                       "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 
 
 def run_step(label: str, cmd: List[str], log_dir: Path) -> Dict[str, Any]:

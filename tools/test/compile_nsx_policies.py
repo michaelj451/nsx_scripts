@@ -20,6 +20,8 @@ from nsx.nsx_constants import (
     nsx_lm2,
     nsx_lm3,
     nsx_lm4,
+    nsx_lm5,
+    nsx_lm6,
     nsx_log_dir,
 )
 
@@ -80,6 +82,8 @@ def _manager_map() -> Dict[str, str]:
         "nsx-lm2": nsx_lm2,
         "nsx-lm3": nsx_lm3,
         "nsx-lm4": nsx_lm4,
+        "nsx-lm5": nsx_lm5,
+        "nsx-lm6": nsx_lm6,
     }
 
 

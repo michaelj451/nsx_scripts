@@ -51,7 +51,7 @@ from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError  # noqa: E402
 log = logging.getLogger(__name__)
 
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
-                       "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+                       "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 THROTTLE_SECONDS = 0.2
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 

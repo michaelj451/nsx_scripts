@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +107,9 @@ def _setup_logging(out_dir: Path) -> None:
         "%(asctime)s UTC [%(levelname)s] %(name)s: %(message)s",
         "%Y-%m-%dT%H:%M:%S",
     )
+    # The format says UTC, so the clock must be UTC. This tool never imports
+    # nsx.cli_bootstrap (which sets it process-wide), so set it here.
+    fmt.converter = time.gmtime
     for h in (logging.StreamHandler(),
               logging.FileHandler(log_dir / f"add_services_{_ts()}.log",
                                   encoding="utf-8")):

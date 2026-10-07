@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from nsx.cli_bootstrap import init_cli
-from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4
+from nsx.nsx_constants import nsx_gm1, nsx_lm1, nsx_lm2, nsx_lm3, nsx_lm4, nsx_lm5, nsx_lm6
 from nsx.nsx_policy_client import NsxPolicyClient
 from nsx.nsx_vm_functions.nsx_tagged_vms_importer import (
     VmTagsImportConfig,
@@ -28,13 +28,13 @@ def main() -> None:
 
     parser.add_argument(
         "--source",
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         default="nsx-lm1",
         help="Source NSX manager (where tagged-vms index lives)",
     )
     parser.add_argument(
         "--dest",
-        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        choices=["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         default="nsx-lm2",
         help="Destination NSX manager (where tags are applied)",
     )
@@ -82,6 +82,8 @@ def main() -> None:
         "nsx-lm2": nsx_lm2,
         "nsx-lm3": nsx_lm3,
         "nsx-lm4": nsx_lm4,
+        "nsx-lm5": nsx_lm5,
+        "nsx-lm6": nsx_lm6,
     }
 
     src_mgr = mgr_map.get(args.source)

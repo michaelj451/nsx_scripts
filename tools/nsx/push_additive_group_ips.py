@@ -399,7 +399,7 @@ def main() -> None:
     parser.add_argument(
         "--target",
         required=True,
-        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"],
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         help="Target manager alias from .env/nsx_constants",
     )
     parser.add_argument(

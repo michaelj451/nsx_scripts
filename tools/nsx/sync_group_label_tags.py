@@ -80,7 +80,7 @@ from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError  # noqa: E402
 log = logging.getLogger(__name__)
 
 NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2",
-                       "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+                       "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 DEFAULT_MATCH_TAGS = "network,vm"
 # Which criterion field the match values are compared against. "scope" is the
 # corrected orientation (category lives in scope, e.g. network|10.6.0.0);

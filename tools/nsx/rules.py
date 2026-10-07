@@ -152,7 +152,7 @@ def _merge_group_refs(rule: Dict[str, Any], target_payload: Dict[str, Any],
     return (merged if changed else rule), report
 
 
-NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9._\-]+$')
 

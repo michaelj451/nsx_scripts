@@ -685,7 +685,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--target",
-        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4"],
+        choices=["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"],
         required=True,
         help="NSX manager to validate against.",
     )

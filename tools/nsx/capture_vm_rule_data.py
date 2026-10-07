@@ -63,7 +63,7 @@ from nsx.vm_rule_data import SNAPSHOT_FILE, collect_live, write_snapshot  # noqa
 
 log = logging.getLogger(__name__)
 
-NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5"]
+NSX_MANAGER_CHOICES = ["nsx-gm1", "nsx-gm2", "nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "nsx_vm_rule_snapshots"
 LOG_FORMAT = logging.Formatter("%(asctime)s UTC [%(levelname)s] %(name)s: %(message)s",
