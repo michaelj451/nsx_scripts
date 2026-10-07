@@ -32,6 +32,7 @@ proves the API calls and payloads, not traffic flow.
 | 2026-10-06 | **Service groups stay** (briefly dropped, then reinstated the same hour): an NSX service spanning TCP and UDP is `<svc>-tcp` + `<svc>-udp` inside a service group named after the NSX service. Mike enables the `agent_role` permission for them instead |
 | 2026-10-06 | **Rules can carry a security profile and a log forwarding profile**, and the device group, security profile group and log forwarding profile live in `.env` (`PANORAMA_DEVICE_GROUP`, `PANORAMA_SECURITY_PROFILE_GROUP`, `PANORAMA_LOG_FORWARDING_PROFILE`); command-line flags override them, `none` switches a profile off. Profiles must already exist on Panorama: `push` checks first and sends nothing if one is missing. Security profiles go on allow rules only |
 | 2026-10-06 | **Post-rulebase supported** (`--rulebase post`). Rule names are unique across pre and post, so `--rule-suffix` and `--nsx-rule` exist for putting a rule into both |
+| 2026-10-06 | **One Palo group per NSX group, `<group>_np_ips`** (the NSX sibling naming convention, suffix from `OBJECT_APPENDIX`), holding the group's addresses at **every** site, replacing one group per sibling view. Rule sides read like the NSX rule; the address object names keep the view (`-np_ips`, `-avs_ips`, `-lm3_ips`) so the site stays visible inside the group; retiring a site later means removing address objects, not editing rules |
 | 2026-10-06 | **Workflow A to D code is not touched.** The multivendor and Palo workflows are additive, built on `app/common` and the Palo track's own modules; they only read the NSX workflows' bundles |
 
 ## Built (branch `nsx-lm3_palo-1`; in commits `dfd06c3` and `e8bcd5e` unless marked uncommitted)
@@ -40,9 +41,9 @@ proves the API calls and payloads, not traffic flow.
 
 | Item | Status |
 |---|---|
-| `data/subnet_map_lm2.csv` | `nonprod_map.csv` minus its 10.8 rows. Existing loader: 21 rows, 0 invalid |
-| `data/subnet_map_lm3.csv` | 10.6 to 10.8, 10.4 to 10.24, 10.5 to 10.25, 10.10 to 10.30, 10.21 to 10.41, 10.250 to 10.252. 21 rows, 0 invalid |
-| Map checks | No collision within either map or between them |
+| `data/subnet_map_lm2.csv` | **Trimmed 2026-10-06** to the subnets that actually move: 10.6.0/1/2.0/24 to 10.7.0/1/2.0/24 (3 rows). The 21-row template copied from `nonprod_map.csv` remapped networks that never move (10.4, the 10.5 BGP/TEP network, 10.10, 10.21, 10.250) and /24s that do not exist; the old version is in git (`dfd06c3`) |
+| `data/subnet_map_lm3.csv` | **Trimmed 2026-10-06** the same way: 10.6.0/1/2.0/24 to 10.8.0/1/2.0/24 (3 rows) |
+| Map checks | Both "Map OK", no collision. Step 4/5 `d2a` dry runs rebuilt with them: 17 siblings each (was 22), mapped addresses only in 10.7.0-2.x and 10.8.0-2.x |
 | Runbook + PowerShell card | Steps 2 to 6, each with its own run directory. Steps 2 and 3 are covered by [RUN_AC_LM3.md](../nsx/RUN_AC_LM3.md) (lm3 duplicated from lm2 on 2026-10-06). **Steps 4 and 5 `d2a` dry runs ran clean on 2026-10-06** (22 `_avs_ips` and 22 `_lm3_ips` siblings from lm1, 0 errors); nothing applied |
 
 ### Shared library (new, existing scripts not migrated)
@@ -128,10 +129,12 @@ services (read-only) and plans, besides the objects above:
 | NSX | Panorama (`dg-5` pre-rulebase) |
 |---|---|
 | rule that uses a group with a sibling | one rule, same name (63 characters, hash suffix beyond that), NSX evaluation order, appended at the bottom of the pre-rulebase |
-| group on a rule side | every sibling of the group across the bundles; an IP-only group with no source-view sibling also as itself (static group, same name); a group of groups as its members, expanded the same way |
+| group on a rule side | one static group `<group>_np_ips` holding the members of every sibling of the group across the bundles; an IP-only group adds its own addresses; a group of groups adds its members' addresses, expanded the same way. On the Palo `<group>_np_ips` holds all sites' addresses (on lm2/lm3 the NSX group of that name holds lm1's only); IP-only groups get a `_np_ips` name there that has no NSX twin |
 | segment member, empty tag group, unsupported action, context profile | left out and reported; the Palo rule is narrower than NSX, never wider; a side with nothing left, or a context profile, skips the rule |
 | `ANY` | `any` (never produced by leaving members out) |
-| TCP/UDP service | service object of the same name in `shared` (one per protocol plus a service group when a service spans TCP and UDP); nested services flattened |
+| TCP/UDP service | mirrored exactly: one port entry = a service of the same name in `shared`; several entries, or nested services = a service group of the same name whose members are one service per entry (`<svc>-tcp`, `<svc>-udp`) and the nested services' own objects. Entries are never merged |
+| ALG service (FTP, TFTP, Oracle TNS, RPC) | its port as a service (ports wherever possible), listed in the App-ID review |
+| App-ID anything | every case is listed in the "App-ID review" section of `plan.md`: NSX rules with context profiles (skipped), ICMP (App-IDs, no port form), ALGs (ports), services with no port form (left out) |
 | ICMP service | a second rule `<name>-icmp` with App-IDs `icmp`, `ping`, `ipv6-icmp` and `application-default` |
 | `ALLOW` / `DROP` / `REJECT`, disabled, negated sides | `allow` / `drop` / `reset-both`, `disabled`, `negate-source` / `negate-destination` |
 | zones | `any` to `any` (`--zone-from` / `--zone-to`) |
@@ -162,12 +165,32 @@ A post-rule test followed (`--rulebase post --nsx-rule seed-web-https
 unchanged and created `seed-web-https-post` in dg-5's post-rulebase, read back
 with the profile group and log forwarding profile, 0 differences.
 
-Everything is **candidate config, not committed**. Undo in three steps, newest
-manifest first because the rules reference the objects:
-`revert --manifest .../20261006_155901/push_20261006_155955_apply.json` (1
-post-rule), then `.../20261006_150209/push_20261006_150344_apply.json` (30),
-then `.../20261006_142921/push_20261006_143143_apply.json` (171); each as a
-dry run, then `--apply`.
+**All of it was reverted the same day (16:57 UTC)**, newest first: 1
+post-rule, then 28 pre-rules and 2 service groups, then 171 shared objects,
+each after a dry run showing the same count. Independent read-back: none of
+the 202 left; `shared` back to its earlier 18 addresses, 2 groups and 11
+services; `dg-5` rulebases and objects empty. Nothing on pano4 from this work
+now.
+
+**Layout changed the same afternoon** to one `<group>_np_ips` group per NSX
+group (decision above). lm1 plan `20261006_171654`: 28 rules, **27 groups
+(was 69)**, **75 names on the rules' sides (was 205)**, 87 addresses, 15
+services, 2 service groups, profiles from `.env`, 0 errors. Applied 17:26 UTC
+(159 created), then **reverted at 17:31 (159 deleted)** because the subnet
+maps still carried template rows; the maps were then trimmed (above).
+
+**Pushed again 17:48 UTC from the rebuilt bundles** (plan `20261006_174622`):
+22 NSX rules in scope, 2 skipped, **24 Palo pre-rules**, 27 `<group>_np_ips`
+groups, 57 addresses, 14 services, 2 service groups, profiles from `.env`.
+Dry run 124 `would_create`, apply 124 created; independent read-back: nothing
+missing, 0 field differences, rule order as planned. **In pano4 candidate
+config now, not committed.** Undo: `revert --manifest
+pan_mirror_runs/nsx-lm1.lab.local/20261006_174622/push_20261006_174718_apply.json
+--no-tls-verify`, dry run then `--apply`. At the same check, pano4's
+own shared objects and dg-3/4/6 objects were gone as well, removed outside
+this tool (the revert deleted exactly the 159 names it had created). Keeping the Palo current as NSX changes still needs an additive
+"add missing members" push (today's push only creates objects that are
+missing).
 
 ## Security finding (not fixed)
 
@@ -183,9 +206,12 @@ reports connection errors without the URL.
 | NSX steps 4 to 6 | Steps 2 and 3 done through RUN_AC_LM3.md. Steps 4 and 5 `d2a` dry runs clean (2026-10-06); no apply yet |
 | Palo P1: object plan | **Built, siblings only** (2026-10-05): `nsx_pan_mirror.py plan --bundle <NSX step run dir>`. On the existing lm1 `_avs_ips` bundle: 24 static groups, 26 addresses (1 named by hostname; the other VMs are powered off), 0 errors |
 | Palo P2: push to `pano4` dg-5 | **Working** (REST API only; XML API not allowed). First live test 2026-10-05 created 24 objects in candidate config, all read back exactly; **those 24 were reverted the same day** (independent read-back: all gone). Nothing is on pano4 from this work now. Lab runs need `--no-tls-verify` (PAN-OS default self-signed certificate) |
-| Palo P3: rules | **In pano4 candidate config since 2026-10-06**: 28 pre-rules in `dg-5`, 173 objects in `shared`, read back identical to the plan. Next: Mike reviews in the Panorama UI; revert at the end of the test (two manifests, newest first, see above). Open: zones (`any`/`any` today), the real path through pano1 |
+| Palo P3: rules | **Working end to end and reverted** (2026-10-06): 28 pre-rules and a post-rule with profiles were created, read back identical, then removed. Next: decide the group layout (above), then the additive update push. Open: zones (`any`/`any` today), the real path through pano1 |
 
 ## Open questions
+
+The full list, with today's behaviour and how to answer each, is in
+[QUESTIONS.md](QUESTIONS.md) (2026-10-06). Older items:
 
 1. Settled 2026-10-05: the Palo gets only the sibling IP groups, named as on NSX, with `<hostname>-<address>-<suffix>` address objects.
 2. Settled 2026-10-05: tags are not used on the Palo for now (pano4 does accept `scope.value` tag names if they come back).

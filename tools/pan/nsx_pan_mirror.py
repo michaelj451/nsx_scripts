@@ -16,9 +16,10 @@ Panorama device group. Separate commands; nothing here ever commits.
            The same objects, plus a security rule (pre-rulebase by default,
            --rulebase post for the post-rulebase) for every NSX
            rule that uses a group with a sibling (Palo track P3). Each NSX
-           group on a rule becomes ALL its siblings across the bundles given,
-           plus the IP-only NSX group itself when no source-view bundle holds
-           its current addresses. Reads NSX policies, rules, groups and
+           group on a rule becomes ONE group "<group>_np_ips" (OBJECT_APPENDIX)
+           holding its addresses at every site, from all the bundles given
+           (plus an IP-only group's own addresses when no source-view bundle
+           holds them). Reads NSX policies, rules, groups and
            services from the source manager (read-only). Mapping rules:
            app/multisite/pan_rules.py. No Panorama call.
   push     Against Panorama CANDIDATE config, through the REST API only (the
@@ -171,6 +172,7 @@ def _read_vms(client: Any, run_dir: Path) -> List[Dict[str, Any]]:
 ENV_DEVICE_GROUP = "PANORAMA_DEVICE_GROUP"
 ENV_PROFILE_GROUP = "PANORAMA_SECURITY_PROFILE_GROUP"
 ENV_LOG_SETTING = "PANORAMA_LOG_FORWARDING_PROFILE"
+ENV_GROUP_SUFFIX = "OBJECT_APPENDIX"
 
 
 def _setting(cli: Optional[str], env_var: str, default: Optional[str] = None) -> Optional[str]:
@@ -192,6 +194,8 @@ def _resolve_env_settings(args: argparse.Namespace) -> None:
             args.profile_group = None   # individual --profile flags replace the .env group
         else:
             args.profile_group = _setting(args.profile_group, ENV_PROFILE_GROUP)
+        # Same suffix as the NSX sibling groups (Workflow C reads OBJECT_APPENDIX too).
+        args.group_suffix = _setting(args.group_suffix, ENV_GROUP_SUFFIX, "_np_ips")
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -233,14 +237,17 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def render_rules_md(plan: Dict[str, Any], meta: Dict[str, Any]) -> str:
     c = plan["counts"]
     o = plan["options"]
-    rb = f"{o.get('rulebase', 'pre')}-rulebase"
+    rb = f"{o.get('rulebase', 'pre')}-rulebase" if o.get("rulebase") != "local" else "local rulebase"
+    where = (f"firewall {o.get('vsys') or 'vsys1'}" if o.get("object_location") == "vsys"
+             else f"{plan['device_group']}")
     prof = (f"profile group `{o['profile_group']}`" if o.get("profile_group") else
             ", ".join(f"{t} `{n}`" for t, n in (o.get("profiles") or {}).items()) or "none")
-    L = [f"# NSX to Panorama rule plan: {meta['source']} to {plan['device_group']} {rb}", "",
+    L = [f"# NSX to Palo Alto rule plan: {meta['source']} to {where} {rb}", "",
          f"Generated {meta['generated_at']}. Read-only: NSX was read, Panorama was not contacted.", "",
          "One Panorama rule per NSX rule that uses a group with a sibling (plus `<name>-icmp` when the "
-         "rule also allows ICMP). Each NSX group becomes all its siblings across the bundles, plus the "
-         "IP-only NSX group itself when no source-view bundle holds its current addresses. Zones "
+         f"rule also allows ICMP). Each NSX group becomes one group `<group>{o.get('group_suffix', '_np_ips')}` "
+         "holding its addresses at every site (the address names keep the view: `-np_ips` current, "
+         "`-avs_ips` lm2, `-lm3_ips` lm3). Zones "
          f"`{plan['options']['zone_from']}` to `{plan['options']['zone_to']}`. A push appends the rules to "
          f"the bottom of the {rb} in NSX order.", "",
          f"Security profiles (allow rules): {prof}. Log forwarding profile: "
@@ -248,11 +255,24 @@ def render_rules_md(plan: Dict[str, Any], meta: Dict[str, Any]) -> str:
          + (f" Rule name suffix `{o['name_suffix']}`." if o.get("name_suffix") else "")
          + (f" Only NSX rules: {', '.join(o['only_rules'])}." if o.get("only_rules") else ""), "",
          "Bundles: " + ", ".join(f"`{b}`" for b in meta["bundles"]), ""]
-    L += md_table(["NSX rules", "in scope", "skipped", "Panorama rules", "sibling groups", "mirrored groups",
+    L += md_table(["NSX rules", "in scope", "skipped", "Panorama rules", "address groups",
                    "addresses", "services", "service groups", "errors", "warnings"],
                   [[c["nsx_rules"], c["nsx_rules_in_scope"], c["nsx_rules_skipped"], c["pan_rules"],
-                    c["sibling_groups"], c["mirrored_groups"], c["addresses"], c["services"],
-                    c["service_groups"], c["errors"], c["warnings"]]], ["r"] * 11)
+                    c["address_groups"], c["addresses"], c["services"],
+                    c["service_groups"], c["errors"], c["warnings"]]], ["r"] * 10)
+    # Mike, 2026-10-06: ports wherever possible; anything App-ID related gets its own section.
+    review = plan.get("app_id_review") or []
+    kinds = {"nsx_app_id": "NSX rule uses App-IDs (context profile)",
+             "icmp_app_id": "ICMP: no ports exist, the Palo needs an App-ID",
+             "alg_ports": "NSX ALG service mirrored as ports",
+             "no_port_form": "NSX service with no port form, left out"}
+    L += ["", "## App-ID review", "",
+          f"NSX rules in scope that use App-IDs through a context profile: "
+          f"**{c.get('nsx_rules_with_app_id', 0)}** (skipped: ports alone would allow every "
+          "application on them). Everything else below is mirrored with ports where a port form exists.", ""]
+    L += (md_table(["what", "NSX policy / rule", "on NSX", "on the Palo"],
+                   [[kinds.get(x["kind"], x["kind"]), f"{x['nsx_policy']} / {x['nsx_rule']}", x["nsx"], x["palo"]]
+                    for x in review]) if review else ["None."])
     L += ["", "## Rules (in push order)", ""]
     L += md_table(["#", "rule", "action", "source", "destination", "application", "service", "NSX policy / rule"],
                   [[i, r["name"], r["entry"]["action"] + (" (disabled)" if r["entry"]["disabled"] == "yes" else ""),
@@ -277,10 +297,9 @@ def render_rules_md(plan: Dict[str, Any], meta: Dict[str, Any]) -> str:
         L += md_table(["name", "members", "NSX service"],
                       [[g["name"], ", ".join(g["members"]), g["nsx_service"]] for g in plan["service_groups"]])
     L += ["", "## Address groups", ""]
-    L += md_table(["name", "kind", "members", "from"],
-                  [[g["name"], "mirrored NSX group" if g.get("view") == "group" else f"sibling ({g.get('view')})",
-                    ", ".join(g["members"]), g.get("nsx_original") or g.get("nsx_group") or ""]
-                   for g in plan["address_groups"]])
+    L += md_table(["name", "NSX group", "addresses", "members"],
+                  [[g["name"], g.get("nsx_original") or g.get("nsx_group") or "", len(g["members"]),
+                    ", ".join(g["members"])] for g in plan["address_groups"]], ["l", "l", "r", "l"])
     L += ["", "## Address objects", ""]
     L += md_table(["name", "type", "value", "from"],
                   [[a["name"], a["type"], a["value"], a["description"]] for a in plan["addresses"]])
@@ -312,9 +331,12 @@ def cmd_plan_rules(args: argparse.Namespace) -> int:
         p["rules"] = client.list_security_rules(p["id"])
     groups = client.list_groups()
     services = client.list_services()
+    # Context profiles carry NSX's App-IDs; read so the App-ID review can name them.
+    context_profiles = client._get_all_results(client._policy_path("/context-profiles"))
     write_json(run_dir / "nsx_policies.json", policies)
     write_json(run_dir / "nsx_groups.json", groups)
     write_json(run_dir / "nsx_services.json", services)
+    write_json(run_dir / "nsx_context_profiles.json", context_profiles)
 
     vms: List[Dict[str, Any]] = []
     vm_host = None
@@ -326,8 +348,11 @@ def cmd_plan_rules(args: argparse.Namespace) -> int:
         log.info("Reading VMs from %s (read-only) for hostnames", vm_host)
         vms = _read_vms(vm_client, run_dir)
 
+    firewall = args.target == "firewall"
+    if firewall and args.rulebase != "pre":
+        raise SystemExit("--target firewall has one local rulebase; drop --rulebase.")
     opts = MirrorOptions(device_group=args.device_group, hostname_scope=args.hostname_scope,
-                         object_location=args.object_location)
+                         object_location="vsys" if firewall else args.object_location, vsys=args.vsys)
     profiles = {}
     for p in args.profile or []:
         t, _, n = p.partition("=")
@@ -338,11 +363,13 @@ def cmd_plan_rules(args: argparse.Namespace) -> int:
         suffix = args.rule_suffix.strip()
         if suffix and suffix[0] not in "-_":
             suffix = f"-{suffix}"
-        ropts = RuleOptions(zone_from=args.zone_from, zone_to=args.zone_to, rulebase=args.rulebase,
+        ropts = RuleOptions(zone_from=args.zone_from, zone_to=args.zone_to,
+                            rulebase="local" if firewall else args.rulebase,
                             only_rules=args.nsx_rule or None, name_suffix=suffix,
                             profile_group=args.profile_group, profiles=profiles or None,
-                            log_setting=args.log_setting)
-        plan = build_rule_mirror(policies, groups, services, bundles, vms, opts, ropts)
+                            log_setting=args.log_setting, group_suffix=args.group_suffix)
+        plan = build_rule_mirror(policies, groups, services, bundles, vms, opts, ropts,
+                                 context_profiles=context_profiles)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
     meta = {"source": source_host, "nsx_source": nsx_host, "vm_source": vm_host,
@@ -398,8 +425,11 @@ class RestSession:
     @staticmethod
     def _params(w: Dict[str, Any]) -> Dict[str, str]:
         # Manifests written before 2026-10-06 carry no location: device group.
-        if w.get("location", "device-group") == "shared":
+        loc = w.get("location", "device-group")
+        if loc == "shared":
             return {"location": "shared", "name": w["name"]}
+        if loc in ("vsys", "panorama-pushed"):          # directly on a firewall
+            return {"location": loc, "vsys": w.get("vsys") or "vsys1", "name": w["name"]}
         return {"location": "device-group", "device-group": w["device_group"], "name": w["name"]}
 
     def exists(self, w: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -421,17 +451,25 @@ class RestSession:
         if r.status_code >= 300:
             raise RuntimeError(f"delete {w['kind']} {w['name']}: HTTP {r.status_code} {self._why(r)}")
 
-    def named_exists(self, resource: str, name: str, device_group: str) -> Optional[str]:
-        """Where an existing object `name` is visible to the device group:
-        "shared", "device-group", or None. Read-only."""
-        for params in ({"location": "shared", "name": name},
-                       {"location": "device-group", "device-group": device_group, "name": name}):
-            r = self._req("GET", resource, params)
+    def named_exists(self, resource: str, name: str, scopes: List[Dict[str, str]]) -> Optional[str]:
+        """The first scope (location params) in which an object `name` exists,
+        as its location, or None. Read-only."""
+        for scope in scopes:
+            r = self._req("GET", resource, {**scope, "name": name})
             if r.status_code == 200 and (r.json().get("result") or {}).get("entry"):
-                return params["location"]
+                return scope["location"]
             if r.status_code not in (200, 404):
                 raise RuntimeError(f"read {resource} {name}: HTTP {r.status_code} {self._why(r)}")
         return None
+
+    def vsys_exists(self, vsys: str) -> bool:
+        """A firewall vsys answers an object listing; an unknown one is refused."""
+        r = self._req("GET", "Objects/Addresses", {"location": "vsys", "vsys": vsys})
+        if r.status_code == 200:
+            return True
+        if r.status_code in (400, 404):
+            return False
+        raise RuntimeError(f"read vsys {vsys}: HTTP {r.status_code} {self._why(r)}")
 
     def device_group_exists(self, device_group: str) -> bool:
         r = self._req("GET", "Panorama/DeviceGroups", {"name": device_group})
@@ -443,7 +481,7 @@ class RestSession:
 
 
 def open_session(user_env: str, password_env: str, host: Optional[str],
-                 no_tls_verify: bool = False) -> RestSession:
+                 no_tls_verify: bool = False, rest_version: Optional[str] = None) -> RestSession:
     from palo.pan_env import load_repo_env
     from palo.pan_rest_client import PanRestClient, PanRestError
     load_repo_env()
@@ -452,11 +490,14 @@ def open_session(user_env: str, password_env: str, host: Optional[str],
         # name never matches the host (docs/pan/RUNBOOK_PAN_LAB.md).
         os.environ["PANORAMA_TLS_VERIFY"] = "false"
     try:
+        # A device accepts its own REST version and older ones only (PAN-OS
+        # 10.2 firewalls refuse v11.x with 501), so a firewall target may need
+        # --rest-version v10.2.
         client = PanRestClient.from_env(user_env=user_env, password_env=password_env,
-                                        host=host, load_env=False)
+                                        host=host, load_env=False, rest_version=rest_version)
         _ = client.api_key                      # log in now, not mid-push
     except PanRestError as exc:
-        raise SystemExit(f"Panorama login failed: {exc}") from None
+        raise SystemExit(f"Login failed: {exc}") from None
     log.info("Logged in to %s as %s (REST %s, tls_verify=%s)", client.env.url,
              os.environ.get(user_env), client.rest_version, client.env.verify)
     return RestSession(client)
@@ -472,17 +513,58 @@ def device_group_exists(session: Any, device_group: str) -> bool:
     return session.device_group_exists(device_group)
 
 
+def is_firewall(plan: Dict[str, Any]) -> bool:
+    return (plan.get("options") or {}).get("object_location") == "vsys"
+
+
+def target_label(plan: Dict[str, Any]) -> str:
+    o = plan.get("options") or {}
+    return f"vsys {o.get('vsys') or 'vsys1'}" if is_firewall(plan) else f"device group {plan['device_group']}"
+
+
+def lookup_scopes(plan: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Where an existing object the rules reference can live: shared or the
+    device group on Panorama; the vsys or Panorama's push on a firewall."""
+    o = plan.get("options") or {}
+    if is_firewall(plan):
+        v = o.get("vsys") or "vsys1"
+        return [{"location": "vsys", "vsys": v}, {"location": "panorama-pushed", "vsys": v}]
+    return [{"location": "shared"}, {"location": "device-group", "device-group": plan["device_group"]}]
+
+
+def target_exists(session: Any, plan: Dict[str, Any]) -> bool:
+    """Checked before any write: refuse to write into a device group (or vsys)
+    that is not there rather than find out object by object."""
+    if is_firewall(plan):
+        return session.vsys_exists((plan.get("options") or {}).get("vsys") or "vsys1")
+    return device_group_exists(session, plan["device_group"])
+
+
 def missing_profiles(session: Any, plan: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """Security / log forwarding profiles the plan's rules name that Panorama
+    """Security / log forwarding profiles the plan's rules name that the target
     does not have. Checked before any write; built-in profiles are skipped."""
     from multisite.pan_rules import profile_refs
     out = []
     for label, resource, name in profile_refs(plan.get("options") or {}):
-        where = session.named_exists(resource, name, plan["device_group"])
+        where = session.named_exists(resource, name, lookup_scopes(plan))
         if where is None:
             out.append((label, name))
         else:
             log.info("Found %s %s in %s", label, name, where)
+    return out
+
+
+def pushed_conflicts(session: Any, plan: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Firewall target only: plan objects whose name Panorama has already
+    pushed to the firewall. A local object of the same name either shadows the
+    pushed one or is refused; either way it needs a decision. Read-only."""
+    if not is_firewall(plan):
+        return []
+    v = (plan.get("options") or {}).get("vsys") or "vsys1"
+    out = []
+    for w in plan["writes"]:
+        if session.named_exists(w["resource"], w["name"], [{"location": "panorama-pushed", "vsys": v}]):
+            out.append({"kind": w["kind"], "name": w["name"]})
     return out
 
 
@@ -630,8 +712,8 @@ def render_push_md(doc: Dict[str, Any]) -> str:
     rows = doc["results"]
     apply = doc["mode"] == "apply"
     planned = doc.get("planned", len(rows))
-    L = [f"# Panorama push report ({'APPLY' if apply else 'DRY RUN'}): device group "
-         f"{doc['device_group']} on {doc['panorama']}", "",
+    L = [f"# Palo Alto push report ({'APPLY' if apply else 'DRY RUN'}): "
+         f"{doc.get('target') or 'device group ' + str(doc['device_group'])} on {doc['panorama']}", "",
          f"Generated {doc['created_at']}. Plan `{repo_relative(doc['plan'])}`. "
          f"{len(rows)} of {planned} planned object(s) checked. Candidate configuration only: "
          f"nothing is committed.", ""]
@@ -643,6 +725,12 @@ def render_push_md(doc: Dict[str, Any]) -> str:
     if failed:
         L += ["", f"## Failed: the push stopped here, {planned - len(rows)} later object(s) not sent", ""]
         L += md_table(["kind", "name", "error"], [[r["kind"], r["name"], r.get("error", "")] for r in failed])
+    pushed = doc.get("pushed_conflicts") or []
+    if pushed:
+        L += ["", f"## Same name already pushed by Panorama to this firewall ({len(pushed)})", "",
+              "A local object with one of these names shadows Panorama's or is refused. An apply needs "
+              "`--allow-pushed-conflicts`.", ""]
+        L += md_table(["kind", "name"], [[c["kind"], c["name"]] for c in pushed])
     diffs = [r for r in rows if r.get("differs")]
     if diffs:
         L += ["", "## Already on Panorama with different content (left unchanged)", ""]
@@ -705,24 +793,32 @@ def cmd_push(args: argparse.Namespace) -> int:
     by_loc = {}
     for w in plan["writes"]:
         by_loc[w.get("location", "device-group")] = by_loc.get(w.get("location", "device-group"), 0) + 1
-    log.info("%s %d object(s): %s; device group %s (candidate config; never commits)",
+    log.info("%s %d object(s): %s; %s (candidate config; never commits)",
              "APPLY:" if args.apply else "DRY RUN:", len(plan["writes"]),
-             ", ".join(f"{n} in {loc}" for loc, n in sorted(by_loc.items())), plan["device_group"])
-    session = open_session(args.user_env, args.password_env, args.host, args.no_tls_verify)
-    if not device_group_exists(session, plan["device_group"]):
-        log.error("Device group %r does not exist on %s; nothing sent (a set would create it).",
-                  plan["device_group"], session.base_url)
+             ", ".join(f"{n} in {loc}" for loc, n in sorted(by_loc.items())), target_label(plan))
+    session = open_session(args.user_env, args.password_env, args.host, args.no_tls_verify, args.rest_version)
+    if not target_exists(session, plan):
+        log.error("%s does not exist on %s; nothing sent.", target_label(plan), session.base_url)
         return 2
     missing = missing_profiles(session, plan)
     if missing:
         for label, name in missing:
-            log.error("The plan's %s %r is not on %s (shared or %s); nothing sent.", label, name,
-                      session.base_url, plan["device_group"])
+            log.error("The plan's %s %r is not on %s (%s); nothing sent.", label, name, session.base_url,
+                      " or ".join(s["location"] for s in lookup_scopes(plan)))
         return 2
+    conflicts = pushed_conflicts(session, plan)
+    if conflicts:
+        log.warning("%d plan object(s) share a name with what Panorama pushed to this firewall, e.g. %s",
+                    len(conflicts), ", ".join(f"{c['kind']} {c['name']}" for c in conflicts[:3]))
+        if args.apply and not args.allow_pushed_conflicts:
+            log.error("Nothing sent: review the dry-run report, then pass --allow-pushed-conflicts to "
+                      "create local objects with those names anyway.")
+            return 2
     rows = push_writes(session, plan["writes"], args.apply)
     mode = "apply" if args.apply else "dryrun"
     doc = {"created_at": utc_now_iso(), "mode": mode, "plan": str(plan_path),
-           "device_group": plan["device_group"], "panorama": session.base_url,
+           "device_group": plan["device_group"], "target": target_label(plan), "panorama": session.base_url,
+           "rest_version": session.c.rest_version, "pushed_conflicts": conflicts,
            "committed": False, "planned": len(plan["writes"]), "summary": _summary(rows), "results": rows}
     n_diff = sum(1 for r in rows if r.get("differs"))
     if n_diff:
@@ -746,7 +842,8 @@ def cmd_revert(args: argparse.Namespace) -> int:
         return 2
     ts = run_ts()
     setup_logging("nsx_pan_mirror_revert", mpath.parent / "logs", run_ts=ts)
-    session = open_session(args.user_env, args.password_env, args.host, args.no_tls_verify)
+    session = open_session(args.user_env, args.password_env, args.host, args.no_tls_verify,
+                           args.rest_version or manifest.get("rest_version"))
     rows = revert_created(session, manifest["results"], args.apply)
     mode = "apply" if args.apply else "dryrun"
     doc = {"created_at": utc_now_iso(), "mode": mode, "source_manifest": str(mpath),
@@ -795,11 +892,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(default shared). Rules always go to --device-group.")
     pr.add_argument("--zone-from", default="any", help="Source zone of every rule (default any).")
     pr.add_argument("--zone-to", default="any", help="Destination zone of every rule (default any).")
+    pr.add_argument("--target", choices=["panorama", "firewall"], default="panorama",
+                    help="panorama (default): objects in --object-location, rules in --device-group. "
+                         "firewall: everything directly on one firewall, objects and rules in --vsys "
+                         "(push with --host <firewall> and, for PAN-OS 10.2, --rest-version v10.2).")
+    pr.add_argument("--vsys", default="vsys1", help="Firewall vsys for --target firewall (default vsys1).")
     pr.add_argument("--rulebase", choices=["pre", "post"], default="pre",
                     help="Device-group rulebase the rules go to (default pre). Names are unique across "
                          "pre and post: use --rule-suffix to put rules already in one into the other.")
     pr.add_argument("--nsx-rule", action="append",
                     help="Only this NSX rule (display name or id). Repeat for several; default all.")
+    pr.add_argument("--group-suffix",
+                    help="Suffix of the one Panorama group per NSX group (default: OBJECT_APPENDIX in .env, "
+                         "the NSX sibling suffix, else _np_ips).")
     pr.add_argument("--rule-suffix", default="",
                     help="Appended to every Panorama rule name after a hyphen: --rule-suffix post gives "
                          "<rule>-post.")
@@ -825,7 +930,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         sp.add_argument("--apply", action="store_true")
         sp.add_argument("--user-env", default="agent_user")
         sp.add_argument("--password-env", default="agent_password")
-        sp.add_argument("--host", default=None, help="Panorama host override (default from .env).")
+        sp.add_argument("--host", default=None,
+                        help="Panorama or firewall host override (default: the panorama host in .env).")
+        sp.add_argument("--rest-version", default=None,
+                        help="REST API version, e.g. v10.2 for a PAN-OS 10.2 firewall (default: "
+                             "PANORAMA_REST_VERSION in .env, else v11.2; a revert reuses the push's).")
+        if name == "push":
+            sp.add_argument("--allow-pushed-conflicts", action="store_true",
+                            help="Firewall target: create local objects even where Panorama already "
+                                 "pushed one with the same name.")
         sp.add_argument("--no-tls-verify", action="store_true",
                         help="Skip TLS verification (lab Panoramas with the default self-signed certificate).")
     rp = sub.add_parser("report", help="Write the markdown report for an existing push or revert manifest "

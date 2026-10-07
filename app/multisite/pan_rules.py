@@ -8,18 +8,21 @@ findings). No network calls.
 Decisions (Mike, 2026-10-06):
   - Target: a device group's pre-rulebase (lab: pano4 dg-5), candidate
     config only; the push and revert are the existing nsx_pan_mirror ones.
-  - ALL SIBLING VIEWS: an NSX group on a rule side becomes every sibling of
-    that group across the bundles given (<g>_np_ips holds its current lm1
-    addresses, <g>_avs_ips the lm2 addresses, <g>_lm3_ips the lm3 ones), so
-    the rule matches a VM before and after it moves. A rule on one manager
-    names only one view; copying that alone would allow only traffic that
-    never crosses the firewall.
-  - A group with no source-view sibling: an IP-only NSX group is mirrored as
-    itself (static group, same name, its own addresses); a group of groups
-    is replaced by its members, each expanded the same way. Segments, empty
-    tag groups and other members Panorama cannot match are reported and
-    left out, so a Palo rule can be narrower than NSX, never wider. A side
-    left with nothing skips the rule; it never becomes "any".
+  - ONE GROUP PER NSX GROUP, named with the NSX sibling convention
+    "<group>_np_ips" (RuleOptions.group_suffix, OBJECT_APPENDIX in .env),
+    holding the group's addresses at EVERY site: the members of all its
+    siblings across the bundles (<g>_np_ips current lm1 addresses, <g>_avs_ips
+    lm2, <g>_lm3_ips lm3), so the rule matches a VM before and after it
+    moves. A rule on one manager names only one view; copying that alone would
+    allow only traffic that never crosses the firewall. The per-view sibling
+    groups are not created on Panorama; the address object names keep the
+    view (ax2001-10.7.0.101-avs_ips), so the site stays visible in the group.
+  - A group with no source-view sibling: an IP-only NSX group adds its own
+    addresses; a group of groups adds its members' addresses, each expanded
+    the same way. Segments, empty tag groups and other members Panorama
+    cannot match are reported and left out, so a Palo rule can be narrower
+    than NSX, never wider. A side left with nothing skips the rule; it never
+    becomes "any".
   - Zones: any/any for the lab (options, so a later zone map can fill them).
   - Objects (addresses, address groups, services, service groups) are created
     in `shared` by default (Mike, 2026-10-06), rules in the device group;
@@ -29,8 +32,8 @@ HOW AN NSX RULE MAPS
 
   NSX                                 Panorama (device-group pre-rulebase)
   rule display name                   rule name (63 characters max, hash suffix)
-  source / destination group          every sibling of the group, plus its current
-                                      addresses when no source-view sibling holds them
+  source / destination group          one static group "<group>_np_ips" with the
+                                      group's addresses from every view
   ANY                                 any
   sources_excluded / ..._excluded     negate-source / negate-destination
   TCP/UDP port-set service            service object named after the NSX service
@@ -68,7 +71,11 @@ from multisite.pan_mirror import (MirrorOptions, _vm_ip_index, build_sibling_mir
 CATEGORY_ORDER = ["Emergency", "Infrastructure", "Environment", "Application"]
 ACTIONS = {"ALLOW": "allow", "DROP": "drop", "REJECT": "reset-both"}
 RESOURCE = {"service": "Objects/Services", "service-group": "Objects/ServiceGroups"}
-RULEBASE = {"pre": "Policies/SecurityPreRules", "post": "Policies/SecurityPostRules"}
+# "pre"/"post": a Panorama device group's rulebases. "local": a firewall's own
+# rulebase, when writing directly to the firewall (MirrorOptions.object_location
+# "vsys").
+RULEBASE = {"pre": "Policies/SecurityPreRules", "post": "Policies/SecurityPostRules",
+            "local": "Policies/SecurityRules"}
 
 
 @dataclass
@@ -84,6 +91,9 @@ class RuleOptions:
     profile_group: Optional[str] = None        # security profile group
     profiles: Optional[Dict[str, str]] = None  # or individual profiles: {type: name}, see PROFILE_TYPES
     log_setting: Optional[str] = None          # log forwarding profile
+    # Mike, 2026-10-06: one Panorama group per NSX group, named with the NSX
+    # sibling convention "<group>_np_ips" (OBJECT_APPENDIX), holding every site.
+    group_suffix: str = "_np_ips"
 
 
 # Individual security profile types (the rule's profile-setting keys) and the
@@ -176,47 +186,28 @@ def _icmp_apps(entry: Dict[str, Any]) -> List[str]:
     return ["ping"] if t in (0, 8) else ["icmp"]
 
 
-def flatten_service(sid: str, services: Dict[str, Dict[str, Any]],
-                    seen: Optional[Set[str]] = None) -> Tuple[List[Tuple[str, str, str]], List[str], List[str]]:
-    """An NSX service -> (port entries [(proto, dst ports, src ports)], ICMP App-IDs,
-    unsupported entry descriptions). Nested services are followed."""
-    seen = set() if seen is None else seen
-    ports: List[Tuple[str, str, str]] = []
-    apps: List[str] = []
-    bad: List[str] = []
-    if sid in seen:
-        return ports, apps, bad
-    seen.add(sid)
-    svc = services.get(sid)
-    if svc is None:
-        return ports, apps, [f"service {sid} not found on NSX"]
-    for e in svc.get("service_entries") or []:
-        rt = e.get("resource_type")
-        if rt == "L4PortSetServiceEntry" and e.get("l4_protocol") in ("TCP", "UDP"):
-            dst = ",".join(str(p) for p in e.get("destination_ports") or []) or "0-65535"
-            src = ",".join(str(p) for p in e.get("source_ports") or [])
-            ports.append((e["l4_protocol"].lower(), dst, src))
-        elif rt == "ICMPTypeServiceEntry":
-            apps += [a for a in _icmp_apps(e) if a not in apps]
-        elif rt == "NestedServiceServiceEntry":
-            p, a, b = flatten_service(_last(e.get("nested_service_path", "")), services, seen)
-            ports += p
-            apps += [x for x in a if x not in apps]
-            bad += b
-        else:
-            bad.append(f"{svc.get('display_name') or sid}: {rt} {e.get('l4_protocol') or e.get('protocol') or ''}".strip())
-    return ports, apps, bad
+# NSX ALG service entries become plain port services (Mike, 2026-10-06: use
+# ports as much as possible). Protocol per ALG; ports from the entry, else the
+# well-known default.
+ALG_PORTS = {"FTP": ("tcp", "21"), "TFTP": ("udp", "69"), "ORACLE_TNS": ("tcp", "1521"),
+             "SUN_RPC_TCP": ("tcp", "111"), "SUN_RPC_UDP": ("udp", "111"),
+             "MS_RPC_TCP": ("tcp", "135"), "MS_RPC_UDP": ("udp", "135"),
+             "NBNS_BROADCAST": ("udp", "137"), "NBDG_BROADCAST": ("udp", "138")}
 
 
-def _merge_ports(ports: List[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
-    """One (proto, src) pair -> one Panorama service with the ports joined."""
-    merged: Dict[Tuple[str, str], List[str]] = {}
-    for proto, dst, src in ports:
-        lst = merged.setdefault((proto, src), [])
-        for p in dst.split(","):
-            if p not in lst:
-                lst.append(p)
-    return [(proto, ",".join(dst), src) for (proto, src), dst in merged.items()]
+def port_entry(e: Dict[str, Any]) -> Optional[Tuple[str, str, str, Optional[str]]]:
+    """An NSX service entry with a port form -> (proto, dst ports, src ports,
+    ALG note or None); None for any other entry type."""
+    rt = e.get("resource_type")
+    src = ",".join(str(p) for p in e.get("source_ports") or [])
+    if rt == "L4PortSetServiceEntry" and e.get("l4_protocol") in ("TCP", "UDP"):
+        dst = ",".join(str(p) for p in e.get("destination_ports") or []) or "0-65535"
+        return e["l4_protocol"].lower(), dst, src, None
+    if rt == "ALGTypeServiceEntry" and e.get("alg") in ALG_PORTS:
+        proto, default = ALG_PORTS[e["alg"]]
+        dst = ",".join(str(p) for p in e.get("destination_ports") or []) or default
+        return proto, dst, src, f"ALG {e['alg']} as {proto}/{dst}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -236,11 +227,23 @@ def _ordered_rules(policies: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any],
     return out
 
 
+def _profile_summary(pid: str, ctx: Dict[str, Dict[str, Any]]) -> str:
+    """An NSX context profile as "<id>: APP_ID a, b; DOMAIN_NAME c"."""
+    p = ctx.get(pid)
+    if p is None:
+        return f"{pid} (definition not read)"
+    attrs = "; ".join(f"{a.get('key')} {', '.join(str(v) for v in a.get('value') or [])}"
+                      for a in p.get("attributes") or [])
+    return f"{p.get('display_name') or pid}: {attrs or 'no attributes'}"
+
+
 def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any]],
                       services: List[Dict[str, Any]], bundles: List[Dict[str, Any]],
                       vms: List[Dict[str, Any]], opts: Optional[MirrorOptions] = None,
-                      ropts: Optional[RuleOptions] = None) -> Dict[str, Any]:
-    """`policies`: NSX security policies, each with its rules under "rules"."""
+                      ropts: Optional[RuleOptions] = None,
+                      context_profiles: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """`policies`: NSX security policies, each with its rules under "rules".
+    `context_profiles`: NSX context profiles, to name the App-IDs a rule uses."""
     opts = opts or MirrorOptions()
     ropts = ropts or RuleOptions()
     if ropts.profile_group and ropts.profiles:
@@ -250,9 +253,15 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
         raise ValueError(f"unknown security profile type(s) {bad_types}; known: {sorted(PROFILE_TYPES)}")
     if ropts.rulebase not in RULEBASE:
         raise ValueError(f"rulebase must be one of {sorted(RULEBASE)}")
+    if (ropts.rulebase == "local") != (opts.object_location == "vsys"):
+        raise ValueError("a firewall target needs rulebase 'local' with objects in 'vsys', and only then")
     base = build_sibling_mirror(bundles, vms, opts)
     findings: List[Dict[str, Any]] = list(base["findings"])
-    in_plan = {g["name"] for g in base["address_groups"]}
+    # The per-view sibling plan supplies the address objects; its groups are
+    # not pushed. Their members are folded into one group per NSX group.
+    sib_members = {g["name"]: g["members"] for g in base["address_groups"]}
+    in_plan = set(sib_members)
+    views = [b["sibling_map"].get("appendix") or "" for b in bundles]
 
     # Sibling index: NSX group id -> [(Panorama group name, source view?)].
     sibs: Dict[str, List[Tuple[str, bool]]] = {}
@@ -276,8 +285,9 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
     sby = {s["id"]: s for s in services}
     index, _ = _vm_ip_index(vms, opts)
 
-    # Mirrored IP-only groups (same name as on NSX) and their addresses.
-    mirror_groups: Dict[str, Dict[str, Any]] = {}
+    # One Panorama group per NSX group a rule uses, and the addresses of IP-only
+    # NSX groups (their current addresses have no source-view sibling).
+    combined: Dict[str, Dict[str, Any]] = {}
     mirror_addrs: Dict[str, Dict[str, Any]] = {}
 
     def mirror_address(addr: str, gname: str) -> Optional[str]:
@@ -301,25 +311,15 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
                                        "source": "group"})
         return name
 
-    def mirror_group(g: Dict[str, Any]) -> Optional[str]:
-        gname = safe_name(g.get("display_name") or g["id"])
-        if gname not in mirror_groups:
-            members = [n for n in (mirror_address(a, gname) for a in _group_ips(g)) if n]
-            members = list(dict.fromkeys(members))
-            if not members:
-                return None
-            mirror_groups[gname] = {"name": gname, "kind": "static", "members": members,
-                                    "nsx_group": g.get("display_name"), "nsx_original": g.get("display_name"),
-                                    "view": "group", "helper_for": None}
-        return gname
-
     def expand(gid: str, seen: Set[str], dropped: List[str]) -> List[str]:
-        """Panorama members for one NSX group: all its siblings, plus its current
-        addresses when no source-view sibling holds them."""
+        """Address objects for one NSX group: those of all its siblings, plus its
+        current addresses when no source-view sibling holds them."""
         if gid in seen:
             return []
         seen = seen | {gid}
-        out = [n for n, _ in sibs.get(gid, [])]
+        out: List[str] = []
+        for n, _ in sibs.get(gid, []):
+            out += [a for a in sib_members[n] if a not in out]
         if any(src for _, src in sibs.get(gid, [])):
             return out
         g = gby.get(gid)
@@ -329,8 +329,10 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
         kind = group_kind(g)
         label = g.get("display_name") or gid
         if kind in ("ip_only", "ip_nested"):
-            n = mirror_group(g)
-            out += [n] if n else []
+            for a in _group_ips(g):
+                n = mirror_address(a, label)
+                if n and n not in out:
+                    out.append(n)
         if kind in ("nested", "ip_nested"):
             for m in _group_member_ids(g):
                 out += [x for x in expand(m, seen, dropped) if x not in out]
@@ -348,7 +350,11 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
     rules_out: List[Dict[str, Any]] = []
     svc_objs: Dict[str, Dict[str, Any]] = {}
     svc_groups: Dict[str, Dict[str, Any]] = {}
-    svc_ref: Dict[str, Tuple[Optional[str], List[str], List[str]]] = {}
+    svc_ref: Dict[str, Tuple[Optional[str], List[str], List[str], List[str]]] = {}
+    # Mike, 2026-10-06: ports wherever possible; every place an App-ID is
+    # involved (NSX context profiles, ICMP, ALGs, no port form) is listed here.
+    app_review: List[Dict[str, Any]] = []
+    ctx = {p["id"]: p for p in context_profiles or []}
     used_names: Set[str] = set()
     report: List[Dict[str, Any]] = []
     ordered = _ordered_rules(policies)
@@ -360,33 +366,70 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
                              "detail": "no NSX rule with that name or id (default sections are never mirrored)"})
         ordered = [(p, r) for p, r in ordered if r.get("display_name") in wanted or r.get("id") in wanted]
 
-    def service_ref(sid: str) -> Tuple[Optional[str], List[str], List[str]]:
-        """NSX service id -> (Panorama service or group name or None, App-IDs, unsupported)."""
+    def service_ref(sid: str, stack: Tuple[str, ...] = ()) -> Tuple[Optional[str], List[str], List[str], List[str]]:
+        """NSX service id -> (Panorama service or service group name or None,
+        App-IDs, entries with no port form, ALG entries mapped to ports).
+
+        Mirrors the NSX service exactly (Mike, 2026-10-06): a service with one
+        port entry is one Panorama service of the same name; a service with
+        several entries, or one nesting other services, is a service group of
+        the same name whose members are one service per port entry
+        (<svc>-tcp, <svc>-udp, ...) and the nested services' own objects.
+        ICMP has no port form, so it contributes App-IDs instead."""
         if sid in svc_ref:
             return svc_ref[sid]
-        ports, apps, bad = flatten_service(sid, sby)
-        ports = _merge_ports(ports)
-        sname = safe_name((sby.get(sid) or {}).get("display_name") or sid)
+        svc = sby.get(sid)
+        if svc is None or sid in stack:
+            return None, [], [f"service {sid} not found on NSX" if svc is None else f"service {sid} nests itself"], []
+        label = svc.get("display_name") or sid
+        sname = safe_name(label)
+        entries = svc.get("service_entries") or []
+        protos = [pe[0] for pe in (port_entry(e) for e in entries) if pe]
+        members: List[str] = []
+        apps: List[str] = []
+        bad: List[str] = []
+        algs: List[str] = []
+        for e in entries:
+            pe = port_entry(e)
+            rt = e.get("resource_type")
+            if pe:
+                proto, dst, src, alg = pe
+                n = sname if len(entries) == 1 else safe_name(
+                    f"{sname}-{proto}" + (f"-{len([m for m in members if m.startswith(f'{sname}-{proto}')]) + 1}"
+                                          if protos.count(proto) > 1 else ""))
+                body = {"port": dst}
+                if src:
+                    body["source-port"] = src
+                prev = svc_objs.get(n)
+                if prev and prev["protocol"] != {proto: body}:
+                    findings.append({"severity": "error", "code": "service_name_clash", "object": n,
+                                     "detail": f"two NSX services would share the Panorama service name {n!r}"})
+                svc_objs.setdefault(n, {"name": n, "protocol": {proto: body}, "nsx_service": sid})
+                members.append(n)
+                if alg:
+                    algs.append(f"{label}: {alg}")
+            elif rt == "ICMPTypeServiceEntry":
+                apps += [a for a in _icmp_apps(e) if a not in apps]
+            elif rt == "NestedServiceServiceEntry":
+                ref, a, b, g = service_ref(_last(e.get("nested_service_path", "")), stack + (sid,))
+                if ref and ref not in members:
+                    members.append(ref)
+                apps += [x for x in a if x not in apps]
+                bad += b
+                algs += g
+            else:
+                detail = e.get("alg") or e.get("l4_protocol") or e.get("protocol") or e.get("protocol_number") or ""
+                bad.append(f"{label}: {rt} {detail}".strip())
         ref: Optional[str] = None
-        if len(ports) == 1:
+        if members == [sname]:                        # one port entry: the service itself
             ref = sname
-            names = [sname]
-        else:
-            names = [safe_name(f"{sname}-{p}" + (f"-{i}" if sum(q == p for q, _, _ in ports) > 1 else ""))
-                     for i, (p, _, _) in enumerate(ports)]
-            if ports:
-                ref = sname
-                svc_groups[sname] = {"name": sname, "members": names, "nsx_service": sid}
-        for n, (proto, dst, src) in zip(names, ports):
-            body = {"port": dst}
-            if src:
-                body["source-port"] = src
-            prev = svc_objs.get(n)
-            if prev and prev["protocol"] != {proto: body}:
-                findings.append({"severity": "error", "code": "service_name_clash", "object": n,
-                                 "detail": f"two NSX services would share the Panorama service name {n!r}"})
-            svc_objs.setdefault(n, {"name": n, "protocol": {proto: body}, "nsx_service": sid})
-        svc_ref[sid] = (ref, apps, bad)
+        elif members:
+            ref = sname
+            if sname in svc_objs:
+                findings.append({"severity": "error", "code": "service_name_clash", "object": sname,
+                                 "detail": "a service and a service group would share this name"})
+            svc_groups[sname] = {"name": sname, "members": members, "nsx_service": sid}
+        svc_ref[sid] = (ref, apps, bad, algs)
         return svc_ref[sid]
 
     def rule_name(base_name: str, policy_id: str) -> str:
@@ -413,8 +456,28 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
             if gid not in seen_orig:
                 seen_orig.append(gid)
         for gid in seen_orig:
-            out += [x for x in expand(gid, set(), dropped) if x not in out]
+            n = combined_group(gid, dropped)
+            if n and n not in out:
+                out.append(n)
         return out, False
+
+    def combined_group(gid: str, dropped: List[str]) -> Optional[str]:
+        """The one Panorama group for NSX group `gid`: "<NSX display name><suffix>",
+        holding the group's addresses at every site (all bundles' views)."""
+        g = gby.get(gid) or {}
+        display = g.get("display_name") or next(
+            (r.get("original_display_name") for b in bundles for r in b["sibling_map"].get("map") or []
+             if r.get("original_id") == gid), gid)
+        name = safe_name(f"{display}{ropts.group_suffix}")
+        if name not in combined:
+            members = expand(gid, set(), dropped)
+            if not members:
+                return None
+            combined[name] = {"name": name, "kind": "static", "members": members, "nsx_group": display,
+                              "nsx_original": display, "view": "all", "helper_for": None,
+                              "description": f"NSX group {display}: its addresses at every site "
+                                             f"({', '.join(v for v in views if v)} views)"}
+        return name
 
     in_scope = 0
     for pol, r in ordered:
@@ -439,6 +502,9 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
             continue
         profiles = [p for p in r.get("profiles") or [] if p != "ANY"]
         if profiles:
+            app_review.append({"kind": "nsx_app_id", "nsx_policy": row["nsx_policy"], "nsx_rule": row["nsx_rule"],
+                               "nsx": "; ".join(_profile_summary(_last(p), ctx) for p in profiles),
+                               "palo": "rule skipped (ports alone would allow every application on them)"})
             skip(f"context profile(s) {', '.join(_last(p) for p in profiles)}: leaving them out would widen the rule")
             continue
         dropped: List[str] = []
@@ -462,13 +528,20 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
                              "detail": "the rule's own service entries are left out"})
         if not svc_any:
             for p in svc_paths:
-                ref, a, bad = service_ref(_last(p))
+                ref, a, bad, algs = service_ref(_last(p))
                 if ref and ref not in port_refs:
                     port_refs.append(ref)
                 apps += [x for x in a if x not in apps]
                 for b in bad:
                     findings.append({"severity": "warning", "code": "service_not_mirrored", "object": label,
                                      "detail": f"left out: {b}"})
+                    app_review.append({"kind": "no_port_form", "nsx_policy": row["nsx_policy"],
+                                       "nsx_rule": row["nsx_rule"], "nsx": b,
+                                       "palo": "left out (would need an App-ID)"})
+                for g in algs:
+                    app_review.append({"kind": "alg_ports", "nsx_policy": row["nsx_policy"],
+                                       "nsx_rule": row["nsx_rule"], "nsx": g,
+                                       "palo": f"port service {ref}"})
             if not port_refs and not apps:
                 skip("no service Panorama can match")
                 continue
@@ -504,40 +577,49 @@ def build_rule_mirror(policies: List[Dict[str, Any]], groups: List[Dict[str, Any
             rules_out.append({"name": name, "entry": entry, "nsx_policy": row["nsx_policy"],
                               "nsx_rule": row["nsx_rule"]})
             row["pan_rules"].append(name)
+            if app_list is apps:
+                app_review.append({"kind": "icmp_app_id", "nsx_policy": row["nsx_policy"],
+                                   "nsx_rule": row["nsx_rule"], "nsx": "ICMP service (no ports exist for ICMP)",
+                                   "palo": f"rule {name}: App-ID {', '.join(apps)}, service application-default"})
 
-    # One namespace for addresses and address groups: mirrored originals must
-    # not reuse a sibling plan name for something else.
-    addresses = list(base["addresses"])
-    names = {a["name"]: a for a in addresses}
+    # Only the address objects the plan's groups and rules use are pushed. One
+    # namespace for addresses and address groups: no name may mean two things.
+    pool = {a["name"]: a for a in base["addresses"]}
     for a in mirror_addrs.values():
-        prev = names.get(a["name"])
+        prev = pool.get(a["name"])
         if prev is None:
-            addresses.append(a)
-            names[a["name"]] = a
+            pool[a["name"]] = a
         elif prev["value"] != a["value"]:
             findings.append({"severity": "error", "code": "name_clash", "object": a["name"],
                              "detail": f"{prev['value']} and {a['value']} would share the name {a['name']!r}"})
-    group_names = {g["name"] for g in base["address_groups"]}
-    for g in mirror_groups.values():
-        if g["name"] in group_names or g["name"] in names:
+    used: List[str] = []
+    for g in combined.values():
+        used += [m for m in g["members"] if m not in used]
+    for r in rules_out:
+        for side_name in ("source", "destination"):
+            used += [m for m in r["entry"][side_name]["member"] if m in pool and m not in used]
+    addresses = [pool[n] for n in used]
+    for g in combined.values():
+        if g["name"] in pool:
             findings.append({"severity": "error", "code": "name_clash", "object": g["name"],
-                             "detail": "a mirrored NSX group would reuse an existing plan name"})
+                             "detail": "an address object and an address group would share this name"})
     plan = {"device_group": opts.device_group, "options": {**opts.__dict__, **ropts.__dict__}, "mode": "rules",
-            "tags": [], "addresses": addresses,
-            "address_groups": base["address_groups"] + list(mirror_groups.values()),
+            "tags": [], "addresses": addresses, "address_groups": list(combined.values()),
             "services": list(svc_objs.values()), "service_groups": list(svc_groups.values()),
-            "rules": rules_out, "rule_report": report, "findings": findings}
+            "rules": rules_out, "rule_report": report, "app_id_review": app_review, "findings": findings}
     plan["writes"] = rest_writes(plan) + service_rule_writes(plan)
     plan["counts"] = {
         "nsx_rules": len(ordered), "nsx_rules_in_scope": in_scope,
         "nsx_rules_skipped": sum(1 for x in report if x["skipped"]),
         "pan_rules": len(rules_out), "addresses": len(addresses),
-        "sibling_groups": len(base["address_groups"]), "mirrored_groups": len(mirror_groups),
+        "address_groups": len(combined),
         "static_groups": len(plan["address_groups"]), "dynamic_groups": 0, "tags": 0,
         "services": len(svc_objs), "service_groups": len(svc_groups),
         "named_by_hostname": sum(1 for a in addresses if a["description"].startswith("NSX VM")),
         "errors": sum(f["severity"] == "error" for f in findings),
-        "warnings": sum(f["severity"] == "warning" for f in findings)}
+        "warnings": sum(f["severity"] == "warning" for f in findings),
+        "app_id_review": len(app_review),
+        "nsx_rules_with_app_id": sum(1 for x in app_review if x["kind"] == "nsx_app_id")}
     return plan
 
 
@@ -546,17 +628,21 @@ def service_rule_writes(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     {kind, name, resource, location, device_group, entry} like rest_writes."""
     dg = plan["device_group"]
     loc = object_location(plan)
+    o = plan.get("options") or {}
+    vsys = o.get("vsys") or "vsys1"
     out: List[Dict[str, Any]] = []
     for s in plan["services"]:
         out.append({"kind": "service", "name": s["name"], "resource": RESOURCE["service"], "location": loc,
-                    "device_group": dg, "entry": {"@name": s["name"], "protocol": s["protocol"],
-                                                  "description": f"NSX service {s['nsx_service']}"}})
+                    "device_group": dg, "vsys": vsys, "entry": {"@name": s["name"], "protocol": s["protocol"],
+                                                                "description": f"NSX service {s['nsx_service']}"}})
     for g in plan["service_groups"]:
         out.append({"kind": "service-group", "name": g["name"], "resource": RESOURCE["service-group"],
-                    "location": loc, "device_group": dg,
+                    "location": loc, "device_group": dg, "vsys": vsys,
                     "entry": {"@name": g["name"], "members": {"member": list(g["members"])}}})
-    rule_resource = RULEBASE[(plan.get("options") or {}).get("rulebase") or "pre"]
-    for r in plan["rules"]:   # rules always live in the device group
-        out.append({"kind": "security-rule", "name": r["name"], "resource": rule_resource,
-                    "location": "device-group", "device_group": dg, "entry": r["entry"]})
+    rulebase = o.get("rulebase") or "pre"
+    # Rules live in the device group on Panorama, in the vsys on a firewall.
+    rule_loc = "vsys" if rulebase == "local" else "device-group"
+    for r in plan["rules"]:
+        out.append({"kind": "security-rule", "name": r["name"], "resource": RULEBASE[rulebase],
+                    "location": rule_loc, "device_group": dg, "vsys": vsys, "entry": r["entry"]})
     return out

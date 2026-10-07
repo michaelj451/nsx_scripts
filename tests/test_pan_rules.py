@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from multisite.pan_rules import build_rule_mirror, flatten_service, group_kind  # noqa: E402
+from multisite.pan_rules import build_rule_mirror, group_kind  # noqa: E402
 
 G = "/infra/domains/default/groups/"
 S = "/infra/services/"
@@ -81,7 +81,9 @@ SERVICES = [svc("HTTPS", l4("TCP", "443")), svc("DNS", l4("TCP", "53"), l4("UDP"
             svc("echo", {"resource_type": "ICMPTypeServiceEntry", "protocol": "ICMPv4", "icmp_type": 8}),
             svc("bundle", {"resource_type": "NestedServiceServiceEntry", "nested_service_path": S + "HTTPS"},
                 l4("TCP", "8443")),
-            svc("gre", {"resource_type": "IPProtocolServiceEntry", "protocol_number": 47})]
+            svc("gre", {"resource_type": "IPProtocolServiceEntry", "protocol_number": 47}),
+            svc("FTP", {"resource_type": "ALGTypeServiceEntry", "alg": "FTP", "destination_ports": ["21"]}),
+            svc("two-tcp", l4("TCP", "80"), l4("TCP", "8080"))]
 BUNDLES = [source_bundle("_np_ips", ("web", ["10.6.0.101"]), ("db", ["10.6.1.101"])),
            mapped_bundle("_avs_ips", ("web", [["10.6.0.101", ["10.7.0.101"]]]),
                          ("db", [["10.6.1.101", ["10.7.1.101"]]]),
@@ -99,35 +101,59 @@ def by_name(plan):
 
 
 class SideTests(unittest.TestCase):
-    def test_every_sibling_view_on_each_side(self):
+    """Mike, 2026-10-06: one Panorama group per NSX group, "<group>_np_ips",
+    holding the group's addresses from every view."""
+
+    @staticmethod
+    def members(p, name):
+        return {g["name"]: g["members"] for g in p["address_groups"]}[name]
+
+    def test_one_group_per_nsx_group_with_every_view(self):
         p = plan_for(rule("r1", ["web"], ["db"], ["HTTPS"]))
         e = by_name(p)["r1"]
-        self.assertEqual(e["source"]["member"], ["web_np_ips", "web_avs_ips", "web_lm3_ips"])
-        self.assertEqual(e["destination"]["member"], ["db_np_ips", "db_avs_ips", "db_lm3_ips"])
+        self.assertEqual(e["source"]["member"], ["web_np_ips"])
+        self.assertEqual(e["destination"]["member"], ["db_np_ips"])
+        self.assertEqual(self.members(p, "web_np_ips"), ["10.6.0.101-np_ips", "10.7.0.101-avs_ips", "10.8.0.101-lm3_ips"])
         self.assertEqual((e["from"], e["to"]), ({"member": ["any"]}, {"member": ["any"]}))
+        # The per-view sibling groups are not created on Panorama.
+        names = [g["name"] for g in p["address_groups"]]
+        self.assertEqual(sorted(names), ["db_np_ips", "web_np_ips"])
+        self.assertIn("all", p["address_groups"][0]["view"])
+        self.assertIn("every site", p["writes"][[w["kind"] for w in p["writes"]].index("address-group")]["entry"]["description"])
 
     def test_sibling_refs_on_the_rule_fold_back_to_the_original(self):
-        # A rule read from lm2/lm3 names original + _np_ips; the Palo still gets every view once.
+        # A rule read from lm2/lm3 names original + _np_ips; the Palo still gets one group.
         p = plan_for(rule("r1", ["web", "web_np_ips"], ["db_np_ips"], ["HTTPS"]))
         e = by_name(p)["r1"]
-        self.assertEqual(e["source"]["member"], ["web_np_ips", "web_avs_ips", "web_lm3_ips"])
-        self.assertEqual(e["destination"]["member"], ["db_np_ips", "db_avs_ips", "db_lm3_ips"])
+        self.assertEqual((e["source"]["member"], e["destination"]["member"]), (["web_np_ips"], ["db_np_ips"]))
 
-    def test_ip_only_group_mirrored_as_itself_plus_its_mapped_sibling(self):
+    def test_ip_only_group_adds_its_own_addresses(self):
         p = plan_for(rule("r1", ["mgmt"], ["web"], ["HTTPS"]))
-        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["mgmt_avs_ips", "mgmt"])
-        g = {x["name"]: x for x in p["address_groups"]}
-        self.assertEqual(g["mgmt"]["members"], ["10.2.1.0_24"])
-        self.assertEqual(p["counts"]["mirrored_groups"], 1)
+        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["mgmt_np_ips"])
+        self.assertEqual(self.members(p, "mgmt_np_ips"), ["10.20.1.0_24-avs_ips", "10.2.1.0_24"])
+        self.assertEqual(p["counts"]["address_groups"], 2)
 
-    def test_nested_group_expands_to_its_members(self):
+    def test_nested_group_is_one_group_of_its_members_addresses(self):
         p = plan_for(rule("r1", ["nest"], ["db"], ["HTTPS"]))
-        self.assertEqual(by_name(p)["r1"]["source"]["member"],
-                         ["mgmt_avs_ips", "mgmt", "web_np_ips", "web_avs_ips", "web_lm3_ips"])
+        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["nest_np_ips"])
+        self.assertEqual(self.members(p, "nest_np_ips"),
+                         ["10.20.1.0_24-avs_ips", "10.2.1.0_24", "10.6.0.101-np_ips", "10.7.0.101-avs_ips",
+                          "10.8.0.101-lm3_ips"])
+
+    def test_only_used_addresses_are_pushed(self):
+        p = plan_for(rule("r1", ["web"], ["web"], ["HTTPS"]))
+        self.assertEqual(sorted(a["name"] for a in p["addresses"]),
+                         ["10.6.0.101-np_ips", "10.7.0.101-avs_ips", "10.8.0.101-lm3_ips"])
+
+    def test_group_suffix_option(self):
+        from multisite.pan_rules import RuleOptions
+        p = build_rule_mirror([policy("p1", rule("r1", ["web"], ["db"]))], GROUPS, SERVICES, BUNDLES, [],
+                              ropts=RuleOptions(group_suffix="_x"))
+        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["web_x"])
 
     def test_unmatchable_member_narrows_the_rule(self):
         p = plan_for(rule("r1", ["web", "seg"], ["db"], ["HTTPS"]))
-        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["web_np_ips", "web_avs_ips", "web_lm3_ips"])
+        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["web_np_ips"])
         self.assertIn("rule_narrower", [f["code"] for f in p["findings"]])
 
     def test_empty_side_skips_the_rule_never_any(self):
@@ -139,7 +165,7 @@ class SideTests(unittest.TestCase):
         p = plan_for(rule("r1", ["ANY"], ["db", "10.9.9.9"], ["HTTPS"]))
         e = by_name(p)["r1"]
         self.assertEqual(e["source"]["member"], ["any"])
-        self.assertEqual(e["destination"]["member"], ["10.9.9.9", "db_np_ips", "db_avs_ips", "db_lm3_ips"])
+        self.assertEqual(e["destination"]["member"], ["10.9.9.9", "db_np_ips"])
         self.assertIn("10.9.9.9", [a["name"] for a in p["addresses"]])
 
     def test_rules_without_any_sibling_are_out_of_scope(self):
@@ -150,42 +176,62 @@ class SideTests(unittest.TestCase):
     def test_no_source_view_bundle_is_an_error(self):
         p = plan_for(rule("r1", ["web"], ["db"], ["HTTPS"]), bundles=BUNDLES[1:])
         self.assertIn("no_source_view", [f["code"] for f in p["findings"] if f["severity"] == "error"])
-        self.assertEqual(by_name(p)["r1"]["source"]["member"], ["web_avs_ips", "web_lm3_ips"])
+        self.assertEqual(self.members(p, "web_np_ips"), ["10.7.0.101-avs_ips", "10.8.0.101-lm3_ips"])
 
 
 class ServiceTests(unittest.TestCase):
-    def test_flatten(self):
-        idx = {s["id"]: s for s in SERVICES}
-        self.assertEqual(flatten_service("bundle", idx), ([("tcp", "443", ""), ("tcp", "8443", "")], [], []))
-        self.assertEqual(flatten_service("ICMP-ALL", idx)[1], ["icmp", "ping", "ipv6-icmp"])
-        self.assertEqual(flatten_service("echo", idx)[1], ["ping"])
-        self.assertTrue(flatten_service("gre", idx)[2])
+    """Mike, 2026-10-06: services mirror NSX exactly; ports wherever possible."""
 
-    def test_one_protocol_is_one_service_two_is_a_group(self):
-        p = plan_for(rule("r1", ["web"], ["db"], ["HTTPS", "DNS", "bundle"]))
-        s = {x["name"]: x["protocol"] for x in p["services"]}
-        self.assertEqual(s["HTTPS"], {"tcp": {"port": "443"}})
-        self.assertEqual(s["bundle"], {"tcp": {"port": "443,8443"}})
-        self.assertEqual(s["DNS-tcp"], {"tcp": {"port": "53"}})
-        self.assertEqual(p["service_groups"], [{"name": "DNS", "members": ["DNS-tcp", "DNS-udp"], "nsx_service": "DNS"}])
-        self.assertEqual(by_name(p)["r1"]["service"]["member"], ["HTTPS", "DNS", "bundle"])
+    @staticmethod
+    def svcs(p):
+        return {x["name"]: x["protocol"] for x in p["services"]}, {g["name"]: g["members"] for g in p["service_groups"]}
 
-    def test_icmp_gets_its_own_rule(self):
+    def test_services_mirror_nsx_structure(self):
+        p = plan_for(rule("r1", ["web"], ["db"], ["HTTPS", "DNS", "bundle", "two-tcp"]))
+        s, g = self.svcs(p)
+        self.assertEqual(s["HTTPS"], {"tcp": {"port": "443"}})               # one entry: the service itself
+        self.assertEqual((s["DNS-tcp"], s["DNS-udp"]), ({"tcp": {"port": "53"}}, {"udp": {"port": "53"}}))
+        self.assertEqual(g["DNS"], ["DNS-tcp", "DNS-udp"])                  # several entries: a group
+        self.assertEqual(g["bundle"], ["HTTPS", "bundle-tcp"])              # nested service kept as a member
+        self.assertEqual(s["bundle-tcp"], {"tcp": {"port": "8443"}})
+        self.assertEqual(g["two-tcp"], ["two-tcp-tcp-1", "two-tcp-tcp-2"])  # entries never merged
+        self.assertEqual(by_name(p)["r1"]["service"]["member"], ["HTTPS", "DNS", "bundle", "two-tcp"])
+
+    def test_alg_becomes_a_port_service_and_is_reviewed(self):
+        p = plan_for(rule("r1", ["web"], ["db"], ["FTP"]))
+        self.assertEqual(self.svcs(p)[0]["FTP"], {"tcp": {"port": "21"}})
+        self.assertEqual([x["kind"] for x in p["app_id_review"]], ["alg_ports"])
+
+    def test_icmp_gets_its_own_rule_and_is_reviewed(self):
         p = plan_for(rule("r1", ["web"], ["db"], ["HTTPS", "ICMP-ALL"]))
         e = by_name(p)
         self.assertEqual(e["r1"]["application"]["member"], ["any"])
         self.assertEqual(e["r1-icmp"]["application"]["member"], ["icmp", "ping", "ipv6-icmp"])
         self.assertEqual(e["r1-icmp"]["service"]["member"], ["application-default"])
+        self.assertEqual([(x["kind"], x["nsx_rule"]) for x in p["app_id_review"]], [("icmp_app_id", "r1")])
 
     def test_icmp_only_rule_keeps_its_name(self):
         e = by_name(plan_for(rule("r1", ["web"], ["db"], ["echo"])))
         self.assertEqual(list(e), ["r1"])
         self.assertEqual(e["r1"]["application"]["member"], ["ping"])
 
-    def test_unsupported_service_left_out_and_rule_skipped_if_nothing_remains(self):
+    def test_no_port_form_left_out_reviewed_and_rule_skipped_if_nothing_remains(self):
         p = plan_for(rule("r1", ["web"], ["db"], ["gre"]), rule("r2", ["web"], ["db"], ["gre", "HTTPS"], seq=2))
         self.assertEqual([r["name"] for r in p["rules"]], ["r2"])
         self.assertIn("service_not_mirrored", [f["code"] for f in p["findings"]])
+        self.assertEqual({x["kind"] for x in p["app_id_review"]}, {"no_port_form"})
+
+    def test_nsx_context_profile_app_id_is_reviewed_and_skipped(self):
+        ctx = [{"id": "SSL", "display_name": "SSL",
+                "attributes": [{"key": "APP_ID", "value": ["SSL", "TLS1.2"]}]}]
+        p = build_rule_mirror([policy("p1", rule("r1", ["web"], ["db"], ["HTTPS"],
+                                                 profiles=["/infra/context-profiles/SSL"]))],
+                              GROUPS, SERVICES, BUNDLES, [], context_profiles=ctx)
+        self.assertEqual(p["rules"], [])
+        rv = p["app_id_review"]
+        self.assertEqual((rv[0]["kind"], rv[0]["nsx_rule"]), ("nsx_app_id", "r1"))
+        self.assertIn("APP_ID SSL, TLS1.2", rv[0]["nsx"])
+        self.assertEqual(p["counts"]["nsx_rules_with_app_id"], 1)
 
     def test_any_service(self):
         e = by_name(plan_for(rule("r1", ["web"], ["db"])))["r1"]
@@ -267,6 +313,20 @@ class RuleFieldTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_rule_mirror(pols, GROUPS, SERVICES, BUNDLES, [], ropts=RuleOptions(profiles={"bogus": "y"}))
 
+    def test_firewall_target_writes_vsys_and_local_rulebase(self):
+        from multisite.pan_mirror import MirrorOptions
+        from multisite.pan_rules import RuleOptions
+        pols = [policy("p1", rule("r1", ["web"], ["db"], ["DNS"]))]
+        p = build_rule_mirror(pols, GROUPS, SERVICES, BUNDLES, [],
+                              MirrorOptions(object_location="vsys", vsys="vsys2"), RuleOptions(rulebase="local"))
+        self.assertEqual({(w["kind"], w["location"], w["vsys"]) for w in p["writes"]},
+                         {(k, "vsys", "vsys2") for k in ("address", "address-group", "service", "service-group",
+                                                          "security-rule")})
+        self.assertEqual([w["resource"] for w in p["writes"] if w["kind"] == "security-rule"],
+                         ["Policies/SecurityRules"])
+        with self.assertRaises(ValueError):    # a firewall rulebase needs firewall (vsys) objects
+            build_rule_mirror(pols, GROUPS, SERVICES, BUNDLES, [], ropts=RuleOptions(rulebase="local"))
+
     def test_group_kinds(self):
         g = {x["id"]: group_kind(x) for x in GROUPS}
         self.assertEqual(g, {"web": "tag", "db": "tag", "mgmt": "ip_only", "seg": "segment", "nest": "nested",
@@ -305,10 +365,25 @@ class DiffersTests(unittest.TestCase):
 
     def test_missing_profiles_checked_before_push(self):
         class Pan:
-            def named_exists(self, resource, name, dg):
+            def named_exists(self, resource, name, scopes):
                 return "shared" if name == "pg1" else None
         plan = {"device_group": "dg-5", "options": {"profile_group": "pg1", "log_setting": "gone"}}
         self.assertEqual(self.tool.missing_profiles(Pan(), plan), [("log forwarding profile", "gone")])
+
+    def test_firewall_scopes_params_and_pushed_conflicts(self):
+        fw = {"device_group": None, "options": {"object_location": "vsys", "vsys": "vsys1"},
+              "writes": [{"kind": "address", "name": "a1", "resource": "Objects/Addresses"},
+                         {"kind": "address", "name": "a2", "resource": "Objects/Addresses"}]}
+        self.assertEqual([s["location"] for s in self.tool.lookup_scopes(fw)], ["vsys", "panorama-pushed"])
+        self.assertEqual(self.tool.target_label(fw), "vsys vsys1")
+        self.assertEqual(self.tool.RestSession._params({"location": "vsys", "vsys": "vsys1", "name": "a1"}),
+                         {"location": "vsys", "vsys": "vsys1", "name": "a1"})
+
+        class Pan:
+            def named_exists(self, resource, name, scopes):
+                return "panorama-pushed" if name == "a2" else None
+        self.assertEqual(self.tool.pushed_conflicts(Pan(), fw), [{"kind": "address", "name": "a2"}])
+        self.assertEqual(self.tool.pushed_conflicts(Pan(), {**fw, "options": {}}), [])   # Panorama target
 
     def test_push_and_revert_reports(self):
         rows = [{"kind": "address", "name": "a1", "status": "created", "entry": {"ip-netmask": "1.1.1.1/32"}},

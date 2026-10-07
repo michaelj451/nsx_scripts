@@ -52,8 +52,11 @@ class MirrorOptions:
     include_system: bool = False
     # Where address objects, address groups, services and service groups are
     # created: "shared" (Mike, 2026-10-06: usable by every device group) or
-    # "device-group". Rules always go to device_group.
+    # "device-group" on Panorama; "vsys" when writing directly to a firewall
+    # (Mike, 2026-10-06: direct to palo5). Rules go to device_group, or to the
+    # firewall's vsys.
     object_location: str = "shared"
+    vsys: str = "vsys1"
 
 
 def safe_name(text: str, max_len: int = NAME_MAX) -> str:
@@ -429,11 +432,12 @@ def rest_writes(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     &name=<name> (or location=device-group&device-group=<dg>&name=<name>)."""
     dg = plan["device_group"]
     loc = object_location(plan)
+    vsys = (plan.get("options") or {}).get("vsys") or "vsys1"
     out: List[Dict[str, Any]] = []
 
     def add(kind: str, entry: Dict[str, Any]) -> None:
         out.append({"kind": kind, "name": entry["@name"], "resource": RESOURCE[kind],
-                    "location": loc, "device_group": dg, "entry": entry})
+                    "location": loc, "device_group": dg, "vsys": vsys, "entry": entry})
 
     for t in plan["tags"]:
         add("tag", {"@name": t["name"], "comments": "mirrored from NSX"})
@@ -449,8 +453,9 @@ def rest_writes(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
             e["dynamic"] = {"filter": g["filter"]}
         else:
             e["static"] = {"member": list(g["members"])}
-        e["description"] = (f"helper for {g['helper_for']} (NSX {g['nsx_group']})" if g.get("helper_for")
-                            else f"NSX group {g['nsx_group']}")
+        e["description"] = g.get("description") or (
+            f"helper for {g['helper_for']} (NSX {g['nsx_group']})" if g.get("helper_for")
+            else f"NSX group {g['nsx_group']}")
         add("address-group", e)
     return out
 

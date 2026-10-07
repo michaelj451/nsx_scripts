@@ -62,6 +62,12 @@ than raw log lines.
 |---|---|---|
 | [RUNBOOK_MULTIVENDOR_ROLLOUT.md](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md) | [ps](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md) | `nsx-lm1` VMs moving to **either** `nsx-lm2` or `nsx-lm3`, traffic between all three sites, and the Palo Alto `dg-5` firewall between them. Separate steps (A and C onto lm3, then each site's mapped addresses onto the others) through the existing driver, one two-column map per target (`data/subnet_map_lm2.csv`, `data/subnet_map_lm3.csv`). The Palo Alto track is separate and still being built |
 
+Status and decisions: [STATUS.md](multivendor/STATUS.md). Open questions
+(group naming, App-ID use on NSX, name case, which rules cross sites, zones,
+profiles, target, updates): [QUESTIONS.md](multivendor/QUESTIONS.md). Test
+migration plan (one VM from lm1 to lm3 through the firewall, planning only):
+[TEST_MIGRATION_PLAN.md](multivendor/TEST_MIGRATION_PLAN.md).
+
 ## Backup (separate from capture on purpose)
 
 | Doc | Purpose |
