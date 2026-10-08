@@ -1,0 +1,71 @@
+# Traffic plan for the nsx-lm1 -> nsx-lm4 hit-only copy simulation (2026-10-07).
+#
+# A chosen SUBSET of lm1's hittable rules gets traffic; the rest stay cold, so the
+# consolidator's kept/skipped lists can be checked against a known answer.
+#
+# expect: the rule each flow should hit (rule id as the rules-usage report prints it).
+# cold:   hittable rules that must show NO new hits after the run.
+#
+# Already hot before this plan and impossible to keep cold: allow-icmp-network-0/1/2
+# (earlier pings from the Mac) and ssh-network-0/1/2 (every SSH from aidev into an lm1
+# VM, including this tool's own logins).
+#
+# Infrastructure rules are copied whole regardless of hits; seed-infra-dns gets
+# traffic only for variety.
+
+manager: nsx-lm1
+
+hosts:
+  mac:   {local: true, ip: 10.10.2.78}
+  aidev: {ssh: aidev.lab.local, ip: 10.2.1.189}
+  vm601: {ssh: mxferguson@10.6.0.101, jump: aidev.lab.local}
+  vm602: {ssh: mxferguson@10.6.0.102, jump: aidev.lab.local}
+  vm611: {ssh: mxferguson@10.6.1.101, jump: aidev.lab.local}
+  vm612: {ssh: mxferguson@10.6.1.102, jump: aidev.lab.local}
+
+flows:
+  # --- Start_Policy ICMP rules (already hot; Mac is in group a8b5ed22) ---
+  - {id: mac-ping-net0, from: mac, action: ping, dst: 10.6.0.101, count: 5, expect: allow-icmp-network-0}
+  - {id: mac-ping-net1, from: mac, action: ping, dst: 10.6.1.101, count: 5, expect: allow-icmp-network-1}
+  - {id: mac-ping-net2, from: mac, action: ping, dst: 10.6.2.101, count: 5, expect: allow-icmp-network-2}
+
+  # --- Start_Policy SSH rules (already hot; aidev is in hardware-subnet) ---
+  - {id: aidev-ssh-net0, from: aidev, action: tcp, dst: 10.6.0.101, port: 22, repeat: 3, expect: ssh-network-0}
+  - {id: aidev-ssh-net1, from: aidev, action: tcp, dst: 10.6.1.101, port: 22, repeat: 3, expect: ssh-network-1}
+  - {id: aidev-ssh-net2, from: aidev, action: tcp, dst: 10.6.2.101, port: 22, repeat: 3, expect: ssh-network-2}
+
+  # --- web_rule: hardware-subnet -> vm1/vm2 on HTTP/HTTPS (OpenSpeedtest listens) ---
+  - {id: aidev-web-http,     from: aidev, action: http,     url: "http://10.6.0.101/",              repeat: 20, expect: web_rule}
+  - {id: aidev-web-https,    from: aidev, action: http,     url: "https://10.6.0.102/",             repeat: 10, expect: web_rule}
+  - {id: aidev-web-download, from: aidev, action: download, url: "http://10.6.1.101/downloading",   repeat: 3,  expect: web_rule}
+
+  # --- ping-out: vm1/vm2 -> public resolvers ---
+  - {id: vm601-ping-out-8888, from: vm601, action: ping, dst: 8.8.8.8, count: 5, expect: ping-out}
+  - {id: vm601-ping-out-1111, from: vm601, action: ping, dst: 1.1.1.1, count: 5, expect: ping-out}
+
+  # --- seed-web-https: seed-tag-net-10-6-0 -> seed-mixed-web on tcp/8443 ---
+  - {id: vm601-iperf-8443, from: vm601, action: iperf3, server: vm602, dst: 10.6.0.102, port: 8443, seconds: 10, expect: seed-web-https}
+  - {id: vm601-tcp-8443,   from: vm601, action: tcp,    dst: 10.6.0.102, port: 8443, repeat: 10, expect: seed-web-https}
+
+  # --- seed-multi: 10-6-0/10-6-1 tags -> db block / mixed web on tcp/9000-9010 ---
+  - {id: vm601-multi-db,    from: vm601, action: tcp,    dst: 10.21.2.20, port: 9005, repeat: 15, expect: seed-multi}
+  - {id: vm601-iperf-9005,  from: vm601, action: iperf3, server: vm612, dst: 10.6.1.102, port: 9005, seconds: 10, expect: seed-multi}
+
+  # --- seed-logged-drop: ANY -> seed-ip-whole-subnet ICMP echo, DROP ---
+  - {id: vm601-logged-drop, from: vm601, action: ping, dst: 10.21.4.10, count: 10, expect: seed-logged-drop}
+
+  # --- Infrastructure seed-infra-dns: ANY -> seed-ip-mgmt dns ---
+  - {id: vm601-infra-dns, from: vm601, action: dns, server: 10.21.250.10, name: lab.local, repeat: 10, expect: seed-infra-dns}
+
+  # --- noise that should land on the Default Layer3 DROP ---
+  - {id: vm601-scan-602,  from: vm601, action: scan, dst: 10.6.0.102, ports: "20-40", expect: default-layer3-rule}
+  - {id: mac-tcp-601,     from: mac,   action: tcp,  dst: 10.6.0.101, port: 80, repeat: 3, expect: default-layer3-rule}
+  - {id: vm611-udp-noise, from: vm611, action: udp,  dst: 10.6.2.101, port: 5000, repeat: 5, expect: default-layer3-rule}
+
+cold:
+  - seed-syslog-any
+  - seed-icmp-vm1-asl2
+  - seed-ssh-and-group
+  - seed-nested-web
+  - seed-segment-rule
+  - test-infrastructure-rule-1

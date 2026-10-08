@@ -61,6 +61,7 @@ than raw log lines.
 | Runbook | PowerShell | What it covers |
 |---|---|---|
 | [RUNBOOK_MULTIVENDOR_ROLLOUT.md](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md) | [ps](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md) | `nsx-lm1` VMs moving to **either** `nsx-lm2` or `nsx-lm3`, traffic between all three sites, and the Palo Alto `dg-5` firewall between them. Separate steps (A and C onto lm3, then each site's mapped addresses onto the others) through the existing driver, one two-column map per target (`data/subnet_map_lm2.csv`, `data/subnet_map_lm3.csv`). The Palo Alto track is separate and still being built |
+| [RUNBOOK_MIGRATION_REQUEST.md](multivendor/RUNBOOK_MIGRATION_REQUEST.md) | [ps](multivendor/RUNBOOK_MIGRATION_REQUEST_PS.md) | **Migration requests**: a list of servers (VM names or IP addresses) becomes an approver's report of every change the move needs (the NSX rules they use, Workflow A to the destination, C siblings there, D siblings and rule amendments on the source scoped to the servers' groups, and exactly what is created on Palo Alto), an approval pinned to a fingerprint, and a later re-capture that applies it phase by phase (`tools/multisite/migration_request.py`) |
 
 Status and decisions: [STATUS.md](multivendor/STATUS.md). Open questions
 (group naming, App-ID use on NSX, name case, which rules cross sites, zones,

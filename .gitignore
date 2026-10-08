@@ -57,6 +57,8 @@ nsx_vm_tags_manifests/
 # Multi-manager security-object pulls (per-host groups/services/policies/rules JSON dumps)
 multi_manager_pull/
 nsx_filtered_bundle/
+# Migration requests and their runs (tools/multisite/migration_request.py)
+migration_requests/
 nsx_wipe_bundle/
 nsx_fabric_capture/
 nsx_health_backup/

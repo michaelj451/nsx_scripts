@@ -60,8 +60,17 @@ pano4 `dg-5`, which stands in for the real firewall.
 | REST | `/restapi/v11.2/Objects/LogForwardingProfiles` | GET | Objects > Log Forwarding: read |
 | REST | the individual security profile types (`AntivirusSecurityProfiles` and so on) | GET | read, only if individual profiles are used instead of a group |
 
+**Directly to a firewall** (no Panorama; tested on palo5, PAN-OS 10.2,
+2026-10-07): the same login, the same resources with REST `v10.2` (a device
+accepts its own REST version and older, never newer), objects and rules at
+`location=vsys&vsys=vsys1` (`shared` is refused on a single-vsys firewall),
+and the firewall's one local rulebase `/restapi/v10.2/Policies/SecurityRules`
+instead of pre and post rules. The account needs the same read/write
+permissions on the firewall itself. On a firewall that Panorama also manages,
+local objects must not reuse names Panorama pushes; `push` checks and refuses.
+
 Writes go to `location=shared` (objects) and `location=device-group`
-(rules). A dry run issues only GETs. **Commits are never made through the
+(rules) on Panorama. A dry run issues only GETs. **Commits are never made through the
 API**: the operator reviews the candidate config and commits in Panorama
 (question 12).
 

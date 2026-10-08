@@ -65,6 +65,13 @@ from filter_policy_bundle import (                       # noqa: E402
     VALID_CATEGORIES,
 )
 
+# NSX 3.2.x answers HTTP 500 on the Policy-API /statistics call even for local
+# /infra policies (seen on nsx-lm1 and nsx-lm2, 2026-10-07). The rules-usage
+# report already falls back to the pre-Policy firewall API; reuse its helper so
+# both tools read the same counters.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "reports"))
+from report_rules_usage import _fetch_stats_via_old_firewall_api   # noqa: E402
+
 log = logging.getLogger(__name__)
 
 
@@ -251,6 +258,7 @@ def consolidate(
     kept_pol_paths: Set[str] = set()
     kept_pol_infos: List[Dict[str, Any]] = []
     hit_by_irid: Dict[str, int] = {}   # internal_rule_id -> aggregated hit_count
+    stats_source: Dict[str, str] = {}  # policy id -> policy_api | old_firewall_api | none
 
     for pol in live_policies:
         cat = pol.get("category")
@@ -267,14 +275,21 @@ def consolidate(
         kept_pol_paths.add(path)
         kept_pol_infos.append({"id": pol_id, "path": path, "category": cat,
                                "display_name": pol.get("display_name")})
+        stats_by_irid: Dict[str, Dict[str, Any]] = {}
+        source = "policy_api"
         try:
-            stats = client.get_security_policy_statistics(
+            stats_by_irid = _flatten_policy_stats(client.get_security_policy_statistics(
                 security_policy_id=pol_id, domain_id=domain_id,
-            )
+            ))
         except Exception as exc:
-            log.warning("Could not get statistics for %s: %s", pol_id, exc)
-            continue
-        for irid, row in _flatten_policy_stats(stats).items():
+            log.warning("Policy-API statistics failed for %s: %s", pol_id, str(exc)[:160])
+        if not stats_by_irid:
+            stats_by_irid = _fetch_stats_via_old_firewall_api(
+                client, pol.get("display_name") or pol_id)
+            source = "old_firewall_api" if stats_by_irid else "none"
+        stats_source[pol_id] = source
+        log.info("  %-40s stats via %s (%d rules)", pol_id, source, len(stats_by_irid))
+        for irid, row in stats_by_irid.items():
             hit_by_irid[irid] = hit_by_irid.get(irid, 0) + int(row.get("hit_count") or 0)
     log.info("  in-scope customer policies: %d", len(kept_pol_paths))
     log.info("  rules with any statistics data: %d", len(hit_by_irid))
@@ -287,6 +302,15 @@ def consolidate(
     all_services = _discover_services(services_dir)
     log.info("  local exports: policies=%d rules-parent-groups=%d groups=%d services=%d",
              len(all_policies), len(all_rules), len(all_groups), len(all_services))
+
+    # A policy with rules but no counters from either API must not be read as
+    # "no hits": that would silently drop every one of its rules.
+    blind = sorted(info["id"] for info in kept_pol_infos
+                   if stats_source.get(info["id"]) == "none" and all_rules.get(info["path"]))
+    if blind:
+        raise SystemExit(f"no hit counts for policies that have rules: {blind}. "
+                         "Refusing to treat their rules as unused.")
+    manifest["stats_source"] = stats_source
 
     # 3. Pick out rules with hit_count > min_hits from kept policies
     kept_rules: List[Dict[str, Any]] = []
