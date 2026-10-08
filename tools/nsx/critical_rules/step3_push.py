@@ -40,6 +40,7 @@ def main() -> int:
     p.add_argument("--source", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--target", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--run", help="run folder (default: newest for this source/target)")
+    cr.add_runs_dir_arg(p)
     p.add_argument("--apply", action="store_true", help="write to the target (default: dry run)")
     p.add_argument("--allow-non-empty", action="store_true",
                    help="apply even though the target already holds customer objects")
@@ -47,7 +48,7 @@ def main() -> int:
                    help="segment references inside groups (default: strip)")
     args = p.parse_args()
 
-    run = cr.resolve_run(args.source, args.target, args.run)
+    run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
     pull = rec.get("steps", {}).get("pull") or {}
@@ -55,6 +56,7 @@ def main() -> int:
         raise SystemExit(f"no successful step 2 in {run}; run step2_pull.py first")
     bundles = {"infra": Path(pull["infra"]), "hits": Path(pull["hits"])}
     mode = "apply" if args.apply else "dryrun"
+    cr.use_run_environment(run)
     setup_logging(f"step3_push_{mode}", run / "logs")
     log.info("Run: %s", run)
 
@@ -88,10 +90,10 @@ def main() -> int:
     print()
     if ok and not args.apply:
         print("Read the dry run above, then apply:")
-        print(f"  python tools/nsx/critical_rules/step3_push.py --source {args.source} --target {args.target} --apply")
+        print("  " + cr.next_command("step3_push.py", args, "--apply"))
     elif ok:
         print("Next:")
-        print(f"  python tools/nsx/critical_rules/step4_verify.py --source {args.source} --target {args.target}")
+        print("  " + cr.next_command("step4_verify.py", args))
 
     cr.record_step(run, f"push_{mode}", {"ok": ok, "target_was_empty": empty, "steps": results})
     return 0 if ok else 1

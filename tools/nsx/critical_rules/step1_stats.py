@@ -38,17 +38,19 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     p.add_argument("--source", required=True, choices=cr.LM_CHOICES, help="manager the rules come from (read only)")
     p.add_argument("--target", required=True, choices=cr.LM_CHOICES, help="new, empty manager they go to")
+    cr.add_runs_dir_arg(p)
     args = p.parse_args()
     if args.source == args.target:
         raise SystemExit("source and target are the same manager")
 
     src_host, tgt_host = resolve_manager(args.source), resolve_manager(args.target)
-    run = cr.new_run(args.source, args.target, src_host, tgt_host)
+    run = cr.new_run(args.source, args.target, src_host, tgt_host, base=cr.runs_base(args.runs_dir))
+    cr.use_run_environment(run)
     setup_logging("step1_stats", run / "logs")
     log.info("Run: %s", run)
 
     res = cr.run_tool("step1_rules_usage", [
-        cr.PY, "tools/reports/report_rules_usage.py", "--target", args.source,
+        cr.PY, cr.tool("tools/reports/report_rules_usage.py"), "--target", args.source,
         "--include-defaults", "--output-base", str(run / "stats"),
     ], run / "logs")
     if not res["ok"]:
@@ -72,7 +74,7 @@ def main() -> int:
     print(f"Report: {report}")
     print()
     print("Next:")
-    print(f"  python tools/nsx/critical_rules/step2_pull.py --source {args.source} --target {args.target}")
+    print("  " + cr.next_command("step2_pull.py", args))
 
     cr.record_step(run, "stats", {
         "ok": True, "report": str(report), "rules_with_hits": len(rows),

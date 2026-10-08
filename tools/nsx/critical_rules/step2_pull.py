@@ -4,8 +4,8 @@
 Critical-rules copy, step 2 of 4: pull those objects into two bundles.
 
 In the newest run folder for this source/target (or --run):
-  1. capture the source (read only; refreshes the flat exports the bundle
-     tools read; --no-capture reuses the current ones);
+  1. capture the source (read only) into the run, and write the flat exports
+     the bundle tools read into the run as well (nothing lands in the repo);
   2. Infrastructure bundle: every Infrastructure policy, whole, original order
      (filter_policy_bundle.py);
   3. hit-rules bundle: every Application rule with hit_count > --min-hits, in
@@ -40,7 +40,7 @@ def main() -> int:
     p.add_argument("--source", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--target", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--run", help="run folder (default: newest for this source/target)")
-    p.add_argument("--no-capture", action="store_true", help="reuse the current flat exports")
+    cr.add_runs_dir_arg(p)
     p.add_argument("--whole-categories", default="Infrastructure",
                    help="categories copied whole (default: Infrastructure)")
     p.add_argument("--hit-categories", default="Application",
@@ -50,30 +50,35 @@ def main() -> int:
     p.add_argument("--policy-name", default="Critical Rules", help="display name of the new policy")
     args = p.parse_args()
 
-    run = cr.resolve_run(args.source, args.target, args.run)
+    run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
     src_host = rec["source_host"]
+    cr.use_run_environment(run)
     setup_logging("step2_pull", run / "logs")
     log.info("Run: %s", run)
-    if (run / "infra").exists() or (run / "hits").exists():
-        raise SystemExit(f"this run already has bundles ({run}); start a new run with step1_stats.py")
+    if any((run / d).exists() for d in ("capture", "infra", "hits")):
+        raise SystemExit(f"this run already has a capture or bundles ({run}); start a new run with step1_stats.py")
 
-    tools = []
-    if not args.no_capture:
-        tools.append(cr.run_tool("step2_capture", [
-            cr.PY, "tools/nsx/capture_nsx_state.py", "--source", args.source, "--live-query"], run / "logs"))
-        if not tools[-1]["ok"]:
-            cr.record_step(run, "pull", {"ok": False, "tools": tools})
-            return 1
+    tools = [cr.run_tool("step2_capture", [
+        cr.PY, cr.tool("tools/nsx/capture_nsx_state.py"), "--source", args.source,
+        "--output-dir", str(run / "capture"), "--no-flat-exports"], run / "logs")]
+    if not tools[-1]["ok"]:
+        cr.record_step(run, "pull", {"ok": False, "tools": tools})
+        return 1
+    exported = cr.emit_flat_exports(run / "capture", src_host, run)
+    log.info("Flat exports in the run: %s", exported)
+
+    # The bundle tools read nsx_*_export/<host> relative to their working
+    # directory, so they run from the run folder and read the exports above.
     tools.append(cr.run_tool("step2_infra_bundle", [
-        cr.PY, "tools/nsx/filter_policy_bundle.py", "--source", args.source,
-        "--categories", args.whole_categories, "--output-base", str(run / "infra")], run / "logs"))
+        cr.PY, cr.tool("tools/nsx/filter_policy_bundle.py"), "--source", args.source,
+        "--categories", args.whole_categories, "--output-base", str(run / "infra")], run / "logs", cwd=run))
     tools.append(cr.run_tool("step2_hits_bundle", [
-        cr.PY, "tools/nsx/consolidate_hot_rules.py", "--source", args.source,
+        cr.PY, cr.tool("tools/nsx/consolidate_hot_rules.py"), "--source", args.source,
         "--categories", args.hit_categories, "--min-hits", str(args.min_hits),
         "--new-policy-id", args.policy_id, "--new-policy-display", args.policy_name,
-        "--output-base", str(run / "hits")], run / "logs"))
+        "--output-base", str(run / "hits")], run / "logs", cwd=run))
     if not all(t["ok"] for t in tools):
         cr.record_step(run, "pull", {"ok": False, "tools": tools})
         log.error("a bundle tool failed; nothing to push")
@@ -114,10 +119,11 @@ def main() -> int:
         print(f"  kept rules match step 1 ({len(kept)})")
     print()
     print("Next (dry run):")
-    print(f"  python tools/nsx/critical_rules/step3_push.py --source {args.source} --target {args.target}")
+    print("  " + cr.next_command("step3_push.py", args))
 
     cr.record_step(run, "pull", {
-        "ok": True, "infra": str(infra), "hits": str(hits), "policy_id": args.policy_id,
+        "ok": True, "capture": str(run / "capture"), "flat_exports": exported,
+        "infra": str(infra), "hits": str(hits), "policy_id": args.policy_id,
         "infra_counts": im["counts"], "hits_counts": hm["counts"], "kept_rules": sorted(kept),
         "order": order, "tools": tools,
     })

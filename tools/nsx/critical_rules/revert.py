@@ -36,10 +36,11 @@ def main() -> int:
     p.add_argument("--source", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--target", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--run", help="run folder (default: newest for this source/target)")
+    cr.add_runs_dir_arg(p)
     p.add_argument("--apply", action="store_true", help="write to the target (default: dry run)")
     args = p.parse_args()
 
-    run = cr.resolve_run(args.source, args.target, args.run)
+    run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
     pull = rec.get("steps", {}).get("pull") or {}
@@ -47,6 +48,7 @@ def main() -> int:
         raise SystemExit(f"no successful step 2 in {run}; nothing to revert")
     bundles = {"infra": Path(pull["infra"]), "hits": Path(pull["hits"])}
     mode = "apply" if args.apply else "dryrun"
+    cr.use_run_environment(run)
     setup_logging(f"revert_{mode}", run / "logs")
     log.info("Run: %s", run)
 
@@ -72,8 +74,7 @@ def main() -> int:
         print("Nothing was applied in this run, so there is nothing to revert.")
     print(f"Result: {'OK' if ok else 'FAILED'}")
     if ok and not args.apply and not all(r.get("skipped") for r in results):
-        print(f"Read the dry run above, then: python tools/nsx/critical_rules/revert.py "
-              f"--source {args.source} --target {args.target} --apply")
+        print("Read the dry run above, then: " + cr.next_command("revert.py", args, "--apply"))
 
     cr.record_step(run, f"revert_{mode}", {"ok": ok, "steps": results})
     return 0 if ok else 1

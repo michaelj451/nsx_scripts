@@ -22,11 +22,21 @@ What gets copied:
 The target must already be empty (only NSX's two default sections); step 3
 checks that and refuses to apply otherwise.
 
-Every run lives in its own folder,
-`nsx_critical_runs/<source>_to_<target>/<UTC_TS>/`: the report, the two
-bundles, `run.json` (what each step did, with paths) and one log per tool.
+Every run lives in its own folder under `$RUNS` (set in Setup; any folder you
+choose), and everything a run produces stays there; nothing is written to the
+repo:
+
+```
+$RUNS/<source>_to_<target>/<UTC_TS>/
+    run.json                 what each step did, with paths
+    stats/  hits.json        step 1: rules-usage report, rules with hits
+    capture/  nsx_*_export/  step 2: source capture and the exports the bundle tools read
+    infra/  hits/            step 2: the two bundles (push reports and revert baselines land inside)
+    logs/                    each script's log, one log per tool, logs/tools/ for tool logs
+```
+
 Step 1 starts a run; steps 2 to 4 and `revert.py` use the newest run for the
-same source and target (or `--run <folder>`).
+same source and target under `$RUNS` (or `--run <folder>`).
 
 PowerShell variant (nsx-ws1): [RUNBOOK_CRITICAL_RULES_PS.md](RUNBOOK_CRITICAL_RULES_PS.md).
 
@@ -61,19 +71,24 @@ PowerShell variant (nsx-ws1): [RUNBOOK_CRITICAL_RULES_PS.md](RUNBOOK_CRITICAL_RU
 ## Setup
 
 ```bash
-cd ~/dev/nsx_scripts
-source .venv/bin/activate
-export PYTHONPATH="$PWD/app"
-export NSX_LOG_DIR="$PWD/nsx_logs"
+REPO=~/dev/nsx_scripts               # the toolkit checkout
+RUNS="$REPO/nsx_critical_runs"       # where every run is stored (any folder)
+SRC=nsx-lm2                          # read only
+TGT=nsx-lm3                          # new, empty manager
 
-SRC=nsx-lm2      # read only
-TGT=nsx-lm3      # new, empty manager
+cd "$REPO"
+source .venv/bin/activate
+export PYTHONPATH="$REPO/app"
+export NSX_LOG_DIR="$REPO/nsx_logs"
 ```
+
+Instead of `--runs-dir` on every command you can `export NSX_CRITICAL_RUNS_DIR="$RUNS"`;
+the commands below pass it explicitly so it is visible.
 
 ## Step 1 - Gather hit stats
 
 ```bash
-python tools/nsx/critical_rules/step1_stats.py --source $SRC --target $TGT
+python tools/nsx/critical_rules/step1_stats.py --source $SRC --target $TGT --runs-dir "$RUNS"
 ```
 
 Lists every rule with hits. The Application rules in the list are the ones
@@ -82,7 +97,7 @@ step 2 keeps.
 ## Step 2 - Pull those objects
 
 ```bash
-python tools/nsx/critical_rules/step2_pull.py --source $SRC --target $TGT
+python tools/nsx/critical_rules/step2_pull.py --source $SRC --target $TGT --runs-dir "$RUNS"
 ```
 
 Captures the source, builds the Infrastructure bundle and the hit-rules
@@ -91,13 +106,13 @@ statistics came from an API for every policy, and every `CHECK:` line about a
 DROP/REJECT (Read this first, item 4).
 
 Options: `--min-hits N` (keep rules with more than N hits), `--policy-id`,
-`--policy-name`, `--whole-categories`, `--hit-categories`, `--no-capture`.
+`--policy-name`, `--whole-categories`, `--hit-categories`.
 
 ## Step 3 - Push them to the new manager
 
 ```bash
-python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT            # dry run
-python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT --apply    # write
+python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT --runs-dir "$RUNS"            # dry run
+python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT --runs-dir "$RUNS" --apply    # write
 ```
 
 Checks the target is empty, then runs services, groups (segment references
@@ -109,7 +124,7 @@ hit-rules bundle. Stops at the first failure. Read the dry run's table
 ## Step 4 - Verify
 
 ```bash
-python tools/nsx/critical_rules/step4_verify.py --source $SRC --target $TGT
+python tools/nsx/critical_rules/step4_verify.py --source $SRC --target $TGT --runs-dir "$RUNS"
 ```
 
 Compares every object in the two bundles with the target. Expect
@@ -118,8 +133,8 @@ Compares every object in the two bundles with the target. Expect
 ## Revert
 
 ```bash
-python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT            # dry run
-python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --apply    # write
+python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --runs-dir "$RUNS"            # dry run
+python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --runs-dir "$RUNS" --apply    # write
 ```
 
 Hit-rules bundle first, then Infrastructure; rules, policies, groups,
@@ -162,4 +177,4 @@ run output are informational: a dropped flow still hits its rule.
 | Date | Source -> target | Result |
 |---|---|---|
 | 2026-10-08 | `nsx-lm1 -> nsx-lm4` (rehearsal, before the scripts) | Traffic graded PASS; kept 11 Application rules, exactly the expected set; dry run clean. Not applied |
-| 2026-10-08 | `nsx-lm2 -> nsx-lm3`, run `nsx_critical_runs/nsx-lm2_to_nsx-lm3/20261008_151911` (Mac) | Traffic graded PASS (`nsx_logs/traffic_runs/20261008_113718`). Steps 1 and 2: 9 Application rules with hits, kept set matches; step 3 dry run 2/7/2/4 and 2/17/1/9 (services/groups/policies/rules), 0 failed; step 4 expects 4 services, 22 groups, 3 policies, 13 rules. Not applied |
+| 2026-10-08 | `nsx-lm2 -> nsx-lm3`, run `nsx_critical_runs/nsx-lm2_to_nsx-lm3/20261008_151911` (Mac; folder since deleted) | Traffic graded PASS (`nsx_logs/traffic_runs/20261008_113718`). Steps 1 and 2: 9 Application rules with hits, kept set matches; step 3 dry run 2/7/2/4 and 2/17/1/9 (services/groups/policies/rules), 0 failed; step 4 expects 4 services, 22 groups, 3 policies, 13 rules. Not applied |

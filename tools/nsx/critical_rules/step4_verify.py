@@ -31,14 +31,16 @@ def main() -> int:
     p.add_argument("--source", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--target", required=True, choices=cr.LM_CHOICES)
     p.add_argument("--run", help="run folder (default: newest for this source/target)")
+    cr.add_runs_dir_arg(p)
     args = p.parse_args()
 
-    run = cr.resolve_run(args.source, args.target, args.run)
+    run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
     pull = rec.get("steps", {}).get("pull") or {}
     if not pull.get("ok"):
         raise SystemExit(f"no successful step 2 in {run}; nothing to verify against")
+    cr.use_run_environment(run)
     setup_logging("step4_verify", run / "logs")
     log.info("Run: %s", run)
 

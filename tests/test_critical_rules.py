@@ -83,6 +83,24 @@ class RunFolderTests(unittest.TestCase):
         self.assertTrue(rec["steps"]["push_dryrun"]["ok"])
         self.assertEqual([h["ok"] for h in rec["history"]], [False, True])
 
+    def test_runs_base_flag_then_env_then_repo_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {cr.RUNS_ENV: str(self.base / "from_env")}):
+            self.assertEqual(cr.runs_base(str(self.base / "from_flag")), (self.base / "from_flag").resolve())
+            self.assertEqual(cr.runs_base(None), (self.base / "from_env").resolve())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(cr.runs_base(None), cr.RUNS_BASE)
+
+    def test_next_command_carries_runs_dir(self):
+        class A:
+            source, target, runs_dir = "nsx-lm2", "nsx-lm5", "/data/runs"
+        self.assertEqual(cr.next_command("step3_push.py", A(), "--apply"),
+                         'python tools/nsx/critical_rules/step3_push.py --source nsx-lm2 --target nsx-lm5 '
+                         '--runs-dir "/data/runs" --apply')
+        A.runs_dir = None
+        self.assertEqual(cr.next_command("step4_verify.py", A()),
+                         "python tools/nsx/critical_rules/step4_verify.py --source nsx-lm2 --target nsx-lm5")
+
     def test_check_pair_refuses_other_managers(self):
         with self.assertRaises(SystemExit):
             cr.check_pair({"source": "nsx-lm1", "target": "nsx-lm4"}, "nsx-lm2", "nsx-lm3")
@@ -126,6 +144,26 @@ class BundleTests(unittest.TestCase):
         order = cr.hit_rules_order(b)
         self.assertEqual([(r["sequence"], r["action"], r["id"], r["hits"]) for r in order],
                          [(1, "ALLOW", "web_rule", 33), (2, "DROP", "seed-logged-drop", 15)])
+
+
+class FlatExportTests(unittest.TestCase):
+    def test_emit_flat_exports_copies_trees_and_injects_parent_policy_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            cap = Path(d) / "capture" / "nsx_export" / "h" / "domains" / "default"
+            _yaml(cap / "groups" / "g1.yaml", {"id": "g1"})
+            _yaml(cap / "services" / "s1.yaml", {"id": "s1"})
+            _yaml(cap / "security-policies" / "Start-x" / "policy.yaml", {"id": "Start_Policy"})
+            _yaml(cap / "security-policies" / "Start-x" / "rules" / "0001_r.yaml",
+                  {"id": "r", "parent_path": "/infra/domains/default/security-policies/Start_Policy"})
+            run = Path(d) / "run"
+            counts = cr.emit_flat_exports(Path(d) / "capture", "h", run)
+            self.assertEqual(counts["nsx_groups_export"], 1)
+            rule = yaml.safe_load((run / "nsx_rules_export/h/security-policies/Start-x/rules/0001_r.yaml").read_text())
+            self.assertEqual(rule["_parent_policy_id"], "Start_Policy")
+            pol = yaml.safe_load((run / "nsx_policies_export/h/security-policies/Start-x/rules/0001_r.yaml").read_text())
+            self.assertNotIn("_parent_policy_id", pol)   # only the rules tree gets the field
+            with self.assertRaises(SystemExit):           # never overwrites an existing export
+                cr.emit_flat_exports(Path(d) / "capture", "h", run)
 
 
 class CompareTests(unittest.TestCase):
