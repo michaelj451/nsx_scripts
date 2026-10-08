@@ -32,6 +32,7 @@ a matching revert.
 | **D** Prod remap-to-siblings | [RUNBOOK_D.md](nsx/RUNBOOK_D.md) | [cmds](nsx/RUNBOOK_D_COMMANDS.md) | [ps](nsx/RUNBOOK_D_COMMANDS_PS.md) | Production-grade WF-C: land IP-only siblings in place on a live manager |
 | Single-capture clone + WF-D | [RUNBOOK_FROM_CAPTURE.md](nsx/RUNBOOK_FROM_CAPTURE.md) | included | [ps](nsx/RUNBOOK_FROM_CAPTURE_PS.md) | One capture, then run everything else off it |
 | Selective category copy | [RUNBOOK_FILTER_COPY.md](nsx/RUNBOOK_FILTER_COPY.md) | included | [ps](nsx/RUNBOOK_FILTER_COPY_PS.md) | Copy chosen DFW policies plus only their transitive dependencies |
+| Critical rules copy | [RUNBOOK_CRITICAL_RULES.md](nsx/RUNBOOK_CRITICAL_RULES.md) | included | [ps](nsx/RUNBOOK_CRITICAL_RULES_PS.md) | One script per step in `tools/nsx/critical_rules/`: gather hit stats on the source, pull every Infrastructure policy whole plus only the Application rules with hits (into one new policy, busiest first), push them to a new, empty manager, verify, revert. Lab test traffic in its appendix |
 | Services only | [RUNBOOK_SERVICES.md](nsx/RUNBOOK_SERVICES.md) | included | included | Export / push / revert customer services alone |
 | GM to LM copy | `tools/nsx/transform_gm_export_to_lm.py` | tool docstring | n/a | Rewrite a Global Manager export's `/global-infra/` refs (and optionally the domain) so the standard Workflow A pushes land it on a Local Manager |
 | **AVS** Federation teardown | [RUNBOOK_AVS.md](nsx/RUNBOOK_AVS.md) | included | n/a | End-to-end GM to LM to target with tag groups decomposed to IP-only siblings, for a destination with no matching VM inventory or tag scheme. Read the two failure modes first: a capture without `--live-query` and any powered-off VM both silently drop IPs |
@@ -110,6 +111,7 @@ everything under `tools/test/` lives in [`docs/tools/test/`](tools/test/).
 |---|---|
 | [README-TEST.md](tools/test/README-TEST.md) | Load-test scaffolding under `tools/test/` for exercising the NSX tools at scale |
 | [RUNBOOK_WIPE.md](tools/test/RUNBOOK_WIPE.md) | `wipe_target_manager.py`: delete customer DFW objects in dependency order. Full wipe, or `--id-prefix` to clear one family of test objects while leaving the Default sections (and their NDP/DHCP rules) alone. Back up first: there is no paired revert |
+| [RUNBOOK_CRITICAL_RULES.md, step 3](nsx/RUNBOOK_CRITICAL_RULES.md#step-3---lab-only-generate-and-grade-test-traffic) | `predict_dfw_hits.py`: offline first-match model of which rule a flow hits on a manager. `generate_lab_traffic.py`: run a YAML flow plan from the Mac, aidev or lab VMs, then grade a rules-usage diff against it. Plans in `tools/test/traffic_plans/` |
 
 Unit tests for the remap / audit / backup / Panorama code live in
 [`tests/`](../tests/): `python -m unittest discover tests`.

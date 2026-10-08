@@ -60,6 +60,8 @@ nsx_filtered_bundle/
 # Migration requests and their runs (tools/multisite/migration_request.py)
 migration_requests/
 nsx_wipe_bundle/
+# Critical-rules copy runs (tools/nsx/critical_rules/)
+nsx_critical_runs/
 nsx_fabric_capture/
 nsx_health_backup/
 

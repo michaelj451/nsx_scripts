@@ -4,27 +4,28 @@
 Generate lab traffic from a YAML flow plan so chosen DFW rules collect hits,
 then check the rules-usage diff against the plan's expectations.
 
-Lab test tool only. It never talks to NSX: traffic goes from the Mac, from
-aidev, or from lab VMs over SSH (key auth; lm1/lm2 VMs through a jump host,
-because their DFW drops SSH from the Mac). Hit counts are read separately
-with tools/reports/report_rules_usage.py.
+Lab test tool only. Traffic goes from the Mac, from aidev, or from lab VMs
+over SSH (key auth; lm1/lm2 VMs through a jump host, because their DFW drops
+SSH from the Mac). Hit counts come from tools/reports/report_rules_usage.py
+(read-only GETs against the plan's `manager`).
 
-Three modes:
-  (default)  list the plan: every flow, where it runs from, the command, and
-             the rule it should hit. Sends nothing.
-  --run      send the traffic and write a run record.
-  --check    read a rules-usage diff.json (report run with --compare-to a
-             report taken before the traffic) and grade it: every expected
-             rule must have new hits, every rule under `cold:` must have none.
+Modes:
+  (default)      list the plan: every flow, where it runs from, the command,
+                 and the rule it should hit. Sends nothing.
+  --run          send the traffic and write a run record.
+  --run --grade  the whole cycle in one command: take a rules-usage report
+                 before, send, re-run the report every --poll-seconds until
+                 every expected rule has new hits (or --wait-minutes passes;
+                 NSX counters lag 5 to 30 minutes), then grade. Exit 0 on PASS.
+  --check        grade a rules-usage diff.json you produced yourself (report
+                 run with --compare-to a report taken before the traffic):
+                 every expected rule must have new hits, every rule under
+                 `cold:` must have none.
 
 USAGE:
-    P=tools/test/traffic_plans/lm1_hit_subset.yaml
-    python tools/reports/report_rules_usage.py --target nsx-lm1          # before
+    P=tools/test/traffic_plans/lm2_hit_subset.yaml
     python tools/test/generate_lab_traffic.py --plan $P                  # list
-    python tools/test/generate_lab_traffic.py --plan $P --run            # send
-    # wait until the counters move (20-30 min on lm1), then:
-    python tools/reports/report_rules_usage.py --target nsx-lm1 --compare-to <before dir>
-    python tools/test/generate_lab_traffic.py --plan $P --check <after dir>/diff.json
+    python tools/test/generate_lab_traffic.py --plan $P --run --grade    # send, wait, grade
 
 PLAN FORMAT: see tools/test/traffic_plans/lm1_hit_subset.yaml. Actions:
     ping      dst, count
@@ -41,7 +42,9 @@ PLAN FORMAT: see tools/test/traffic_plans/lm1_hit_subset.yaml. Actions:
 OUTPUT (with --run):
     $NSX_LOG_DIR/traffic_runs/<UTC_TS>/run.json   per-flow command, exit code,
                                                   output tail, start/end UTC
+                                                  (and the grade, with --grade)
     $NSX_LOG_DIR/traffic_runs/<UTC_TS>/logs/
+    $NSX_LOG_DIR/traffic_runs/<UTC_TS>/reports/   rules-usage reports (--grade)
 """
 from __future__ import annotations
 
@@ -52,6 +55,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -186,12 +190,17 @@ def run_plan(plan: Dict[str, Any], only: Optional[set]) -> List[Dict[str, Any]]:
 # Check
 # =============================================================================
 
-def check(plan: Dict[str, Any], diff_path: Path) -> int:
+def _deltas(diff_path: Path) -> Tuple[Dict[str, Any], Dict[str, Optional[int]]]:
     doc = json.loads(diff_path.read_text(encoding="utf-8"))
     delta: Dict[str, Optional[int]] = {}
     for t in doc.get("transitions") or []:
         d = t.get("hit_count_delta")
         delta[t["rule_id"]] = (delta.get(t["rule_id"]) or 0) + (d or 0)
+    return doc, delta
+
+
+def check(plan: Dict[str, Any], diff_path: Path) -> int:
+    doc, delta = _deltas(diff_path)
     expected = sorted({f["expect"] for f in plan["flows"]})
     cold = sorted(set(plan.get("cold") or []))
     failures = 0
@@ -218,6 +227,45 @@ def check(plan: Dict[str, Any], diff_path: Path) -> int:
 
 
 # =============================================================================
+# Grade (--run --grade)
+# =============================================================================
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _report(manager: str, out: Path, compare_to: Optional[Path] = None) -> Path:
+    """Run the read-only rules-usage report into `out` and return its folder."""
+    cmd = [sys.executable, str(REPO_ROOT / "tools/reports/report_rules_usage.py"),
+           "--target", manager, "--include-defaults", "--output-base", str(out)]
+    if compare_to:
+        cmd += ["--compare-to", str(compare_to)]
+    before = set(out.glob("*/rules_usage/*"))
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    new = sorted(set(out.glob("*/rules_usage/*")) - before)
+    if proc.returncode != 0 or not new:
+        raise SystemExit(f"rules-usage report failed (exit {proc.returncode}): {proc.stderr[-400:]}")
+    return new[-1]
+
+
+def grade(plan: Dict[str, Any], out_dir: Path, before: Path,
+          poll_seconds: int, wait_minutes: int) -> Tuple[int, Path]:
+    """Re-run the report until every expected rule moved, then grade it."""
+    manager = plan["manager"]
+    expected = {f["expect"] for f in plan["flows"]}
+    deadline = time.time() + wait_minutes * 60
+    while True:
+        after = _report(manager, out_dir / "reports", compare_to=before)
+        _, delta = _deltas(after / "diff.json")
+        waiting = sorted(r for r in expected if not (delta.get(r) or 0) > 0)
+        if not waiting or time.time() >= deadline:
+            break
+        log.info("  counters not there yet for %s; next look in %ds", waiting, poll_seconds)
+        time.sleep(poll_seconds)
+    print()
+    return check(plan, after / "diff.json"), after
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -226,6 +274,7 @@ def _setup_logging(log_dir: Optional[Path]) -> None:
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s UTC [%(levelname)s] %(message)s",
                             "%Y-%m-%dT%H:%M:%S")
+    fmt.converter = time.gmtime
     handlers: List[logging.Handler] = [logging.StreamHandler()]
     if log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -243,6 +292,12 @@ def main() -> int:
     mode.add_argument("--run", action="store_true", help="send the traffic")
     mode.add_argument("--check", type=Path, metavar="DIFF_JSON",
                       help="grade a rules-usage diff.json against the plan")
+    p.add_argument("--grade", action="store_true",
+                   help="with --run: report before, send, wait for the counters, grade")
+    p.add_argument("--poll-seconds", type=int, default=120,
+                   help="with --grade: seconds between report runs (default 120)")
+    p.add_argument("--wait-minutes", type=int, default=45,
+                   help="with --grade: give up waiting after this long (default 45)")
     p.add_argument("--only", default="",
                    help="comma-separated flow ids to run (default: all)")
     p.add_argument("--output-base", type=Path, default=None,
@@ -251,6 +306,10 @@ def main() -> int:
     args = p.parse_args()
 
     plan = load_plan(args.plan)
+    if args.grade and not args.run:
+        raise SystemExit("--grade goes with --run")
+    if args.grade and not plan.get("manager"):
+        raise SystemExit("--grade needs `manager:` in the plan")
 
     if args.check:
         _setup_logging(None)
@@ -275,16 +334,28 @@ def main() -> int:
     _setup_logging(out_dir / "logs")
     only = {x.strip() for x in args.only.split(",") if x.strip()} or None
     log.info("Traffic run %s, plan %s (%s)", ts, args.plan, plan.get("manager"))
+    before = None
+    if args.grade:
+        log.info("Rules-usage report before the traffic (%s) ...", plan["manager"])
+        before = _report(plan["manager"], out_dir / "reports")
+        log.info("  before: %s", before)
     started = datetime.now(timezone.utc).isoformat()
     records = run_plan(plan, only)
     run = {"plan": str(args.plan.resolve()), "manager": plan.get("manager"),
            "started_at": started, "finished_at": datetime.now(timezone.utc).isoformat(),
-           "flows": records, "cold": plan.get("cold") or []}
+           "flows": records, "cold": plan.get("cold") or [],
+           "before_report": str(before) if before else None}
     (out_dir / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
     log.info("Run record: %s", out_dir / "run.json")
-    log.info("Next: wait for the counters to move, then report_rules_usage.py "
-             "--compare-to <before report dir> and --check its diff.json")
-    return 0
+    if not args.grade:
+        log.info("Next: wait for the counters to move, then report_rules_usage.py "
+                 "--compare-to <before report dir> and --check its diff.json")
+        return 0
+    log.info("Waiting for the counters (every %ds, up to %d min) ...", args.poll_seconds, args.wait_minutes)
+    rc, after = grade(plan, out_dir, before, args.poll_seconds, args.wait_minutes)
+    run.update({"after_report": str(after), "graded": "PASS" if rc == 0 else "FAIL"})
+    (out_dir / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+    return rc
 
 
 if __name__ == "__main__":
