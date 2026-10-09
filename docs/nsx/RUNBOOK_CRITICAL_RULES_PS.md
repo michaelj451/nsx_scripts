@@ -11,10 +11,15 @@ new, empty one. One script per step, under `tools/nsx/critical_rules/`:
 | 4. Verify | `step4_verify.py` | target, read only |
 | Undo step 3 | `revert.py` | target; dry run unless `--apply` |
 
-Infrastructure policies are copied whole; Application rules with hits go
-into one new policy, `critical-rules`, busiest first; every group and
-service they need comes along. The target must already be empty; step 3
-checks that.
+Policies and rules are copied exactly as they are on the source (same ids,
+names, sequence numbers, settings; nothing renamed, merged or reordered). All
+Infrastructure policies with every rule; every Application policy that holds
+at least one active (hot) rule, with only its hot rules; every group and
+service they need. NSX's system defaults
+are never copied: the Default Layer2/Layer3 sections and their rules, built-in
+groups and services, anything `is_default`, `_system_owned` or created by NSX
+itself. Step 2 enforces both and stops if either fails. The target must
+already be empty; step 3 checks that.
 
 Every run lives under `$RUNS` (set in Setup; any folder you choose), in
 `$RUNS/<source>_to_<target>/<UTC_TS>/`, and everything it produces stays there:
@@ -26,9 +31,9 @@ same source and target under `$RUNS` (or `--run <folder>`).
 Bash variant, with the background ("Read this first"):
 [RUNBOOK_CRITICAL_RULES.md](RUNBOOK_CRITICAL_RULES.md). Read it before a first
 run. In short: lab hit counts are thin and lag 5 to 30 minutes; NSX 3.2.x
-statistics fall back to the older firewall API; the new policy reorders rules
-by hit count, so check every DROP/REJECT step 2 flags; `_np_ips` siblings copy
-stale port bindings as is.
+statistics fall back to the older firewall API; DROP/REJECT rules with no hits
+are not copied, so check every one step 2 flags with `CHECK:`; `_np_ips`
+siblings copy stale port bindings as is.
 
 ---
 
@@ -67,8 +72,11 @@ python tools/nsx/critical_rules/step1_stats.py --source $SRC --target $TGT --run
 python tools/nsx/critical_rules/step2_pull.py --source $SRC --target $TGT --runs-dir "$RUNS"
 ```
 
-Check: `kept rules match step 1`, statistics came from an API for every
-policy, and every `CHECK:` line about a DROP/REJECT in the new order.
+Check: `Infrastructure copied whole: all N policies`, `Hot rules copied: N of
+N`, `System defaults in the bundles: none`, and every `CHECK:` line about a
+DROP/REJECT rule not copied. Step 2 stops with `STOP:` if an Infrastructure
+policy or rule is missing, a hot rule is missing, or a system default got into
+a bundle.
 
 ## Step 3 - Push them to the new manager
 

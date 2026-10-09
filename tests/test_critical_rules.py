@@ -138,12 +138,6 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(want["rules"], {"seed-policy-infra/seed-infra-dns", "critical-rules/web_rule",
                                          "critical-rules/seed-logged-drop"})
 
-    def test_hit_rules_order_reports_actions_and_hits(self):
-        b = make_bundle(self.root, "20261008_141530", "h", "critical-rules",
-                        [("web_rule", "ALLOW", 33), ("seed-logged-drop", "DROP", 15)], [], [])
-        order = cr.hit_rules_order(b)
-        self.assertEqual([(r["sequence"], r["action"], r["id"], r["hits"]) for r in order],
-                         [(1, "ALLOW", "web_rule", 33), (2, "DROP", "seed-logged-drop", 15)])
 
 
 class FlatExportTests(unittest.TestCase):
@@ -164,6 +158,61 @@ class FlatExportTests(unittest.TestCase):
             self.assertNotIn("_parent_policy_id", pol)   # only the rules tree gets the field
             with self.assertRaises(SystemExit):           # never overwrites an existing export
                 cr.emit_flat_exports(Path(d) / "capture", "h", run)
+
+
+class SystemDefaultTests(unittest.TestCase):
+    def test_is_system_default(self):
+        self.assertTrue(cr.is_system_default({"id": "default-layer3-section", "is_default": True,
+                                              "_system_owned": False, "_create_user": "system"}))
+        self.assertTrue(cr.is_system_default({"id": "HTTP", "_system_owned": True}))
+        self.assertTrue(cr.is_system_default({"id": "x", "_create_user": "system"}))   # NSX-created, unflagged
+        self.assertFalse(cr.is_system_default({"id": "seed-policy-infra", "is_default": False,
+                                               "_system_owned": False, "_create_user": "admin"}))
+
+    def test_system_defaults_in_bundle(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = make_bundle(Path(d), "20261008_141528", "h", "p", [("r1", "ALLOW", 0)], ["g1"], ["s1"])
+            self.assertEqual(cr.system_defaults_in_bundle(b), [])
+            _yaml(b / "groups/groups/sysg.yaml", {"id": "sysg", "_create_user": "system"})
+            _yaml(b / "policies/security-policies/default-layer3-section/policy.yaml",
+                  {"id": "default-layer3-section", "is_default": True})
+            self.assertEqual(sorted(cr.system_defaults_in_bundle(b)),
+                             ["group sysg", "policy default-layer3-section"])
+
+    def _source(self, d: Path) -> Path:
+        run = Path(d)
+        for pid, cat, flags, rules in (
+                ("seed-policy-infra", "Infrastructure", {"_create_user": "admin"}, ["a", "b"]),
+                ("test-infrastructure-policy", "Infrastructure", {}, ["c"]),
+                ("default-layer3-section", "Application", {"is_default": True, "_create_user": "system"}, ["d"])):
+            _yaml(run / "nsx_policies_export/h/security-policies" / pid / "policy.yaml",
+                  {"id": pid, "category": cat, **flags})
+            for r in rules:
+                _yaml(run / "nsx_rules_export/h/security-policies" / pid / "rules" / f"{r}.yaml", {"id": r})
+        return run
+
+    def test_source_policies_marks_system_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = {p["id"]: p for p in cr.source_policies(self._source(Path(d)), "h")}
+            self.assertTrue(src["default-layer3-section"]["system_default"])
+            self.assertFalse(src["seed-policy-infra"]["system_default"])
+            self.assertEqual(src["seed-policy-infra"]["rules"], ["a", "b"])
+
+    def test_whole_category_gaps(self):
+        with tempfile.TemporaryDirectory() as d:
+            sources = cr.source_policies(self._source(Path(d) / "run"), "h")
+            full = Path(d) / "full"
+            make_bundle(full, "20261008_141528", "h", "seed-policy-infra",
+                        [("a", "ALLOW", 0), ("b", "ALLOW", 0)], [], [])
+            _yaml(full / "20261008_141528/h/policies/security-policies/test-infrastructure-policy/policy.yaml",
+                  {"id": "test-infrastructure-policy"})
+            _yaml(full / "20261008_141528/h/rules/security-policies/test-infrastructure-policy/rules/0001_c.yaml",
+                  {"id": "c", "parent_path": "/infra/domains/default/security-policies/test-infrastructure-policy"})
+            self.assertEqual(cr.whole_category_gaps(sources, {"Infrastructure"}, full / "20261008_141528/h"), [])
+            part = Path(d) / "part"
+            make_bundle(part, "20261008_141528", "h", "seed-policy-infra", [("a", "ALLOW", 0)], [], [])
+            self.assertEqual(cr.whole_category_gaps(sources, {"Infrastructure"}, part / "20261008_141528/h"),
+                             ["rule seed-policy-infra/b", "policy test-infrastructure-policy"])
 
 
 class CompareTests(unittest.TestCase):
@@ -189,7 +238,8 @@ class CompareTests(unittest.TestCase):
                 return [{"id": "HTTP", "_system_owned": True}, {"id": "s1"}]
 
             def list_groups(self, domain_id):
-                return [{"id": "sys", "_system_owned": True}, {"id": "g1"}]
+                return [{"id": "sys", "_system_owned": True}, {"id": "nsxmade", "_create_user": "system"},
+                        {"id": "g1"}]
 
             def list_security_rules(self, security_policy_id, domain_id):
                 return [{"id": "r1"}] if security_policy_id == "p" else [{"id": "default-layer3-rule"}]
@@ -247,6 +297,90 @@ class HitRowsTests(unittest.TestCase):
             (Path(d) / "rules_usage.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
             got = [(r["policy_id"], r["rule_id"]) for r in cr.hit_rows(Path(d))]
             self.assertEqual(got, [("Start_Policy", "web_rule"), ("seed-policy-infra", "seed-infra-dns")])
+
+
+def make_exports(root: Path, host: str = "h") -> Path:
+    """A small flat export: two Application policies, one Infrastructure, one default section."""
+    G = "/infra/domains/default/groups/"
+    P = "/infra/domains/default/security-policies/"
+    def pol(slug, pid, cat, seq, rules, **extra):
+        _yaml(root / f"nsx_policies_export/{host}/security-policies/{slug}/policy.yaml",
+              {"id": pid, "display_name": extra.pop("display", pid), "path": P + pid, "category": cat,
+               "sequence_number": seq, **extra})
+        _yaml(root / f"nsx_policies_export/{host}/security-policies/{slug}/rules_order.yaml",
+              {"policy": pid, "rules": [r["id"] for r in rules]})
+        for i, r in enumerate(rules, start=1):
+            _yaml(root / f"nsx_rules_export/{host}/security-policies/{slug}/rules/{i:04d}_{r['id']}.yaml",
+                  {"parent_path": P + pid, "_parent_policy_id": pid, "services": ["ANY"], **r})
+    pol("Start-x", "Start_Policy", "Application", 2, [
+        {"id": "web_rule", "sequence_number": 32, "action": "ALLOW", "source_groups": [G + "hw"],
+         "destination_groups": [G + "vm1"], "services": ["/infra/services/web"]},
+        {"id": "cold_drop", "sequence_number": 5, "action": "DROP", "source_groups": [G + "only-cold"],
+         "destination_groups": ["ANY"]},
+        {"id": "ssh", "sequence_number": 17, "action": "ALLOW", "source_groups": [G + "hw"],
+         "destination_groups": ["ANY"]},
+    ], display="test-policy-1", scope=[G + "policy-scope"])
+    pol("test-x", "test-policy-2", "Application", 5, [
+        {"id": "special", "sequence_number": 10, "action": "REJECT", "source_groups": ["ANY"],
+         "destination_groups": ["ANY"]}])
+    pol("infra-x", "seed-policy-infra", "Infrastructure", 20, [
+        {"id": "dns", "sequence_number": 10, "action": "ALLOW", "source_groups": ["ANY"],
+         "destination_groups": [G + "mgmt"]}])
+    pol("defau-x", "default-layer3-section", "Application", 2147483647, [
+        {"id": "default-layer3-rule", "sequence_number": 2147483647, "action": "DROP", "is_default": True}],
+        is_default=True, _create_user="system")
+    for gid, expr in (("hw", []), ("vm1", [{"resource_type": "PathExpression", "paths": [G + "nested"]}]),
+                      ("nested", []), ("only-cold", []), ("mgmt", []), ("policy-scope", [])):
+        _yaml(root / f"nsx_groups_export/{host}/groups/{gid}.yaml", {"id": gid, "path": G + gid, "expression": expr})
+    _yaml(root / f"nsx_services_export/{host}/services/web.yaml", {"id": "web", "path": "/infra/services/web"})
+    return root
+
+
+class BuildBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = make_exports(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_hot_only_keeps_original_policies_and_rules_exactly(self):
+        hot = {("Start_Policy", "web_rule"), ("Start_Policy", "ssh")}
+        b = cr.build_bundle(self.root, "h", self.root / "hits", {"Application"}, hot=hot)
+        src_pol = self.root / "nsx_policies_export/h/security-policies/Start-x/policy.yaml"
+        self.assertEqual((b / "policies/security-policies/Start-x/policy.yaml").read_bytes(), src_pol.read_bytes())
+        self.assertEqual((b / "rules/security-policies/Start-x/policy.yaml").read_bytes(), src_pol.read_bytes())
+        copied = sorted(f.name for f in (b / "rules/security-policies/Start-x/rules").glob("*.yaml"))
+        self.assertEqual(copied, ["0001_web_rule.yaml", "0003_ssh.yaml"])
+        src_rule = self.root / "nsx_rules_export/h/security-policies/Start-x/rules/0001_web_rule.yaml"
+        self.assertEqual((b / "rules/security-policies/Start-x/rules/0001_web_rule.yaml").read_bytes(),
+                         src_rule.read_bytes())
+        order = yaml.safe_load((b / "rules/security-policies/Start-x/rules_order.yaml").read_text())
+        self.assertEqual(order, {"policy": "Start_Policy", "rules": ["ssh", "web_rule"]})   # by sequence
+        m = json.loads((b / "manifest.json").read_text())
+        self.assertEqual([p["id"] for p in m["policies"]], ["Start_Policy"])
+        self.assertEqual(m["policies"][0]["display_name"], "test-policy-1")
+        self.assertEqual([r["id"] for r in m["policies"][0]["not_copied"]], ["cold_drop"])
+        skipped = {s["policy"]: s for s in m["skipped_policies"]}
+        self.assertEqual(skipped["test-policy-2"]["reason"], "no hot rules")
+        self.assertEqual(skipped["test-policy-2"]["rules"][0]["action"], "REJECT")
+        self.assertEqual(skipped["default-layer3-section"]["reason"], "system default")
+        groups = {g.rsplit("/", 1)[-1] for g in m["groups"]}
+        self.assertEqual(groups, {"hw", "vm1", "nested", "policy-scope"})   # not only-cold
+        self.assertEqual(m["services"], ["/infra/services/web"])
+
+    def test_whole_copies_every_rule(self):
+        b = cr.build_bundle(self.root, "h", self.root / "infra", {"Infrastructure"})
+        m = json.loads((b / "manifest.json").read_text())
+        self.assertEqual([(p["id"], [r["id"] for r in p["rules"]]) for p in m["policies"]],
+                         [("seed-policy-infra", ["dns"])])
+        self.assertEqual(cr.system_defaults_in_bundle(b), [])
+        self.assertEqual([g.rsplit("/", 1)[-1] for g in m["groups"]], ["mgmt"])
+
+    def test_two_bundles_never_share_a_folder(self):
+        a = cr.build_bundle(self.root, "h", self.root / "out", {"Infrastructure"})
+        b = cr.build_bundle(self.root, "h", self.root / "out", {"Infrastructure"})
+        self.assertNotEqual(a, b)
 
 
 if __name__ == "__main__":

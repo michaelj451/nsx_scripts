@@ -68,10 +68,13 @@ commands that reach Panorama take `--no-tls-verify`.
 
 ## 1) Request
 
-Put the servers in a file, one per line:
+The servers go in **`migration_request_servers.txt`** at the repository root,
+one per line. The file is tracked in git, so its history shows what was
+requested and when. `request` reads it whenever no servers are given on the
+command line.
 
 ```text
-# wave 1, ticket REQ-1234
+# wave 1, REQ-1234
 ubuntu22-speedtest-10.6.0.101-ax2001
 10.6.2.102
 ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102
@@ -82,16 +85,24 @@ Workflow D sibling and its Palo address object have nothing to work with.
 
 ```bash
 mr request --source nsx-lm1 --destination nsx-lm3 --device-group dg-4 \
-  --no-tls-verify --name "wave 1" --server-list servers_wave1.txt
+  --no-tls-verify --name "wave 1"
 
 R=migration_requests/nsx-lm1_to_nsx-lm3/latest
 open $R/request.md
 ```
 
-`--servers "name1,10.6.0.101"` works too: every comma-separated token is its
-own server. The run takes a minute or two: two read-only captures of the
-source, the builds, then dry runs against the destination, the source and
-Panorama. Exit code 1 means the request lists errors (top of the report).
+Each request keeps its own copy of the list (`servers.txt`), and
+`request.json` records the tracked file's sha256, so a later edit to the
+file never changes an existing request. The report names the list it came
+from near the top.
+
+Other ways to give servers: `--server-list FILE` reads another file in the
+same format, and `--servers "name1,10.6.0.101"` takes them on the command
+line, where every comma-separated token is its own server. With either, the
+tracked file is not read unless it is the file named. The run takes a
+minute or two: two read-only captures of the source, the builds, then dry
+runs against the destination, the source and Panorama. Exit code 1 means
+the request lists errors (top of the report).
 
 Useful options:
 
@@ -208,7 +219,7 @@ the apply would be removed too (pending item in STATUS.md).
 
 ```text
 migration_requests/<source>_to_<destination>/<UTC_TS>/
-  request.md  request.json  servers.txt  approval.json
+  request.md  request.json  servers.txt (copy of the list used)  approval.json
   source/capture/          source capture (capture_nsx_state.py, effective IPs)
   source/vm_rules/         VM-rule snapshot (capture_vm_rule_data.py)
   bundle/                  Workflow A bundle, plus c_input/ and d_input/

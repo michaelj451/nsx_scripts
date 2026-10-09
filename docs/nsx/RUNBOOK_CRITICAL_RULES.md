@@ -1,23 +1,35 @@
 # Runbook - Critical rules copy (rules with hits) (macOS / Linux / bash)
 
 Copy only the firewall rules that matter from one NSX Local Manager to a
-new, empty one. One script per step, under `tools/nsx/critical_rules/`:
+new, empty one, **exactly as they are on the source**: same policy and rule
+ids, names, sequence numbers and settings. Nothing is renamed, merged or
+reordered. One script per step, under `tools/nsx/critical_rules/`:
 
 | Step | Script | Touches |
 |---|---|---|
 | 1. Gather hit stats | `step1_stats.py` | source, read only |
-| 2. Pull those objects | `step2_pull.py` | source, read only; writes two bundles locally |
+| 2. Pull those objects | `step2_pull.py` | source, read only; writes the two bundles into the run |
 | 3. Push them to the new manager | `step3_push.py` | target; dry run unless `--apply` |
 | 4. Verify | `step4_verify.py` | target, read only |
 | Undo step 3 | `revert.py` | target; dry run unless `--apply` |
 
 What gets copied:
 
-- every **Infrastructure** policy, whole, with its rules in their original order;
-- every **Application** rule that has **hits**, collected into **one new
-  policy** (`critical-rules`), busiest rule first;
-- every group and service those rules need (nested ones too, and the
-  `_np_ips` siblings a rule references).
+- **all Infrastructure** policies, with every rule, hits or not;
+- every **Application** policy that holds at least one **active (hot)** rule,
+  with **only its hot rules** (hit count above `--min-hits`, default 0). Cold
+  rules are left out; a policy with no hot rule is not copied at all;
+- every group and service those rules need (nested ones too, a policy's own
+  Applied To, and the `_np_ips` siblings a rule references).
+
+Each kept policy and rule is the source's own export file, copied unchanged.
+
+Never copied: **NSX's system defaults**, meaning the Default Layer2/Layer3
+sections and their rules (including NSX's own NDP/DHCP rules), built-in
+groups and services, and anything else marked `is_default` or
+`_system_owned`, or created by NSX itself (`_create_user: system`). The
+default sections are not marked `_system_owned`, so all three markers are
+checked. Step 2 enforces both rules and stops if either fails.
 
 The target must already be empty (only NSX's two default sections); step 3
 checks that and refuses to apply otherwise.
@@ -49,15 +61,17 @@ PowerShell variant (nsx-ws1): [RUNBOOK_CRITICAL_RULES_PS.md](RUNBOOK_CRITICAL_RU
    rules show 0; [Appendix A](#appendix-a---lab-only-test-traffic) generates
    known traffic. Your own SSH and pings into the lab VMs count too.
 2. **NSX 3.2.x answers rule statistics with HTTP 500** on the Policy API, even
-   for local policies. The report and the consolidator fall back to the older
-   firewall API; if a policy that has rules gets no counters from either API,
-   step 2 stops instead of treating its rules as unused.
+   for local policies. Step 1's report falls back to the older firewall API.
+   Step 2 takes the hot rules from step 1's report, so what step 1 lists is
+   exactly what is copied.
 3. **Counters lag 5 to 30 minutes.** An ALLOW rule counts sessions; a DROP
    rule counts packets. Traffic between two VMs on the same manager is counted
    at both VMs.
-4. **The new policy changes rule order.** Step 2 prints the new order with each
-   rule's action and flags every DROP/REJECT; compare each one with the ALLOW
-   rules below it before step 3.
+4. **Leaving out cold rules changes what the target does for traffic nobody
+   has sent yet.** A DROP or REJECT rule with no hits is not copied, so traffic
+   it would have blocked reaches the next rule (or the target's default rule)
+   instead. Step 2 lists every such rule with a `CHECK:` line; decide on each
+   before step 3.
 5. **Stale port bindings.** NSX keeps old IPs on a VM port long after the VM
    changed address, and `_np_ips` siblings copy them as literal IPs. Decision
    2026-10-08: copy as is.
@@ -91,8 +105,8 @@ the commands below pass it explicitly so it is visible.
 python tools/nsx/critical_rules/step1_stats.py --source $SRC --target $TGT --runs-dir "$RUNS"
 ```
 
-Lists every rule with hits. The Application rules in the list are the ones
-step 2 keeps.
+Lists every rule with hits. The Application rules in the list are the hot
+rules step 2 copies.
 
 ## Step 2 - Pull those objects
 
@@ -100,13 +114,21 @@ step 2 keeps.
 python tools/nsx/critical_rules/step2_pull.py --source $SRC --target $TGT --runs-dir "$RUNS"
 ```
 
-Captures the source, builds the Infrastructure bundle and the hit-rules
-bundle, and prints the new policy's rule order. Check: `kept rules match step 1`,
-statistics came from an API for every policy, and every `CHECK:` line about a
-DROP/REJECT (Read this first, item 4).
+Captures the source, builds the Infrastructure bundle (every rule) and the
+Application bundle (hot rules only), and prints every policy as it will land:
+id, display name, sequence number, and each rule with its sequence number,
+action and hits, plus the rules and policies not copied. Check:
 
-Options: `--min-hits N` (keep rules with more than N hits), `--policy-id`,
-`--policy-name`, `--whole-categories`, `--hit-categories`.
+- `Infrastructure copied whole: all N policies`
+- `Hot rules copied: N of N`
+- `System defaults in the bundles: none` (the ones left out are listed)
+- every `CHECK:` line about a DROP/REJECT rule not copied (Read this first, item 4)
+
+It stops with `STOP:` if an Infrastructure policy or rule is missing, a hot
+rule is missing, or a system default got into a bundle.
+
+Options: `--min-hits N` (a rule is hot when it has more than N hits),
+`--whole-categories`, `--hit-categories`.
 
 ## Step 3 - Push them to the new manager
 
@@ -177,4 +199,4 @@ run output are informational: a dropped flow still hits its rule.
 | Date | Source -> target | Result |
 |---|---|---|
 | 2026-10-08 | `nsx-lm1 -> nsx-lm4` (rehearsal, before the scripts) | Traffic graded PASS; kept 11 Application rules, exactly the expected set; dry run clean. Not applied |
-| 2026-10-08 | `nsx-lm2 -> nsx-lm3`, run `nsx_critical_runs/nsx-lm2_to_nsx-lm3/20261008_151911` (Mac; folder since deleted) | Traffic graded PASS (`nsx_logs/traffic_runs/20261008_113718`). Steps 1 and 2: 9 Application rules with hits, kept set matches; step 3 dry run 2/7/2/4 and 2/17/1/9 (services/groups/policies/rules), 0 failed; step 4 expects 4 services, 22 groups, 3 policies, 13 rules. Not applied |
+| 2026-10-08 | `nsx-lm2 -> nsx-lm3`, run `nsx_critical_runs/nsx-lm2_to_nsx-lm3/20261008_160929` (Mac, exact copy) | Infrastructure: 2 policies, 4 rules. Application: `Start_Policy` (7 of 9 rules hot) and `seed-policy-app` (2 of 13), original ids, names and sequence numbers; `test-policy-2` not copied (no hot rules); default sections left out. Step 3 dry run 2/7/2/4 and 2/17/2/9 (services/groups/policies/rules), 0 failed. Not applied |

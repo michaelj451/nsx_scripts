@@ -1,0 +1,34 @@
+# Migration request server list.
+# Used by tools/multisite/migration_request.py request
+# (docs/multivendor/RUNBOOK_MIGRATION_REQUEST.md).
+#
+# AUTO-DISCOVERED: `request` reads this file when neither --servers nor
+# --server-list is given. Tracked in git, so the history shows what was
+# requested and when; every request also keeps its own copy (servers.txt)
+# and this file's sha256 in request.json.
+#
+# One server per line:
+#
+#   name               VM display name on the source manager (case-insensitive).
+#   ip                 An IP address. If exactly one VM owns it, the request
+#                      resolves it to that VM; otherwise it matches by address only.
+#   name,ip[,ip...]    A VM plus its addresses. Use this for a powered-off VM:
+#                      it reports no address to NSX, and Workflow D and the Palo
+#                      address objects need one.
+#
+# Blank lines and lines starting with `#` are ignored. Put the change or
+# request reference in a comment above each batch.
+#
+# Examples (uncomment / edit):
+#   # wave 1, REQ-1234
+#   ubuntu22-speedtest-10.6.0.101-ax2001
+#   10.6.2.102
+#   ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102
+
+# --------------------------------------------------------------------------
+# Batch 1 (lab dry run, 2026-10-08): nsx-lm1 to nsx-lm3. Lab test servers,
+# one per entry form: a name, a bare IP, and name,ip for a powered-off VM.
+ubuntu22-speedtest-10.6.0.101-ax2001
+10.6.2.102
+ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102
+ubuntu22-speedtest-10.6.0.103-x515

@@ -774,6 +774,11 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
     L: List[str] = [f"# {title}: {inp.get('name') or rec['request_id']}", ""]
     L += [f"Servers moving from **{src}** to **{dst}**. Request `{rec['request_id']}`, built "
           f"{rec['created_at']} from a capture of {src} taken {rec['captured_at']}.", ""]
+    srcs = inp.get("server_sources") or []
+    if srcs:
+        L += ["Server list: " + "; ".join(
+            f"`{x['file']}` ({x['entries']} entries, sha256 {x['sha256'][:12]})" if "file" in x
+            else f"{x['command_line']} from the command line" for x in srcs) + ".", ""]
     if rec.get("approval"):
         a = rec["approval"]
         L += [f"Status: **approved** by {a.get('approved_by') or 'unknown'} under change "

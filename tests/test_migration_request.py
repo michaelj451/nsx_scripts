@@ -410,6 +410,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(d3[0]["cmd"][4], "nsx-lm1")
         self.assertIn(work / "d" / "rules_amend" / "lm1.h" / "push_report", d3[0]["cmd"])
 
+    def test_server_list_default_and_overrides(self):
+        tmp = Path(tempfile.mkdtemp())
+        dflt = tmp / "migration_request_servers.txt"
+        dflt.write_text("# wave 1\nweb01\n10.6.0.101\n", encoding="utf-8")
+        e, w, src = self.cli.load_server_entries(None, None, default=dflt)
+        self.assertEqual(e, [("web01", None), ("10.6.0.101", None)])
+        self.assertEqual((w, src[0]["entries"], len(src[0]["sha256"])), ([], 2, 64))
+        # Servers on the command line: the tracked file is not read.
+        e, _, src = self.cli.load_server_entries(["db01"], None, default=dflt)
+        self.assertEqual((e, src), ([("db01", None)], [{"command_line": 1}]))
+        other = tmp / "other.txt"
+        other.write_text("x,10.6.0.5\n", encoding="utf-8")
+        e, _, _ = self.cli.load_server_entries(["db01"], str(other), default=dflt)
+        self.assertEqual(e, [("x", ["10.6.0.5"]), ("db01", None)])
+        empty = tmp / "empty.txt"
+        empty.write_text("# only comments\n", encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            self.cli.load_server_entries(None, None, default=empty)
+
     def test_rollback_reverse_order_with_allow_delete(self):
         inputs = {"source": "nsx-lm1", "destination": "nsx-lm3", "source_host": "lm1.h",
                   "destination_host": "lm3.h"}

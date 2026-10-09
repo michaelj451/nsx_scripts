@@ -66,6 +66,8 @@ log = logging.getLogger("migration_request")
 PY = sys.executable
 NSX_CHOICES = ["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 OUT_BASE = REPO_ROOT / "migration_requests"
+# Tracked server list (Mike, 2026-10-08), read when no servers are given on the command line.
+DEFAULT_SERVER_LIST = REPO_ROOT / "migration_request_servers.txt"
 # Destination site (manager alias without "nsx-") -> Workflow D suffix and subnet
 # map, as in docs/multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md. Other destinations
 # take --d-appendix and --subnet-map.
@@ -111,6 +113,32 @@ def sib_dir(work: Path, wf: str, src_host: str) -> Path:
 
 def amend_dir(work: Path, wf: str, host: str) -> Path:
     return work / wf / "rules_amend" / host
+
+
+def load_server_entries(servers: Optional[List[str]], server_list: Optional[str],
+                        default: Path = DEFAULT_SERVER_LIST):
+    """The request's servers: --server-list and/or --servers as given; with
+    neither, the tracked list at the repo root. Returns (entries, warnings,
+    sources), each source recorded in request.json (a file with its sha256)."""
+    entries: List[mr.Entry] = []
+    warnings: List[str] = []
+    sources: List[Dict[str, Any]] = []
+    path = Path(server_list) if server_list else (None if servers else default)
+    if path is not None:
+        if not path.is_file():
+            raise SystemExit(f"Server list not found: {path}")
+        e, w = mr.parse_list_lines(path.read_text(encoding="utf-8").splitlines())
+        entries += e
+        warnings += [f"{path.name}: {x}" for x in w]
+        sources.append({"file": repo_relative(path), "sha256": sha256_file(path), "entries": len(e)})
+    if servers:
+        tokens = mr.parse_tokens(servers)
+        entries += tokens
+        sources.append({"command_line": len(tokens)})
+    if not entries:
+        raise SystemExit(f"No servers given: add them to {repo_relative(default)} (one per line), "
+                         "or pass --servers / --server-list.")
+    return entries, warnings, sources
 
 
 def _setting(cli: Optional[str], env_var: str) -> Optional[str]:
@@ -503,15 +531,7 @@ def render(work: Path, rec: Dict[str, Any], title: str, out_name: str) -> Path:
 def cmd_request(args: argparse.Namespace) -> int:
     from palo.pan_env import load_repo_env
     load_repo_env()
-    entries: List[mr.Entry] = []
-    warnings: List[str] = []
-    if args.server_list:
-        e, w = mr.parse_list_lines(Path(args.server_list).read_text(encoding="utf-8").splitlines())
-        entries += e
-        warnings += w
-    entries += mr.parse_tokens(args.servers or [])
-    if not entries:
-        raise SystemExit("No servers given: pass --servers and/or --server-list.")
+    entries, warnings, sources = load_server_entries(args.servers, args.server_list)
     if args.source == args.destination:
         raise SystemExit("Source and destination are the same manager.")
     dflt = DEST_DEFAULTS.get(args.destination.replace("nsx-", "", 1), {})
@@ -537,6 +557,7 @@ def cmd_request(args: argparse.Namespace) -> int:
         "source": args.source, "source_host": resolve(args.source),
         "destination": args.destination, "destination_host": resolve(args.destination),
         "domain_id": args.domain_id, "entries": [[n, ips] for n, ips in entries],
+        "server_sources": sources,
         "include_default_sections": args.include_default_sections,
         "c_appendix": c_app, "d_appendix": d_app,
         "subnet_map": repo_relative(smap_path), "subnet_map_sha256": sha256_file(smap_path),
@@ -895,7 +916,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     rq.add_argument("--servers", action="append", metavar="LIST",
                     help="Comma-separated VM names and/or IP addresses; each token is one server. Repeatable.")
     rq.add_argument("--server-list", metavar="FILE",
-                    help="One server per line: name, ip, or name,ip[,ip]. # comments allowed.")
+                    help="One server per line: name, ip, or name,ip[,ip]. # comments allowed. "
+                         f"Default when neither this nor --servers is given: {DEFAULT_SERVER_LIST.name} "
+                         "(tracked, at the repo root).")
     rq.add_argument("--name", default=None, help="Short label shown in the report title.")
     rq.add_argument("--domain-id", default="default")
     rq.add_argument("--include-default-sections", action="store_true",

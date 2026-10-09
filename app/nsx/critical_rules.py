@@ -24,9 +24,11 @@ source capture (capture/), the flat exports the bundle tools read
 run folder as their working directory), and every tool log (logs/tools/,
 via NSX_LOG_DIR).
 
-The scripts only call the existing tools (report_rules_usage, capture,
-filter_policy_bundle, consolidate_hot_rules, the four push tools); nothing
-here writes to NSX itself.
+Policies and rules are copied exactly as on the source: build_bundle copies
+the source's own policy and rule files unchanged (nothing renamed, merged or
+reordered). The scripts call the existing tools (report_rules_usage, capture,
+the four push tools) and reuse filter_policy_bundle's reference walkers;
+nothing here writes to NSX itself.
 """
 from __future__ import annotations
 
@@ -288,6 +290,68 @@ def hit_rows(report_dir: Path) -> List[Dict[str, Any]]:
     return sorted(keep, key=lambda r: (r.get("policy_category", ""), r["policy_id"], r.get("sequence_number") or 0))
 
 
+SYSTEM_USERS = {"system", "nsx_policy"}
+
+
+def is_system_default(obj: Dict[str, Any]) -> bool:
+    """NSX's own objects, never copied: the default sections and their rules,
+    built-in groups and services, anything NSX created itself. The default
+    sections are not marked _system_owned, so is_default and the creating
+    user are checked too."""
+    return bool(obj.get("is_default") or obj.get("_system_owned") or obj.get("system_owned")
+                or str(obj.get("_create_user") or "") in SYSTEM_USERS)
+
+
+def _bundle_files(bundle: Path) -> Dict[str, List[Path]]:
+    return {
+        "services": sorted((bundle / "services/services").glob("*.yaml")),
+        "groups": sorted((bundle / "groups/groups").glob("*.yaml")),
+        "policies": sorted((bundle / "policies/security-policies").glob("*/policy.yaml")),
+        "rules": sorted((bundle / "rules/security-policies").glob("*/rules/*.yaml")),
+    }
+
+
+def system_defaults_in_bundle(bundle: Path) -> List[str]:
+    """'<kind> <id>' for every system default object a bundle would push (should be none)."""
+    singular = {"services": "service", "groups": "group", "policies": "policy", "rules": "rule"}
+    found = []
+    for kind, files in _bundle_files(bundle).items():
+        for f in files:
+            obj = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+            if is_system_default(obj):
+                found.append(f"{singular[kind]} {obj.get('id')}")
+    return found
+
+
+def source_policies(run: Path, source_host: str) -> List[Dict[str, Any]]:
+    """Every policy in the run's flat export: id, category, rule count, system default or not."""
+    root = run / "nsx_rules_export" / source_host / "security-policies"
+    out = []
+    for p in sorted((run / "nsx_policies_export" / source_host / "security-policies").glob("*/policy.yaml")):
+        d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        rules = [yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+                 for f in (root / p.parent.name / "rules").glob("*.yaml")]
+        out.append({"id": d.get("id"), "category": d.get("category"),
+                    "system_default": is_system_default(d),
+                    "rules": sorted(r.get("id") for r in rules if not is_system_default(r))})
+    return out
+
+
+def whole_category_gaps(sources: List[Dict[str, Any]], categories: Set[str],
+                        bundle: Path) -> List[str]:
+    """Policies (or rules) of the copied-whole categories that the bundle lacks."""
+    have = bundle_objects(bundle)
+    gaps = []
+    for p in sources:
+        if p["category"] not in categories or p["system_default"]:
+            continue
+        if p["id"] not in have["policies"]:
+            gaps.append(f"policy {p['id']}")
+            continue
+        gaps += [f"rule {p['id']}/{r}" for r in p["rules"] if f"{p['id']}/{r}" not in have["rules"]]
+    return gaps
+
+
 def _ids(paths: Sequence[Path]) -> Set[str]:
     return {yaml.safe_load(f.read_text(encoding="utf-8"))["id"] for f in paths}
 
@@ -315,14 +379,15 @@ def merge_objects(parts: Sequence[Dict[str, Set[str]]]) -> Dict[str, Set[str]]:
 
 
 def target_objects(client: Any, domain_id: str = "default") -> Dict[str, Set[str]]:
-    """Customer objects on a manager (read only); default sections left out."""
-    pols = [p for p in client.list_security_policies(domain_id=domain_id) if not p.get("is_default")]
+    """Customer objects on a manager (read only); NSX's own system defaults left out."""
+    pols = [p for p in client.list_security_policies(domain_id=domain_id) if not is_system_default(p)]
     return {
-        "services": {s["id"] for s in client.list_services() if not s.get("_system_owned")},
-        "groups": {g["id"] for g in client.list_groups(domain_id=domain_id) if not g.get("_system_owned")},
+        "services": {s["id"] for s in client.list_services() if not is_system_default(s)},
+        "groups": {g["id"] for g in client.list_groups(domain_id=domain_id) if not is_system_default(g)},
         "policies": {p["id"] for p in pols},
         "rules": {f"{p['id']}/{r['id']}" for p in pols
-                  for r in client.list_security_rules(security_policy_id=p["id"], domain_id=domain_id)},
+                  for r in client.list_security_rules(security_policy_id=p["id"], domain_id=domain_id)
+                  if not is_system_default(r)},
     }
 
 
@@ -335,13 +400,123 @@ def is_empty(objs: Dict[str, Set[str]]) -> bool:
     return not any(objs[k] for k in CLASSES)
 
 
-def hit_rules_order(bundle: Path) -> List[Dict[str, Any]]:
-    """The hit-rules policy in its new order: sequence, action, id, hit count."""
-    m = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    hits = {k["final_id"]: k["hit_count"] for k in m.get("kept_rules", [])}
-    out = []
-    for f in sorted((bundle / "rules/security-policies").glob("*/rules/*.yaml")):
-        r = yaml.safe_load(f.read_text(encoding="utf-8"))
-        out.append({"sequence": r.get("sequence_number"), "action": r.get("action"),
-                    "id": r["id"], "hits": hits.get(r["id"])})
+# =============================================================================
+# Building a bundle: policies and rules exactly as on the source
+# =============================================================================
+
+def _filter_helpers():
+    """Reference walkers and discovery from tools/nsx/filter_policy_bundle.py."""
+    tools_nsx = str(REPO_ROOT / "tools" / "nsx")
+    if tools_nsx not in sys.path:
+        sys.path.insert(0, tools_nsx)
+    import filter_policy_bundle as fpb   # noqa: E402
+    return fpb
+
+
+def _ref_closure(refs: Set[str], index: Dict[str, Tuple[Path, Dict[str, Any]]], nested) -> Tuple[Set[str], Set[str]]:
+    kept: Set[str] = set()
+    unresolved: Set[str] = set()
+    pending = set(refs)
+    while pending:
+        p = pending.pop()
+        if p in kept:
+            continue
+        if p not in index:
+            unresolved.add(p)
+            continue
+        kept.add(p)
+        pending |= nested(index[p][1]) - kept
+    return kept, unresolved
+
+
+def build_bundle(exports_root: Path, source_host: str, out_root: Path, categories: Set[str],
+                 hot: Optional[Set[Tuple[str, str]]] = None) -> Path:
+    """Write a push-ready bundle under <out_root>/<UTC_TS>/<source host>/.
+
+    Every policy of `categories` (system defaults never) is copied with its
+    policy file unchanged: same id, name, sequence number, settings. Its rule
+    files are copied unchanged too, so ids, names, order and settings match
+    the source. hot=None copies every rule; otherwise only the rules whose
+    (policy id, rule id) is in `hot`, and a policy left with none is not
+    copied. Groups and services come along when a kept rule, a kept policy's
+    own Applied To, or another kept group/service references them.
+    """
+    fpb = _filter_helpers()
+    all_pol = fpb._discover_policies(exports_root / "nsx_policies_export" / source_host)
+    all_rules = fpb._discover_rules(exports_root / "nsx_rules_export" / source_host)
+    all_grp = fpb._discover_groups(exports_root / "nsx_groups_export" / source_host)
+    all_svc = fpb._discover_services(exports_root / "nsx_services_export" / source_host)
+
+    kept, skipped = [], []
+    ref_groups: Set[str] = set()
+    ref_services: Set[str] = set()
+    for path, (pfile, pol) in sorted(all_pol.items()):
+        if pol.get("category") not in categories:
+            continue
+        if is_system_default(pol):
+            skipped.append({"policy": pol.get("id"), "reason": "system default"})
+            continue
+        rules = sorted((fr for fr in all_rules.get(path, []) if not is_system_default(fr[1])),
+                       key=lambda fr: (fr[1].get("sequence_number") or 0, str(fr[1].get("id"))))
+        keep = rules if hot is None else [fr for fr in rules if (pol.get("id"), fr[1].get("id")) in hot]
+        keep_ids = {fr[1].get("id") for fr in keep}
+        cold = [fr[1] for fr in rules if fr[1].get("id") not in keep_ids]
+        if hot is not None and not keep:
+            skipped.append({"policy": pol.get("id"), "reason": "no hot rules",
+                            "rules": [{"id": r.get("id"), "sequence_number": r.get("sequence_number"),
+                                       "action": r.get("action"), "disabled": bool(r.get("disabled"))}
+                                      for r in cold]})
+            continue
+        kept.append((pfile, pol, keep, cold))
+        for _, r in keep:
+            ref_groups |= fpb._extract_group_paths_from_rule(r)
+            ref_services |= fpb._extract_service_paths_from_rule(r)
+        ref_groups |= {p for p in (pol.get("scope") or []) if p and p not in ("ANY", "any") and p.startswith("/")}
+
+    groups, groups_unresolved = _ref_closure(ref_groups, all_grp, fpb._extract_nested_group_paths)
+    services, services_unresolved = _ref_closure(ref_services, all_svc, fpb._extract_nested_service_paths)
+    segments = sorted({s for g in groups for s in fpb._extract_segment_paths(all_grp[g][1])})
+    system_refs = sorted([p for p in groups if is_system_default(all_grp[p][1])] +
+                         [p for p in services if is_system_default(all_svc[p][1])])
+
+    out = new_run_dir(out_root) / source_host
+    for sub in ("services/services", "groups/groups", "policies/security-policies", "rules/security-policies"):
+        (out / sub).mkdir(parents=True, exist_ok=True)
+    for p in sorted(services):
+        shutil.copy2(all_svc[p][0], out / "services/services" / all_svc[p][0].name)
+    for p in sorted(groups):
+        shutil.copy2(all_grp[p][0], out / "groups/groups" / all_grp[p][0].name)
+    for pfile, pol, keep, _ in kept:
+        order = yaml.safe_dump({"policy": pol.get("id"), "rules": [r.get("id") for _, r in keep]}, sort_keys=False)
+        for tree in ("policies", "rules"):
+            d = out / tree / "security-policies" / pfile.parent.name
+            d.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pfile, d / "policy.yaml")
+            (d / "rules_order.yaml").write_text(order, encoding="utf-8")
+        rdir = out / "rules/security-policies" / pfile.parent.name / "rules"
+        rdir.mkdir(exist_ok=True)
+        for f, _ in keep:
+            shutil.copy2(f, rdir / f.name)
+
+    manifest = {
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "source_host": source_host, "categories": sorted(categories),
+        "mode": "whole" if hot is None else "hot rules only",
+        "policies": [{"id": pol.get("id"), "display_name": pol.get("display_name"),
+                      "category": pol.get("category"), "sequence_number": pol.get("sequence_number"),
+                      "rules": [{"id": r.get("id"), "sequence_number": r.get("sequence_number"),
+                                 "action": r.get("action"), "disabled": bool(r.get("disabled"))} for _, r in keep],
+                      "not_copied": [{"id": r.get("id"), "sequence_number": r.get("sequence_number"),
+                                      "action": r.get("action"), "disabled": bool(r.get("disabled"))} for r in cold]}
+                     for _, pol, keep, cold in kept],
+        "skipped_policies": skipped,
+        "groups": sorted(groups), "services": sorted(services),
+        "unresolved": {"group_refs": sorted(groups_unresolved), "service_refs": sorted(services_unresolved)},
+        "segments_referenced_by_groups": segments,
+        "system_default_references": system_refs,
+        "counts": {"policies": len(kept), "rules": sum(len(k[2]) for k in kept),
+                   "rules_not_copied": sum(len(k[3]) for k in kept), "groups": len(groups),
+                   "services": len(services), "policies_skipped": len(skipped)},
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     return out

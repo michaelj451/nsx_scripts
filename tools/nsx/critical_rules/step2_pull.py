@@ -3,17 +3,27 @@
 
 Critical-rules copy, step 2 of 4: pull those objects into two bundles.
 
+Policies and rules are copied exactly as they are on the source: same ids,
+names, sequence numbers and settings. Nothing is renamed, merged or reordered.
+
 In the newest run folder for this source/target (or --run):
   1. capture the source (read only) into the run, and write the flat exports
-     the bundle tools read into the run as well (nothing lands in the repo);
-  2. Infrastructure bundle: every Infrastructure policy, whole, original order
-     (filter_policy_bundle.py);
-  3. hit-rules bundle: every Application rule with hit_count > --min-hits, in
-     one new policy, busiest first (consolidate_hot_rules.py);
-then prints the new policy's rule order with each action, so a DROP or REJECT
-that moved above an ALLOW can be checked, and compares the kept rules with
-step 1's list. Each bundle goes into its own folder of the run, so the two
-can never collide.
+     the bundles are built from into the run as well (nothing lands in the repo);
+  2. Infrastructure bundle: every Infrastructure policy with every one of its
+     rules (--whole-categories);
+  3. hot-rules bundle: every Application policy that holds at least one active
+     (hot) rule, with only its hot rules (--hit-categories). Hot means the
+     rule's hit count in step 1's report is above --min-hits (default 0).
+     A policy with no hot rule is not copied.
+NSX's own system defaults are never copied (default sections and their rules,
+anything _system_owned, anything NSX created itself).
+
+Then it checks, and stops if either fails: no system default is in either
+bundle, and every non-default policy of the copied-whole categories is in the
+Infrastructure bundle with all its rules. It lists every policy as it will land
+on the target, the hot rules left out because of their category, and every
+DROP/REJECT rule not copied (no hits), so the effect of leaving it out can be
+checked.
 
 USAGE:
     python tools/nsx/critical_rules/step2_pull.py --source nsx-lm2 --target nsx-lm3
@@ -35,6 +45,27 @@ import nsx.critical_rules as cr                        # noqa: E402
 log = logging.getLogger("critical_rules")
 
 
+def _categories(text: str) -> set:
+    return {c.strip() for c in text.split(",") if c.strip()}
+
+
+def _print_bundle(title: str, bundle: Path, hits: dict) -> dict:
+    m = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    print(f"{title}: {bundle}")
+    for p in m["policies"]:
+        print(f"  policy {p['id']} ({p['display_name']}), {p['category']}, sequence {p['sequence_number']}")
+        for r in p["rules"]:
+            print(f"      {r['sequence_number']:>4} {r['action']:<6} {r['id']:<32} "
+                  f"hits={hits.get((p['id'], r['id']), 0)}{'  (disabled)' if r['disabled'] else ''}")
+        if p["not_copied"]:
+            print(f"      not copied (no hits): {[r['id'] for r in p['not_copied']]}")
+    for s in m["skipped_policies"]:
+        print(f"  not copied: policy {s['policy']} ({s['reason']})")
+    print(f"  counts: {m['counts']}")
+    print(f"  unresolved: {m['unresolved']}  segments: {m['segments_referenced_by_groups']}")
+    return m
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     p.add_argument("--source", required=True, choices=cr.LM_CHOICES)
@@ -42,17 +73,20 @@ def main() -> int:
     p.add_argument("--run", help="run folder (default: newest for this source/target)")
     cr.add_runs_dir_arg(p)
     p.add_argument("--whole-categories", default="Infrastructure",
-                   help="categories copied whole (default: Infrastructure)")
+                   help="categories copied whole, every rule (default: Infrastructure)")
     p.add_argument("--hit-categories", default="Application",
-                   help="categories filtered by hits (default: Application)")
-    p.add_argument("--min-hits", type=int, default=0, help="keep rules with hit_count > this (default 0)")
-    p.add_argument("--policy-id", default="critical-rules", help="id of the new policy")
-    p.add_argument("--policy-name", default="Critical Rules", help="display name of the new policy")
+                   help="categories copied with their hot rules only (default: Application)")
+    p.add_argument("--min-hits", type=int, default=0, help="a rule is hot when hit_count > this (default 0)")
     args = p.parse_args()
 
+    whole_cats, hit_cats = _categories(args.whole_categories), _categories(args.hit_categories)
+    if whole_cats & hit_cats:
+        raise SystemExit(f"a category cannot be both whole and hot-only: {sorted(whole_cats & hit_cats)}")
     run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
+    if not (run / "hits.json").is_file():
+        raise SystemExit(f"no step 1 hit list in {run}; run step1_stats.py first")
     src_host = rec["source_host"]
     cr.use_run_environment(run)
     setup_logging("step2_pull", run / "logs")
@@ -69,63 +103,70 @@ def main() -> int:
     exported = cr.emit_flat_exports(run / "capture", src_host, run)
     log.info("Flat exports in the run: %s", exported)
 
-    # The bundle tools read nsx_*_export/<host> relative to their working
-    # directory, so they run from the run folder and read the exports above.
-    tools.append(cr.run_tool("step2_infra_bundle", [
-        cr.PY, cr.tool("tools/nsx/filter_policy_bundle.py"), "--source", args.source,
-        "--categories", args.whole_categories, "--output-base", str(run / "infra")], run / "logs", cwd=run))
-    tools.append(cr.run_tool("step2_hits_bundle", [
-        cr.PY, cr.tool("tools/nsx/consolidate_hot_rules.py"), "--source", args.source,
-        "--categories", args.hit_categories, "--min-hits", str(args.min_hits),
-        "--new-policy-id", args.policy_id, "--new-policy-display", args.policy_name,
-        "--output-base", str(run / "hits")], run / "logs", cwd=run))
-    if not all(t["ok"] for t in tools):
-        cr.record_step(run, "pull", {"ok": False, "tools": tools})
-        log.error("a bundle tool failed; nothing to push")
-        return 1
+    rows = json.loads((run / "hits.json").read_text(encoding="utf-8"))
+    hits = {(r["policy_id"], r["rule_id"]): r["hit_count"] for r in rows}
+    hot = {(r["policy_id"], r["rule_id"]) for r in rows
+           if r.get("policy_category") in hit_cats and r["hit_count"] > args.min_hits}
+    hot_elsewhere = sorted(f"{r['policy_id']}/{r['rule_id']} ({r.get('policy_category')})" for r in rows
+                           if r.get("policy_category") not in hit_cats | whole_cats)
 
-    infra = cr.single_bundle(run / "infra", src_host)
-    hits = cr.single_bundle(run / "hits", src_host)
-    im = json.loads((infra / "manifest.json").read_text(encoding="utf-8"))
-    hm = json.loads((hits / "manifest.json").read_text(encoding="utf-8"))
-    order = cr.hit_rules_order(hits)
+    infra = cr.build_bundle(run, src_host, run / "infra", whole_cats)
+    hot_bundle = cr.build_bundle(run, src_host, run / "hits", hit_cats, hot=hot)
+
+    sources = cr.source_policies(run, src_host)
+    system_found = cr.system_defaults_in_bundle(infra) + cr.system_defaults_in_bundle(hot_bundle)
+    gaps = cr.whole_category_gaps(sources, whole_cats, infra)
+    copied_hot = cr.bundle_objects(hot_bundle)["rules"]
+    hot_missing = sorted(f"{pid}/{rid}" for pid, rid in hot if f"{pid}/{rid}" not in copied_hot)
+    left_out = [f"{s['id']} ({s['category']})" for s in sources if s["system_default"]]
+    whole = [s for s in sources if s["category"] in whole_cats and not s["system_default"]]
 
     print()
-    print(f"Infrastructure bundle: {infra}")
-    print(f"  {im['counts']}")
-    print(f"  unresolved: {im.get('unresolved')}")
-    print(f"Hit-rules bundle: {hits}")
-    print(f"  statistics source per policy: {hm.get('stats_source')}")
-    print(f"  policy {args.policy_id!r}, new order:")
-    for r in order:
-        print(f"    {r['sequence']:>3} {r['action']:<6} {r['id']:<32} hits={r['hits']}")
-    print(f"  skipped (no hits): {sorted(s['rule_id'] for s in hm.get('skipped_rules', []))}")
-    print(f"  unresolved: {hm.get('unresolved')}  segments: {hm.get('segments_referenced_by_groups')}  "
-          f"id collisions: {hm['counts'].get('id_collisions')}")
-    blocking = [r for r in order if r["action"] in ("DROP", "REJECT")]
+    im = _print_bundle(f"{', '.join(sorted(whole_cats))} bundle (every rule)", infra, hits)
+    print()
+    hm = _print_bundle(f"{', '.join(sorted(hit_cats))} bundle (hot rules only, hit_count > {args.min_hits})",
+                       hot_bundle, hits)
+    print()
+    if gaps:
+        print(f"MISSING from the {', '.join(sorted(whole_cats))} bundle: {gaps}")
+    else:
+        print(f"{', '.join(sorted(whole_cats))} copied whole: all {len(whole)} policies, "
+              f"{sum(len(s['rules']) for s in whole)} rules")
+    print(f"Hot rules copied: {len(copied_hot)} of {len(hot)}"
+          + (f"; MISSING {hot_missing}" if hot_missing else ""))
+    if hot_elsewhere:
+        print(f"NOTE: rules with hits in other categories, not copied: {hot_elsewhere}")
+    print(f"System defaults left out (never copied): {left_out or 'none'}")
+    print(f"System defaults in the bundles: {system_found or 'none'}")
+    not_copied = [(q["id"], r) for q in hm["policies"] for r in q["not_copied"]]
+    not_copied += [(s["policy"], r) for s in hm["skipped_policies"] for r in s.get("rules", [])]
+    blocking = [f"{pid}/{r['id']} ({r['action']}{', disabled' if r['disabled'] else ''})"
+                for pid, r in not_copied if r["action"] in ("DROP", "REJECT")]
     if blocking:
-        print(f"  CHECK: {len(blocking)} DROP/REJECT rule(s) in the new order: "
-              f"{[(r['sequence'], r['id']) for r in blocking]}; compare each with the ALLOW rules below it")
+        print(f"CHECK: DROP/REJECT rules not copied (no hits): {blocking}; traffic they would block "
+              f"falls through to later rules on the target")
 
-    hit_cats = {c.strip() for c in args.hit_categories.split(",")}
-    step1 = {r["rule_id"] for r in json.loads((run / "hits.json").read_text(encoding="utf-8"))
-             if r.get("policy_category") in hit_cats and r["hit_count"] > args.min_hits} \
-        if (run / "hits.json").is_file() else None
-    kept = {k["orig_id"] for k in hm.get("kept_rules", [])}
-    if step1 is not None and step1 != kept:
-        print(f"  NOTE: kept rules differ from step 1 (counters moved?): "
-              f"only in step 1 {sorted(step1 - kept)}, only now {sorted(kept - step1)}")
-    elif step1 is not None:
-        print(f"  kept rules match step 1 ({len(kept)})")
+    if system_found or gaps or hot_missing:
+        print()
+        print("STOP: " + "; ".join(
+            ([f"system default objects in the bundles: {system_found}"] if system_found else []) +
+            ([f"copied-whole policies or rules missing: {gaps}"] if gaps else []) +
+            ([f"hot rules missing: {hot_missing}"] if hot_missing else [])))
+        cr.record_step(run, "pull", {"ok": False, "system_defaults_in_bundles": system_found,
+                                     "whole_category_gaps": gaps, "hot_missing": hot_missing,
+                                     "infra": str(infra), "hits": str(hot_bundle), "tools": tools})
+        return 1
     print()
     print("Next (dry run):")
     print("  " + cr.next_command("step3_push.py", args))
 
     cr.record_step(run, "pull", {
         "ok": True, "capture": str(run / "capture"), "flat_exports": exported,
-        "infra": str(infra), "hits": str(hits), "policy_id": args.policy_id,
-        "infra_counts": im["counts"], "hits_counts": hm["counts"], "kept_rules": sorted(kept),
-        "order": order, "tools": tools,
+        "infra": str(infra), "hits": str(hot_bundle),
+        "infra_counts": im["counts"], "hits_counts": hm["counts"],
+        "hot_rules": sorted(f"{a}/{b}" for a, b in hot), "min_hits": args.min_hits,
+        "system_defaults_left_out": left_out, "whole_policies": [s["id"] for s in whole],
+        "tools": tools,
     })
     return 0
 

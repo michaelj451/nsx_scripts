@@ -27,22 +27,28 @@ function Newest($dir) {
 
 ## 1) Request
 
-`servers_wave1.txt`, one server per line (`name`, `ip`, or `name,ip`):
+Put the servers in `migration_request_servers.txt` at the repository root
+(tracked in git), one per line: `name`, `ip`, or `name,ip`. `request` reads it
+when no servers are given on the command line.
 
 ```text
-# wave 1, ticket REQ-1234
+# wave 1, REQ-1234
 ubuntu22-speedtest-10.6.0.101-ax2001
 10.6.2.102
 ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102
 ```
 
 ```powershell
+notepad migration_request_servers.txt
 Mr request --source nsx-lm1 --destination nsx-lm3 --device-group dg-4 `
-  --no-tls-verify --name "wave 1" --server-list servers_wave1.txt
+  --no-tls-verify --name "wave 1"
 
 $R = Newest "migration_requests\nsx-lm1_to_nsx-lm3"
 notepad "$R\request.md"
 ```
+
+`--server-list FILE` or `--servers "name1,10.6.0.101"` override the tracked
+file for one request.
 
 Offline instead (`--no-preview`), then the dry runs one part at a time:
 
