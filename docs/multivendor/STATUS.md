@@ -34,6 +34,9 @@ proves the API calls and payloads, not traffic flow.
 | 2026-10-06 | **Post-rulebase supported** (`--rulebase post`). Rule names are unique across pre and post, so `--rule-suffix` and `--nsx-rule` exist for putting a rule into both |
 | 2026-10-06 | **One Palo group per NSX group, `<group>_np_ips`** (the NSX sibling naming convention, suffix from `OBJECT_APPENDIX`), holding the group's addresses at **every** site, replacing one group per sibling view. Rule sides read like the NSX rule; the address object names keep the view (`-np_ips`, `-avs_ips`, `-lm3_ips`) so the site stays visible inside the group; retiring a site later means removing address objects, not editing rules |
 | 2026-10-06 | **Workflow A to D code is not touched.** The multivendor and Palo workflows are additive, built on `app/common` and the Palo track's own modules; they only read the NSX workflows' bundles |
+| 2026-10-07 | **Migration requests** ([RUNBOOK_MIGRATION_REQUEST.md](RUNBOOK_MIGRATION_REQUEST.md)): a requester submits the servers to migrate (VM names or IP addresses; an IP resolves to the VM that owns it); a report lists every rule they use and every change on the destination (A, C), the source (D) and Palo Alto; the request is approved; at the change window a re-capture rebuilds it and applies it. Source changes since approval went through their own approval and are taken and listed; a change to the request's own servers stops the run |
+| 2026-10-07 | **Workflow D scope in a request: only the groups the servers are members of, and the rules those groups are in.** Each D sibling holds only the requested servers' new addresses |
+| 2026-10-07 | **Palo device group `dg-4`** for migration requests (pano4). palo5's direct-push objects were removed first (124 reverted, read back clean) |
 
 ## Built (branch `nsx-lm3_palo-1`; in commits `dfd06c3` and `e8bcd5e` unless marked uncommitted)
 
@@ -45,6 +48,14 @@ proves the API calls and payloads, not traffic flow.
 | `data/subnet_map_lm3.csv` | **Trimmed 2026-10-06** the same way: 10.6.0/1/2.0/24 to 10.8.0/1/2.0/24 (3 rows) |
 | Map checks | Both "Map OK", no collision. Step 4/5 `d2a` dry runs rebuilt with them: 17 siblings each (was 22), mapped addresses only in 10.7.0-2.x and 10.8.0-2.x |
 | Runbook + PowerShell card | Steps 2 to 6, each with its own run directory. Steps 2 and 3 are covered by [RUN_AC_LM3.md](../nsx/RUN_AC_LM3.md) (lm3 duplicated from lm2 on 2026-10-06). **Steps 4 and 5 `d2a` dry runs ran clean on 2026-10-06** (22 `_avs_ips` and 22 `_lm3_ips` siblings from lm1, 0 errors); nothing applied |
+
+### Migration requests (built 2026-10-07, uncommitted)
+
+`tools/multisite/migration_request.py` (commands `request`, `preview`, `approve`, `refresh`, `run`, `report`) with its logic in `app/multisite/migration_request.py` and 20 tests in `tests/test_migration_request.py`. It runs the existing push tools with the workflow driver's flags on its own bundles and never edits Workflow A to D code. The Palo plan uses the same mapping code as `plan-rules`, from the request's own capture.
+
+Proof run 2026-10-07, read-only, lm1 to lm3 with Palo `dg-4`: 22 rules, 30 groups, 8 services, 14 C siblings, 18 D siblings (21 source rules amended, matching the live amend dry run), 106 Palo objects to create on `dg-4`; a refresh from a new capture gave the same fingerprint; every phase passed as a dry run. Nothing applied.
+
+Found while building it (not fixed, existing tools): `filter_policy_bundle.py` and `consolidate_hot_rules.py` look for nested services in a field NSX does not use (`members` instead of `nested_service_path`), so their bundles leave out the services a service group nests (lm1/lm2: `seed-svc-web-bundle`). The migration tool follows `nested_service_path`.
 
 ### Shared library (new, existing scripts not migrated)
 
@@ -75,7 +86,7 @@ time.
 | VM-tag push **and** revert prompts auto-approved the next batch when input closed | Now stop and still write the manifest, like the shared batch helper; runbooks updated |
 | `nsx-lm6` added | Every live tool's manager list runs lm1 to lm6; resolver maps `NSX_LM5`/`NSX_LM6`; `.env` not changed (no DNS records for lm5 or lm6 yet) |
 
-Tests: 474 in the suite (28 for the rule planner in `tests/test_pan_rules.py`);
+Tests: 505 in the suite (28 for the rule planner in `tests/test_pan_rules.py`, 20 for migration requests);
 the only failure is `test_longest_prefix_wins`, which predates this work.
 
 ## Deck
@@ -93,6 +104,7 @@ Uncommitted; the previous version is in git.
 | `nsx-lm1` | `hostname` tag added to 3 VMs (x515, gh0202, 551x4) | `revert_hostname_tags.py` with manifest `nsx_logs/reports/vm_tags_push/nsx-lm1.lab.local/20261004_183028_apply.json` |
 | `nsx-lm3` | `hostname` tag added to all 6 VMs | same tool, manifest `.../nsx-lm3.lab.local/20261004_183041_apply.json` |
 | `nsx-lm3` | `asl_id=8` added to all 6 VMs (one-off script, outside the repo) | its `--revert` with manifest `.../nsx-lm3.lab.local/20261004_183133_asl_id_apply.json` |
+| palo5 (firewall, vsys1 candidate config) | 2026-10-07: the 124 objects of the 04:31 UTC direct push removed with its own revert (dry run 124, apply 124 deleted, read back: no addresses, address groups, service groups or local rules left; the three local services `dns-53`, `udp-53`, `tcp-53` predate this work and were left) | re-push `pan_mirror_runs/nsx-lm1.lab.local/20261006_200022/plan.json` with `--host palo5.lab.local` |
 
 Left to Mike: hostname tags on lm1's `-old` and `-New` VMs (on the exclusion
 list on purpose), and removing the stale group tags on six leftover test groups
@@ -179,7 +191,22 @@ services, 2 service groups, profiles from `.env`, 0 errors. Applied 17:26 UTC
 (159 created), then **reverted at 17:31 (159 deleted)** because the subnet
 maps still carried template rows; the maps were then trimmed (above).
 
-**Pushed again 17:48 UTC from the rebuilt bundles** (plan `20261006_174622`):
+**Direct to the firewall, 2026-10-07 04:31 UTC.** `plan-rules --target
+firewall` (objects in `vsys1`, rules in the firewall's local rulebase) and
+`push --host palo5.lab.local --rest-version v10.2`. First the dry run found
+110 names Panorama had already pushed to palo5 (a 15:05 version committed
+from pano4); the 124 were reverted from pano4 and Mike committed and pushed
+pano4, which cleared them. The second dry run had 0 clashes; the apply
+**created 124 objects in palo5's candidate config** as `agentuser` (57
+addresses, 27 `<group>_np_ips` groups, 13 services, 3 service groups, 24
+local rules with the `.env` profiles). Independent read-back: nothing
+missing, 0 field differences, rule order as planned. Not committed on palo5.
+Undo: `revert --manifest
+pan_mirror_runs/nsx-lm1.lab.local/20261006_200022/push_20261007_042611_apply.json
+--host palo5.lab.local --no-tls-verify` (the REST version is taken from the
+push). pano4 now holds none of these objects. **Removed 2026-10-07 20:20 UTC** with that revert (124 deleted, read back clean), before the migration-request work moved the Palo target to `dg-4`.
+
+Earlier, **pushed again 17:48 UTC from the rebuilt bundles** (plan `20261006_174622`, reverted at 03:41 UTC on 10-07 to clear the way):
 22 NSX rules in scope, 2 skipped, **24 Palo pre-rules**, 27 `<group>_np_ips`
 groups, 57 addresses, 14 services, 2 service groups, profiles from `.env`.
 Dry run 124 `would_create`, apply 124 created; independent read-back: nothing

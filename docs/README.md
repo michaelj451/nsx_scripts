@@ -32,6 +32,7 @@ a matching revert.
 | **D** Prod remap-to-siblings | [RUNBOOK_D.md](nsx/RUNBOOK_D.md) | [cmds](nsx/RUNBOOK_D_COMMANDS.md) | [ps](nsx/RUNBOOK_D_COMMANDS_PS.md) | Production-grade WF-C: land IP-only siblings in place on a live manager |
 | Single-capture clone + WF-D | [RUNBOOK_FROM_CAPTURE.md](nsx/RUNBOOK_FROM_CAPTURE.md) | included | [ps](nsx/RUNBOOK_FROM_CAPTURE_PS.md) | One capture, then run everything else off it |
 | Selective category copy | [RUNBOOK_FILTER_COPY.md](nsx/RUNBOOK_FILTER_COPY.md) | included | [ps](nsx/RUNBOOK_FILTER_COPY_PS.md) | Copy chosen DFW policies plus only their transitive dependencies |
+| Critical rules copy | [RUNBOOK_CRITICAL_RULES.md](nsx/RUNBOOK_CRITICAL_RULES.md) | included | [ps](nsx/RUNBOOK_CRITICAL_RULES_PS.md) | One script per step in `tools/nsx/critical_rules/`: gather hit stats on the source, pull every Infrastructure policy whole plus every Application policy that has active (hot) rules, with only those rules, exactly as on the source (nothing renamed or reordered), push them to a new, empty manager, verify, revert. Lab test traffic in its appendix |
 | Services only | [RUNBOOK_SERVICES.md](nsx/RUNBOOK_SERVICES.md) | included | included | Export / push / revert customer services alone |
 | GM to LM copy | `tools/nsx/transform_gm_export_to_lm.py` | tool docstring | n/a | Rewrite a Global Manager export's `/global-infra/` refs (and optionally the domain) so the standard Workflow A pushes land it on a Local Manager |
 | **AVS** Federation teardown | [RUNBOOK_AVS.md](nsx/RUNBOOK_AVS.md) | included | n/a | End-to-end GM to LM to target with tag groups decomposed to IP-only siblings, for a destination with no matching VM inventory or tag scheme. Read the two failure modes first: a capture without `--live-query` and any powered-off VM both silently drop IPs |
@@ -61,6 +62,7 @@ than raw log lines.
 | Runbook | PowerShell | What it covers |
 |---|---|---|
 | [RUNBOOK_MULTIVENDOR_ROLLOUT.md](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md) | [ps](multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md) | `nsx-lm1` VMs moving to **either** `nsx-lm2` or `nsx-lm3`, traffic between all three sites, and the Palo Alto `dg-5` firewall between them. Separate steps (A and C onto lm3, then each site's mapped addresses onto the others) through the existing driver, one two-column map per target (`data/subnet_map_lm2.csv`, `data/subnet_map_lm3.csv`). The Palo Alto track is separate and still being built |
+| [RUNBOOK_MIGRATION_REQUEST.md](multivendor/RUNBOOK_MIGRATION_REQUEST.md) | [ps](multivendor/RUNBOOK_MIGRATION_REQUEST_PS.md) | **Migration requests**: a list of servers (VM names or IP addresses) becomes an approver's report of every change the move needs (the NSX rules they use, Workflow A to the destination, C siblings there, D siblings and rule amendments on the source scoped to the servers' groups, and exactly what is created on Palo Alto), an approval pinned to a fingerprint, and a later re-capture that applies it phase by phase (`tools/multisite/migration_request.py`) |
 
 Status and decisions: [STATUS.md](multivendor/STATUS.md). Open questions
 (group naming, App-ID use on NSX, name case, which rules cross sites, zones,
@@ -109,6 +111,7 @@ everything under `tools/test/` lives in [`docs/tools/test/`](tools/test/).
 |---|---|
 | [README-TEST.md](tools/test/README-TEST.md) | Load-test scaffolding under `tools/test/` for exercising the NSX tools at scale |
 | [RUNBOOK_WIPE.md](tools/test/RUNBOOK_WIPE.md) | `wipe_target_manager.py`: delete customer DFW objects in dependency order. Full wipe, or `--id-prefix` to clear one family of test objects while leaving the Default sections (and their NDP/DHCP rules) alone. Back up first: there is no paired revert |
+| [RUNBOOK_CRITICAL_RULES.md, step 3](nsx/RUNBOOK_CRITICAL_RULES.md#step-3---lab-only-generate-and-grade-test-traffic) | `predict_dfw_hits.py`: offline first-match model of which rule a flow hits on a manager. `generate_lab_traffic.py`: run a YAML flow plan from the Mac, aidev or lab VMs, then grade a rules-usage diff against it. Plans in `tools/test/traffic_plans/` |
 
 Unit tests for the remap / audit / backup / Panorama code live in
 [`tests/`](../tests/): `python -m unittest discover tests`.

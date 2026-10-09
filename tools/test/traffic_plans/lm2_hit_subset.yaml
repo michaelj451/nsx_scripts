@@ -1,0 +1,59 @@
+# Traffic plan for the nsx-lm2 -> nsx-lm3 hit-only ("critical rules") copy (2026-10-08).
+#
+# A chosen SUBSET of lm2's hittable rules gets traffic; the rest stay cold, so the
+# copy's kept/skipped lists can be checked against a known answer. Hittable set
+# found with tools/test/predict_dfw_hits.py --search: seed-web-https, seed-multi,
+# seed-ssh-and-group, seed-nested-web and seed-segment-rule have only lm1 sources
+# on lm2 (10.6 tag groups and their _np_ips siblings), so no lm2 host can hit them.
+#
+# Already hot and impossible to keep cold: allow-icmp-network-0/1/2 and
+# ssh-network-0/1/2 (SSH from aidev into lm2 VMs, including this tool's logins).
+
+manager: nsx-lm2
+
+hosts:
+  mac:   {local: true, ip: 10.10.2.78}
+  aidev: {ssh: aidev.lab.local, ip: 10.2.1.189}
+  vm701: {ssh: mxferguson@10.7.0.101, jump: aidev.lab.local}
+  vm702: {ssh: mxferguson@10.7.0.102, jump: aidev.lab.local}
+  vm711: {ssh: mxferguson@10.7.1.101, jump: aidev.lab.local}
+  vm712: {ssh: mxferguson@10.7.1.102, jump: aidev.lab.local}
+  vm721: {ssh: mxferguson@10.7.2.101, jump: aidev.lab.local}
+  vm722: {ssh: mxferguson@10.7.2.102, jump: aidev.lab.local}
+
+flows:
+  # --- Start_Policy ICMP rules (already hot; Mac is in group a8b5ed22) ---
+  - {id: mac-ping-net0, from: mac, action: ping, dst: 10.7.0.101, count: 5, expect: allow-icmp-network-0}
+  - {id: mac-ping-net1, from: mac, action: ping, dst: 10.7.1.101, count: 5, expect: allow-icmp-network-1}
+  - {id: mac-ping-net2, from: mac, action: ping, dst: 10.7.2.101, count: 5, expect: allow-icmp-network-2}
+
+  # --- Start_Policy SSH rules (already hot; aidev is in hardware-subnet) ---
+  - {id: aidev-ssh-net0, from: aidev, action: tcp, dst: 10.7.0.101, port: 22, repeat: 3, expect: ssh-network-0}
+  - {id: aidev-ssh-net1, from: aidev, action: tcp, dst: 10.7.1.101, port: 22, repeat: 3, expect: ssh-network-1}
+  - {id: aidev-ssh-net2, from: aidev, action: tcp, dst: 10.7.2.101, port: 22, repeat: 3, expect: ssh-network-2}
+
+  # --- web_rule: hardware-subnet -> vm1/vm2 on HTTP/HTTPS (OpenSpeedtest listens) ---
+  - {id: aidev-web-http,     from: aidev, action: http,     url: "http://10.7.0.101/",            repeat: 20, expect: web_rule}
+  - {id: aidev-web-https,    from: aidev, action: http,     url: "https://10.7.1.102/",           repeat: 10, expect: web_rule}
+  - {id: aidev-web-download, from: aidev, action: download, url: "http://10.7.2.101/downloading", repeat: 3,  expect: web_rule}
+
+  # --- seed-icmp-vm1-asl2: vm|1 -> asl_id|2 ICMP echo ---
+  - {id: vm701-icmp-asl2-722, from: vm701, action: ping, dst: 10.7.2.102, count: 5, expect: seed-icmp-vm1-asl2}
+  - {id: vm711-icmp-asl2-721, from: vm711, action: ping, dst: 10.7.2.101, count: 5, expect: seed-icmp-vm1-asl2}
+
+  # --- seed-logged-drop: ANY -> seed-ip-whole-subnet ICMP echo, DROP ---
+  - {id: vm701-logged-drop,   from: vm701, action: ping, dst: 10.21.10.20, count: 10, expect: seed-logged-drop}
+  - {id: vm712-logged-drop,   from: vm712, action: ping, dst: 10.21.4.10,  count: 5,  expect: seed-logged-drop}
+
+  # --- Infrastructure seed-infra-dns: ANY -> seed-ip-mgmt dns ---
+  - {id: vm701-infra-dns, from: vm701, action: dns, server: 10.21.250.10, name: lab.local, repeat: 10, expect: seed-infra-dns}
+
+  # --- noise that should land on the Default Layer3 DROP ---
+  - {id: vm701-scan-702,  from: vm701, action: scan, dst: 10.7.0.102, ports: "20-40", expect: default-layer3-rule}
+  - {id: mac-tcp-701,     from: mac,   action: tcp,  dst: 10.7.0.101, port: 80, repeat: 3, expect: default-layer3-rule}
+  - {id: vm711-udp-noise, from: vm711, action: udp,  dst: 10.7.2.101, port: 5000, repeat: 5, expect: default-layer3-rule}
+
+cold:
+  - ping-out
+  - seed-syslog-any
+  - test-infrastructure-rule-1
