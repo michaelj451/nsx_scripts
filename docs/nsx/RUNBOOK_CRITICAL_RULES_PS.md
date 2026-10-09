@@ -85,8 +85,12 @@ python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT --runs
 python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT --runs-dir "$RUNS" --apply    # write
 ```
 
-Read the dry run's table (`failed=0` everywhere) before `--apply`. After a
-partial apply, rerun with `--apply --allow-non-empty` to continue.
+Read the dry run's table (`failed=0` everywhere) before `--apply`. Run
+`--apply` in the PowerShell window yourself: every push tool asks before each
+batch (`Enter` continue, a number sets the batch size, `x` stops), and without
+a terminal the script refuses `--apply`. `--piped-answers` lets answers come
+from a pipe, only with the operator's approval. After a partial apply, rerun
+with `--apply --allow-non-empty` to continue.
 
 ## Step 4 - Verify
 
@@ -103,7 +107,11 @@ python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --runs-dir
 python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --runs-dir "$RUNS" --apply    # write
 ```
 
-Returns the target to empty. Classes step 3 never applied are skipped.
+Undoes every push step 3 made, newest first, including an earlier apply that
+stopped partway, so one `--apply` returns the target to empty. The dry run
+shows each pending push; classes with nothing left show `already reverted` or
+`never applied`. Like step 3, `--apply` asks before each batch and needs the
+PowerShell window (or `--piped-answers`).
 
 ---
 

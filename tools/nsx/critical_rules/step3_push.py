@@ -10,7 +10,11 @@ Infrastructure bundle, then for the hit-rules bundle: services, groups
 that fails.
 
 Dry run by default: every push reports what it would do and nothing is
-written. Read that output, then run again with --apply. --apply refuses a
+written. Read that output, then run again with --apply, in a terminal: the
+push tools ask before every batch (Enter=continue, number=batch size, x=stop).
+Without a terminal --apply is refused, so it can never stop after one object
+and leave the target half done; --piped-answers allows answers fed on stdin
+(only with the operator's approval). --apply refuses a
 target that is not empty; after a partial apply, rerun with
 --allow-non-empty to continue (pushes skip objects that are already identical).
 
@@ -46,7 +50,9 @@ def main() -> int:
                    help="apply even though the target already holds customer objects")
     p.add_argument("--segments-mode", default="strip", choices=["strip", "keep", "convert"],
                    help="segment references inside groups (default: strip)")
+    cr.add_piped_answers_arg(p)
     args = p.parse_args()
+    cr.require_terminal(args.apply, args.piped_answers)
 
     run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
@@ -95,7 +101,8 @@ def main() -> int:
         print("Next:")
         print("  " + cr.next_command("step4_verify.py", args))
 
-    cr.record_step(run, f"push_{mode}", {"ok": ok, "target_was_empty": empty, "steps": results})
+    cr.record_step(run, f"push_{mode}", {"ok": ok, "target_was_empty": empty,
+                                         "piped_answers": args.piped_answers, "steps": results})
     return 0 if ok else 1
 
 

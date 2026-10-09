@@ -210,6 +210,34 @@ def push_steps(bundles: Dict[str, Path], target: str, apply: bool,
     return steps
 
 
+def add_piped_answers_arg(parser: Any) -> None:
+    parser.add_argument("--piped-answers", action="store_true",
+                        help="allow --apply without a terminal: the push tools' batch prompts are then "
+                             "answered from stdin (e.g. yes '' | ...). Only with the operator's approval.")
+
+
+def require_terminal(apply: bool, piped_answers: bool, stdin: Any = None) -> None:
+    """With --apply the push and revert tools ask before every batch. Without a
+    terminal that question reads end-of-input and the tool stops after one
+    object, leaving the target half done. Refuse that up front."""
+    stdin = stdin if stdin is not None else sys.stdin
+    if apply and not piped_answers and not (hasattr(stdin, "isatty") and stdin.isatty()):
+        raise SystemExit(
+            "--apply needs a terminal: the push tools ask before every batch (Enter=continue, "
+            "number=batch size, x=stop). Run this in a terminal, or add --piped-answers and feed "
+            "the answers yourself (only with the operator's approval).")
+
+
+def unreverted_baselines(reports_dir: Path) -> List[Path]:
+    """Baselines a push wrote and no revert has used yet, newest first. The push
+    tools rename a baseline to *.json.reverted when a revert completes."""
+    return sorted((reports_dir / "baselines").glob("*_target_baseline.json"), reverse=True)
+
+
+def reverted_baselines(reports_dir: Path) -> List[Path]:
+    return sorted((reports_dir / "baselines").glob("*_target_baseline.json.reverted"), reverse=True)
+
+
 def revert_steps(bundles: Dict[str, Path], target: str, apply: bool) -> List[Tuple[str, List[str]]]:
     """(label, cmd) for every revert: hit-rules bundle first, rules down to services.
 

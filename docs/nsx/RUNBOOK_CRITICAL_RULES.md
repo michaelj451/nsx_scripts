@@ -139,9 +139,16 @@ python tools/nsx/critical_rules/step3_push.py --source $SRC --target $TGT --runs
 
 Checks the target is empty, then runs services, groups (segment references
 stripped), policies and rules for the Infrastructure bundle, then the
-hit-rules bundle. Stops at the first failure. Read the dry run's table
-(`failed=0` everywhere) before `--apply`. After a partial apply, rerun with
-`--apply --allow-non-empty` to continue.
+hot-rules bundle. Stops at the first failure. Read the dry run's table
+(`failed=0` everywhere) before `--apply`.
+
+`--apply` must run in a terminal: every push tool starts at batch size 1 and
+asks before each next batch (`Enter` continue, a number sets the batch size,
+`x` stops). Without a terminal the script refuses `--apply` instead of letting
+the first prompt read end-of-input and stop after one object. To drive it from
+a script, add `--piped-answers` and feed the answers yourself (for example
+`yes "" | ...`), only with the operator's approval. After a partial apply,
+rerun with `--apply --allow-non-empty` to continue.
 
 ## Step 4 - Verify
 
@@ -159,11 +166,16 @@ python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --runs-dir
 python tools/nsx/critical_rules/revert.py --source $SRC --target $TGT --runs-dir "$RUNS" --apply    # write
 ```
 
-Hit-rules bundle first, then Infrastructure; rules, policies, groups,
-services. Each class is undone from the baseline its own push wrote (classes
-never applied are skipped), which returns the target to empty. Groups are
-reverted with `--allow-delete`; without that flag `groups.py revert` keeps the
-groups its push created and still reports success.
+Hot-rules bundle first, then Infrastructure; rules, policies, groups,
+services. Every push step 3 made is undone, newest first, including an earlier
+apply that stopped partway, so one run of `--apply` returns the target to
+empty. Each push left a baseline under `<bundle>/<class>/push_report/baselines/`,
+and the push tool renames it to `*.reverted` once a revert completes; the
+dry run shows the plan for every pending baseline, and a class shows
+`already reverted` or `never applied` when nothing is left. Groups are reverted
+with `--allow-delete`; without that flag `groups.py revert` keeps the groups
+its push created and still reports success. Like step 3, `--apply` needs a
+terminal (or `--piped-answers`, only with the operator's approval).
 
 ---
 

@@ -383,5 +383,100 @@ class BuildBundleTests(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class TerminalGuardTests(unittest.TestCase):
+    class _Stdin:
+        def __init__(self, tty):
+            self.tty = tty
+
+        def isatty(self):
+            return self.tty
+
+    def test_apply_without_terminal_is_refused(self):
+        with self.assertRaises(SystemExit):
+            cr.require_terminal(True, False, stdin=self._Stdin(False))
+
+    def test_dry_run_terminal_or_piped_answers_pass(self):
+        cr.require_terminal(False, False, stdin=self._Stdin(False))
+        cr.require_terminal(True, False, stdin=self._Stdin(True))
+        cr.require_terminal(True, True, stdin=self._Stdin(False))
+
+
+class RevertLoopTests(unittest.TestCase):
+    """revert.py undoes every push of a class, newest first, until none is left."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "cr_revert", ROOT / "tools/nsx/critical_rules/revert.py")
+        self.revert = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.revert)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.run = cr.new_run("nsx-lm2", "nsx-lm3", "lm2.h", "lm3.h", base=base)
+        self.bundles = {name: base / name / "t" / "h" for name in cr.BUNDLES}
+        for b in self.bundles.values():
+            for sub in ("services", "groups", "policies", "rules"):
+                (b / sub / "push_report" / "baselines").mkdir(parents=True)
+        svc = self.bundles["infra"] / "services/push_report/baselines"
+        for ts in ("20261008_181558", "20261009_111205"):      # a stopped first apply, then the full one
+            (svc / f"{ts}_target_baseline.json").write_text("{}", encoding="utf-8")
+        (self.bundles["hits"] / "rules/push_report/baselines/20261009_111232_target_baseline.json").write_text("{}")
+        cr.record_step(self.run, "pull", {"ok": True, "infra": str(self.bundles["infra"]),
+                                          "hits": str(self.bundles["hits"])})
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _fake_tool(self, label, cmd, log_dir, cwd=None):
+        """Stand-in for a revert tool: on --apply it marks its newest baseline reverted."""
+        self.calls.append((label, "--from-baseline" in cmd))
+        if "--apply" in cmd:
+            reports = Path(cmd[cmd.index("--reports-dir") + 1])
+            pending = cr.unreverted_baselines(reports)
+            pending[0].rename(pending[0].with_suffix(".json.reverted"))
+        return {"label": label, "ok": True, "rc": 0, "summary": None}
+
+    def _main(self, *extra):
+        from unittest.mock import patch
+        argv = ["revert.py", "--source", "nsx-lm2", "--target", "nsx-lm3", "--run", str(self.run), *extra]
+        with patch.object(sys, "argv", argv), patch.object(cr, "run_tool", self._fake_tool), \
+                patch.dict(os.environ, {}), patch.object(self.revert, "setup_logging", lambda *a, **k: None):
+            return self.revert.main()
+
+    def test_apply_undoes_every_push_newest_first(self):
+        self.assertEqual(self._main("--apply", "--piped-answers"), 0)
+        self.assertEqual([c[0] for c in self.calls],
+                         ["01_hits_rules_revert_apply", "08_infra_services_revert_apply_1of2",
+                          "08_infra_services_revert_apply_2of2"])
+        svc = self.bundles["infra"] / "services/push_report"
+        self.assertEqual(cr.unreverted_baselines(svc), [])
+        self.assertEqual(len(cr.reverted_baselines(svc)), 2)
+        rec = cr.load_record(self.run)["steps"]["revert_apply"]
+        skipped = {r["label"]: r.get("skipped") for r in rec["steps"] if r.get("skipped")}
+        self.assertEqual(skipped["02_hits_policies_revert_apply"], "never applied")
+        # a second run finds nothing left
+        self.calls.clear()
+        self.assertEqual(self._main("--apply", "--piped-answers"), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_dry_run_shows_each_pending_push_explicitly(self):
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.calls, [("01_hits_rules_revert_dryrun", True),
+                                      ("08_infra_services_revert_dryrun_1of2", True),
+                                      ("08_infra_services_revert_dryrun_2of2", True)])
+        self.assertEqual(len(cr.unreverted_baselines(self.bundles["infra"] / "services/push_report")), 2)
+
+    def test_stops_when_a_baseline_is_not_marked(self):
+        from unittest.mock import patch
+        def lazy_tool(label, cmd, log_dir, cwd=None):
+            return {"label": label, "ok": True, "rc": 0, "summary": None}
+        argv = ["revert.py", "--source", "nsx-lm2", "--target", "nsx-lm3", "--run", str(self.run),
+                "--apply", "--piped-answers"]
+        with patch.object(sys, "argv", argv), patch.object(cr, "run_tool", lazy_tool), \
+                patch.dict(os.environ, {}), patch.object(self.revert, "setup_logging", lambda *a, **k: None):
+            self.assertEqual(self.revert.main(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
