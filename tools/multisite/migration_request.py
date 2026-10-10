@@ -259,7 +259,7 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
     # 7. Palo plan, from the same capture.
     palo, plan = None, None
     if inputs["palo"]["enabled"]:
-        palo, plan = build_palo(work, inputs, cap, selected, data, c_sib, c_map, d_sib, d_map)
+        palo, plan = build_palo(work, inputs, cap, selected, data, c_sib, c_map, d_sib, d_map, logs)
         if plan["counts"]["errors"]:
             errors.append(f"Palo plan has {plan['counts']['errors']} error(s); see {palo['plan_md']}")
 
@@ -288,7 +288,7 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_palo(work: Path, inputs: Dict[str, Any], cap: mr.CaptureView, selected: List[Dict[str, Any]],
                data: Dict[str, Any], c_sib: Path, c_map: Dict[str, Any], d_sib: Path,
-               d_map: Dict[str, Any]):
+               d_map: Dict[str, Any], logs: Path):
     """The Palo plan for exactly the selected rules, built by the same mapping
     code as `nsx_pan_mirror.py plan-rules`, from the request's own capture.
     Built-in NSX services and context profiles are not in a capture, so they
@@ -449,6 +449,24 @@ def palo_flags(args: argparse.Namespace) -> List[str]:
     return out
 
 
+def cli_flag(inputs: Dict[str, Any]) -> List[str]:
+    """The request's --palo-cli choice, passed to the Palo push dry run."""
+    return [] if (inputs.get("palo") or {}).get("cli_commands", True) else ["--no-cli-commands"]
+
+
+def paste_files(work: Path, dry_manifest: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Paths of the paste-ready CLI text a Palo dry run wrote, if it wrote any."""
+    if not (inputs.get("palo") or {}).get("cli_commands", True):
+        return {}
+    stem = dry_manifest.name[:-len(".json")]
+    dated = work / "palo" / f"{stem}_set_commands.txt"
+    if not dated.is_file():
+        return {}
+    return {"set_commands": repo_relative(dated),
+            "delete_commands": repo_relative(work / "palo" / f"{stem}_delete_commands.txt"),
+            "set_commands_latest": repo_relative(work / "palo" / "pan_set_commands.txt")}
+
+
 def newest(directory: Path, pattern: str) -> Optional[Path]:
     found = sorted(directory.glob(pattern))
     return found[-1] if found else None
@@ -495,7 +513,8 @@ def run_previews(work: Path, rec: Dict[str, Any], parts: Sequence[str],
         elif part == "palo" and rec.get("palo"):
             plan_path = work / "palo" / "plan.json"
             r = run_step("palo_push_dryrun", [PY, "tools/pan/nsx_pan_mirror.py", "push", "--plan", plan_path,
-                                              "--allow-plan-errors"] + palo_flags(args), logs)
+                                              "--allow-plan-errors"] + palo_flags(args)
+                         + cli_flag(inputs), logs)
             doc_path = newest(work / "palo", "push_*_dryrun.json")
             if r["ok"] and doc_path:
                 doc = read_json(doc_path)
@@ -506,6 +525,7 @@ def run_previews(work: Path, rec: Dict[str, Any], parts: Sequence[str],
                                     "would_create": [{"kind": x["kind"], "name": x["name"]}
                                                      for x in doc.get("results") or []
                                                      if x.get("status") == "would_create"]}
+                previews["palo"].update(paste_files(work, doc_path, inputs))
             else:
                 previews["palo"] = None
                 log.error("Palo preview failed (device group or profiles missing, or login); see %s", r["log"])
@@ -566,7 +586,8 @@ def cmd_request(args: argparse.Namespace) -> int:
                  "object_location": args.object_location, "rulebase": args.rulebase,
                  "zone_from": args.zone_from, "zone_to": args.zone_to,
                  "profile_group": _setting(args.profile_group, "PANORAMA_SECURITY_PROFILE_GROUP"),
-                 "log_setting": _setting(args.log_setting, "PANORAMA_LOG_FORWARDING_PROFILE")},
+                 "log_setting": _setting(args.log_setting, "PANORAMA_LOG_FORWARDING_PROFILE"),
+                 "cli_commands": args.palo_cli},
     }
     write_text(work / "servers.txt", "".join(f"{n}{',' + ','.join(ips) if ips else ''}\n" for n, ips in entries))
     log.info("=" * 70)
@@ -587,6 +608,11 @@ def cmd_request(args: argparse.Namespace) -> int:
     path = render(work, rec, "Migration request", "request.md")
     update_latest(work.parent, work)
     log.info("Request: %s", repo_relative(path))
+    pp = (read_json(work / "preview" / "previews.json") if (work / "preview" / "previews.json").is_file()
+          else {}).get("palo") or {}
+    if pp.get("set_commands"):
+        log.info("Palo Alto paste file from the dry run (%d missing object(s)): %s",
+                 (pp.get("summary") or {}).get("would_create", 0), pp["set_commands"])
     log.info("Fingerprint: %s", rec["model"]["digest"])
     for e in rec["errors"]:
         log.error("  %s", e)
@@ -782,7 +808,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             cmd = [PY, "tools/pan/nsx_pan_mirror.py", "revert", "--manifest", manifest] + palo_flags(args)
             records.append(run_step("palo_revert", cmd + (["--apply"] if args.apply else []), logs))
         else:
-            cmd = [PY, "tools/pan/nsx_pan_mirror.py", "push", "--plan", plan] + palo_flags(args)
+            cmd = [PY, "tools/pan/nsx_pan_mirror.py", "push", "--plan", plan] + palo_flags(args) + cli_flag(inputs)
             if args.allow_plan_errors:
                 cmd.append("--allow-plan-errors")
             apply = args.apply and action == "push"
@@ -791,6 +817,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             doc_path = newest(work / "palo", f"push_*_{'apply' if apply else 'dryrun'}.json")
             if doc_path is not None:
                 doc = read_json(doc_path)
+                if not apply:
+                    pf = paste_files(work, doc_path, inputs)
+                    if pf:
+                        log.info("Palo Alto paste file from this dry run (%d missing object(s)): %s",
+                                 (doc.get("summary") or {}).get("would_create", 0), pf["set_commands"])
                 gaps = mr._palo_existing_gaps(doc, read_json(plan))
                 for g in gaps:
                     log.warning("Address group %s already on Panorama lacks %s member(s): %s "
@@ -938,6 +969,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     rq.add_argument("--log-setting", default=None,
                     help="Log forwarding profile (default .env; 'none' for none).")
     rq.add_argument("--no-palo", action="store_true", help="NSX only: no Palo plan.")
+    rq.add_argument("--palo-cli", action=argparse.BooleanOptionalAction, default=True,
+                    help="The Palo dry run also writes paste-ready PAN-OS CLI text for exactly the objects it "
+                         "finds missing (palo/pan_set_commands.txt, pan_delete_commands.txt, plus dated copies "
+                         "beside each dry-run report). On by default; --no-palo-cli leaves it out. A refresh "
+                         "and its run --phase palo dry runs keep the request's choice.")
     rq.add_argument("--no-preview", action="store_true",
                     help="Skip the dry runs (offline report; run `preview` later).")
     rq.add_argument("--rate-limit", type=float, default=None, metavar="RPS",

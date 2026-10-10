@@ -51,6 +51,7 @@ def main() -> int:
     run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
+    cr.check_target_host(rec, args.target)
     pull = rec.get("steps", {}).get("pull") or {}
     if not pull.get("ok"):
         raise SystemExit(f"no successful step 2 in {run}; nothing to revert")

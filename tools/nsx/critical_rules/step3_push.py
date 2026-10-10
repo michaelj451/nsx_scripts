@@ -57,6 +57,7 @@ def main() -> int:
     run = cr.resolve_run(args.source, args.target, args.run, base=cr.runs_base(args.runs_dir))
     rec = cr.load_record(run)
     cr.check_pair(rec, args.source, args.target)
+    cr.check_target_host(rec, args.target)
     pull = rec.get("steps", {}).get("pull") or {}
     if not pull.get("ok"):
         raise SystemExit(f"no successful step 2 in {run}; run step2_pull.py first")
@@ -73,10 +74,14 @@ def main() -> int:
     log.info("Target %s customer objects now: %s", rec["target_host"],
              {k: len(v) for k, v in current.items()})
     if not empty:
+        for k in cr.CLASSES:
+            if current[k]:
+                log.warning("  already on the target, %s (%d): %s", k, len(current[k]), sorted(current[k])[:25]
+                            + (["..."] if len(current[k]) > 25 else []))
         if args.apply and not args.allow_non_empty:
             log.error("target is not empty; refusing to apply (use --allow-non-empty to continue a partial apply)")
             cr.record_step(run, f"push_{mode}", {"ok": False, "refused": "target not empty",
-                                                 "target_objects": {k: len(v) for k, v in current.items()}})
+                                                 "target_objects": {k: sorted(v) for k, v in current.items()}})
             return 2
         log.warning("target is not empty: objects that already exist will show as update or unchanged")
 

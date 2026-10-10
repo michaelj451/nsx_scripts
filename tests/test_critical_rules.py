@@ -441,6 +441,7 @@ class RevertLoopTests(unittest.TestCase):
         from unittest.mock import patch
         argv = ["revert.py", "--source", "nsx-lm2", "--target", "nsx-lm3", "--run", str(self.run), *extra]
         with patch.object(sys, "argv", argv), patch.object(cr, "run_tool", self._fake_tool), \
+                patch.object(cr, "check_target_host", lambda *a, **k: None), \
                 patch.dict(os.environ, {}), patch.object(self.revert, "setup_logging", lambda *a, **k: None):
             return self.revert.main()
 
@@ -474,8 +475,46 @@ class RevertLoopTests(unittest.TestCase):
         argv = ["revert.py", "--source", "nsx-lm2", "--target", "nsx-lm3", "--run", str(self.run),
                 "--apply", "--piped-answers"]
         with patch.object(sys, "argv", argv), patch.object(cr, "run_tool", lazy_tool), \
+                patch.object(cr, "check_target_host", lambda *a, **k: None), \
                 patch.dict(os.environ, {}), patch.object(self.revert, "setup_logging", lambda *a, **k: None):
             self.assertEqual(self.revert.main(), 1)
+
+
+class NestedServiceTests(unittest.TestCase):
+    def test_nested_service_members_come_along(self):
+        """NestedServiceServiceEntry.nested_service_path members must be in the bundle,
+        or the nested service fails to push on a target that lacks them."""
+        with tempfile.TemporaryDirectory() as d:
+            root = make_exports(Path(d))
+            S = "/infra/services/"
+            _yaml(root / "nsx_services_export/h/services/bundle.yaml", {
+                "id": "bundle", "path": S + "bundle", "service_entries": [
+                    {"resource_type": "NestedServiceServiceEntry", "nested_service_path": S + "member-a"},
+                    {"resource_type": "NestedServiceServiceEntry", "nested_service_path": S + "member-b"}]})
+            _yaml(root / "nsx_services_export/h/services/member-a.yaml", {"id": "member-a", "path": S + "member-a"})
+            _yaml(root / "nsx_services_export/h/services/member-b.yaml", {"id": "member-b", "path": S + "member-b"})
+            rule = root / "nsx_rules_export/h/security-policies/Start-x/rules/0003_ssh.yaml"
+            r = yaml.safe_load(rule.read_text()); r["services"] = [S + "bundle"]; _yaml(rule, r)
+            b = cr.build_bundle(root, "h", root / "hits", {"Application"}, hot={("Start_Policy", "ssh")})
+            m = json.loads((b / "manifest.json").read_text())
+            self.assertEqual(m["services"], [S + "bundle", S + "member-a", S + "member-b"])
+            self.assertEqual(sorted(f.name for f in (b / "services/services").glob("*.yaml")),
+                             ["bundle.yaml", "member-a.yaml", "member-b.yaml"])
+
+    def test_missing_member_is_reported_unresolved(self):
+        svc = {"service_entries": [{"resource_type": "NestedServiceServiceEntry",
+                                    "nested_service_path": "/infra/services/gone"}]}
+        self.assertEqual(cr.nested_service_refs(svc), {"/infra/services/gone"})
+
+
+class TargetHostTests(unittest.TestCase):
+    def test_alias_must_still_resolve_to_the_recorded_host(self):
+        from unittest.mock import patch
+        import nsx.nsx_constants as nc
+        with patch.object(nc, "resolve_manager", lambda alias: "new-host.lab.local"):
+            with self.assertRaises(SystemExit):
+                cr.check_target_host({"target_host": "nsx-lm3.lab.local"}, "nsx-lm3")
+            cr.check_target_host({"target_host": "new-host.lab.local"}, "nsx-lm3")
 
 
 if __name__ == "__main__":

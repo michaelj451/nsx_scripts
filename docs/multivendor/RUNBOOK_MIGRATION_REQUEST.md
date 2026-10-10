@@ -110,6 +110,7 @@ Useful options:
 |---|---|
 | `--no-preview` | Skip the dry runs (offline report). Run `mr preview --request $R --part a` (or `c`, `d`, `palo`, `all`) later |
 | `--no-palo` | NSX only |
+| `--no-palo-cli` | The Palo dry run does not write the paste-ready CLI text (see "Palo Alto by the Panorama command line") |
 | `--include-default-sections` | Also copy rules from NSX's default sections (normally never) |
 | `--rulebase post`, `--object-location device-group`, `--zone-from`, `--zone-to` | Palo placement, as in `plan-rules` |
 | `--profile-group none`, `--log-setting none` | No security profile or log forwarding profile on the Palo rules |
@@ -137,7 +138,60 @@ Useful options:
    added by hand.
 
 The full Palo plan is `palo/plan.md`, the Panorama dry run
-`palo/push_<ts>_dryrun.md`.
+`palo/push_<ts>_dryrun.md`, and the paste-ready Panorama commands that dry
+run wrote, `palo/pan_set_commands.txt` (next section).
+
+### Palo Alto by the Panorama command line
+
+The Palo dry run writes a plain text file of Panorama commands you paste on
+the command line, for **exactly the objects it found missing** on Panorama.
+The dry run runs inside `request` (it is part of building this approval
+report) and again in `run --phase palo` at the change window, so each one
+leaves the file for that moment beside its own report, in `palo/`:
+
+| File | What it holds |
+|---|---|
+| `pan_set_commands.txt` | From the newest dry run: one `set` command per missing object, in creation order (addresses, address groups with members before the groups that hold them, services, service groups, then the security rules in NSX order). Pasted into configure mode it creates them, with the same names and content the REST push would create |
+| `pan_delete_commands.txt` | The matching `delete` commands, newest first. Removes only what the set file creates, never an object that was already there |
+| `push_<ts>_dryrun_set_commands.txt`, `..._delete_commands.txt` | The same two files kept per dry run, beside that dry run's report `push_<ts>_dryrun.md` |
+
+Both files hold commands only: no comments, no `configure`, no `commit`.
+Each line is built from the same REST entry the push sends. On Panorama:
+
+```text
+set cli scripting-mode on
+configure
+(paste pan_set_commands.txt)
+exit
+```
+
+`set cli scripting-mode on` stops the CLI from completing and paging while a
+long paste is processed. Review the candidate configuration and commit in
+Panorama yourself. Address groups already on Panorama that lack members are
+not in the file (the dry run lists them under "lack members").
+
+The file is made by a separate script, `tools/pan/pan_cli_commands.py`,
+logic `app/multisite/pan_set_commands.py`. Include or leave it out:
+
+| Where | Include (default) | Leave out |
+|---|---|---|
+| `migration_request.py request` (its refresh and `run --phase palo` dry runs keep the choice) | `--palo-cli` | `--no-palo-cli` |
+| `nsx_pan_mirror.py push` dry run | `--cli-commands` | `--no-cli-commands` |
+
+The same script writes the text afterwards from any finished run, with no
+device contact: from the newest dry run by default, or, when Panorama could
+not be checked, every object of the plan as `pan_all_set_commands.txt` /
+`pan_all_delete_commands.txt` (these may include objects that already exist):
+
+```bash
+python tools/pan/pan_cli_commands.py --plan $R                 # from the newest dry run
+python tools/pan/pan_cli_commands.py --plan $R --all-objects   # every object, unchecked
+```
+
+Not yet pasted on a real Panorama: the commands follow PAN-OS CLI syntax and
+match the REST entries field for field (tests in
+`tests/test_pan_set_commands.py`). Paste them on pano4 once before relying on
+them.
 
 ## 3) Approve
 
@@ -224,7 +278,8 @@ migration_requests/<source>_to_<destination>/<UTC_TS>/
   source/vm_rules/         VM-rule snapshot (capture_vm_rule_data.py)
   bundle/                  Workflow A bundle, plus c_input/ and d_input/
   c/ d/                    Workflow C and D sibling bundles (build_sibling_groups.py)
-  palo/                    plan.json, plan.md, Panorama dry runs
+  palo/                    plan.json, plan.md, Panorama dry runs (push_<ts>_dryrun.*),
+                           pan_set_commands.txt / pan_delete_commands.txt from the newest
   preview/previews.json    dry-run counts shown in request.md
   runs/<UTC_TS>/           one per refresh: the same layout, plus run.json,
                            delta.md, implementation.md, phases.json, report/

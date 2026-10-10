@@ -897,6 +897,7 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
     else:
         L += [f"Panorama device group **{palo['device_group']}**, objects in `{palo['object_location']}`, "
               f"{palo['rulebase']}-rulebase. Full plan: `{palo['plan_md']}`.", ""]
+
         pc = palo["counts"]
         L += md_table(["Panorama rules", "address groups", "addresses", "services", "service groups",
                        "NSX rules not mirrored", "errors", "warnings"],
@@ -909,6 +910,12 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
                           [[pp["summary"].get("would_create", 0), pp["summary"].get("exists_unchanged", 0)
                             - pp["summary"].get("exists_differs", 0), pp["summary"].get("exists_differs", 0),
                             pp["summary"].get("failed", 0)]], ["r"] * 4)
+            if pp.get("set_commands"):
+                L += ["", f"**Paste file from this dry run:** `{pp['set_commands']}` holds one `set` command for each "
+                          f"of the {pp['summary'].get('would_create', 0)} objects the dry run found missing, in "
+                          "creation order, ready to paste in configure mode; "
+                          f"`{pp['delete_commands']}` removes exactly those again, newest first. The newest dry run "
+                          f"is also at `{pp['set_commands_latest']}`. Neither file commits."]
             gaps = pp.get("member_gaps") or []
             if gaps:
                 L += ["", "**Address groups already on Panorama that lack members.** The push never edits an "
@@ -946,6 +953,9 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
           f"- Workflow C siblings: `{rec['paths']['c']}`", f"- Workflow D siblings: `{rec['paths']['d']}`"]
     if palo:
         L += [f"- Palo plan: `{palo['plan_md']}`"]
+        ppf = previews.get("palo") or {}
+        if ppf.get("set_commands"):
+            L += [f"- Panorama paste file (from the dry run): `{ppf['set_commands']}`, undo `{ppf['delete_commands']}`"]
     L += [f"- Fingerprint: `{rec['model']['digest']}`", ""]
     return align_markdown_tables("\n".join(L)) + "\n"
 

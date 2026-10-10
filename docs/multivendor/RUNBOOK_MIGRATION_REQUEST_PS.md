@@ -58,7 +58,11 @@ Mr preview --request $R --part a --no-tls-verify   # or c, d, palo, all
 
 ## 2) Review
 
-Read `$R\request.md`. The full Palo plan is `$R\palo\plan.md`.
+Read `$R\request.md`. The full Palo plan is `$R\palo\plan.md`. The Palo dry run
+also wrote the paste-ready Panorama commands for the objects it found missing,
+`$R\palo\pan_set_commands.txt`, with `$R\palo\pan_delete_commands.txt` to remove
+them; how to paste them is in the bash card's "Palo Alto by the Panorama
+command line" section.
 
 ## 3) Approve
 
