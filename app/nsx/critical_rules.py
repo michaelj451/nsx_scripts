@@ -457,6 +457,32 @@ def _ref_closure(refs: Set[str], index: Dict[str, Tuple[Path, Dict[str, Any]]], 
     return kept, unresolved
 
 
+def nested_service_refs(service: Dict[str, Any], fpb: Any = None) -> Set[str]:
+    """Services a service needs on the target before it can be pushed.
+
+    NSX stores a nested service's members as NestedServiceServiceEntry
+    `nested_service_path`; filter_policy_bundle's walker only follows `members`
+    lists, so a bundle built with it alone leaves the members out and the
+    nested service then fails to push on a target that lacks them."""
+    refs = set((fpb or _filter_helpers())._extract_nested_service_paths(service))
+    for entry in service.get("service_entries") or []:
+        path = entry.get("nested_service_path")
+        if entry.get("resource_type") == "NestedServiceServiceEntry" and path and path.startswith("/infra/services/"):
+            refs.add(path)
+    return refs
+
+
+def check_target_host(rec: Dict[str, Any], target: str) -> None:
+    """The push and revert tools resolve the target alias from .env each time
+    they run. Refuse when it no longer resolves to the host this run recorded,
+    so a run cannot check one manager and write to another."""
+    from nsx.nsx_constants import resolve_manager
+    now = resolve_manager(target)
+    if now != rec.get("target_host"):
+        raise SystemExit(f"{target} now resolves to {now!r} but this run was started for "
+                         f"{rec.get('target_host')!r}; fix .env (NSX_LM*) or start a new run")
+
+
 def build_bundle(exports_root: Path, source_host: str, out_root: Path, categories: Set[str],
                  hot: Optional[Set[Tuple[str, str]]] = None) -> Path:
     """Write a push-ready bundle under <out_root>/<UTC_TS>/<source host>/.
@@ -502,7 +528,7 @@ def build_bundle(exports_root: Path, source_host: str, out_root: Path, categorie
         ref_groups |= {p for p in (pol.get("scope") or []) if p and p not in ("ANY", "any") and p.startswith("/")}
 
     groups, groups_unresolved = _ref_closure(ref_groups, all_grp, fpb._extract_nested_group_paths)
-    services, services_unresolved = _ref_closure(ref_services, all_svc, fpb._extract_nested_service_paths)
+    services, services_unresolved = _ref_closure(ref_services, all_svc, lambda s: nested_service_refs(s, fpb))
     segments = sorted({s for g in groups for s in fpb._extract_segment_paths(all_grp[g][1])})
     system_refs = sorted([p for p in groups if is_system_default(all_grp[p][1])] +
                          [p for p in services if is_system_default(all_svc[p][1])])

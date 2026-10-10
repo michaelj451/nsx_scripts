@@ -47,6 +47,7 @@ $TGT  = "nsx-lm3"                         # new, empty manager
 
 Set-Location $REPO
 git pull
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this window only; Windows blocks Activate.ps1 otherwise
 .\.venv\Scripts\Activate.ps1
 $env:PYTHONPATH  = "$REPO/app"
 $env:NSX_LOG_DIR = "$REPO/nsx_logs"
@@ -90,7 +91,7 @@ Read the dry run's table (`failed=0` everywhere) before `--apply`. Run
 batch (`Enter` continue, a number sets the batch size, `x` stops), and without
 a terminal the script refuses `--apply`. `--piped-answers` lets answers come
 from a pipe, only with the operator's approval. After a partial apply, rerun
-with `--apply --allow-non-empty` to continue.
+with `--apply --allow-non-empty` to continue. When the target is not empty, step 3 lists every customer object already there. Steps 3 and 4 and `revert.py` stop if the target alias now resolves (in `.env`) to a different host than the run recorded at step 1.
 
 ## Step 4 - Verify
 

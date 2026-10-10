@@ -148,7 +148,7 @@ asks before each next batch (`Enter` continue, a number sets the batch size,
 the first prompt read end-of-input and stop after one object. To drive it from
 a script, add `--piped-answers` and feed the answers yourself (for example
 `yes "" | ...`), only with the operator's approval. After a partial apply,
-rerun with `--apply --allow-non-empty` to continue.
+rerun with `--apply --allow-non-empty` to continue. When the target is not empty, step 3 lists every customer object already there, so you can tell an expected leftover from a surprise before using `--allow-non-empty`. Steps 3 and 4 and `revert.py` stop if the target alias now resolves (in `.env`) to a different host than the run recorded at step 1.
 
 ## Step 4 - Verify
 

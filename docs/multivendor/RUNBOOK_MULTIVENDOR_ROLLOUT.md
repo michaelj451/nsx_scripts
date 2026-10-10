@@ -320,6 +320,11 @@ python tools/pan/nsx_pan_mirror.py push --plan $P/plan.json --no-tls-verify --ap
 # Undo exactly what that apply created (dry run, then --apply)
 python tools/pan/nsx_pan_mirror.py revert --manifest $P/push_<ts>_apply.json --no-tls-verify
 python tools/pan/nsx_pan_mirror.py revert --manifest $P/push_<ts>_apply.json --no-tls-verify --apply
+
+# CLI instead of REST: the push DRY RUN also writes $P/pan_set_commands.txt (paste in
+# configure mode; creates exactly the objects it found missing) and
+# $P/pan_delete_commands.txt; --no-cli-commands leaves them out. Afterwards, from any
+# run: python tools/pan/pan_cli_commands.py --plan $P [--all-objects]
 ```
 
 A plan with errors (for example a VM without a hostname tag) is refused by

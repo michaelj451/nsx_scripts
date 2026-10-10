@@ -31,6 +31,14 @@ Panorama device group. Separate commands; nothing here ever commits.
   revert   Deletes only the objects a push manifest says it created, newest
            first, and only while they still exist. Dry run by default.
 
+A push dry run also writes paste-ready PAN-OS CLI text (Mike, 2026-10-09)
+for exactly the objects it found missing: pan_set_commands.txt creates them
+when pasted into configure mode, pan_delete_commands.txt removes them again,
+newest first (dated copies push_<ts>_dryrun_*_commands.txt sit beside the
+dry-run report). --no-cli-commands leaves them out;
+tools/pan/pan_cli_commands.py writes them afterwards, or for every object of
+a plan when the device cannot be checked.
+
 Mapping rules: app/multisite/pan_mirror.py.
 
 USAGE
@@ -54,7 +62,8 @@ USAGE
     python tools/pan/nsx_pan_mirror.py report --manifest <run>/push_<ts>_apply.json
 
 OUTPUT
-    pan_mirror_runs/<nsx-host>/<UTC_TS>/  plan.json  plan.md  push_*.json + .md  revert_*.json + .md
+    pan_mirror_runs/<nsx-host>/<UTC_TS>/  plan.json  plan.md  pan_set_commands.txt  pan_delete_commands.txt
+                                          push_*.json + .md  revert_*.json + .md
 """
 from __future__ import annotations
 
@@ -76,6 +85,7 @@ from common.paths import repo_relative                            # noqa: E402
 from common.timeutil import run_ts, utc_now_iso                   # noqa: E402
 from multisite.pan_mirror import MirrorOptions, build_sibling_mirror  # noqa: E402
 from multisite.pan_rules import RuleOptions, build_rule_mirror       # noqa: E402
+from multisite.pan_set_commands import write_from_dryrun              # noqa: E402
 
 log = logging.getLogger("nsx_pan_mirror")
 OUT_BASE = REPO_ROOT / "pan_mirror_runs"
@@ -827,6 +837,13 @@ def cmd_push(args: argparse.Namespace) -> int:
     write_json(path, doc)
     log.info("Summary: %s", doc["summary"])
     log.info("Manifest: %s  Report: %s", repo_relative(path), repo_relative(write_report(doc, path)))
+    if not args.apply and args.cli_commands:
+        # Mike, 2026-10-09: the dry run writes the paste-ready CLI text, for
+        # exactly the objects it found missing on the device.
+        cli = write_from_dryrun(path, doc)
+        log.info("Paste file (configure mode, creates the %d missing object(s)): %s",
+                 doc["summary"].get("would_create", 0), repo_relative(cli[2]))
+        log.info("Undo file (deletes only those, newest first): %s", repo_relative(cli[3]))
     if args.apply and doc["summary"].get("created"):
         log.info("Nothing is committed. Review in Panorama; undo with: "
                  "python tools/pan/nsx_pan_mirror.py revert --manifest %s --apply", repo_relative(path))
@@ -923,6 +940,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         sp = sub.add_parser(name, help=hlp)
         if name == "push":
             sp.add_argument("--plan", required=True)
+            sp.add_argument("--cli-commands", action=argparse.BooleanOptionalAction, default=True,
+                            help="Dry run only: also write pan_set_commands.txt / pan_delete_commands.txt, "
+                                 "paste-ready PAN-OS CLI for exactly the objects found missing. On by default; "
+                                 "--no-cli-commands leaves them out.")
             sp.add_argument("--allow-plan-errors", action="store_true",
                             help="Push even though the plan reported errors (those objects are absent).")
         else:
