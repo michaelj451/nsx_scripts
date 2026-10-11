@@ -10,10 +10,11 @@ or --run).
 Without --apply (always first): reads the target (read only) and writes the
 plan:
   rules     the rules step 1 disabled, if each is still on the manager, still
-            disabled, unchanged since step 1, and has no hits. With
-            --include-pre-disabled also the never-hit rules that were already
-            disabled when step 1 planned (left out by default: rules are often
-            staged disabled ahead of a change window).
+            disabled, unchanged since step 1, and its counters have not moved
+            since step 1 recorded them. With --include-pre-disabled also the
+            rules that qualified but were already disabled when step 1 planned
+            (left out by default: rules are often staged disabled ahead of a
+            change window).
   policies  every customer DFW policy with no rules once those are gone,
             including policies that were already empty. NSX's default
             sections are never deleted.
@@ -114,7 +115,7 @@ def print_plan(plan: Dict[str, Any]) -> None:
     pre = plan["candidates"]
     if pre.get("pre_disabled") and not plan["include_pre_disabled"]:
         print()
-        print(f"Left out: {pre['pre_disabled']} never-hit rule(s) that were already disabled before step 1 "
+        print(f"Left out: {pre['pre_disabled']} qualifying rule(s) that were already disabled before step 1 "
               "(add --include-pre-disabled to delete them too).")
 
 
@@ -272,7 +273,7 @@ def main() -> int:
     p.add_argument("--run", help="run folder (default: newest for this target)")
     rc.add_runs_dir_arg(p)
     p.add_argument("--include-pre-disabled", action="store_true",
-                   help="also delete never-hit rules that were already disabled before step 1")
+                   help="also delete qualifying rules that were already disabled before step 1")
     p.add_argument("--apply", action="store_true", help="delete what the plan lists (default: plan only)")
     cr.add_piped_answers_arg(p)
     args = p.parse_args()

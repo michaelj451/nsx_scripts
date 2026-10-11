@@ -166,16 +166,98 @@ class ClassifyTests(unittest.TestCase):
     Z = {"hit_count": 0, "packet_count": 0, "byte_count": 0, "session_count": 0}
 
     def test_classes(self):
-        now = 40 * 86_400_000
-        self.assertEqual(rc.classify(rule("a", 1), None, now_ms=now), rc.NO_STATS)
-        self.assertEqual(rc.classify(rule("a", 1), {**self.Z, "packet_count": 3}, now_ms=now), rc.USED)
-        self.assertEqual(rc.classify(rule("a", 1), self.Z, now_ms=now), rc.DISABLE)
-        self.assertEqual(rc.classify(rule("a", 1, disabled=True), self.Z, now_ms=now), rc.ALREADY_DISABLED)
-        self.assertEqual(rc.classify(rule("a", 1, action="DROP"), self.Z, now_ms=now, keep_deny=True), rc.KEEP_DENY)
-        self.assertEqual(rc.classify(rule("a", 1, action="DROP"), self.Z, now_ms=now), rc.DISABLE)
-        young = {**rule("a", 1), "_create_time": now - 5 * 86_400_000}
-        self.assertEqual(rc.classify(young, self.Z, now_ms=now, min_age_days=30), rc.TOO_NEW)
-        self.assertEqual(rc.classify(young, self.Z, now_ms=now, min_age_days=3), rc.DISABLE)
+        now = 1_000 * rc.DAY_MS
+        never_old = {"since_ms": 0, "never": True, "last_hit": "never"}
+        never_young = {"since_ms": now - 5 * rc.DAY_MS, "never": True, "last_hit": "never"}
+        hit_recent = {"since_ms": now - 3 * rc.DAY_MS, "never": False, "last_hit": "x"}
+        unknown = {"since_ms": None, "never": False, "last_hit": "unknown"}
+        c = lambda r, u, ev, **kw: rc.classify(r, u, ev, now_ms=now, no_hit_days=30, **kw)  # noqa: E731
+        self.assertEqual(c(rule("a", 1), None, never_old), rc.NO_STATS)
+        self.assertEqual(c(rule("a", 1), self.Z, never_old), rc.DISABLE)
+        self.assertEqual(c(rule("a", 1), self.Z, never_young), rc.TOO_NEW)
+        self.assertEqual(c(rule("a", 1), {**self.Z, "hit_count": 4}, hit_recent), rc.RECENT)
+        self.assertEqual(c(rule("a", 1), self.Z, unknown), rc.RECENT)
+        self.assertEqual(c(rule("a", 1, disabled=True), self.Z, never_old), rc.ALREADY_DISABLED)
+        self.assertEqual(c(rule("a", 1, action="DROP"), self.Z, never_old, keep_deny=True), rc.KEEP_DENY)
+        self.assertEqual(c(rule("a", 1, action="DROP"), self.Z, never_old), rc.DISABLE)
+
+    def test_window_means_not_hit_for_more_than_n_days(self):
+        now = 1_000 * rc.DAY_MS
+        exactly = {"since_ms": now - 730 * rc.DAY_MS, "never": False}
+        longer = {"since_ms": now - 730 * rc.DAY_MS - 1, "never": False}
+        self.assertEqual(rc.classify(rule("a", 1), self.Z, exactly, now_ms=now, no_hit_days=730), rc.RECENT)
+        self.assertEqual(rc.classify(rule("a", 1), self.Z, longer, now_ms=now, no_hit_days=730), rc.DISABLE)
+
+    def test_no_hit_days_comes_from_argument_then_env_then_default(self):
+        import os
+        import nsx.nsx_constants  # noqa: F401  (load .env once, before the environment is patched)
+        with patch.dict(os.environ, {rc.NO_HIT_ENV: "90"}):
+            self.assertEqual(rc.resolve_no_hit_days(7), (7, "--no-hit-days"))
+            self.assertEqual(rc.resolve_no_hit_days(None), (90, rc.NO_HIT_ENV))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(rc.NO_HIT_ENV, None)
+            self.assertEqual(rc.resolve_no_hit_days(None), (90, "default"))
+        with patch.dict(os.environ, {rc.NO_HIT_ENV: "two years"}):
+            with self.assertRaises(SystemExit):
+                rc.resolve_no_hit_days(None)
+        with self.assertRaises(SystemExit):
+            rc.resolve_no_hit_days(0)
+
+
+class LastHitTests(unittest.TestCase):
+    """no_hit_since: when a rule was last hit, from counter readings over time."""
+    D = rc.DAY_MS
+
+    def r(self, day, hits, byts=None):
+        return (day * self.D, (hits, hits, hits * 100 if byts is None else byts, hits))
+
+    def test_never_hit_uses_creation_time(self):
+        ev = rc.no_hit_since([self.r(990, 0), self.r(1000, 0)], created_ms=10 * self.D)
+        self.assertEqual((ev["since_ms"], ev["last_hit"], ev["never"]), (10 * self.D, "never", True))
+
+    def test_counters_flat_since_oldest_reading(self):
+        ev = rc.no_hit_since([self.r(100, 5), self.r(500, 5), self.r(1000, 5)], created_ms=0)
+        self.assertEqual(ev["since_ms"], 100 * self.D)
+        self.assertTrue(ev["last_hit"].startswith("before "))
+
+    def test_last_increase_bounds_the_last_hit(self):
+        ev = rc.no_hit_since([self.r(100, 5), self.r(400, 9), self.r(700, 9), self.r(1000, 9)], created_ms=0)
+        self.assertEqual(ev["since_ms"], 400 * self.D)
+        self.assertTrue(ev["last_hit"].startswith("between "))
+
+    def test_bytes_alone_count_as_traffic(self):
+        # a long-lived session: no new hits, but bytes still grow
+        ev = rc.no_hit_since([self.r(100, 5, 500), self.r(900, 5, 800), self.r(1000, 5, 800)], created_ms=0)
+        self.assertEqual(ev["since_ms"], 900 * self.D)
+
+    def test_reset_discards_older_readings(self):
+        ev = rc.no_hit_since([self.r(100, 50), self.r(600, 0), self.r(1000, 0)], created_ms=0)
+        self.assertEqual(ev["since_ms"], 600 * self.D)       # not "never": hits were seen before the reset
+        self.assertTrue(ev["reset_seen"])
+        self.assertFalse(ev["never"])
+
+    def test_single_live_reading_with_hits_proves_nothing_old(self):
+        ev = rc.no_hit_since([self.r(1000, 7)], created_ms=0)
+        self.assertEqual(ev["since_ms"], 1000 * self.D)
+
+    def test_load_history_skips_unanswered_rows_and_other_domains(self):
+        with tempfile.TemporaryDirectory() as t:
+            h = Path(t)
+            for ts, iso, rows in (("20261001_000000", "2026-10-01T00:00:00+00:00",
+                                   [{"policy_id": "p", "rule_id": "a", "hit_count": 3, "byte_count": 9},
+                                    {"policy_id": "p", "rule_id": "b", "hit_count": 0, "stats_available": False},
+                                    {"domain_id": "other", "policy_id": "p", "rule_id": "a", "hit_count": 1}]),
+                                  ("20261005_000000", "2026-10-05T00:00:00+00:00",
+                                   [{"policy_id": "p", "rule_id": "a", "hit_count": 4}])):
+                rc.write_json(h / ts / "rules_usage.json", {"summary": {"ran_at": iso}, "rules": rows})
+            series, times = rc.load_hit_history(h)
+            self.assertEqual(len(times), 2)
+            self.assertEqual([c[0] for _, c in series[("p", "a")]], [3, 4])
+            self.assertNotIn(("p", "b"), series)
+
+
+class ClassifyTestsTail(unittest.TestCase):
+    Z = ClassifyTests.Z
 
     def test_missing_counter_row_is_not_zero_hits(self):
         self.assertIsNone(rc.rule_usage(rule("a", 7), {"8": {"hit_count": 0}}))
@@ -257,9 +339,13 @@ def lab_state(**over):
     return state
 
 
-def cand(state, pid, rid, origin="disabled by step 1"):
+ZERO = {"hit_count": 0, "packet_count": 0, "byte_count": 0, "session_count": 0}
+
+
+def cand(state, pid, rid, origin="disabled by step 1", counters=ZERO):
     ref = next(r for r in state["rules"][pid] if r["id"] == rid)
-    return {"policy_id": pid, "rule_id": rid, "origin": origin, "reference": copy.deepcopy(ref)}
+    return {"policy_id": pid, "rule_id": rid, "origin": origin, "reference": copy.deepcopy(ref),
+            "counters": dict(counters)}
 
 
 class PlanStep2Tests(unittest.TestCase):
@@ -293,7 +379,14 @@ class PlanStep2Tests(unittest.TestCase):
         self.assertEqual(rc.plan_step2(s, [gone], {})["rules_kept"][0]["reason"], "no longer on the manager")
         hit = rc.plan_step2(s, [cand(s, "app", "r-dead")],
                             {"app/r-dead": {"hit_count": 2, "packet_count": 2, "byte_count": 0, "session_count": 0}})
-        self.assertTrue(hit["rules_kept"][0]["reason"].startswith("has hits now"))
+        self.assertTrue(hit["rules_kept"][0]["reason"].startswith("traffic since step 1"))
+        # old hits recorded at step 1 and unchanged now: still deleted
+        old = {"hit_count": 9, "packet_count": 9, "byte_count": 900, "session_count": 9}
+        same = rc.plan_step2(s, [cand(s, "app", "r-dead", counters=old)], {"app/r-dead": dict(old)})
+        self.assertEqual([r["rule_id"] for r in same["rules"]], ["r-dead"])
+        # counters back to 0 (a reset on a disabled rule) is not traffic
+        reset = rc.plan_step2(s, [cand(s, "app", "r-dead", counters=old)], {"app/r-dead": dict(ZERO)})
+        self.assertEqual([r["rule_id"] for r in reset["rules"]], ["r-dead"])
         # a kept candidate keeps its groups and its policy
         self.assertNotIn("dead-g", [g["id"] for g in hit["groups"]])
 
@@ -335,7 +428,7 @@ class RunFolderTests(unittest.TestCase):
                 {"policy_id": "p", "rule_id": "b", "after": {"id": "b"}, "reenabled_at": "x"}]})
             rc.write_json(run / "step1" / "plan.json", {"rules": [
                 {"class": rc.ALREADY_DISABLED, "policy_id": "p", "rule_id": "c", "rule": {"id": "c"}},
-                {"class": rc.USED, "policy_id": "p", "rule_id": "d", "rule": {"id": "d"}}]})
+                {"class": rc.RECENT, "policy_id": "p", "rule_id": "d", "rule": {"id": "d"}}]})
             got, counts = rc.step2_candidates(run, False)
             self.assertEqual([c["rule_id"] for c in got], ["a"])
             got, counts = rc.step2_candidates(run, True)
@@ -368,7 +461,7 @@ class EndToEndTests(unittest.TestCase):
 
     def _step1(self):
         with patch.object(rc, "policy_counters", counters(self.hits)):
-            plan = self.s1.build_plan(self.nsx, "h", 0, False)
+            plan = self.s1.build_plan(self.nsx, "h", 730, False, "test", Path(self.tmp.name) / "history")
             rc.write_json(self.run / "step1" / "plan.json", plan)
             with patch.object(builtins, "input", lambda *_: ""):
                 return plan, self.s1.apply_plan(self.run, self.nsx, plan, False)
@@ -376,8 +469,9 @@ class EndToEndTests(unittest.TestCase):
     def test_step1_disables_only_never_hit_enabled_rules(self):
         plan, res = self._step1()
         by = {e["rule_id"]: e["class"] for e in plan["rules"]}
-        self.assertEqual(by, {"r-used": rc.USED, "r-dead": rc.DISABLE, "r-pre": rc.ALREADY_DISABLED,
-                              "r-gone": rc.DISABLE, "r-scoped": rc.USED})
+        # no history: rules with hits stay RECENT; never-hit rules created long ago qualify
+        self.assertEqual(by, {"r-used": rc.RECENT, "r-dead": rc.DISABLE, "r-pre": rc.ALREADY_DISABLED,
+                              "r-gone": rc.DISABLE, "r-scoped": rc.RECENT})
         self.assertNotIn("default", by)
         self.assertTrue(res["ok"])
         self.assertEqual(res["disabled_now"], 2)
@@ -390,14 +484,14 @@ class EndToEndTests(unittest.TestCase):
 
     def test_step1_skips_rules_that_changed_or_got_hits(self):
         with patch.object(rc, "policy_counters", counters(self.hits)):
-            plan = self.s1.build_plan(self.nsx, "h", 0, False)
+            plan = self.s1.build_plan(self.nsx, "h", 730, False, "test", Path(self.tmp.name) / "history")
         self.nsx.rules["app"]["r-dead"]["services"] = ["/infra/services/SSH"]
         self.hits[4] = 3
         with patch.object(rc, "policy_counters", counters(self.hits)), patch.object(builtins, "input", lambda *_: ""):
             res = self.s1.apply_plan(self.run, self.nsx, plan, False)
         reasons = {r["rule_id"]: r.get("reason") for r in res["results"]}
         self.assertEqual(reasons["r-dead"], "changed since the plan")
-        self.assertTrue(reasons["r-gone"].startswith("has hits now"))
+        self.assertTrue(reasons["r-gone"].startswith("counters moved since the plan"))
         self.assertEqual(self.nsx.writes, [])
 
     def test_step2_then_undo_round_trip(self):

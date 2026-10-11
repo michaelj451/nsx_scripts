@@ -2,18 +2,34 @@
 """tools/nsx/rule_cleanup/step1_disable.py
 
 Unused rule cleanup, step 1 of 2: disable every customer DFW rule that has
-never been hit.
+not been hit for more than N days.
 
-Without --apply (always first): starts a new run folder, reads every customer
-policy and rule on the target with its hit counters (read only; the client is
-locked against writes), and writes the plan. A rule is DISABLE when NSX
-returned a counter row for it, its hit, packet, byte and session counts are
-all 0, and it is enabled. NSX's default sections and their rules are never
-looked at; a rule without a counter row is NO_STATS and left alone.
+N is NSX_CLEANUP_NO_HIT_DAYS in .env (default 90); --no-hit-days
+overrides it. NSX keeps no last-hit time, only running counters, so the last
+hit comes from counter snapshots over time (see app/nsx/rule_cleanup.py):
+
+Without --apply (always first): starts a new run folder and runs the
+rules-usage report once (read only), which adds a counter snapshot to the
+history under --history-root (default $NSX_LOG_DIR/reports, where that report
+keeps its runs; schedule the report daily so the history is dense). Then it
+reads every customer policy and rule with its live counters (read only; the
+client is locked against writes), works out each rule's last hit from the
+history plus the live counters, and writes the plan:
+  DISABLE           not hit for more than N days, enabled
+  ALREADY_DISABLED  the same, already disabled (step 2 only with --include-pre-disabled)
+  TOO_NEW           never hit, but created within the last N days
+  RECENT            hit within the last N days, or the history does not reach
+                    back N days, so that cannot be ruled out
+  NO_STATS          no counter row: never touched
+  KEEP_DENY         would be DISABLE, but DROP/REJECT and --keep-deny
+A never-hit rule needs no history (its counters cover its whole life); a rule
+that was ever hit qualifies only once the history reaches back N days.
+NSX's default sections and their rules are never looked at.
 
 With --apply: carries out the newest run's plan (or --run). Right before each
 write it re-reads the rule and its policy's counters, and skips the rule if it
-is gone, already disabled, changed since the plan, or has hits now. The write
+is gone, already disabled, changed since the plan, or its counters moved
+since the plan (traffic, or a counter reset: plan again). The write
 sends the rule back with only `disabled: true` changed and its _revision, so a
 concurrent edit makes NSX refuse it (skipped). Asks before every batch
 (Enter=continue, number=batch size, n=reset to 1, x=stop), so it needs a
@@ -25,9 +41,11 @@ USAGE:
     python tools/nsx/rule_cleanup/step1_disable.py --target nsx-lm2
     python tools/nsx/rule_cleanup/step1_disable.py --target nsx-lm2 --apply
 
-OPTIONS:
-    --min-age-days N   leave never-hit rules younger than N days (TOO_NEW); default 0
-    --keep-deny        leave never-hit DROP/REJECT rules enabled (KEEP_DENY)
+OPTIONS (plan only):
+    --no-hit-days N     disable only rules not hit for more than N days (overrides
+                        NSX_CLEANUP_NO_HIT_DAYS in .env; default 90)
+    --history-root DIR  counter history root (default $NSX_LOG_DIR/reports)
+    --keep-deny         leave DROP/REJECT rules enabled (KEEP_DENY)
 
 OUTPUT (run folder, see app/nsx/rule_cleanup.py):
     step1/plan.json, step1/plan.md, step1/disabled.json, logs/
@@ -55,8 +73,30 @@ import nsx.rule_cleanup as rc                          # noqa: E402
 log = logging.getLogger("rule_cleanup")
 
 
-def build_plan(client: Any, host: str, min_age_days: int, keep_deny: bool) -> Dict[str, Any]:
+def take_snapshot(target: str, history_root: Path, run: Path) -> bool:
+    """Run the rules-usage report once (read only): it adds a counter snapshot
+    to the history. Its output goes to the run's log, not the screen."""
+    import subprocess
+    step_log = run / "logs" / "step1_rules_usage_snapshot.log"
+    step_log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [cr.PY, cr.tool("tools/reports/report_rules_usage.py"), "--target", target,
+           "--output-base", str(history_root)]
+    log.info("Taking a counter snapshot (rules-usage report, read only) into %s", history_root)
+    with step_log.open("w", encoding="utf-8") as fh:
+        rc_ = subprocess.run(cmd, cwd=str(cr.REPO_ROOT), stdout=fh, stderr=subprocess.STDOUT).returncode
+    if rc_ != 0:
+        tail = step_log.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+        log.error("rules-usage report failed (rc=%d); last lines of %s:\n%s", rc_, step_log, "\n".join(tail))
+        return False
+    log.info("Snapshot taken (log: %s)", step_log)
+    return True
+
+
+def build_plan(client: Any, host: str, no_hit_days: int, keep_deny: bool,
+               no_hit_source: str, history_dir: Path) -> Dict[str, Any]:
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    history, snaps = rc.load_hit_history(history_dir)
+    log.info("Counter history: %d snapshot(s) in %s", len(snaps), history_dir)
     entries: List[Dict[str, Any]] = []
     skipped: List[Dict[str, str]] = []
     sources: Counter = Counter()
@@ -76,18 +116,29 @@ def build_plan(client: Any, host: str, min_age_days: int, keep_deny: bool) -> Di
             if cr.is_system_default(r):
                 continue
             usage = rc.rule_usage(r, rows)
+            series = list(history.get((pol["id"], r.get("id")), []))
+            if usage is not None:
+                series.append((now_ms, tuple(usage[k] for k in rc.COUNTERS)))
+            ev = rc.no_hit_since(series, r.get("_create_time"))
+            since = ev["since_ms"]
             entries.append({
-                "class": rc.classify(r, usage, now_ms=now_ms, min_age_days=min_age_days, keep_deny=keep_deny),
+                "class": rc.classify(r, usage, ev, now_ms=now_ms, no_hit_days=no_hit_days, keep_deny=keep_deny),
                 "policy_id": pol["id"], "policy_display": pol.get("display_name"),
                 "category": pol.get("category"), "rule_id": r.get("id"),
                 "display_name": r.get("display_name"), "sequence_number": r.get("sequence_number"),
                 "action": r.get("action"), "disabled": bool(r.get("disabled")),
                 "counters": usage, "stats_source": source, "age_days": rc.age_days(r, now_ms),
-                "rule": r,
+                "last_hit": ev["last_hit"], "reset_seen": ev["reset_seen"],
+                "no_hit_days": round((now_ms - since) / rc.DAY_MS, 1) if since is not None else None,
+                "readings": len(series), "rule": r,
             })
+    iso = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat() if ms else None  # noqa: E731
     return {
         "target_host": host, "planned_at": datetime.now(timezone.utc).isoformat(),
-        "min_age_days": min_age_days, "keep_deny": keep_deny,
+        "no_hit_days": no_hit_days, "no_hit_source": no_hit_source, "keep_deny": keep_deny,
+        "history": {"dir": str(history_dir), "snapshots": len(snaps),
+                    "oldest": iso(snaps[0]) if snaps else None, "newest": iso(snaps[-1]) if snaps else None,
+                    "covers_days": round((now_ms - snaps[0]) / rc.DAY_MS, 1) if snaps else 0},
         "stats_sources": dict(sources), "skipped_policies": skipped, "rules": entries,
         "counts": {"rules": len(entries), "by_class": dict(Counter(e["class"] for e in entries))},
     }
@@ -95,32 +146,46 @@ def build_plan(client: Any, host: str, min_age_days: int, keep_deny: bool) -> Di
 
 def print_plan(plan: Dict[str, Any]) -> None:
     by = plan["counts"]["by_class"]
+    n = plan["no_hit_days"]
+    h = plan["history"]
     todo = [e for e in plan["rules"] if e["class"] == rc.DISABLE]
     print()
     print(f"Customer rules on {plan['target_host']}: {plan['counts']['rules']}  "
           f"(counters per policy: {plan['stats_sources']})")
+    print(f"Window: disable only rules not hit for more than {n} days (from {plan['no_hit_source']})")
+    print(f"Counter history: {h['snapshots']} snapshot(s), oldest {h['oldest'] or '-'} "
+          f"({h['covers_days']} days back)")
     for cls in rc.CLASS_ORDER:
         if by.get(cls):
             print(f"  {cls:<17} {by[cls]}")
     print()
-    print(f"Step 1 would DISABLE {len(todo)} rule(s) (never hit, enabled now):")
+    print(f"Step 1 would DISABLE {len(todo)} rule(s):")
     for e in todo:
         print(f"  {e['category'] or '':<15} {e['policy_id']:<28} {str(e['display_name'] or e['rule_id']):<34} "
-              f"seq {e['sequence_number']!s:<5} {e['action']}")
+              f"{e['action'] or '':<7} last hit: {e['last_hit']}")
     deny = [e for e in todo if str(e["action"] or "").upper() in rc.DENY_ACTIONS]
     if deny:
         print()
-        print(f"CHECK: {len(deny)} of them are DROP/REJECT rules. Disabling a never-hit deny rule lets "
-              "traffic it would have blocked fall through to later rules if that traffic ever "
-              "arrives. Use --keep-deny to leave them enabled.")
+        print(f"CHECK: {len(deny)} of them are DROP/REJECT rules. Disabling a deny rule lets traffic it "
+              "would have blocked fall through to later rules if that traffic ever arrives. Use "
+              "--keep-deny to leave them enabled.")
     if by.get(rc.NO_STATS):
         print()
         print(f"WARNING: {by[rc.NO_STATS]} rule(s) have no counter row (NO_STATS) and are left alone; "
               "see plan.md.")
+    if h["covers_days"] <= n:
+        print()
+        print(f"NOTE: the counter history reaches back {h['covers_days']} days, not {n}. Until it does, a "
+              f"rule that was ever hit stays RECENT; only never-hit rules created more than {n} days ago "
+              "can qualify. Schedule the rules-usage report (daily) to build the history.")
+    if by.get(rc.TOO_NEW):
+        print()
+        print(f"{by[rc.TOO_NEW]} never-hit rule(s) were created within the last {n} days (TOO_NEW) and are "
+              "left alone; ages are in plan.md.")
     pre = [e for e in plan["rules"] if e["class"] == rc.ALREADY_DISABLED]
     if pre:
         print()
-        print(f"{len(pre)} never-hit rule(s) are already disabled (not changed by step 1; step 2 deletes "
+        print(f"{len(pre)} qualifying rule(s) are already disabled (not changed by step 1; step 2 deletes "
               "them only with --include-pre-disabled).")
 
 
@@ -163,8 +228,9 @@ def apply_plan(run: Path, client: Any, plan: Dict[str, Any], piped: bool) -> Dic
             reason = "changed since the plan"
         elif usage is None:
             reason = "no counter row now"
-        elif any(usage.values()):
-            reason = f"has hits now (hit_count {usage['hit_count']})"
+        elif usage != e["counters"]:
+            reason = (f"counters moved since the plan (hit_count {e['counters']['hit_count']} -> "
+                      f"{usage['hit_count']}, bytes {e['counters']['byte_count']} -> {usage['byte_count']})")
         else:
             reason = None
         if reason:
@@ -194,7 +260,7 @@ def apply_plan(run: Path, client: Any, plan: Dict[str, Any], piped: bool) -> Dic
                 "policy_id": pid, "rule_id": rid, "display_name": e["display_name"],
                 "action": e["action"], "disabled_at": datetime.now(timezone.utc).isoformat(),
                 "revision_before": live.get("_revision"), "revision_after": after.get("_revision"),
-                "before": live, "after": after,
+                "counters": usage, "last_hit": e.get("last_hit"), "before": live, "after": after,
             })
             rc.write_json(rec_path, record)
         if not after.get("disabled") or rc.content(after, ("disabled",)) != rc.content(live, ("disabled",)):
@@ -220,9 +286,13 @@ def main() -> int:
     p.add_argument("--run", help="run folder for --apply (default: newest for this target)")
     rc.add_runs_dir_arg(p)
     p.add_argument("--apply", action="store_true", help="disable the planned rules (default: plan only)")
-    p.add_argument("--min-age-days", type=int, default=0,
-                   help="leave never-hit rules younger than this many days (default 0: no age limit)")
-    p.add_argument("--keep-deny", action="store_true", help="leave never-hit DROP/REJECT rules enabled")
+    p.add_argument("--no-hit-days", type=int, default=None,
+                   help=f"disable only rules not hit for more than N days; overrides {rc.NO_HIT_ENV} "
+                        f"in .env (default {rc.DEFAULT_NO_HIT_DAYS})")
+    p.add_argument("--history-root", default=None,
+                   help="counter history root: <root>/<host>/rules_usage/<ts>/ "
+                        "(default: $NSX_LOG_DIR/reports, where report_rules_usage.py keeps its runs)")
+    p.add_argument("--keep-deny", action="store_true", help="leave DROP/REJECT rules enabled")
     cr.add_piped_answers_arg(p)
     args = p.parse_args()
     cr.require_terminal(args.apply, args.piped_answers)
@@ -237,9 +307,15 @@ def main() -> int:
         run = rc.new_run(args.target, host, base=rc.runs_base(args.runs_dir))
         setup_logging("step1_plan", run / "logs")
         log.info("Run: %s", run)
+        no_hit, no_hit_source = rc.resolve_no_hit_days(args.no_hit_days)
+        from nsx.report_paths import reports_root
+        root = reports_root(args.history_root)
+        if not take_snapshot(args.target, root, run):
+            rc.record_step(run, "disable_plan", {"ok": False, "error": "rules-usage snapshot failed"})
+            raise SystemExit("the rules-usage snapshot failed; see the log above")
         client = NsxPolicyClient(nsxmanager=host, federation_global=False)
         rc.lock_read_only(client)
-        plan = build_plan(client, host, args.min_age_days, args.keep_deny)
+        plan = build_plan(client, host, no_hit, args.keep_deny, no_hit_source, root / host / "rules_usage")
         rc.write_json(run / "step1" / "plan.json", plan)
         (run / "step1" / "plan.md").write_text(rc.step1_markdown(plan), encoding="utf-8")
         print_plan(plan)
@@ -254,6 +330,9 @@ def main() -> int:
                                              "counts": plan["counts"], "stats_sources": plan["stats_sources"]})
         return 0
 
+    if args.no_hit_days is not None or args.keep_deny or args.history_root:
+        raise SystemExit("--no-hit-days, --history-root and --keep-deny are plan options; --apply carries "
+                         "out the reviewed plan. Plan again with them, then --apply.")
     run = rc.resolve_run(args.target, args.run, base=rc.runs_base(args.runs_dir))
     rec = rc.load_record(run)
     rc.check_run(rec, args.target, host)

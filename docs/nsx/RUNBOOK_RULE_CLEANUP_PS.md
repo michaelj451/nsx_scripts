@@ -5,15 +5,29 @@ One script per step under `tools/nsx/rule_cleanup/`, each with its own undo:
 
 | Step | Script | Writes |
 |---|---|---|
-| 1. Disable rules that have never been hit | `step1_disable.py` | plan: read only; `--apply` disables |
+| 1. Disable rules not hit for more than N days | `step1_disable.py` | plan: read only; `--apply` disables |
 | Soak period | (wait; watch for breakage) | nothing |
 | 2. Delete the unused rules, then empty policies, then unreferenced groups | `step2_delete.py` | plan: read only; `--apply` deletes |
 | Undo step 1 | `step1_undo.py` | re-enables (all, or one with `--rule`) |
 | Undo step 2 | `step2_undo.py` | re-creates what step 2 deleted |
 
-A rule is unused when NSX returned a counter row for it and every counter is 0
-(no row: `NO_STATS`, never touched). Step 2 deletes the rules step 1 disabled
-that are still disabled, unchanged and without hits, then every customer
+A rule is unused when it has not been hit for **more than N days**: N is
+`NSX_CLEANUP_NO_HIT_DAYS` in `.env`, **90 by default**,
+`--no-hit-days N` overrides it. A rule with no counter row is `NO_STATS` and
+never touched. NSX keeps no last-hit time, only running counters, so the last
+hit comes from counter snapshots: the rules-usage report saves one per run
+under `$env:NSX_LOG_DIR\reports\<host>\rules_usage\`, each step 1 plan takes
+one, and the rule was last hit when its counters last moved. A never-hit rule
+needs no history (created more than N days ago is enough); a rule that was
+ever hit qualifies only once the history reaches back N days, so **schedule
+the report daily** (Task Scheduler):
+
+```powershell
+python tools/reports/report_rules_usage.py --target $TGT
+```
+
+Step 2 deletes the rules step 1 disabled that are still disabled, unchanged
+and whose counters have not moved since step 1, then every customer
 policy left with no rules, then every customer group nothing references
 (DFW, gateway, IDS, redirection, forwarding and endpoint policies, the
 exclusion list, load balancers, nested groups). **Services are never
@@ -28,10 +42,11 @@ plan starts one, every other command uses the newest run for the target (or
 
 Bash variant, with the background ("Read this first"):
 [RUNBOOK_RULE_CLEANUP.md](RUNBOOK_RULE_CLEANUP.md). Read it before a first
-run. In short: counters start at 0 after a reset (check rule ages,
-`--min-age-days`); NSX 3.2.x statistics fall back to the older firewall API;
-disabling a never-hit DROP/REJECT rule can let traffic through later (`CHECK:`
-lines, `--keep-deny`); rules already disabled before step 1 are left out of
+run (section "How the last hit is found" first). In short: NSX keeps no
+last-hit time (API reference and KB 412847); a statistics reset before the
+first snapshot hides old traffic (reboots and upgrades do not reset); NSX 3.2.x statistics fall back to
+the older firewall API; disabling a DROP/REJECT rule can let traffic through
+later (`CHECK:` lines, `--keep-deny`); rules already disabled before step 1 are left out of
 step 2 unless `--include-pre-disabled`; already-empty policies and
 already-unreferenced groups are deleted too.
 
@@ -56,24 +71,38 @@ $env:PYTHONUTF8  = "1"
 Instead of `--runs-dir` on every command you can set `$env:NSX_CLEANUP_RUNS_DIR = $RUNS`;
 the commands below pass it explicitly so it is visible.
 
+Window: add this line to `.env` if it is not there (90 when unset):
+
+```
+NSX_CLEANUP_NO_HIT_DAYS=90
+```
+
+`--no-hit-days N` on the step 1 plan overrides it for that run. A
+`$env:NSX_CLEANUP_NO_HIT_DAYS` set in the window wins over `.env`. Keep
+`$env:NSX_LOG_DIR` the same in every window and in the scheduled report: the
+counter history lives under it.
+
 Backup first (read only):
 
 ```powershell
 python tools/nsx/backup_nsx_state.py --source $TGT
 ```
 
-## Step 1 - Disable rules that have never been hit
+## Step 1 - Disable rules not hit for more than N days
 
 ```powershell
 python tools/nsx/rule_cleanup/step1_disable.py --target $TGT --runs-dir "$RUNS"            # plan
 python tools/nsx/rule_cleanup/step1_disable.py --target $TGT --runs-dir "$RUNS" --apply    # write
 ```
 
-Read the plan first: the count per class (`DISABLE`, `ALREADY_DISABLED`,
-`KEEP_DENY`, `TOO_NEW`, `NO_STATS`, `USED`), every rule it would disable,
-every `CHECK:` line about a DROP/REJECT rule, any `NO_STATS` warning. Full
-table in the run's `step1\plan.md`. Plan options: `--min-age-days N`,
-`--keep-deny`.
+Read the plan first: the `Window:` line (days and where they came from), the
+`Counter history:` line (snapshots and how far back they reach), the count per
+class (`DISABLE`, `ALREADY_DISABLED`, `KEEP_DENY`, `TOO_NEW`, `NO_STATS`,
+`RECENT`), every rule it would disable with its last hit, every `CHECK:` line
+about a DROP/REJECT rule, any `NO_STATS` warning, and the `NOTE` when the
+history is shorter than the window. Full table in the run's `step1\plan.md`.
+Plan options: `--no-hit-days N`, `--history-root DIR`, `--keep-deny`
+(`--apply` refuses them: it carries out the reviewed plan).
 
 Run `--apply` in the PowerShell window yourself: it asks before every batch
 (`Enter` continue, a number sets the batch size, `n` back to 1, `x` stops),

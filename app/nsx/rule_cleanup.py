@@ -14,9 +14,18 @@ _system_owned or created by NSX itself) are never changed. Each step plans
 first (dry run, read only) and its --apply carries out only the reviewed
 plan, re-checking every object live right before writing it.
 
-"Never used" means NSX returned a counter row for the rule and its hit,
-packet, byte and session counts are all 0. NSX counts from the rule's
-creation (or the last statistics reset). A rule with no counter row is
+"Not hit for N days": NSX keeps running totals per rule (hits, packets,
+bytes, sessions) but no last-hit time. So the last hit is worked out from
+counter snapshots taken over time: the rules-usage report keeps one per run
+(<history root>/<host>/rules_usage/<UTC_TS>/rules_usage.json), each step 1
+plan takes a new one, and the live counters are the newest point. The rule
+was last hit between the last snapshot where any of its counters moved and the
+one before (bytes count: a long-lived session keeps a rule busy without new
+hits). A rule whose counters are all 0 and never went down has not been hit
+since it was created. Step 1 disables a rule only when it has provably not
+been hit for MORE than N days: NSX_CLEANUP_NO_HIT_DAYS in .env (default 90),
+--no-hit-days overrides. A rule that was ever hit can therefore only qualify
+once the snapshot history reaches back N days. A rule with no counter row is
 NO_STATS and is never touched. NSX 3.2.x answers the Policy-API statistics
 call with HTTP 500, even for local policies, so the counters fall back to the
 older firewall API on the same manager, exactly as report_rules_usage does.
@@ -57,17 +66,23 @@ DOMAIN = "default"
 
 DEFAULT_SECTION_IDS = {"default-layer3-section", "default-layer2-section"}
 COUNTERS = ("hit_count", "packet_count", "byte_count", "session_count")
+
+# Step 1 disables a rule only when it has not been hit for MORE than this many
+# days. --no-hit-days overrides .env, .env overrides the default.
+NO_HIT_ENV = "NSX_CLEANUP_NO_HIT_DAYS"
+DEFAULT_NO_HIT_DAYS = 90            # Mike, 2026-10-11
+DAY_MS = 86_400_000
 DENY_ACTIONS = {"DROP", "REJECT"}
 
 # Step 1 classes. Only DISABLE is written by step 1; ALREADY_DISABLED rules
 # are step 2 candidates with --include-pre-disabled.
 DISABLE = "DISABLE"
 ALREADY_DISABLED = "ALREADY_DISABLED"
-USED = "USED"
+RECENT = "RECENT"          # hit within the window, or the history is too short to show otherwise
 NO_STATS = "NO_STATS"
-TOO_NEW = "TOO_NEW"
+TOO_NEW = "TOO_NEW"        # never hit, but created within the window
 KEEP_DENY = "KEEP_DENY"
-CLASS_ORDER = (DISABLE, ALREADY_DISABLED, KEEP_DENY, TOO_NEW, NO_STATS, USED)
+CLASS_ORDER = (DISABLE, ALREADY_DISABLED, KEEP_DENY, TOO_NEW, NO_STATS, RECENT)
 
 # Fields NSX manages itself (same set as the push tools strip). Never
 # compared, never sent when re-creating an object.
@@ -234,26 +249,124 @@ def age_days(obj: Dict[str, Any], now_ms: int) -> Optional[int]:
     return max(0, int((now_ms - int(created)) // 86_400_000))
 
 
+def resolve_no_hit_days(arg: Optional[int]) -> Tuple[int, str]:
+    """(days, where it came from): --no-hit-days, else $NSX_CLEANUP_NO_HIT_DAYS
+    (.env; a shell variable wins over .env), else the 90-day default."""
+    import nsx.nsx_constants   # noqa: F401  (loads .env)
+    if arg is not None:
+        value, source = arg, "--no-hit-days"
+    else:
+        raw = (os.getenv(NO_HIT_ENV) or "").strip()
+        if not raw:
+            return DEFAULT_NO_HIT_DAYS, "default"
+        try:
+            value, source = int(raw), NO_HIT_ENV
+        except ValueError:
+            raise SystemExit(f"{NO_HIT_ENV}={raw!r} is not a whole number of days")
+    if value < 1:
+        raise SystemExit(f"the no-hit period must be at least 1 day, got {value} ({source})")
+    return value, source
+
+
+def _iso_ms(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _ts_ms(iso: str) -> Optional[int]:
+    try:
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def load_hit_history(history_dir: Path) -> Tuple[Dict[Tuple[str, str], List[Tuple[int, Tuple[int, ...]]]], List[int]]:
+    """Every rules-usage snapshot under <history_dir>/<UTC_TS>/rules_usage.json.
+
+    Returns ({(policy id, rule id): [(time ms, counters)]} oldest first, snapshot
+    times). Rows the manager could not answer for (stats_available false) are
+    left out: a missing reading is not a 0."""
+    series: Dict[Tuple[str, str], List[Tuple[int, Tuple[int, ...]]]] = {}
+    times: List[int] = []
+    for f in sorted(history_dir.glob("*/rules_usage.json")) if history_dir.is_dir() else []:
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        t = _ts_ms((doc.get("summary") or {}).get("ran_at"))
+        if t is None:
+            continue
+        times.append(t)
+        for r in doc.get("rules") or []:
+            if (r.get("domain_id") or DOMAIN) != DOMAIN or r.get("stats_available") is False:
+                continue
+            series.setdefault((r.get("policy_id"), r.get("rule_id")), []).append(
+                (t, tuple(int(r.get(k) or 0) for k in COUNTERS)))
+    for v in series.values():
+        v.sort()
+    return series, sorted(times)
+
+
+def no_hit_since(series: List[Tuple[int, Tuple[int, ...]]], created_ms: Optional[int]) -> Dict[str, Any]:
+    """From when on a rule has provably not been hit.
+
+    series: (time ms, counters) oldest first, ending with the live reading.
+    Counters only grow, except at a reset (statistics reset by an operator, or
+    the rule re-created; reboots and upgrades keep them, Broadcom KB 412847),
+    so readings before the last drop are ignored. In what is left, the counters
+    reached their current values at reading k: the last hit was between
+    reading k-1 and reading k, so no hit since reading k. If they were already
+    at their current values at the first reading, the last hit is before it,
+    except that all-zero counters with no reset seen mean never hit since the
+    rule was created. Returns {"since_ms": time or None, "last_hit": text,
+    "never": bool, "reset_seen": bool}.
+    """
+    if not series:
+        return {"since_ms": None, "last_hit": "unknown (no counters)", "never": False, "reset_seen": False}
+    start = 0
+    for i in range(1, len(series)):
+        if any(b < a for a, b in zip(series[i - 1][1], series[i][1])):
+            start = i
+    tail = series[start:]
+    reset = start > 0
+    cur = tail[-1][1]
+    k = next(i for i, (_, c) in enumerate(tail) if c == cur)
+    if k > 0:
+        return {"since_ms": tail[k][0], "never": False, "reset_seen": reset,
+                "last_hit": f"between {_iso_ms(tail[k - 1][0])} and {_iso_ms(tail[k][0])}"}
+    if not any(cur) and not reset and created_ms is not None:
+        return {"since_ms": int(created_ms), "last_hit": "never", "never": True, "reset_seen": False}
+    note = "counter reset seen" if reset else "oldest reading"
+    return {"since_ms": tail[0][0], "never": False, "reset_seen": reset,
+            "last_hit": f"before {_iso_ms(tail[0][0])} ({note})"}
+
+
 def is_cleanup_policy(policy: Dict[str, Any]) -> bool:
     """A customer DFW policy these scripts may change (never NSX's default sections)."""
     return not is_system_default(policy) and policy.get("id") not in DEFAULT_SECTION_IDS
 
 
-def classify(rule: Dict[str, Any], usage: Optional[Dict[str, int]], *, now_ms: int,
-             min_age_days: int = 0, keep_deny: bool = False) -> str:
+def classify(rule: Dict[str, Any], usage: Optional[Dict[str, int]], evidence: Dict[str, Any], *,
+             now_ms: int, no_hit_days: int, keep_deny: bool = False) -> str:
+    """evidence is no_hit_since() for the rule. DISABLE only when the rule has
+    provably not been hit for MORE than no_hit_days."""
     if usage is None:
         return NO_STATS
-    if any(usage.values()):
-        return USED
-    if min_age_days:
-        age = age_days(rule, now_ms)
-        if age is None or age < min_age_days:
-            return TOO_NEW
+    since = evidence.get("since_ms")
+    if since is None or now_ms - since <= no_hit_days * DAY_MS:
+        return TOO_NEW if evidence.get("never") else RECENT
     if rule.get("disabled"):
         return ALREADY_DISABLED
     if keep_deny and str(rule.get("action") or "").upper() in DENY_ACTIONS:
         return KEEP_DENY
     return DISABLE
+
+
+def counters_moved(before: Optional[Dict[str, int]], now: Optional[Dict[str, int]]) -> bool:
+    """True when a rule's counters show traffic since `before`. No reading now,
+    or counters back to 0 (a reset), shows no traffic."""
+    if before is None or now is None or not any(now.values()):
+        return False
+    return now != before
 
 
 # =============================================================================
@@ -432,11 +545,13 @@ def step2_candidates(run: Path, include_pre_disabled: bool) -> Tuple[List[Dict[s
     disabled = (read_json(run / "step1" / "disabled.json", {}) or {}).get("rules", [])
     plan = read_json(run / "step1" / "plan.json", {}) or {}
     out = [{"policy_id": d["policy_id"], "rule_id": d["rule_id"], "origin": "disabled by step 1",
-            "reference": d["after"]} for d in disabled if not d.get("reenabled_at")]
+            "reference": d["after"], "counters": d.get("counters")}
+           for d in disabled if not d.get("reenabled_at")]
     pre = [e for e in plan.get("rules", []) if e["class"] == ALREADY_DISABLED]
     if include_pre_disabled:
         out += [{"policy_id": e["policy_id"], "rule_id": e["rule_id"],
-                 "origin": "already disabled before step 1", "reference": e["rule"]} for e in pre]
+                 "origin": "already disabled before step 1", "reference": e["rule"],
+                 "counters": e.get("counters")} for e in pre]
     return out, {"disabled_by_step1": sum(1 for d in disabled if not d.get("reenabled_at")),
                  "reenabled": sum(1 for d in disabled if d.get("reenabled_at")),
                  "pre_disabled": len(pre), "pre_disabled_included": len(pre) if include_pre_disabled else 0}
@@ -447,7 +562,8 @@ def plan_step2(state: Dict[str, Any], candidates: List[Dict[str, Any]],
     """What step 2 deletes, from live state. Pure: no NSX calls.
 
     Rules: a candidate is deleted only if it is still on the manager, still
-    disabled, unchanged since its reference copy, and has no hits now.
+    disabled, unchanged since its reference copy, and its counters have not
+    moved since they were recorded at step 1.
     Policies: every customer policy left with no rules once those are gone
     (including policies that were already empty). Groups: every customer
     group not reachable from what stays (remaining DFW rules and policies,
@@ -470,8 +586,9 @@ def plan_step2(state: Dict[str, Any], candidates: List[Dict[str, Any]],
             reason = "enabled again since step 1"
         elif content(live) != content(c["reference"]):
             reason = "changed since step 1"
-        elif u and any(u.values()):
-            reason = f"has hits now (hit_count {u['hit_count']})"
+        elif counters_moved(c.get("counters"), u):
+            reason = (f"traffic since step 1 (hit_count {(c.get('counters') or {}).get('hit_count')} "
+                      f"-> {u['hit_count']}, bytes {(c.get('counters') or {}).get('byte_count')} -> {u['byte_count']})")
         else:
             reason = None
         row["counters"] = u
@@ -550,25 +667,32 @@ def step1_markdown(plan: Dict[str, Any]) -> str:
     c = plan["counts"]
     lines = [f"# Unused rule cleanup, step 1 plan: {plan['target_host']}", "",
              f"- Planned at: {plan['planned_at']}",
-             f"- Min age (days): {plan['min_age_days']}; keep never-hit DROP/REJECT: {plan['keep_deny']}",
+             f"- Disable only rules not hit for more than {plan['no_hit_days']} days "
+             f"(from {plan.get('no_hit_source', '?')}); keep DROP/REJECT: {plan['keep_deny']}",
+             f"- Counter history: {plan['history']['snapshots']} snapshot(s), "
+             f"{plan['history']['oldest'] or '-'} to {plan['history']['newest'] or '-'} ({plan['history']['dir']})",
              f"- Counter source per policy: {plan['stats_sources']}",
              f"- Customer rules: {c['rules']}; by class: {c['by_class']}", "",
-             "`DISABLE` = step 1 disables it. `ALREADY_DISABLED` = never hit and already off "
-             "(step 2 deletes it only with `--include-pre-disabled`). Every other class is left alone.", ""]
+             "`DISABLE` = not hit for more than the window; step 1 disables it. `ALREADY_DISABLED` = "
+             "the same but already off (step 2 deletes it only with `--include-pre-disabled`). "
+             "`TOO_NEW` = never hit but created within the window. `RECENT` = hit within the window, "
+             "or the history does not reach back far enough to show otherwise. Every other class is "
+             "left alone.", ""]
     if plan.get("skipped_policies"):
         lines += ["## Policies not looked at", "", "| Policy | Reason |", "|---|---|"]
         lines += [f"| `{_cell(s['id'])}` | {_cell(s['reason'])} |" for s in plan["skipped_policies"]]
         lines.append("")
     lines += ["## Rules", "",
-              "| Class | Category | Policy | Rule | Seq | Action | Disabled | Hits | Packets | Sessions | Age (d) |",
-              "|---|---|---|---|---:|---|---|---:|---:|---:|---:|"]
+              "| Class | Category | Policy | Rule | Seq | Action | Disabled | Hits | Bytes | Last hit | No hit for (d) | Age (d) |",
+              "|---|---|---|---|---:|---|---|---:|---:|---|---:|---:|"]
     for e in plan["rules"]:
         u = e.get("counters") or {}
         lines.append(f"| {e['class']} | {_cell(e.get('category'))} | `{_cell(e['policy_id'])}` "
                      f"| `{_cell(e.get('display_name') or e['rule_id'])}` | {_cell(e.get('sequence_number'))} "
                      f"| {_cell(e.get('action'))} | {'yes' if e.get('disabled') else 'no'} "
-                     f"| {_cell(u.get('hit_count', '-'))} | {_cell(u.get('packet_count', '-'))} "
-                     f"| {_cell(u.get('session_count', '-'))} | {_cell(e.get('age_days', '-'))} |")
+                     f"| {_cell(u.get('hit_count', '-'))} | {_cell(u.get('byte_count', '-'))} "
+                     f"| {_cell(e.get('last_hit'))} | {_cell(e.get('no_hit_days', '-'))} "
+                     f"| {_cell(e.get('age_days', '-'))} |")
     return "\n".join(lines) + "\n"
 
 
