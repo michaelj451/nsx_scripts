@@ -36,20 +36,25 @@ stops the run: raise a new request. `refresh --strict` stops on any change.
 | Part | Scope |
 |---|---|
 | Servers | One per entry: a VM name, an IP address, or `name,ip[,ip]`. An IP that exactly one VM owns resolves to that VM, so its group memberships count. An IP no VM owns (powered off, or not a VM) matches by address only. A misspelt name gets "did you mean" suggestions |
-| Rules | Every NSX rule whose source, destination or applied-to contains a server, through a group the VM is in or a group whose addresses cover the server. NSX default sections are never copied. A copied rule covers every member of its groups, not only the requested servers |
+| Rules | Every NSX rule whose source, destination or applied-to contains a server, through a group the VM is in or a group whose addresses cover the server. NSX default sections are never copied. **Infrastructure-category rules are left out** (Mike, 2026-10-14): they are listed under "not copied", and a group used only by them gets no Workflow D sibling (`--include-infrastructure` keeps them). A copied rule covers every member of its groups, not only the requested servers |
 | Workflow A (destination) | Those rules, their policies, and every group and service they need: nested groups, nested services, a policy's own applied-to. Segment references inside groups are stripped (segment ids differ per manager). Built-in NSX services are not copied (every manager has them). Context profiles are listed, not copied |
 | Workflow C (destination) | An IP-only `_np_ips` sibling for every tag-based group in that bundle, holding the source's current addresses, added to the copied rules. Copied rules keep matching servers that have not moved |
 | Workflow D (source) | Mike, 2026-10-07: **only the groups the servers are members of, and the rules those groups are in.** Each sibling holds only the requested servers' new addresses. Segment-based groups get no sibling, as in Workflow D |
 | Palo Alto | Planned from the same capture with the same mapping as `nsx_pan_mirror.py plan-rules`, for exactly the copied rules: one `<group>_np_ips` address group per NSX group holding the C and D addresses, objects in `shared`, rules in the named device group's pre-rulebase. Security profile group and log forwarding profile from `.env` |
 
-The destination picks the Workflow D suffix and subnet map:
+The Workflow D suffix is `OBJECT_APPENDIX_AVS` in `.env`, the same variable
+Workflow D itself uses (`run_workflow.py`); `--d-appendix` overrides it for one
+request. The C suffix is `OBJECT_APPENDIX`. A request records both, so a later
+`.env` change never alters an existing request. The destination picks the
+subnet map:
 
-| Destination | D suffix | Subnet map |
-|---|---|---|
-| `nsx-lm2` (AVS) | `_avs_ips` | `data/subnet_map_lm2.csv` |
-| `nsx-lm3` | `_lm3_ips` | `data/subnet_map_lm3.csv` |
+| Destination | Subnet map |
+|---|---|
+| `nsx-lm2` (AVS) | `data/subnet_map_lm2.csv` |
+| `nsx-lm3` | `data/subnet_map_lm3.csv` |
 
-Any other destination needs `--d-appendix` and `--subnet-map`.
+Any other destination needs `--subnet-map`. Requests made before 2026-10-13
+to `nsx-lm3` used `_lm3_ips` (the old per-destination default).
 
 ---
 
@@ -84,12 +89,17 @@ A powered-off VM reports no address to NSX. Give it as `name,ip`, or its
 Workflow D sibling and its Palo address object have nothing to work with.
 
 ```bash
-mr request --source nsx-lm1 --destination nsx-lm3 --device-group dg-4 \
+mr request --source nsx-lm1 --destination nsx-lm3 \
   --no-tls-verify --name "wave 1"
 
 R=migration_requests/nsx-lm1_to_nsx-lm3/latest
 open $R/request.md
 ```
+
+The Panorama device group is `PANORAMA_DEVICE_GROUP` in `.env`, the same
+variable `nsx_pan_mirror.py` reads; `--device-group` overrides it for one
+request. The request records the device group it was built with, and the
+report names it in the Palo Alto section.
 
 Each request keeps its own copy of the list (`servers.txt`), and
 `request.json` records the tracked file's sha256, so a later edit to the
@@ -112,6 +122,7 @@ Useful options:
 | `--no-palo` | NSX only |
 | `--no-palo-cli` | The Palo dry run does not write the paste-ready CLI text (see "Palo Alto by the Panorama command line") |
 | `--include-default-sections` | Also copy rules from NSX's default sections (normally never) |
+| `--include-infrastructure` | Also take Infrastructure-category rules (normally left out). Without it, Workflow D can still touch an Infrastructure rule on the source when it names a group shared with a copied rule (`amend-refs` changes every rule naming the group); the request lists each such rule under Warnings |
 | `--rulebase post`, `--object-location device-group`, `--zone-from`, `--zone-to` | Palo placement, as in `plan-rules` |
 | `--profile-group none`, `--log-setting none` | No security profile or log forwarding profile on the Palo rules |
 

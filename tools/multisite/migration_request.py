@@ -32,7 +32,7 @@ VM. Docs: docs/multivendor/RUNBOOK_MIGRATION_REQUEST.md.
 
 USAGE
     python tools/multisite/migration_request.py request --source nsx-lm1 \\
-        --destination nsx-lm3 --device-group dg-4 --no-tls-verify \\
+        --destination nsx-lm3 --no-tls-verify \\
         --servers "ubuntu22-speedtest-10.6.0.101-ax2001,10.6.1.102"
     python tools/multisite/migration_request.py approve --request <dir> \\
         --change-ref CHG0001 --approved-by "Mike Ferguson"
@@ -68,11 +68,11 @@ NSX_CHOICES = ["nsx-lm1", "nsx-lm2", "nsx-lm3", "nsx-lm4", "nsx-lm5", "nsx-lm6"]
 OUT_BASE = REPO_ROOT / "migration_requests"
 # Tracked server list (Mike, 2026-10-08), read when no servers are given on the command line.
 DEFAULT_SERVER_LIST = REPO_ROOT / "migration_request_servers.txt"
-# Destination site (manager alias without "nsx-") -> Workflow D suffix and subnet
-# map, as in docs/multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md. Other destinations
-# take --d-appendix and --subnet-map.
-DEST_DEFAULTS = {"lm2": {"d_appendix": "_avs_ips", "subnet_map": "data/subnet_map_lm2.csv"},
-                 "lm3": {"d_appendix": "_lm3_ips", "subnet_map": "data/subnet_map_lm3.csv"}}
+# Destination site (manager alias without "nsx-") -> Workflow D subnet map, as in
+# docs/multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md. Other destinations take
+# --subnet-map. The Workflow D suffix is not per destination: it is
+# OBJECT_APPENDIX_AVS from .env, as in tools/nsx/run_workflow.py (Mike, 2026-10-13).
+DEST_SUBNET_MAPS = {"lm2": "data/subnet_map_lm2.csv", "lm3": "data/subnet_map_lm3.csv"}
 PHASES = ("a", "c", "d2a", "d3", "palo")
 
 
@@ -148,6 +148,21 @@ def _setting(cli: Optional[str], env_var: str) -> Optional[str]:
     return (os.environ.get(env_var) or "").strip() or None
 
 
+def d_appendix(cli: Optional[str]) -> str:
+    """Workflow D suffix: --d-appendix, else OBJECT_APPENDIX_AVS from .env, the
+    same variable tools/nsx/run_workflow.py uses for Workflow D."""
+    value = (cli or os.environ.get("OBJECT_APPENDIX_AVS") or "").strip()
+    if not value:
+        raise SystemExit("No Workflow D suffix: set OBJECT_APPENDIX_AVS in .env, or pass --d-appendix.")
+    return value
+
+
+def device_group(cli: Optional[str]) -> Optional[str]:
+    """Panorama device group: --device-group, else PANORAMA_DEVICE_GROUP from
+    .env, the variable nsx_pan_mirror.py reads (Mike, 2026-10-13)."""
+    return (cli or os.environ.get("PANORAMA_DEVICE_GROUP") or "").strip() or None
+
+
 def _load_record(path: Path, name: str) -> Dict[str, Any]:
     f = path / name
     if not f.is_file():
@@ -198,7 +213,9 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
         by_side = {e: s for e, s in h["info"]["by_side"].items() if e in ok_ext}
         if by_side:
             hits.append({**h, "info": {**h["info"], "by_side": by_side}})
-    selected, excluded = mr.select_rules(hits, cap, inputs["include_default_sections"])
+    # Requests made before 2026-10-14 have no exclude_categories: they keep copying everything.
+    skip_cats = inputs.get("exclude_categories") or []
+    selected, excluded = mr.select_rules(hits, cap, inputs["include_default_sections"], skip_cats)
     errors += [f"{x['policy_name']} / {x['rule_name']}: {x['reason']}" for x in excluded if x.get("error")]
 
     # 4. Workflow A bundle (+ the captured-IP copies Workflow C builds from).
@@ -217,7 +234,7 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
     c_map = read_json(c_sib / "sibling_map.json")
 
     # 6. Workflow D: the servers' groups that sit in a rule, servers' addresses only.
-    scope, left_out = mr.d_scope(servers, data, cap)
+    scope, left_out = mr.d_scope(servers, data, cap, skip_cats)
     mr.write_d_input(work / "bundle" / "d_input", cap, scope)
     d_sib = sib_dir(work, "d", src_host)
     if not run_step("6_build_d_siblings", [PY, "tools/nsx/build_sibling_groups.py",
@@ -246,15 +263,25 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
         for server, ips in sorted(slot["servers"].items()):
             for ip in ips:
                 d_rows.append({"sibling_id": row["sibling_id"],
+                               "sibling": row.get("sibling_display_name") or row["sibling_id"],
                                "original": row.get("original_display_name") or row["original_id"],
                                "server": server, "source_ip": ip, "mapped_ip": ", ".join(pairs.get(ip) or [])})
     d_no = list(left_out) + [{"group": x.get("original_display_name") or x["original_id"], "reason": x["reason"]}
                              for x in d_map.get("no_sibling") or []]
 
-    c_rows = [{"sibling_id": r["sibling_id"], "original": r.get("original_display_name") or r["original_id"],
+    c_rows = [{"sibling_id": r["sibling_id"], "sibling": r.get("sibling_display_name") or r["sibling_id"],
+               "original": r.get("original_display_name") or r["original_id"],
                "ips": r.get("ips_source") or []} for r in c_map.get("map") or []]
     c_amend = mr.amendments(mr.selected_rules(cap, selected), c_map)
     d_amend = mr.amendments(mr.source_rules(cap), d_map)
+    # amend-refs changes every source rule that names a group with a D
+    # sibling, so a group shared with a left-out rule still changes that rule.
+    touched = [a for a in d_amend if (cap.policies.get(a["key"].split("/", 1)[0]) or {}).get("category")
+               in skip_cats]
+    if touched:
+        warnings.append(f"d3 also adds siblings to {len(touched)} {'/'.join(skip_cats)} rule(s) on "
+                        f"{src_host}, because they name a group that gets a D sibling: "
+                        + ", ".join(f"{a['policy_name']} / {a['rule_name']}" for a in touched))
 
     # 7. Palo plan, from the same capture.
     palo, plan = None, None
@@ -265,13 +292,23 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
 
     gnames = {p: g.get("display_name") or g.get("id") for p, g in data["groups_by_path"].items()}
     gnames.update({p: g.get("display_name") or g.get("id") for p, g in cap.groups.items()})
+    # Reports show display names (Mike, 2026-10-14). Built-in services and
+    # context profiles are not in the capture: the Palo plan's read of them
+    # has their names; without it (--no-palo) their ids show.
+    snames = {p: s.get("display_name") or s.get("id") for p, s in cap.services.items()}
+    pnames: Dict[str, str] = {}
+    for f, names in ((work / "palo" / "nsx_services_all.json", snames),
+                     (work / "palo" / "nsx_context_profiles.json", pnames)):
+        if f.is_file():
+            names.update({o["path"]: o.get("display_name") or o.get("id") for o in read_json(f) if o.get("path")})
     rec: Dict[str, Any] = {
         "schema": mr.SCHEMA, "request_id": inputs["request_id"], "created_at": utc_now_iso(),
         "captured_at": cap_manifest.get("captured_at"), "snapshot_at": data.get("collected_at"),
         "inputs": inputs, "servers": servers, "rules": selected, "excluded_rules": excluded,
         "closure": clo, "bundle": bundle, "c_siblings": c_rows, "c_amend": c_amend,
         "d_siblings": d_rows, "d_no_sibling": d_no, "d_amend": d_amend, "palo": palo,
-        "group_names": gnames, "errors": errors, "warnings": warnings,
+        "group_names": gnames, "service_names": snames, "profile_names": pnames,
+        "errors": errors, "warnings": warnings,
         "paths": {"record": repo_relative(work), "bundle": repo_relative(work / "bundle"),
                   "c": repo_relative(c_sib), "d": repo_relative(d_sib)},
     }
@@ -554,19 +591,20 @@ def cmd_request(args: argparse.Namespace) -> int:
     entries, warnings, sources = load_server_entries(args.servers, args.server_list)
     if args.source == args.destination:
         raise SystemExit("Source and destination are the same manager.")
-    dflt = DEST_DEFAULTS.get(args.destination.replace("nsx-", "", 1), {})
-    d_app = args.d_appendix or dflt.get("d_appendix")
-    smap = args.subnet_map or dflt.get("subnet_map")
-    if not d_app or not smap:
-        raise SystemExit(f"No defaults for {args.destination}: pass --d-appendix and --subnet-map.")
+    d_app = d_appendix(args.d_appendix)
+    smap = args.subnet_map or DEST_SUBNET_MAPS.get(args.destination.replace("nsx-", "", 1))
+    if not smap:
+        raise SystemExit(f"No subnet map default for {args.destination}: pass --subnet-map.")
     c_app = args.c_appendix or os.environ.get("OBJECT_APPENDIX") or "_np_ips"
     if c_app == d_app:
         raise SystemExit(f"The C and D suffixes must differ (both {c_app}).")
     smap_path = (REPO_ROOT / smap).resolve()
     if not smap_path.is_file():
         raise SystemExit(f"Subnet map not found: {smap}")
-    if not args.no_palo and not args.device_group:
-        raise SystemExit("Name the Panorama device group (--device-group dg-4), or pass --no-palo.")
+    dg = None if args.no_palo else device_group(args.device_group)
+    if not args.no_palo and not dg:
+        raise SystemExit("No Panorama device group: set PANORAMA_DEVICE_GROUP in .env, "
+                         "pass --device-group, or pass --no-palo.")
 
     work = new_run_dir(OUT_BASE / f"{args.source}_to_{args.destination}")
     setup_logging("migration_request", work / "logs", run_ts=work.name)
@@ -579,10 +617,11 @@ def cmd_request(args: argparse.Namespace) -> int:
         "domain_id": args.domain_id, "entries": [[n, ips] for n, ips in entries],
         "server_sources": sources,
         "include_default_sections": args.include_default_sections,
+        "exclude_categories": [] if args.include_infrastructure else ["Infrastructure"],
         "c_appendix": c_app, "d_appendix": d_app,
         "subnet_map": repo_relative(smap_path), "subnet_map_sha256": sha256_file(smap_path),
         "rate_limit": args.rate_limit,
-        "palo": {"enabled": not args.no_palo, "device_group": args.device_group,
+        "palo": {"enabled": not args.no_palo, "device_group": dg,
                  "object_location": args.object_location, "rulebase": args.rulebase,
                  "zone_from": args.zone_from, "zone_to": args.zone_to,
                  "profile_group": _setting(args.profile_group, "PANORAMA_SECURITY_PROFILE_GROUP"),
@@ -593,7 +632,7 @@ def cmd_request(args: argparse.Namespace) -> int:
     log.info("=" * 70)
     log.info("MIGRATION REQUEST %s", inputs["request_id"])
     log.info("  %s -> %s, %d server entr%s, Palo %s", args.source, args.destination, len(entries),
-             "y" if len(entries) == 1 else "ies", args.device_group if not args.no_palo else "off")
+             "y" if len(entries) == 1 else "ies", dg or "off")
     log.info("=" * 70)
     try:
         rec = build(work, inputs)
@@ -694,7 +733,8 @@ def cmd_refresh(args: argparse.Namespace) -> int:
            "approval": approval, "strict": args.strict, "delta": delta,
            "gate": {"passed": not blocked, "problems": problems, "errors": new["errors"]}}
     write_json(work / "run.json", run)
-    write_text(work / "delta.md", mr.render_delta_md(run, delta, problems + new["errors"], args.strict))
+    write_text(work / "delta.md", mr.render_delta_md(run, delta, problems + new["errors"], args.strict,
+                                                     {**mr.display_names(rec), **mr.display_names(new)}))
     render(work, new, "Implementation plan", "implementation.md")
     update_latest(work.parent, work)
     log.info("Run: %s", repo_relative(work))
@@ -916,9 +956,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     if (p / "run.json").is_file():
         rec = read_json(p / "request.json")
         run = read_json(p / "run.json")
+        approved = REPO_ROOT / run.get("request_dir", "") / "request.json"
+        names = {**(mr.display_names(read_json(approved)) if approved.is_file() else {}), **mr.display_names(rec)}
         write_text(p / "delta.md", mr.render_delta_md(run, run["delta"],
                                                        run["gate"]["problems"] + run["gate"]["errors"],
-                                                       run["strict"]))
+                                                       run["strict"], names))
         print(render(p, rec, "Implementation plan", "implementation.md"))
     else:
         p = _request_dir(args.dir)
@@ -954,12 +996,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     rq.add_argument("--domain-id", default="default")
     rq.add_argument("--include-default-sections", action="store_true",
                     help="Also copy rules in NSX's default sections (off: they exist on every manager).")
+    rq.add_argument("--include-infrastructure", action="store_true",
+                    help="Also take Infrastructure-category rules (off: they are left out of the request, "
+                         "listed as not copied, and their groups get no Workflow D sibling).")
     rq.add_argument("--c-appendix", default=None, help="Workflow C suffix (default OBJECT_APPENDIX, _np_ips).")
     rq.add_argument("--d-appendix", default=None,
-                    help="Workflow D suffix (default _avs_ips for nsx-lm2, _lm3_ips for nsx-lm3).")
+                    help="Workflow D suffix (default OBJECT_APPENDIX_AVS from .env, as in run_workflow.py).")
     rq.add_argument("--subnet-map", default=None,
                     help="Subnet map for D (default data/subnet_map_lm2.csv or data/subnet_map_lm3.csv).")
-    rq.add_argument("--device-group", default=None, help="Panorama device group, e.g. dg-4 (required with Palo).")
+    rq.add_argument("--device-group", default=None,
+                    help="Panorama device group (default PANORAMA_DEVICE_GROUP from .env, as in nsx_pan_mirror.py).")
     rq.add_argument("--object-location", choices=["shared", "device-group"], default="shared")
     rq.add_argument("--rulebase", choices=["pre", "post"], default="pre")
     rq.add_argument("--zone-from", default="any")

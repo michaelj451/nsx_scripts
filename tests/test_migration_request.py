@@ -204,6 +204,26 @@ class SelectionTests(unittest.TestCase):
         sel, _ = mr.select_rules(hits, self.cap)
         self.assertEqual([s["key"] for s in sel], ["infra-pol/dns", "app-pol/r1", "app-pol/r2"])
 
+    def test_infrastructure_rules_left_out(self):
+        hits = [{"rule": r, "info": {"by_side": {"vm-1": ["Src"]}}, "ext_id_to_name": {"vm-1": "web01"}}
+                for r in self.data["rules"][:3]]
+        sel, exc = mr.select_rules(hits, self.cap, exclude_categories=["Infrastructure"])
+        self.assertEqual([s["key"] for s in sel], ["app-pol/r1", "app-pol/r2"])
+        self.assertEqual([(x["key"], x["reason"], x["error"]) for x in exc],
+                         [("infra-pol/dns", "Infrastructure rule (left out of migration requests)", False)])
+        # A group used only by an Infrastructure rule gets no D sibling.
+        cap = mr.load_capture(make_capture(Path(tempfile.mkdtemp())), HOST)
+        cap.rules[("app-pol", "r1")]["destination_groups"] = [G + "other"]
+        data = snapshot_data()
+        data["group_to_members"][G + "db"] = {"vm-1"}
+        merged, notes = mr.merge_entries([("web01", None)], data["vms"])
+        rows = mr.server_rows(merged, notes, analyze(data, merged), data)
+        scope, left = mr.d_scope(rows, data, cap, ["Infrastructure"])
+        self.assertNotIn(G + "db", scope)
+        self.assertIn({"group": "DB", "reason": "only in Infrastructure rules (left out of the request)"}, left)
+        scope, _ = mr.d_scope(rows, data, cap)
+        self.assertIn(G + "db", scope)
+
     def test_closure_and_bundle(self):
         hit = {"rule": self.data["rules"][0], "info": {"by_side": {"vm-1": ["Src"]}},
                "ext_id_to_name": {"vm-1": "web01"}}
@@ -362,18 +382,22 @@ class RenderTests(unittest.TestCase):
                         {"key": "web1", "requested_as": ["web1"], "vm": None, "ips": [], "groups": [], "rules": 0,
                          "status": "not_found", "problems": ["no VM with this name on the source"],
                          "suggestions": ["web01"]}],
-            "rules": [{"policy_name": "App", "rule_name": "web to db", "disabled": False, "global": False,
+            "service_names": {"/infra/services/ICMP-ALL": "ICMP ALL"},
+            "rules": [{"key": "app/r1", "policy_id": "app", "policy_name": "App", "rule_name": "web to db",
+                       "disabled": False, "global": False,
                        "action": "ALLOW", "source_groups": [G + "web"], "destination_groups": ["ANY"],
-                       "services": ["/infra/services/HTTPS"], "scope": ["ANY"],
+                       "services": ["/infra/services/HTTPS", "/infra/services/ICMP-ALL"], "scope": ["ANY"],
                        "matched": [{"server": "web01", "sides": ["Src"]}]}],
             "excluded_rules": [], "bundle": {},
             "closure": {"groups": [G + "web"], "services": [], "builtin_services": ["/infra/services/HTTPS"],
                         "segment_paths": [], "context_profiles": [], "unresolved_groups": []},
-            "c_siblings": [{"sibling_id": "web_np_ips", "original": "WEB", "ips": ["10.6.0.101"]}],
-            "c_amend": [], "d_siblings": [{"sibling_id": "web_lm3_ips", "original": "WEB", "server": "web01",
-                                           "source_ip": "10.6.0.101", "mapped_ip": "10.8.0.101"}],
+            "c_siblings": [{"sibling_id": "web_np_ips", "sibling": "WEB_np_ips", "original": "WEB",
+                            "ips": ["10.6.0.101"]}],
+            "c_amend": [], "d_siblings": [{"sibling_id": "web_lm3_ips", "sibling": "WEB_lm3_ips", "original": "WEB",
+                                           "server": "web01", "source_ip": "10.6.0.101", "mapped_ip": "10.8.0.101"}],
             "d_no_sibling": [], "d_amend": [{"policy_name": "App", "rule_name": "web to db",
-                                             "adds": [{"field": "source_groups", "sibling": "web_lm3_ips"}]}],
+                                             "adds": [{"field": "source_groups", "sibling": "web_lm3_ips",
+                                                       "sibling_name": "WEB_lm3_ips"}]}],
             "palo": None, "warnings": [], "paths": {"record": "r", "bundle": "b", "c": "c", "d": "d"},
             "model": {"digest": "abc"}}
         md = mr.render_request_md(rec, {"a": {"rules": {"new": 1}}})
@@ -381,6 +405,21 @@ class RenderTests(unittest.TestCase):
         self.assertIn("10.6.0.101 to 10.8.0.101", md)
         self.assertIn("did you mean web01?", md)
         self.assertIn("WEB", md)
+        # Display names, not ids (Mike, 2026-10-14).
+        self.assertIn("HTTPS, ICMP ALL", md)
+        self.assertIn("WEB_np_ips", md)
+        self.assertIn("WEB_lm3_ips (source)", md)
+        self.assertNotIn("web_np_ips", md)
+        self.assertNotIn("web_lm3_ips", md)
+        names = mr.display_names(rec)
+        delta = {"rules": {"added": [], "removed": [], "changed": ["app/r1"]},
+                 "d_amend": {"added": ["app/r1 source_groups +web_lm3_ips"], "removed": [], "changed": []}}
+        run = {"request_id": "r", "created_at": "t", "source_host": "lm1.h", "captured_at": "t",
+               "approved_digest": "a", "digest": "b"}
+        dmd = mr.render_delta_md(run, delta, [], False, names)
+        self.assertIn("App / web to db", dmd)
+        self.assertIn("App / web to db: source +WEB_lm3_ips", dmd)
+        self.assertNotIn("app/r1", dmd)
         self.assertNotIn("\u2014", md)
 
 
@@ -428,6 +467,23 @@ class CliTests(unittest.TestCase):
         empty.write_text("# only comments\n", encoding="utf-8")
         with self.assertRaises(SystemExit):
             self.cli.load_server_entries(None, None, default=empty)
+
+    def test_d_appendix_from_env_or_command_line(self):
+        from unittest import mock
+        with mock.patch.dict("os.environ", {"OBJECT_APPENDIX_AVS": "_avs_ips"}):
+            self.assertEqual(self.cli.d_appendix(None), "_avs_ips")
+            self.assertEqual(self.cli.d_appendix("_x_ips"), "_x_ips")
+        with mock.patch.dict("os.environ", {"OBJECT_APPENDIX_AVS": ""}):
+            with self.assertRaises(SystemExit):
+                self.cli.d_appendix(None)
+
+    def test_device_group_from_env_or_command_line(self):
+        from unittest import mock
+        with mock.patch.dict("os.environ", {"PANORAMA_DEVICE_GROUP": "dg-5"}):
+            self.assertEqual(self.cli.device_group(None), "dg-5")
+            self.assertEqual(self.cli.device_group("dg-4"), "dg-4")
+        with mock.patch.dict("os.environ", {"PANORAMA_DEVICE_GROUP": " "}):
+            self.assertIsNone(self.cli.device_group(None))
 
     def test_rollback_reverse_order_with_allow_delete(self):
         inputs = {"source": "nsx-lm1", "destination": "nsx-lm3", "source_host": "lm1.h",

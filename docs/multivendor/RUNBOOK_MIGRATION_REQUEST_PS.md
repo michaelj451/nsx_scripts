@@ -40,8 +40,8 @@ ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102
 
 ```powershell
 notepad migration_request_servers.txt
-Mr request --source nsx-lm1 --destination nsx-lm3 --device-group dg-4 `
-  --no-tls-verify --name "wave 1"
+Mr request --source nsx-lm1 --destination nsx-lm3 `
+  --no-tls-verify --name "wave 1"   # device group: PANORAMA_DEVICE_GROUP in .env
 
 $R = Newest "migration_requests\nsx-lm1_to_nsx-lm3"
 notepad "$R\request.md"

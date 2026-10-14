@@ -6,6 +6,192 @@ Static lab layout lives in [LAB_TOPOLOGY.md](LAB_TOPOLOGY.md).
 
 ---
 
+## 2026-10-13: nsx-lm3 wiped, critical rules copied from nsx-lm1
+
+**DONE.** lm3 now holds only lm1's critical rules (VERIFY PASS). lm3's
+default Layer3 rule is DROP, so on lm3 only these 15 rules allow anything.
+
+### Wipe (Mike ran the apply)
+
+- Backup first: `nsx_backup/nsx-lm3.lab.local/20261013_164503` (22 groups,
+  4 services, 4 customer policies).
+- `tools/test/wipe_target_manager.py --target nsx-lm3` (full wipe). Dry run
+  plan `nsx_wipe_bundle/20261013_164521/nsx-lm3.lab.local/pre_wipe_state.json`:
+  13 rules, 4 policies, 22 groups (11 groups and their 11 `_np_ips`
+  siblings, lm2's earlier clone of lm1), 4 services. Default sections kept;
+  `default-layer3-rule` (DROP) was their only rule. Segments, T1, VM tags
+  and VMs untouched.
+- Before step 3 below, lm3 read back empty: 0 services, groups, policies,
+  rules.
+
+### Critical rules copy, nsx-lm1 to nsx-lm3
+
+Run `nsx_critical_runs/nsx-lm1_to_nsx-lm3/20261013_170618`
+([RUNBOOK_CRITICAL_RULES.md](../nsx/RUNBOOK_CRITICAL_RULES.md)).
+
+- Step 1: lm1 Policy-API statistics 500 for every policy (3.2.x), the old
+  firewall API answered for 6. Hot: 11 Application rules, 1 Infrastructure.
+- Step 2: Infrastructure whole, 2 policies / 4 rules (`seed-policy-infra`,
+  `test-infrastructure-policy`). Application hot rules 11 of 11:
+  `Start_Policy` 8 of 9 (`allow-icmp-network-8` cold), `seed-policy-app`
+  3 (`seed-web-https`, `seed-multi`, `seed-logged-drop` DROP).
+  `test-policy-2` not copied (no hot rules). CHECK, accepted by Mike: cold
+  `seed-empty-src` (REJECT) and `seed-disabled` (DROP, disabled) not copied.
+- Step 3 apply (Mike approved `--piped-answers`): services 2+4, groups 5+13
+  (`seed-ip-db-block` in both bundles, second push skipped as identical),
+  policies 2+2, rules 4+11, 0 failed.
+- Step 4: services 6, groups 18, policies 4, rules 15; missing 0, extra 0.
+  VERIFY PASS.
+
+Undo: `tools/nsx/critical_rules/revert.py --source nsx-lm1 --target nsx-lm3`
+on the same run returns lm3 to empty.
+
+### lm1 cleanup by Mike, 12:20 to 12:44 CDT
+
+After the copy: `web_rule` and then the rest of `test-policy-1` disabled,
+`seed-policy-app` deleted, then every Application policy removed except
+`test-policy-2`, which now holds only the new `migration-rule` (HTTPS from
+`ip-address-group` + `ip-address-group-10.10.2.0-24` to tag group
+`migration-2555` = `migrate|2555`: ax2001 10.6.0.101, 0102 10.6.1.102).
+The two Infrastructure policies stay. lm3 still holds the earlier critical
+copy (`Start_Policy` 8 rules enabled, `seed-policy-app` 3 rules).
+
+### First applied migration request: 10.6.0.101 (ax2001), lm1 to lm3, dg-4
+
+Request `migration_requests/nsx-lm1_to_nsx-lm3/20261013_174358`, approved
+(LAB-20261013, Mike Ferguson), run `runs/20261013_175707` (refresh: no
+change since approval). One rule, `test-policy-2/migration-rule`. Each
+phase dry run, then apply (batch prompts answered Enter, with Mike's
+approval), then verify:
+
+| Phase | Applied | Verify |
+|---|---|---|
+| a (lm3) | `migration-2555`, `test-policy-2`, `migration-rule` created; 2 groups already identical | every object present |
+| c (lm3) | `migration-2555_np_ips` (10.6.0.101, 10.6.1.102); added to the rule's destination; 15 other rules unchanged | OK |
+| d2a (lm1) | `migration-2555_lm3_ips` (10.8.0.101) | |
+| d3 (lm1) | added to `migration-rule` destination; 4 other rules unchanged | WF-D VALIDATION PASS |
+| palo (pano4) | 18 objects created in the candidate config (17 in `shared`, rule in `dg-4` pre-rulebase); **not committed** | every planned object on Panorama |
+
+**ROLLED BACK 13:39 CDT** (Mike, after the D suffix was moved to
+`OBJECT_APPENDIX_AVS` in `.env`; this request carried `_lm3_ips`). Each
+phase's rollback dry run first, then apply, newest first: palo deleted 18,
+d3 restored `migration-rule`, d2a deleted `migration-2555_lm3_ips`, c
+restored the rule and deleted `migration-2555_np_ips`, a deleted
+`migration-rule`, `test-policy-2`, `migration-2555`. Checked after: lm3
+VERIFY PASS against the critical copy run `20261013_170618` (6/18/4/15,
+nothing extra); lm1 has no `_lm3_ips` group and `migration-rule` names only
+`migration-2555`; a pano4 dry run finds all 18 objects missing again.
+
+### Cold seed policies on lm1, 16:33 CDT
+
+Mike asked for seeded policies with obscure ports, one above and one below
+`test-policy-2` (Application, sequence 5), meant to stay at 0 hits.
+Bundle `nsx_logs/seed_cold_policies/20261013_213329` (services, policies,
+rules in the push tools' layout), pushed with `services.py` / `policies.py` /
+`rules.py push`, dry run then apply, 0 failed, read back from lm1:
+
+| Policy (seq) | Rule | Action | Source -> destination | Port |
+|---|---|---|---|---|
+| `seed-cold-above` (4) | `seed-cold-a-tcp-17239` | ALLOW | ip-address-group -> migration-2555 | TCP 17239 |
+| | `seed-cold-a-udp-19787` | ALLOW | network-6-0 -> vm1 | UDP 19787 |
+| | `seed-cold-a-drop-23417` | DROP | ANY -> segment-group-1 | TCP 23417-23419 |
+| `seed-cold-below` (6) | `seed-cold-b-tcp-27853` | ALLOW | vm2 -> network-6-0 | TCP 27853 |
+| | `seed-cold-b-28411` | ALLOW | hardware-subnet -> migration-2555 | TCP+UDP 28411 |
+| | `seed-cold-b-reject-29873` | REJECT | ANY -> vm1 | TCP 29873 |
+
+Six services `seed-cold-*`. Every rule names a group that holds ax2001
+(10.6.0.101), so a migration request for it now selects these 6 cold rules
+too. Undo: `rules.py revert`, then `policies.py revert`, then
+`services.py revert`, each `--target nsx-lm1 --reports-dir <bundle>/<class>/push_report`.
+
+### `always-rules-poilicy` copied from lm1 to lm2 and lm3, 18:40 CDT
+
+Mike created an Infrastructure policy on lm1 (id and display name are spelled
+`always-rules-poilicy`) and asked for it on lm2 and lm3. Copied as is, the
+Workflow A way: lm1 captured read-only, the policy's 2 rules plus their
+groups bundled (one bundle per target), pushed with `groups.py` (segments
+strip) / `policies.py` / `rules.py`, dry run then apply, 0 failed on both.
+
+- Policy: Infrastructure, sequence 5, applied to ANY. Rules:
+  `servers-to-rustdesk` (5, ALLOW, nsx-lm1/2/3-servers -> allowed servers
+  anytime, any service) and `install-rustdesk` (10, ALLOW,
+  ip-address-group-10.10.2.0-24 -> nsx-lm1/2/3-servers, any service).
+- Groups, all IP-only: `nsx-lm1-servers` 10.6.0.0/16, `nsx-lm2-servers`
+  10.7.0.0/16, `nsx-lm3-servers` 10.8.0.0/16, `allowed_servers_anytime`
+  (10.3.0.151, 10.3.0.152, 10.4.0.200) created on both; 
+  `ip-address-group-10.10.2.0-24` was already identical on both.
+- Read back: policy, rules and groups on lm2 and lm3 match lm1 field for field.
+- lm3 now holds the critical copy plus this policy and its 4 new groups.
+- Bundles and push reports: `nsx_logs/policy_copy/always-rules-policy/20261013_233918/bundle_nsx-lm2` and `bundle_nsx-lm3`.
+  Undo per target: `rules.py revert`, `policies.py revert`, `groups.py revert --allow-delete`,
+  each `--target <t> --reports-dir <bundle>/<class>/push_report`.
+
+---
+
+## 2026-10-12: bit flips on centos9-123/124, root cause bad RAM in vsphere1
+
+**OPEN (vsphere1 RAM).** VMs repaired. Mike moved all four test VMs to
+vsphere7 (Minisforum MS-A2, Ryzen 9 7945HX); after a reboot there, `rpm -Va`
+is clean on all four (.123 also needed `dnf reinstall dnf` for the one file
+damaged on disk). Kernel crash dumps from the vsphere1 period: .123 x3
+(2026-10-11 23:04, 10-12 04:04, 10:15), .124 x1 (10-11 16:36), .121/.122
+none. `ubuntu22-dns-10.3.0.156` is the only VM left on vsphere1. The DNS VMs
+.153 to .155 sit on vsphere2, the same non-ECC Lenovo model. Still to do:
+MemTest86 on vsphere1.
+
+### Symptom
+
+RustDesk on centos9-124 (10.4.3.124) segfaulted about once a second from 08:54
+to 10:05 CDT (5,134 core dumps), then the service itself segfaulted inside
+`dlopen` relocation. centos9-123 logged a kernel oops at 06:29
+(`vmap_pages_pud_range`, comm rustdesk).
+
+### Hosts involved
+
+All four test VMs (`centos9-docker-10.4.3.121` to `.124` in vcenter8) run on
+**vsphere1.lab.local**: Lenovo 10RRS4TM00, Intel Core i7-8700T, 64 GB,
+ESXi 7.0.3, last boot 2026-10-10 19:24 UTC. The i7-8700T does not support
+ECC, so memory errors are neither corrected nor reported; every host hardware
+sensor stays Green. Also on vsphere1: `ubuntu22-dns-10.3.0.155` and `.156`.
+Datastores: .121 on `iscsi-disk-5.1`, .122 to .124 on `datastore-1.1`.
+
+### Evidence, in order
+
+1. `rpm -Va` digest mismatches: .123 = 14 files in 14 packages, .124 = 12
+   files in 11 packages, .121 and .122 = 0. All four were updated in parallel
+   on 2026-10-11 from the same repos; three damaged packages per VM date from
+   the January install and were not rewritten.
+2. After `drop_caches`, 13 of 14 (.123) and 8 of 12 (.124) verified clean: the
+   damage was in the page cache, not on disk. The rest were shared libraries
+   mapped by running processes (gnome-shell greeter, dbus, polkit, pipewire),
+   so their pages could not be evicted.
+3. `dd iflag=direct` (bypasses the page cache) read 6 of the 7 remaining files
+   correctly from disk. The only on-disk damage is `dnf.mo` on .123, written
+   during the update: the flip happened in RAM before writeback.
+4. Byte compare against the good copies on .121: every damaged byte is a
+   single-bit flip. 9 of 10 sit at byte 3 of a 64-bit word, at recurring page
+   offsets 0x063 and 0xe63. Page offsets survive guest-to-host mapping, so
+   this points at one DRAM chip or data line on one vsphere1 DIMM.
+5. Still happening: a cold re-verify at about 11:00 CDT found two new damaged
+   files on .123 (pipewire and wireplumber modules) that were clean at 10:20.
+6. Not storage: .122 shares `datastore-1.1` and is clean; direct disk reads
+   are correct. Not the guest kernel: .121/.122 run the same kernel and are
+   clean. Not ballooning or host swap (both 0 MB on .123/.124).
+7. A 6-minute in-guest zero-hold test (1.5 GiB each on .122/.123/.124) found
+   no flips. It only exercises the host pages backing that buffer, so it does
+   not clear the RAM.
+
+### Next steps (Mike decides)
+
+1. Move the six VMs off vsphere1, or shut them down.
+2. MemTest86 on vsphere1 to identify the DIMM; reseat or replace it.
+3. On healthy hardware: reboot .123/.124 (clears the bad page cache),
+   reinstall `dnf` on .123 (the one damaged file on disk), re-run `rpm -Va`,
+   restart RustDesk.
+4. Check the DNS VMs on vsphere1 (10.3.0.155/.156) for damage.
+
+---
+
 ## 2026-10-10: lm1 ping loss and duplicate replies after a cold start
 
 **CLOSED 23:08 CDT.** Duplicates fixed on lm1, lm2 and lm3. Close-out check

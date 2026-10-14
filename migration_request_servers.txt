@@ -28,7 +28,5 @@
 # --------------------------------------------------------------------------
 # Batch 1 (lab dry run, 2026-10-08): nsx-lm1 to nsx-lm3. Lab test servers,
 # one per entry form: a name, a bare IP, and name,ip for a powered-off VM.
-ubuntu22-speedtest-10.6.0.101-ax2001
-10.6.2.102
-ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102
-ubuntu22-speedtest-10.6.0.103-x515
+10.6.0.101
+10.6.0.102

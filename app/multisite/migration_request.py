@@ -304,10 +304,13 @@ def server_rows(entries: Sequence[Entry], notes: Dict[str, Dict[str, Any]],
 
 
 def select_rules(hits: Sequence[Dict[str, Any]], cap: CaptureView,
-                 include_default_sections: bool = False
+                 include_default_sections: bool = False,
+                 exclude_categories: Sequence[str] = ()
                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """The rules to copy: every rule the server lookup found, as captured.
-    Returns (selected in NSX evaluation order, excluded with a reason)."""
+    """The rules to copy: every rule the server lookup found, as captured,
+    except rules in `exclude_categories` (Mike, 2026-10-14: Infrastructure
+    rules are not part of a request). Returns (selected in NSX evaluation
+    order, excluded with a reason)."""
     selected: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
     for h in hits:
@@ -328,6 +331,8 @@ def select_rules(hits: Sequence[Dict[str, Any]], cap: CaptureView,
             reason = "policy missing from the source capture (captures out of step: re-run)"
         elif is_default_policy(pol) and not include_default_sections:
             reason = "NSX default section (never copied)"
+        elif pol.get("category") in exclude_categories:
+            reason = f"{pol.get('category')} rule (left out of migration requests)"
         elif (pid, rid) not in cap.rules:
             reason = "rule missing from the source capture (captures out of step: re-run)"
         if reason:
@@ -512,24 +517,29 @@ def ip_covered(ip: str, entries: Iterable[str]) -> bool:
     return False
 
 
-def amendable_groups(cap: CaptureView) -> Set[str]:
-    """Group paths named in source/destination of a customer rule on the source."""
+def amendable_groups(cap: CaptureView, exclude_categories: Sequence[str] = ()) -> Set[str]:
+    """Group paths named in source/destination of a customer rule on the source,
+    leaving out rules in `exclude_categories`."""
     out: Set[str] = set()
     for (pid, _rid), rule in cap.rules.items():
-        if is_default_policy(cap.policies.get(pid) or {}):
+        pol = cap.policies.get(pid) or {}
+        if is_default_policy(pol) or pol.get("category") in exclude_categories:
             continue
         for f in AMEND_FIELDS:
             out.update(v for v in rule.get(f) or [] if _is_ref(v))
     return out
 
 
-def d_scope(servers: Sequence[Dict[str, Any]], data: Dict[str, Any], cap: CaptureView
+def d_scope(servers: Sequence[Dict[str, Any]], data: Dict[str, Any], cap: CaptureView,
+            exclude_categories: Sequence[str] = ()
             ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """Workflow D scope (Mike, 2026-10-07): the groups the servers are
     members of that sit in a rule, each holding only those servers'
-    addresses. Returns ({group path: {id, name, servers: {server: [ips]}}},
-    groups left out with the reason)."""
-    used = amendable_groups(cap)
+    addresses. Rules in `exclude_categories` do not count, so a group used
+    only by them gets no sibling. Returns ({group path: {id, name, servers:
+    {server: [ips]}}}, groups left out with the reason)."""
+    used = amendable_groups(cap, exclude_categories)
+    used_any = amendable_groups(cap)
     members = data.get("group_to_members") or {}
     group_ips = data.get("group_ips") or {}
     scope: Dict[str, Dict[str, Any]] = {}
@@ -545,7 +555,9 @@ def d_scope(servers: Sequence[Dict[str, Any]], data: Dict[str, Any], cap: Captur
                 left_out[path] = {"group": name, "reason": "not in the captured domain"}
                 continue
             if path not in used:
-                left_out[path] = {"group": name, "reason": "not in any rule's source or destination"}
+                reason = (f"only in {', '.join(exclude_categories)} rules (left out of the request)"
+                          if path in used_any else "not in any rule's source or destination")
+                left_out[path] = {"group": name, "reason": reason}
                 continue
             ips = [ip for ip in row["ips"] if ip_covered(ip, group_ips.get(path) or ())]
             if not ips and row["external_id"] in set(members.get(path) or ()):
@@ -605,7 +617,8 @@ def amendments(rules: Iterable[Tuple[Dict[str, Any], Dict[str, Any]]],
                 row = pairs.get(v.rsplit("/", 1)[-1])
                 if row and row["sibling_id"] not in ids:
                     adds.append({"field": f, "original": row.get("original_display_name") or row["original_id"],
-                                 "sibling": row["sibling_id"]})
+                                 "sibling": row["sibling_id"],
+                                 "sibling_name": row.get("sibling_display_name") or row["sibling_id"]})
         if adds:
             out.append({"key": f"{pol.get('id')}/{rule.get('id')}",
                         "policy_name": pol.get("display_name") or pol.get("id"),
@@ -716,9 +729,41 @@ def _side(refs: Sequence[str], gbp: Dict[str, Dict[str, Any]]) -> str:
     return ", ".join(names) if names else "ANY"
 
 
-def _services(refs: Sequence[str]) -> str:
-    names = [r.rsplit("/", 1)[-1] if _is_ref(r) else str(r) for r in refs or []]
+def _services(refs: Sequence[str], snames: Optional[Dict[str, str]] = None) -> str:
+    """Service display names (Mike, 2026-10-14: reports show display names,
+    not ids). `snames` maps a service path to its display name."""
+    snames = snames or {}
+    names = [(snames.get(r) or r.rsplit("/", 1)[-1]) if _is_ref(r) else str(r) for r in refs or []]
     return ", ".join(names) if names else "ANY"
+
+
+def _sib(row: Dict[str, Any]) -> str:
+    """A sibling's display name; requests built before 2026-10-14 hold only its id."""
+    return row.get("sibling") or row["sibling_id"]
+
+
+def display_names(rec: Dict[str, Any]) -> Dict[str, str]:
+    """Model key -> display name for one request record: rule keys
+    ("policy/rule"), policy, group, service and sibling ids. Used to show
+    delta.md in display names while the fingerprint stays on ids."""
+    out: Dict[str, str] = {}
+    for x in rec.get("rules") or []:
+        out[x["key"]] = f"{x['policy_name']} / {x['rule_name']}"
+        out[x["policy_id"]] = x["policy_name"]
+    for path, name in (rec.get("group_names") or {}).items():
+        out[path.rsplit("/", 1)[-1]] = _gname(path, rec.get("group_names") or {})
+    for path, name in (rec.get("service_names") or {}).items():
+        out[path.rsplit("/", 1)[-1]] = name
+    for r in (rec.get("c_siblings") or []) + (rec.get("d_siblings") or []):
+        out[r["sibling_id"]] = _sib(r)
+    return out
+
+
+def _delta_item(cat: str, item: str, names: Dict[str, str]) -> str:
+    if cat in ("c_amend", "d_amend"):
+        key, field, sib = item.split(" ", 2)
+        return f"{names.get(key, key)}: {field.split('_')[0]} +{names.get(sib[1:], sib[1:])}"
+    return names.get(item, item)
 
 
 def preview_counts(rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
@@ -770,6 +815,10 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
     previews = previews or {}
     inp = rec["inputs"]
     gbp = rec.get("group_names") or {}
+    snames = rec.get("service_names") or {}
+    pnames = rec.get("profile_names") or {}
+    adds = lambda a: ", ".join(f"{x.get('sibling_name') or x['sibling']} ({x['field'].split('_')[0]})"  # noqa: E731
+                               for x in a["adds"])
     src, dst = inp["source_host"], inp["destination_host"]
     L: List[str] = [f"# {title}: {inp.get('name') or rec['request_id']}", ""]
     L += [f"Servers moving from **{src}** to **{dst}**. Request `{rec['request_id']}`, built "
@@ -814,7 +863,7 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
                    "servers (side)"],
                   [[i, x["policy_name"], x["rule_name"] + (" (disabled)" if x["disabled"] else "")
                     + (" [ANY to ANY]" if x["global"] else ""), x["action"], _side(x["source_groups"], gbp),
-                    _side(x["destination_groups"], gbp), _services(x["services"]), _side(x["scope"], gbp),
+                    _side(x["destination_groups"], gbp), _services(x["services"], snames), _side(x["scope"], gbp),
                     "; ".join(f"{m['server']} ({'/'.join(m['sides'])})" for m in x["matched"])]
                    for i, x in enumerate(rec["rules"], 1)], ["r"] + ["l"] * 8)
     if rec["excluded_rules"]:
@@ -834,17 +883,17 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
     if not a_prev:
         L += ["", "Destination not previewed: run `preview --part a` for new / update / identical."]
     L += ["", "Groups: " + (", ".join(sorted(_gname(p, gbp) for p in rec["closure"]["groups"])) or "none") + ".",
-          "", "Services: " + (", ".join(sorted(p.rsplit('/', 1)[-1] for p in rec["closure"]["services"]))
+          "", "Services: " + (", ".join(sorted(_services([p], snames) for p in rec["closure"]["services"]))
                               or "none") + "."]
     if rec["closure"]["builtin_services"]:
         L += ["", "Built-in NSX services the rules use (already on every manager, not copied): "
-              + ", ".join(p.rsplit("/", 1)[-1] for p in rec["closure"]["builtin_services"]) + "."]
+              + _services(rec["closure"]["builtin_services"], snames) + "."]
     if rec["closure"]["segment_paths"]:
         L += ["", "Segment references inside groups are stripped on the destination (segment ids differ "
               "per manager): " + ", ".join(p.rsplit("/", 1)[-1] for p in rec["closure"]["segment_paths"]) + "."]
     if rec["closure"]["context_profiles"]:
         L += ["", "Context profiles the rules use (not copied by any push tool; must exist on the destination): "
-              + ", ".join(p.rsplit("/", 1)[-1] for p in rec["closure"]["context_profiles"]) + "."]
+              + ", ".join(pnames.get(p) or p.rsplit("/", 1)[-1] for p in rec["closure"]["context_profiles"]) + "."]
     if rec["closure"]["unresolved_groups"]:
         L += ["", "**Group references not found in the capture:** "
               + ", ".join(rec["closure"]["unresolved_groups"]) + "."]
@@ -854,14 +903,13 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
           "still match servers that have not moved yet.", ""]
     c_rows = rec["c_siblings"]
     L += (md_table(["sibling", "original group", "addresses"],
-                   [[r["sibling_id"], r["original"], ", ".join(r["ips"])] for r in c_rows]) if c_rows else ["None."])
+                   [[_sib(r), r["original"], ", ".join(r["ips"])] for r in c_rows]) if c_rows else ["None."])
     c_prev = (previews.get("c") or {}).get("siblings")
     if c_prev:
         L += ["", f"Dry run against {dst}: {counts_text(c_prev)}."]
     L += ["", "Rules on the destination that gain a sibling:", ""]
     L += (md_table(["policy", "rule", "adds"],
-                   [[a["policy_name"], a["rule_name"], ", ".join(f"{x['sibling']} ({x['field'].split('_')[0]})"
-                                                               for x in a["adds"])] for a in rec["c_amend"]])
+                   [[a["policy_name"], a["rule_name"], adds(a)] for a in rec["c_amend"]])
           if rec["c_amend"] else ["None."])
 
     d_prev = previews.get("d") or {}
@@ -871,18 +919,17 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
           "gain the sibling.", ""]
     by_sib: Dict[str, Dict[str, Any]] = {}
     for r in rec["d_siblings"]:
-        slot = by_sib.setdefault(r["sibling_id"], {"original": r["original"], "addrs": []})
+        slot = by_sib.setdefault(r["sibling_id"], {"name": _sib(r), "original": r["original"], "addrs": []})
         slot["addrs"].append(f"{r['mapped_ip'] or 'unmapped'} ({r['server']})")
     L += (md_table(["sibling", "original group", f"addresses at {dst} (server)"],
-                   [[k, v["original"], ", ".join(v["addrs"])] for k, v in by_sib.items()])
+                   [[v["name"], v["original"], ", ".join(v["addrs"])] for v in by_sib.values()])
           if by_sib else ["None."])
     if rec["d_no_sibling"]:
         L += ["", "Groups with no D sibling:", ""]
         L += md_table(["group", "why"], [[x["group"], x["reason"]] for x in rec["d_no_sibling"]])
     L += ["", f"Rules on {src} that gain a sibling:", ""]
     L += (md_table(["policy", "rule", "adds"],
-                   [[a["policy_name"], a["rule_name"], ", ".join(f"{x['sibling']} ({x['field'].split('_')[0]})"
-                                                               for x in a["adds"])] for a in rec["d_amend"]])
+                   [[a["policy_name"], a["rule_name"], adds(a)] for a in rec["d_amend"]])
           if rec["d_amend"] else ["None."])
     if d_prev:
         am = d_prev.get("amend") or {}
@@ -961,7 +1008,11 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
 
 
 def render_delta_md(run: Dict[str, Any], delta: Dict[str, Dict[str, List[str]]],
-                    gate_problems: Sequence[str], strict: bool) -> str:
+                    gate_problems: Sequence[str], strict: bool,
+                    names: Optional[Dict[str, str]] = None) -> str:
+    """`names` (display_names() of the approved and the rebuilt request) turns
+    the fingerprint's ids into display names; without it the ids show."""
+    names = names or {}
     L = [f"# Changes since approval: request {run['request_id']}", "",
          f"Rebuilt {run['created_at']} from a capture of {run['source_host']} taken {run['captured_at']}. "
          f"Approved fingerprint `{run['approved_digest']}`, now `{run['digest']}`.", ""]
@@ -981,6 +1032,7 @@ def render_delta_md(run: Dict[str, Any], delta: Dict[str, Dict[str, List[str]]],
               "palo": "Palo Alto objects"}
     for cat, d in delta.items():
         L += [f"## {labels.get(cat, cat)}", ""]
-        L += md_table(["change", "items"], [[k, ", ".join(md_escape(x) for x in v)] for k, v in d.items() if v])
+        L += md_table(["change", "items"], [[k, ", ".join(md_escape(_delta_item(cat, x, names)) for x in v)]
+                                            for k, v in d.items() if v])
         L += [""]
     return align_markdown_tables("\n".join(L)) + "\n"
