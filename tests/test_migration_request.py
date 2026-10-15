@@ -167,6 +167,18 @@ class InputTests(unittest.TestCase):
         self.assertEqual(out, [("10.6.5.5", None)])
         self.assertEqual(notes["10.6.5.5"]["ambiguous"], ["dup-a", "dup-b"])
 
+    def test_given_ip_of_another_vm_is_flagged(self):
+        data = snapshot_data()
+        cases = {"web01,10.6.0.102": ["address mismatch: 10.6.0.102 belongs to web02, not to web01"],
+                 "web01,10.6.0.101": [],
+                 "newsrv,10.6.0.101": ["address mismatch: 10.6.0.101 belongs to web01, not to newsrv"]}
+        for line, want in cases.items():
+            entries, _ = mr.parse_list_lines([line])
+            merged, notes = mr.merge_entries(entries, data["vms"])
+            rows = mr.server_rows(merged, notes, analyze(data, merged), data)
+            got = [p.split(" (check")[0] for p in rows[0]["problems"] if p.startswith("address mismatch")]
+            self.assertEqual(got, want, line)
+
     def test_suggestions(self):
         self.assertEqual(mr.suggest_names("web", snapshot_data()["vms"]), ["web01", "web02"])
         self.assertEqual(mr.suggest_names("wbe01", snapshot_data()["vms"])[0], "web01")
@@ -197,6 +209,8 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual([s["key"] for s in sel], ["app-pol/r1"])
         self.assertEqual([x["reason"] for x in exc], ["NSX default section (never copied)"])
         self.assertEqual(sel[0]["matched"], [{"server": "web01", "sides": ["Src"]}])
+        # The source rule number (the capture's numeric rule_id), for vRNI and logs.
+        self.assertEqual(sel[0]["rule_number"], 1001)
 
     def test_rules_follow_nsx_order(self):
         hits = [{"rule": r, "info": {"by_side": {"vm-1": ["Src"]}}, "ext_id_to_name": {"vm-1": "web01"}}
@@ -407,6 +421,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("WEB", md)
         # Display names, not ids (Mike, 2026-10-14).
         self.assertIn("HTTPS, ICMP ALL", md)
+        self.assertIn("rule #", md)
         self.assertIn("WEB_np_ips", md)
         self.assertIn("WEB_lm3_ips (source)", md)
         self.assertNotIn("web_np_ips", md)
@@ -467,6 +482,30 @@ class CliTests(unittest.TestCase):
         empty.write_text("# only comments\n", encoding="utf-8")
         with self.assertRaises(SystemExit):
             self.cli.load_server_entries(None, None, default=empty)
+
+    def test_change_record_on_every_push_and_palo_write(self):
+        from common.description_note import append_note, change_note
+        note = change_note("CHG1", "mike", "2026-10-14")
+        self.assertEqual(note, "Ticket CHG1 | mike | 2026-10-14")
+        self.assertEqual(change_note(None, "mike", "2026-10-14"), "Ticket none | mike | 2026-10-14")
+        self.assertEqual(append_note("web servers", note), "web servers [Ticket CHG1 | mike | 2026-10-14]")
+        self.assertEqual(append_note(append_note("x", note), note), append_note("x", note))
+        long = append_note("y" * 2000, note, limit=100)
+        self.assertEqual(len(long), 100)
+        self.assertTrue(long.endswith(f"... [{note}]"))
+        inputs = {"source": "nsx-lm1", "destination": "nsx-lm3", "source_host": "lm1.h",
+                  "destination_host": "lm3.h", "change": {"ticket": "CHG1", "user": "mike", "date": "2026-10-14"}}
+        for phase in ("a", "c", "d2a", "d3"):
+            for st in self.cli.phase_steps(Path("/w"), inputs, phase, True):
+                cmd = [str(c) for c in st["cmd"]]
+                self.assertEqual(cmd[cmd.index("--description-note") + 1], note, st["label"])
+        old = {k: v for k, v in inputs.items() if k != "change"}
+        self.assertNotIn("--description-note", [str(c) for c in self.cli.phase_steps(Path("/w"), old, "a", True)[0]["cmd"]])
+        plan = {"writes": [{"kind": "address", "entry": {"description": "NSX VM web01"}},
+                           {"kind": "security-rule", "entry": {}}]}
+        mr.tag_writes(plan, note)
+        self.assertEqual([w["entry"]["description"] for w in plan["writes"]],
+                         [f"NSX VM web01 [{note}]", f"[{note}]"])
 
     def test_d_appendix_from_env_or_command_line(self):
         from unittest import mock

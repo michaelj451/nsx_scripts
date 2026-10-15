@@ -35,7 +35,7 @@ stops the run: raise a new request. `refresh --strict` stops on any change.
 
 | Part | Scope |
 |---|---|
-| Servers | One per entry: a VM name, an IP address, or `name,ip[,ip]`. An IP that exactly one VM owns resolves to that VM, so its group memberships count. An IP no VM owns (powered off, or not a VM) matches by address only. A misspelt name gets "did you mean" suggestions |
+| Servers | One per entry: a VM name, an IP address, or `name,ip[,ip]`. An IP that exactly one VM owns resolves to that VM, so its group memberships count. An IP no VM owns (powered off, or not a VM) matches by address only. A misspelt name gets "did you mean" suggestions. A `name,ip` line whose address NSX shows on a different VM is flagged as an **address mismatch** on that server's row and under Warnings (it still builds) |
 | Rules | Every NSX rule whose source, destination or applied-to contains a server, through a group the VM is in or a group whose addresses cover the server. NSX default sections are never copied. **Infrastructure-category rules are left out** (Mike, 2026-10-14): they are listed under "not copied", and a group used only by them gets no Workflow D sibling (`--include-infrastructure` keeps them). A copied rule covers every member of its groups, not only the requested servers |
 | Workflow A (destination) | Those rules, their policies, and every group and service they need: nested groups, nested services, a policy's own applied-to. Segment references inside groups are stripped (segment ids differ per manager). Built-in NSX services are not copied (every manager has them). Context profiles are listed, not copied |
 | Workflow C (destination) | An IP-only `_np_ips` sibling for every tag-based group in that bundle, holding the source's current addresses, added to the copied rules. Copied rules keep matching servers that have not moved |
@@ -125,6 +125,26 @@ Useful options:
 | `--include-infrastructure` | Also take Infrastructure-category rules (normally left out). Without it, Workflow D can still touch an Infrastructure rule on the source when it names a group shared with a copied rule (`amend-refs` changes every rule naming the group); the request lists each such rule under Warnings |
 | `--rulebase post`, `--object-location device-group`, `--zone-from`, `--zone-to` | Palo placement, as in `plan-rules` |
 | `--profile-group none`, `--log-setting none` | No security profile or log forwarding profile on the Palo rules |
+
+### Change record on every object
+
+`CHANGE_TICKET` and `CHANGE_USERNAME` in `.env` (or `--ticket` / `--username`
+on `request`) and the request's UTC date are appended to the description of
+every object the request writes, as `[Ticket <#> | <username> | <date>]`
+(Mike, 2026-10-14). An empty username falls back to the login name; an empty
+ticket reads `Ticket none` and the request warns. The request keeps the text,
+so its refresh and run write the same record.
+
+| Where | Gets the record |
+|---|---|
+| NSX, Workflows A, C, D | Every service, group, policy and rule a push creates or changes, the C and D siblings, and every rule `amend-refs` adds a sibling to (`--description-note` on `services.py` / `groups.py` / `policies.py` / `rules.py push` and `rules.py amend-refs`) |
+| Not touched | An object already identical on the target, or already carrying this record, is skipped as before and keeps its description |
+| Panorama | Every object the push creates (it never edits one), and the paste file |
+
+A Workflow A copy that is written gets the source's description plus the
+record, so a later request replaces an earlier request's record on a shared
+object. `amend-refs` appends to the rule's current description, so a rule
+amended by two requests carries both records.
 
 ## 2) Review: what the approver reads
 

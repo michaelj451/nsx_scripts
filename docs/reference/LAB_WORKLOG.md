@@ -6,6 +6,51 @@ Static lab layout lives in [LAB_TOPOLOGY.md](LAB_TOPOLOGY.md).
 
 ---
 
+## 2026-10-14 (20:23 CDT): full apply of the 2-server request, all phases
+
+**APPLIED; Panorama not committed.** Request
+`migration_requests/nsx-lm1_to_nsx-lm3/20261014_201055` (10.6.0.101 ax2001,
+10.6.0.102 0e02; rules `migration-rule-1`, `migration-rule-2`, `migration-ssh`;
+Infrastructure rules left out; `_np_ips` / `_avs_ips`, `dg-5`, change record
+`[Ticket LAB-20261014 | mxferguson | 2026-10-14]`, all from `.env`). Approved
+LAB-20261014 (Mike Ferguson); refresh `runs/20261015_012351`: no change since
+approval. Every phase dry run, apply (NSX batch prompts answered Enter), verify:
+
+| Phase | Applied | Check |
+|---|---|---|
+| a (lm3) | service `a3-super-ssh`, groups `migration-101`/`-102`/`migration-combo`, policy `test-policy-2`, 3 rules; 2 groups already identical, skipped | every object present |
+| c (lm3) | 3 `_np_ips` siblings; 3 rules gain them, 17 untouched | V1-V6 OK |
+| d2a (lm1) | 3 `_avs_ips` siblings (10.8.0.101 / 10.8.0.102) | |
+| d3 (lm1) | 3 rules gain them, 12 untouched | WF-D VALIDATION PASS |
+| palo (pano4) | 28 objects in the candidate config (25 `shared`, 3 rules in `dg-5`) | every object present |
+
+Change record read back: on created groups, policy and rules on lm3, on the C
+and D siblings, and on the amended `migration-ssh` on lm1; `ip-address-group`
+(skipped as identical) has none, as intended. Undo newest first:
+`run --run <run> --phase palo|d3|d2a|c|a --rollback [--apply]` (`palo` needs
+`--no-tls-verify`).
+
+## 2026-10-14: Panorama-only apply of the 2-server request
+
+**APPLIED, NOT COMMITTED.** Request
+`migration_requests/nsx-lm1_to_nsx-lm3/20261014_133645` (10.6.0.101 ax2001,
+10.6.0.102 0e02; rules `migration-rule-1`, `migration-rule-2`; Infrastructure
+rules left out; suffixes `_np_ips` / `_avs_ips` and device group `dg-5` from
+`.env`). Approved LAB-20261014 (Mike Ferguson), refresh `runs/20261014_173908`:
+no change since approval. Mike asked for the Panorama part only: `run --phase
+palo` dry run (23 to create), apply, verify. pano4 candidate config now holds
+23 objects: 21 in `shared` (16 addresses, 4 address groups, HTTPS) and the 2
+rules in `dg-5`'s pre-rulebase; verify found every object. No NSX phase was
+run (lm1 and lm3 unchanged). Commit is Mike's. Undo: `migration_request.py run
+--run <run> --phase palo --rollback --no-tls-verify [--apply]`.
+
+**ROLLED BACK 16:43 CDT** (Mike), never committed. Reason: lm1 changed since
+(new `migration-ssh` rule and `migration-combo` group; `migration-101` gained
+10.6.2.101, `migration-102` gained 10.6.2.102), and a new request would have
+found two of these address groups lacking members, which the push never adds.
+Rollback dry run listed exactly the 23; apply deleted 23; a fresh dry run of
+the same run finds all 23 missing again, so pano4 is back as before.
+
 ## 2026-10-13: nsx-lm3 wiped, critical rules copied from nsx-lm1
 
 **DONE.** lm3 now holds only lm1's critical rules (VERIFY PASS). lm3's

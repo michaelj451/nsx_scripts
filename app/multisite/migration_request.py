@@ -44,6 +44,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from common.fileio import read_yaml, write_yaml
 from common.md import align_markdown_tables, md_escape, md_table
+from common.description_note import PAN_DESCRIPTION_MAX, append_note, change_note
 from nsx.push_skip import content_key
 
 SCHEMA = "nsx-migration-request/1"
@@ -131,12 +132,19 @@ def merge_entries(entries: Sequence[Entry], vms: Sequence[Dict[str, Any]]
                 note["found_by_ip"] = ip
             elif len(own) > 1:
                 note["ambiguous"] = own
+        # A `name,ip` line whose address belongs to another VM is flagged
+        # (Mike, 2026-10-14): a mistyped address would pull that VM's
+        # address and rules into the request.
+        mismatch = {a: others for a in ips or []
+                    if (others := sorted(o for o in owners.get(a, ()) if o.lower() != name.lower()))}
         key = name.lower()
         slot = merged.setdefault(key, {"name": name, "ips": None, "requested_as": [], "notes": {}})
         slot["requested_as"].append(raw)
         if extra:
             slot["ips"] = sorted(set(slot["ips"] or []) | set(extra))
         slot["notes"].update(note)
+        if mismatch:
+            slot["notes"].setdefault("ip_mismatch", {}).update(mismatch)
     out = [(m["name"], m["ips"]) for m in merged.values()]
     notes = {k: {"requested_as": m["requested_as"], **m["notes"]} for k, m in merged.items()}
     return out, notes
@@ -262,6 +270,9 @@ def server_rows(entries: Sequence[Entry], notes: Dict[str, Dict[str, Any]],
                                "found_by_ip": note.get("found_by_ip"), "groups": [],
                                "group_paths": [], "rules": 0, "status": "ok", "problems": [],
                                "suggestions": []}
+        for ip, others in sorted((note.get("ip_mismatch") or {}).items()):
+            row["problems"].append(f"address mismatch: {ip} belongs to {', '.join(others)}, not to "
+                                   f"{name} (check the server list)")
         if meta is None:
             if note.get("ambiguous"):
                 row["status"] = "ambiguous"
@@ -320,7 +331,12 @@ def select_rules(hits: Sequence[Dict[str, Any]], cap: CaptureView,
         matched = [{"server": names.get(ext, ext), "sides": list(sides)}
                    for ext, sides in sorted(h["info"]["by_side"].items(),
                                             key=lambda kv: str(names.get(kv[0], kv[0])))]
+        # rule_number: NSX's numeric rule id on the source (Mike, 2026-10-14),
+        # the number vRNI flows and the firewall logs show. Each manager assigns
+        # its own, so a copy gets a new number on the destination; `rule_id`
+        # (the text id) is the one that stays the same.
         base = {"key": f"{pid}/{rid}", "policy_id": pid, "rule_id": rid,
+                "rule_number": ((cap.rules.get((pid, rid)) or {}).get("rule_id") or r.get("rule_id")),
                 "policy_name": r.get("_policy_display") or pid,
                 "rule_name": r.get("display_name") or rid, "matched": matched}
         reason = None
@@ -637,6 +653,19 @@ def selected_rules(cap: CaptureView, selected: Sequence[Dict[str, Any]]
     return [(cap.policies[s["policy_id"]], cap.rules[(s["policy_id"], s["rule_id"])]) for s in selected]
 
 
+def tag_writes(plan: Dict[str, Any], note: Optional[str]) -> None:
+    """Append the change record to the description of every Panorama object
+    the plan writes (Mike, 2026-10-14). The push only ever creates objects, so
+    these are exactly the Panorama objects a request touches; the paste file
+    carries the same text."""
+    if not note:
+        return
+    for w in plan.get("writes") or []:
+        entry = w.get("entry")
+        if isinstance(entry, dict):
+            entry["description"] = append_note(entry.get("description"), note, PAN_DESCRIPTION_MAX)
+
+
 # ---------------------------------------------------------------------------
 # Fingerprints, comparison and the gate
 # ---------------------------------------------------------------------------
@@ -828,6 +857,10 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
         L += ["Server list: " + "; ".join(
             f"`{x['file']}` ({x['entries']} entries, sha256 {x['sha256'][:12]})" if "file" in x
             else f"{x['command_line']} from the command line" for x in srcs) + ".", ""]
+    chg = inp.get("change")
+    if chg:
+        L += [f"Change record, appended to the description of everything this request creates or changes: "
+              f"`[{change_note(chg.get('ticket'), chg.get('user'), chg.get('date'))}]`.", ""]
     if rec.get("approval"):
         a = rec["approval"]
         L += [f"Status: **approved** by {a.get('approved_by') or 'unknown'} under change "
@@ -859,17 +892,20 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
           "Every NSX rule on the source whose source, destination or applied-to contains a requested "
           "server, in NSX evaluation order. These are the rules copied to the destination. A rule "
           "applies to every member of its groups, not only the requested servers.", ""]
-    L += md_table(["#", "policy", "rule", "action", "source", "destination", "services", "applied to",
+    num = lambda x: x.get("rule_number") or "-"  # noqa: E731
+    L += md_table(["#", "policy", "rule", "rule #", "action", "source", "destination", "services", "applied to",
                    "servers (side)"],
                   [[i, x["policy_name"], x["rule_name"] + (" (disabled)" if x["disabled"] else "")
-                    + (" [ANY to ANY]" if x["global"] else ""), x["action"], _side(x["source_groups"], gbp),
+                    + (" [ANY to ANY]" if x["global"] else ""), num(x), x["action"], _side(x["source_groups"], gbp),
                     _side(x["destination_groups"], gbp), _services(x["services"], snames), _side(x["scope"], gbp),
                     "; ".join(f"{m['server']} ({'/'.join(m['sides'])})" for m in x["matched"])]
-                   for i, x in enumerate(rec["rules"], 1)], ["r"] + ["l"] * 8)
+                   for i, x in enumerate(rec["rules"], 1)], ["r", "l", "l", "r"] + ["l"] * 6)
+    L += ["", f"rule # is NSX's numeric rule id on {src} (the number vRNI and the firewall logs show). "
+              f"{dst} gives each copied rule its own number."]
     if rec["excluded_rules"]:
         L += ["", "Rules the servers touch that are NOT copied:", ""]
-        L += md_table(["policy", "rule", "why"], [[x["policy_name"], x["rule_name"], x["reason"]]
-                                                 for x in rec["excluded_rules"]])
+        L += md_table(["policy", "rule", "rule #", "why"], [[x["policy_name"], x["rule_name"], num(x), x["reason"]]
+                                                           for x in rec["excluded_rules"]], ["l", "l", "r", "l"])
 
     a_prev = previews.get("a") or {}
     L += ["", f"## Workflow A: objects copied to {dst}", ""]

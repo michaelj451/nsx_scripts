@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import getpass
 import os
 import sys
 from pathlib import Path
@@ -56,6 +57,7 @@ for _p in (REPO_ROOT / "app", REPO_ROOT / "tools" / "reports", REPO_ROOT / "tool
         sys.path.insert(0, str(_p))
 
 from common.bundles import new_run_dir, update_latest            # noqa: E402
+from common.description_note import change_note                  # noqa: E402
 from common.fileio import read_json, sha256_file, write_json, write_text  # noqa: E402
 from common.logs import setup_logging                             # noqa: E402
 from common.paths import repo_relative                            # noqa: E402
@@ -185,6 +187,9 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
     logs = work / "logs" / "build"
     errors: List[str] = []
     warnings: List[str] = []
+    if inputs.get("change") and not inputs["change"].get("ticket"):
+        warnings.append("no ticket number (set CHANGE_TICKET in .env or pass --ticket): descriptions "
+                        "will read \"Ticket none\"")
 
     # 1-2. Two read-only captures of the source, back to back, inside `work`.
     cap_dir = work / "source" / "capture"
@@ -207,7 +212,9 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
     merged, notes = mr.merge_entries(entries, data["vms"])
     analysis = analyze(data, merged)
     servers = mr.server_rows(merged, notes, analysis, data)
-    ok_ext = {r["external_id"] for r in servers if r["status"] == "ok" and r["external_id"]}
+    warnings += [f"{r['vm'] or r['key']}: {p}" for r in servers for p in r["problems"]
+                 if p.startswith("address mismatch")]
+    ok_ext ={r["external_id"] for r in servers if r["status"] == "ok" and r["external_id"]}
     hits = []
     for h in analysis["hits"]:
         by_side = {e: s for e, s in h["info"]["by_side"].items() if e in ok_ext}
@@ -368,6 +375,7 @@ def build_palo(work: Path, inputs: Dict[str, Any], cap: mr.CaptureView, selected
             "vm_source": inputs["source_host"], "generated_at": utc_now_iso(),
             "bundles": [b["path"] for b in bundles]}
     plan["meta"] = meta
+    mr.tag_writes(plan, request_note(inputs))
     write_json(pdir / "plan.json", plan)
     write_text(pdir / "plan.md", render_rules_md(plan, meta))
 
@@ -399,8 +407,16 @@ def build_palo(work: Path, inputs: Dict[str, Any], cap: mr.CaptureView, selected
 # Phase steps (the same commands tools/nsx/run_workflow.py runs, on these paths)
 # ---------------------------------------------------------------------------
 
+def request_note(inputs: Dict[str, Any]) -> Optional[str]:
+    """The change record appended to every description the request writes
+    (Mike, 2026-10-14); None for requests made before it existed."""
+    c = inputs.get("change")
+    return change_note(c.get("ticket"), c.get("user"), c.get("date")) if c else None
+
+
 def phase_steps(work: Path, inputs: Dict[str, Any], phase: str, apply: bool) -> List[Dict[str, Any]]:
-    a = ["--apply"] if apply else []
+    note = request_note(inputs)
+    a = (["--apply"] if apply else []) + (["--description-note", note] if note else [])
     src, dst = inputs["source"], inputs["destination"]
     src_host, dst_host = inputs["source_host"], inputs["destination_host"]
     b = work / "bundle"
@@ -619,6 +635,12 @@ def cmd_request(args: argparse.Namespace) -> int:
         "include_default_sections": args.include_default_sections,
         "exclude_categories": [] if args.include_infrastructure else ["Infrastructure"],
         "c_appendix": c_app, "d_appendix": d_app,
+        # Change record: ticket and user from .env (CHANGE_TICKET, CHANGE_USERNAME; the
+        # command line wins), the request's UTC date. Kept with the request so a
+        # refresh writes the same text.
+        "change": {"ticket": _setting(args.ticket, "CHANGE_TICKET"),
+                   "user": _setting(args.username, "CHANGE_USERNAME") or getpass.getuser(),
+                   "date": utc_now_iso()[:10]},
         "subnet_map": repo_relative(smap_path), "subnet_map_sha256": sha256_file(smap_path),
         "rate_limit": args.rate_limit,
         "palo": {"enabled": not args.no_palo, "device_group": dg,
@@ -993,6 +1015,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          f"Default when neither this nor --servers is given: {DEFAULT_SERVER_LIST.name} "
                          "(tracked, at the repo root).")
     rq.add_argument("--name", default=None, help="Short label shown in the report title.")
+    rq.add_argument("--ticket", default=None,
+                    help="Ticket number for the change record (default CHANGE_TICKET in .env).")
+    rq.add_argument("--username", default=None,
+                    help="Username for the change record (default CHANGE_USERNAME in .env, else the login name).")
     rq.add_argument("--domain-id", default="default")
     rq.add_argument("--include-default-sections", action="store_true",
                     help="Also copy rules in NSX's default sections (off: they exist on every manager).")

@@ -51,6 +51,7 @@ from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
+from common.description_note import with_note  # noqa: E402
 from nsx import revert_plan  # noqa: E402
 from nsx import baseline_meta  # noqa: E402
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
@@ -490,7 +491,9 @@ def cmd_push(args: argparse.Namespace) -> int:
             # Target already holds identical content: an identical PUT would
             # only bump _revision and re-realize. Decided before the
             # dry-run/apply fork so the preview matches the apply.
-            if not args.force_push and is_unchanged(obj, baseline.get(sid)):
+            if not args.force_push and (is_unchanged(obj, baseline.get(sid)) or (
+                    args.description_note and is_unchanged(with_note(obj, args.description_note),
+                                                           baseline.get(sid)))):
                 row["status"] = SKIPPED_STATUS
                 row["skipped_reason"] = "target content already identical"
                 skipped += 1
@@ -504,6 +507,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             # Record how, field by field, so the run report can show it: a push
             # over an existing object is otherwise opaque, and "pushed" says
             # nothing about whether a reference was put back or taken away.
+            # Change record (Mike, 2026-10-14): only what is written carries it.
+            obj = with_note(obj, args.description_note)
             _live = baseline.get(sid)
             if _live:
                 _pfd = field_diff(obj, _live)
@@ -919,6 +924,10 @@ def main() -> int:
                     help="Directory containing per-service YAML/JSON files.")
     pp.add_argument("--federation-global", action="store_true",
                     help="Target is a Global Manager.")
+    pp.add_argument("--description-note", default=None, metavar="TEXT",
+                    help="Append [TEXT] to the description of every object this command writes; "
+                         "objects skipped as identical are not touched (migration requests pass "
+                         "the change record: ticket, user, date).")
     pp.add_argument("--force-push", action="store_true",
                     help="Push every object even when the target already holds identical "
                          "content. Default is to skip those: an identical PUT only bumps "

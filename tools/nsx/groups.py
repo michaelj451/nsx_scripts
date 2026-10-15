@@ -71,6 +71,7 @@ from nsx.md_utils import align_markdown_tables
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.nsx_policy_client import NsxPolicyClient, NsxApiError
 from nsx.push_skip import is_unchanged, SKIPPED_STATUS
+from common.description_note import with_note  # noqa: E402
 from nsx import revert_plan  # noqa: E402
 from nsx import baseline_meta  # noqa: E402
 
@@ -1185,7 +1186,9 @@ def cmd_push(args: argparse.Namespace) -> int:
             # overwrite whatever is there with something identical. Decided
             # before the dry-run/apply fork so the preview matches the apply.
             unchanged = (have_baseline and not args.force_push
-                         and is_unchanged(obj, baseline_dict.get(gid)))
+                         and (is_unchanged(obj, baseline_dict.get(gid)) or (
+                             args.description_note and is_unchanged(
+                                 with_note(obj, args.description_note), baseline_dict.get(gid)))))
             # IP-only sibling bundles (WF-C / WF-D): the IP set is the group's
             # only content. The build still regenerates everything around it
             # (its description carries the build time, and NSX adds ids and
@@ -1206,6 +1209,8 @@ def cmd_push(args: argparse.Namespace) -> int:
                 rows.append(row)
                 continue
 
+            # Change record (Mike, 2026-10-14): only what is written carries it.
+            obj = with_note(obj, args.description_note)
             if not args.apply:
                 row["status"] = "dry_run"
                 dry_run_count += 1
@@ -1962,6 +1967,10 @@ def main() -> int:
     pp.add_argument("--batch-size", type=int, choices=[1], default=1,
                     help="Apply always starts with 1. Increase the batch size at a checkpoint "
                          "by entering a positive number; Enter=continue, n=reset, x=stop.")
+    pp.add_argument("--description-note", default=None, metavar="TEXT",
+                    help="Append [TEXT] to the description of every object this command writes; "
+                         "objects skipped as identical are not touched (migration requests pass "
+                         "the change record: ticket, user, date).")
     pp.add_argument("--force-push", action="store_true",
                     help="Push every object even when the target already holds identical "
                          "content. Default is to skip those: an identical PUT only bumps "

@@ -221,3 +221,30 @@ class SkipNoIpChangeTests(UnionPushTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DescriptionNoteTests(UnionPushTests):
+    """--description-note (Mike, 2026-10-14): the change record goes on what
+    the push writes, and only on that."""
+
+    NOTE = "Ticket CHG1 | mike | 2026-10-14"
+
+    def test_written_group_carries_the_note(self):
+        rc, rows, summary, writes = self.push([self.SOURCE], self.TARGET, apply=True,
+                                              extra=["--description-note", self.NOTE])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(writes[0][1]["description"].endswith(f"[{self.NOTE}]"))
+
+    def test_identical_group_is_not_touched(self):
+        same = {"sib": copy.deepcopy(self.SOURCE)}
+        rc, rows, summary, writes = self.push([self.SOURCE], same, apply=True,
+                                              extra=["--description-note", self.NOTE])
+        self.assertEqual((rc, writes), (0, []))
+        self.assertEqual(rows["sib"]["status"], groups.SKIPPED_STATUS)
+
+    def test_group_already_carrying_the_note_is_not_rewritten(self):
+        noted = {"sib": dict(copy.deepcopy(self.SOURCE), description=f"[{self.NOTE}]")}
+        rc, rows, summary, writes = self.push([self.SOURCE], noted, apply=True,
+                                              extra=["--description-note", self.NOTE])
+        self.assertEqual((rc, writes), (0, []))
