@@ -62,6 +62,8 @@ migration_requests/
 nsx_wipe_bundle/
 # Critical-rules copy runs (tools/nsx/critical_rules/)
 nsx_critical_runs/
+# Unused rule cleanup runs (tools/nsx/rule_cleanup/)
+nsx_cleanup_runs/
 nsx_fabric_capture/
 nsx_health_backup/
 

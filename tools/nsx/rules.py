@@ -67,6 +67,7 @@ from nsx.apply_batch import ApplyBatch
 from nsx.cli_bootstrap import init_cli
 from nsx.nsx_constants import resolve_manager, nsx_log_dir
 from nsx.push_skip import is_unchanged, field_diff, SKIPPED_STATUS
+from common.description_note import with_note  # noqa: E402
 from nsx import revert_plan  # noqa: E402
 from nsx import baseline_meta  # noqa: E402
 from nsx.names import target_ref_names, names_for, policy_name_by_id
@@ -683,8 +684,9 @@ def cmd_push(args: argparse.Namespace) -> int:
             # Target already holds identical content: an identical PUT would
             # only bump _revision and re-realize. Decided before the
             # dry-run/apply fork so the preview matches the apply.
-            if not args.force_push and is_unchanged(
-                    rule, (baseline.get(f"{policy_id}::{rid}") or {}).get("payload")):
+            _target = (baseline.get(f"{policy_id}::{rid}") or {}).get("payload")
+            if not args.force_push and (is_unchanged(rule, _target) or (
+                    args.description_note and is_unchanged(with_note(rule, args.description_note), _target))):
                 row["status"] = SKIPPED_STATUS
                 row["skipped_reason"] = "target content already identical"
                 skipped += 1
@@ -698,6 +700,8 @@ def cmd_push(args: argparse.Namespace) -> int:
             # Record how, field by field, so the run report can show it: a push
             # over an existing object is otherwise opaque, and "pushed" says
             # nothing about whether a reference was put back or taken away.
+            # Change record (Mike, 2026-10-14): only what is written carries it.
+            rule = with_note(rule, args.description_note)
             _live = (baseline.get(f"{policy_id}::{rid}") or {}).get("payload")
             if _live:
                 _pfd = field_diff(rule, _live)
@@ -1305,6 +1309,8 @@ def cmd_amend_refs(args: argparse.Namespace) -> int:
             added_total += len(d["added"])
         row["per_field_diff"] = per_field_diff
         row["refs_added_total"] = added_total
+        # Change record (Mike, 2026-10-14): a rule that gains a sibling carries it.
+        new_rule = with_note(new_rule, args.description_note)
 
         if not args.apply:
             row["status"] = "dry_run"
@@ -1418,6 +1424,10 @@ def main() -> int:
                          "Typically nsx_rules_export/<host>/security-policies/")
     pp.add_argument("--domain-id", default="default")
     pp.add_argument("--federation-global", action="store_true")
+    pp.add_argument("--description-note", default=None, metavar="TEXT",
+                    help="Append [TEXT] to the description of every object this command writes; "
+                         "objects skipped as identical are not touched (migration requests pass "
+                         "the change record: ticket, user, date).")
     pp.add_argument("--force-push", action="store_true",
                     help="Push every object even when the target already holds identical "
                          "content. Default is to skip those: an identical PUT only bumps "
@@ -1476,6 +1486,10 @@ def main() -> int:
     pa.add_argument("--batch-size", type=int, choices=[1], default=1,
                     help="Apply always starts with 1. Increase the batch size at a checkpoint "
                          "by entering a positive number; Enter=continue, n=reset, x=stop.")
+    pa.add_argument("--description-note", default=None, metavar="TEXT",
+                    help="Append [TEXT] to the description of every object this command writes; "
+                         "objects skipped as identical are not touched (migration requests pass "
+                         "the change record: ticket, user, date).")
     pa.add_argument("--include-scope", action="store_true", default=False,
                     help="Also append sibling refs to the rule's 'scope' (applied-to) "
                          "field. OFF by default — scope controls where the rule is "
