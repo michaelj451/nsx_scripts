@@ -8,7 +8,7 @@ changes the source has had since. One tool does it:
 
 PowerShell variant: [RUNBOOK_MIGRATION_REQUEST_PS.md](RUNBOOK_MIGRATION_REQUEST_PS.md).
 Background on the sites, suffixes and maps:
-[RUNBOOK_MULTIVENDOR_ROLLOUT.md](RUNBOOK_MULTIVENDOR_ROLLOUT.md). Decisions:
+[RUNBOOK_MULTIVENDOR_ROLLOUT.md](../nsx/RUNBOOK_MULTIVENDOR_ROLLOUT.md). Decisions:
 [STATUS.md](STATUS.md).
 
 Status: built 2026-10-07 and proven read-only in the lab (lm1 to lm3, Palo
@@ -154,7 +154,7 @@ Mike, 2026-10-15. A request lists every rule the servers use as a
 **candidate**, and every candidate starts with `needs_approval: true`. Nothing
 is pushed until rules are approved one by one:
 
-1. `request` writes **`rule_approval.yaml`** in the request folder: one entry
+1. `request` writes **`reports/03_rule_approval_sheet.yaml`** in the request folder: one entry
    per candidate rule with its rule # (the number vRNI shows), policy, rule,
    action, source, destination, services and `needs_approval: true`. The
    report says every rule needs approval, and its dry runs show what each
@@ -169,7 +169,7 @@ is pushed until rules are approved one by one:
 
    ```bash
    mr request --source nsx-lm1 --destination nsx-lm3 --no-tls-verify \
-     --rule-approval migration_requests/nsx-lm1_to_nsx-lm3/<first request>/rule_approval.yaml
+     --rule-approval migration_requests/nsx-lm1_to_nsx-lm3/<first request>/reports/03_rule_approval_sheet.yaml
    ```
 
    The report says "Rule approval: N of M candidate rules approved"; the
@@ -177,6 +177,10 @@ is pushed until rules are approved one by one:
    D and the Palo plan follow the approved rules only: a group used only by
    rules that need approval gets no D sibling. The new request writes its own
    sheet carrying the decisions.
+
+   Requests made before 2026-10-16 kept the sheet as `rule_approval.yaml` in
+   the request folder; the first command that touches such a request copies
+   it into `reports/`, and from then on the `reports/` copy is the one to edit.
 5. Approve, refresh and run the phases as below. A refresh keeps the same
    decisions; a rule that starts touching the servers later is listed as
    "needs approval (new since the rule approval sheet was written)" and is
@@ -188,7 +192,10 @@ no longer a candidate is flagged and not copied.
 
 ## 2) Review: what the approver reads
 
-`request.md`, top to bottom:
+Everything readable is in one folder, **`$R/reports/`**, under numbered names
+(see [Folder layout](#folder-layout)); `00_README.md` says what each file is.
+The approval report is `02_approval_report.md` (a copy of `request.md`), top
+to bottom:
 
 1. **Summary**, then **Servers**: what each entry resolved to, its addresses
    now and at the destination, how many groups and rules, and anything that
@@ -208,9 +215,10 @@ no longer a candidate is flagged and not copied.
    separately: the push never edits an existing object, so those members are
    added by hand.
 
-The full Palo plan is `palo/plan.md`, the Panorama dry run
-`palo/push_<ts>_dryrun.md`, and the paste-ready Panorama commands that dry
-run wrote, `palo/pan_set_commands.txt` (next section).
+The full Palo plan is `reports/04_palo_plan.md`, the Panorama dry run
+`reports/05_palo_dry_run.md`, and the paste-ready Panorama commands that dry
+run wrote, `reports/06_palo_paste_set_commands.txt` (next section; the
+originals are under `palo/`).
 
 ### Palo Alto by the Panorama command line
 
@@ -278,8 +286,8 @@ errors is refused unless `--accept-errors` is given (recorded in the approval).
 
 ```bash
 mr refresh --request $R                 # re-capture the source, rebuild, compare
-cat $R/runs/latest/delta.md
 RUN=$R/runs/latest
+cat $RUN/reports/01_changes_since_approval.md     # delta.md
 ```
 
 `refresh` exits 0 when the gate passes and 2 when it stops. `delta.md` says
@@ -311,7 +319,10 @@ mr run --run $RUN --phase palo --no-tls-verify --verify
 
 Every phase runs the same commands as `tools/nsx/run_workflow.py` (the push
 tools with the same flags), on the run's own bundles, and writes its report to
-`$RUN/report/<phase>/<mode>/`. Applies are interactive (one object, then a
+`$RUN/report/<phase>/<mode>/`. After every phase the run's `reports/` folder
+is rebuilt, so `$RUN/reports/` always holds every report so far under its
+phase's number, with a readable page for each verify (whose tools write JSON
+only). Applies are interactive (one object, then a
 pause before each batch), so the operator runs them, not an agent. D3 is the
 only step that changes what the source enforces. Review and commit the Palo
 change in Panorama yourself.
@@ -344,6 +355,7 @@ the apply would be removed too (pending item in STATUS.md).
 
 ```text
 migration_requests/<source>_to_<destination>/<UTC_TS>/
+  reports/                 every readable file, numbered (next section); 00_README.md lists them
   request.md  request.json  servers.txt (copy of the list used)  approval.json
   source/capture/          source capture (capture_nsx_state.py, effective IPs)
   source/vm_rules/         VM-rule snapshot (capture_vm_rule_data.py)
@@ -353,8 +365,44 @@ migration_requests/<source>_to_<destination>/<UTC_TS>/
                            pan_set_commands.txt / pan_delete_commands.txt from the newest
   preview/previews.json    dry-run counts shown in request.md
   runs/<UTC_TS>/           one per refresh: the same layout, plus run.json,
-                           delta.md, implementation.md, phases.json, report/
+                           delta.md, implementation.md, phases.json, report/, reports/
 ```
+
+### reports/: every readable file in one folder
+
+Mike, 2026-10-16. Each request and each run has a `reports/` folder. Every
+command rebuilds it: the tools keep writing where they always did, and
+`reports/` gets copies under names that say what each file is. Its
+`00_README.md` lists the files; the request's also links each run's.
+
+Request folder:
+
+| File | Copy of |
+|---|---|
+| `01_servers.txt` | `servers.txt` |
+| `02_approval_report.md` | `request.md` |
+| `03_rule_approval_sheet.yaml` | not a copy: the only rule approval sheet; edit it here |
+| `04_palo_plan.md` | `palo/plan.md` |
+| `05_palo_dry_run.md` | the newest `palo/push_<ts>_dryrun.md` |
+| `06_palo_paste_set_commands.txt`, `07_palo_paste_delete_commands.txt` | `palo/pan_set_commands.txt`, `palo/pan_delete_commands.txt` |
+
+Run folder: `01_changes_since_approval.md` (`delta.md`),
+`02_implementation_plan.md` (`implementation.md`), then one block of numbers
+per phase and one number per mode:
+
+| Phase | Block | Modes |
+|---|---|---|
+| a | `1x_A_copy_rules_*` | `1` dry run, `2` apply, `3` verify, `4` rollback dry run, `5` rollback apply |
+| c | `2x_C_destination_ip_groups_*` | same |
+| d2a | `3x_D_source_ip_groups_*` | same |
+| d3 | `4x_D_rule_amend_*` | same |
+| palo | `5x_Palo_panorama_*` | same, plus `50` plan and `56`/`57` paste files |
+
+For example `12_A_copy_rules_apply.md`, `43_D_rule_amend_verify.md`,
+`55_Palo_panorama_rollback_apply.md`. A mode shows its newest report. The
+verify pages of A, C and D are written from the verify JSON. The Palo verify
+is a push dry run, so the Palo files are matched to modes by time (the newest
+of its kind started before the mode finished, from `phases.json`).
 
 `migration_requests/` is not tracked by git.
 

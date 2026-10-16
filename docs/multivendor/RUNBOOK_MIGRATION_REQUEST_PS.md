@@ -44,7 +44,8 @@ Mr request --source nsx-lm1 --destination nsx-lm3 `
   --no-tls-verify --name "wave 1"   # device group: PANORAMA_DEVICE_GROUP in .env
 
 $R = Newest "migration_requests\nsx-lm1_to_nsx-lm3"
-notepad "$R\request.md"
+notepad "$R\reports\00_README.md"       # every readable file, one folder
+notepad "$R\reports\02_approval_report.md"
 ```
 
 `--server-list FILE` or `--servers "name1,10.6.0.101"` override the tracked
@@ -58,11 +59,18 @@ Mr preview --request $R --part a --no-tls-verify   # or c, d, palo, all
 
 ## 2) Review
 
-Read `$R\request.md`. The full Palo plan is `$R\palo\plan.md`. The Palo dry run
-also wrote the paste-ready Panorama commands for the objects it found missing,
-`$R\palo\pan_set_commands.txt`, with `$R\palo\pan_delete_commands.txt` to remove
-them; how to paste them is in the bash card's "Palo Alto by the Panorama
-command line" section.
+Everything readable is in `$R\reports\`, numbered; `00_README.md` says what
+each file is. Read `02_approval_report.md`. The full Palo plan is
+`04_palo_plan.md`, the Palo dry run `05_palo_dry_run.md`, and the paste-ready
+Panorama commands for the objects it found missing
+`06_palo_paste_set_commands.txt`, with `07_palo_paste_delete_commands.txt` to
+remove them; how to paste them is in the bash card's "Palo Alto by the
+Panorama command line" section.
+
+The rule approval sheet is `$R\reports\03_rule_approval_sheet.yaml` (its only
+copy): set `needs_approval: false` on the rules to copy, then rebuild with
+`Mr request ... --rule-approval "$R\reports\03_rule_approval_sheet.yaml"` and
+approve the new request (bash card, "Rule approval").
 
 ## 3) Approve
 
@@ -75,10 +83,13 @@ Mr approve --request $R --change-ref CHG0012345 --approved-by "Name Surname"
 ```powershell
 Mr refresh --request $R
 $RUN = Newest "$R\runs"
-Get-Content "$RUN\delta.md"
+Get-Content "$RUN\reports\01_changes_since_approval.md"   # delta.md
 ```
 
-Exit code 0: gate passed. Exit code 2: stopped, read `delta.md`.
+Exit code 0: gate passed. Exit code 2: stopped, read `delta.md`. After every
+phase, `$RUN\reports\` holds every report so far, numbered by phase (10s A,
+20s C, 30s D2a, 40s D3, 50s Palo) and mode (1 dry run, 2 apply, 3 verify,
+4 rollback dry run, 5 rollback apply).
 
 ```powershell
 Mr run --run $RUN --phase a

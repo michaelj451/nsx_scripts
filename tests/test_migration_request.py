@@ -631,5 +631,86 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.cli.rollback_steps(Path("/w"), inputs, "d2a", True)[0]["cmd"][4], "nsx-lm1")
 
 
+class ReportsFolderTests(unittest.TestCase):
+    """reports/: every readable file of a request or run in one folder under
+    numbered names (Mike, 2026-10-16)."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("mr_cli", ROOT / "tools" / "multisite" / "migration_request.py")
+        cls.cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.cli)
+
+    def _request(self) -> Path:
+        req = Path(tempfile.mkdtemp())
+        (req / "request.json").write_text(json.dumps({"request_id": "lm1_to_lm3/R"}))
+        (req / "servers.txt").write_text("vm1\n")
+        (req / "request.md").write_text("# Migration request\n")
+        (req / "palo").mkdir()
+        (req / "palo" / "plan.md").write_text("plan")
+        for ts in ("20261016_100000", "20261016_110000"):
+            (req / "palo" / f"push_{ts}_dryrun.md").write_text(ts)
+        (req / "palo" / "pan_set_commands.txt").write_text("set x")
+        return req
+
+    def test_request_folder_names_and_sheet_kept(self):
+        req = self._request()
+        (req / mr.LEGACY_APPROVAL_SHEET).write_text("rules: []\n")
+        out = self.cli.collect_reports(req)
+        names = sorted(p.name for p in out.iterdir())
+        self.assertEqual(names, ["00_README.md", "01_servers.txt", "02_approval_report.md",
+                                 "03_rule_approval_sheet.yaml", "04_palo_plan.md", "05_palo_dry_run.md",
+                                 "06_palo_paste_set_commands.txt"])
+        self.assertEqual((out / "05_palo_dry_run.md").read_text(), "20261016_110000")
+        self.assertIn("Not approved yet", (out / "00_README.md").read_text())
+        # The operator's edits to the sheet survive a re-collect; stale copies go.
+        (req / mr.APPROVAL_SHEET).write_text("edited\n")
+        (out / "09_stale.md").write_text("old")
+        (out / "notes.txt").write_text("mine")
+        self.cli.collect_reports(req)
+        self.assertEqual((req / mr.APPROVAL_SHEET).read_text(), "edited\n")
+        self.assertFalse((out / "09_stale.md").exists())
+        self.assertTrue((out / "notes.txt").exists())
+
+    def test_run_folder_phase_numbers_and_palo_by_time(self):
+        run = Path(tempfile.mkdtemp())
+        (run / "run.json").write_text(json.dumps({"request_id": "r", "gate": {"passed": True}}))
+        (run / "delta.md").write_text("delta")
+        (run / "implementation.md").write_text("impl")
+        for phase, mode, name in (("a", "dryrun", "avs_run_report.md"), ("a", "apply", "avs_run_report.md"),
+                                  ("d3", "rollback_apply", "rollback_report.md")):
+            (run / "report" / phase / mode).mkdir(parents=True)
+            (run / "report" / phase / mode / name).write_text(f"{phase} {mode}")
+        palo = run / "palo"
+        palo.mkdir()
+        for f in ("push_20261015_010000_dryrun.md", "push_20261015_010100_apply.md",
+                  "push_20261015_010200_dryrun.md"):
+            (palo / f).write_text(f)
+        (run / "report" / "a" / "verify").mkdir()
+        (run / "report" / "a" / "verify" / "verify_avs_run.json").write_text(json.dumps(
+            {"ok": True, "checks_total": 1, "checks_failed": 0, "source": "nsx-lm1", "target": "nsx-lm3",
+             "checks": [{"check": "V6", "subject": "all target groups", "ok": True, "detail": "resolves"}]}))
+        phases = {"a": {"dryrun": {"at": "2026-10-15T00:59:00+00:00", "ok": True},
+                        "apply": {"at": "2026-10-15T00:59:30+00:00", "ok": True},
+                        "verify": {"at": "2026-10-15T00:59:40+00:00", "ok": True}},
+                  "palo": {"dryrun": {"at": "2026-10-15T01:00:20+00:00", "ok": True},
+                           "apply": {"at": "2026-10-15T01:01:30+00:00", "ok": True},
+                           "verify": {"at": "2026-10-15T01:02:10+00:00", "ok": True}}}
+        (run / "phases.json").write_text(json.dumps(phases))
+        out = self.cli.collect_reports(run)
+        names = sorted(p.name for p in out.iterdir())
+        self.assertEqual(names, ["00_README.md", "01_changes_since_approval.md", "02_implementation_plan.md",
+                                 "11_A_copy_rules_dry_run.md", "12_A_copy_rules_apply.md",
+                                 "13_A_copy_rules_verify.md", "45_D_rule_amend_rollback_apply.md",
+                                 "51_Palo_panorama_dry_run.md", "52_Palo_panorama_apply.md",
+                                 "53_Palo_panorama_verify.md"])
+        self.assertEqual((out / "51_Palo_panorama_dry_run.md").read_text(), "push_20261015_010000_dryrun.md")
+        self.assertEqual((out / "53_Palo_panorama_verify.md").read_text(), "push_20261015_010200_dryrun.md")
+        self.assertIn("| V6", (out / "13_A_copy_rules_verify.md").read_text())
+        readme = (out / "00_README.md").read_text()
+        self.assertIn("Gate **passed**", readme)
+        self.assertLess(readme.index("| a     | verify"), readme.index("| palo  | dryrun"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,8 @@
 # Multivendor rollout: status
 
 Where the three-site NSX plus Palo Alto work stands. Updated 2026-10-06.
-Runbook: [RUNBOOK_MULTIVENDOR_ROLLOUT.md](RUNBOOK_MULTIVENDOR_ROLLOUT.md)
-([PowerShell](RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md)).
+Runbook: [RUNBOOK_MULTIVENDOR_ROLLOUT.md](../nsx/RUNBOOK_MULTIVENDOR_ROLLOUT.md)
+([PowerShell](../nsx/RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md)).
 
 ## Scenario (theoretical, lab-tested piece by piece)
 
@@ -53,6 +53,7 @@ proves the API calls and payloads, not traffic flow.
 | 2026-10-15 | **Rule approval: only approved rules are pushed** (Mike: client wants unused rules left behind; vRNI traffic minus Infrastructure shows what is live; "they can then look at the approval report and pick which rules they want copied"; no client spreadsheet to parse: "needs approval set to true ... we then set it to false and it will then push it on the apply"). Each request writes `rule_approval.yaml` with every candidate rule at `needs_approval: true`; `approve` refuses until rules are approved; after setting `false`, `request --rule-approval <sheet>` rebuilds with only those rules (A, C, D, Palo all follow), then approve, refresh, apply. Lab: 2 of 3 rules approved, the third listed "needs approval", its group got no D sibling |
 | 2026-10-15 | **Workflow A never copies the source's migration siblings** (Mike: "we need to fix that after backing those out"). Found when a second request for the same servers copied lm1's `_avs_ips` D siblings to lm3. Siblings (the request's C or D suffix, or the builder's "IP-only sibling of" description, which also catches older `_lm3_ips`) are left out of the copied groups and stripped from the copied rules, the fingerprint and the Palo plan; a rule side that would be left empty stops the request (empty reads as ANY). The 2026-10-14 apply was backed out first |
 | 2026-10-16 | **A change to the request's servers no longer stops the run** (Mike: "if a server changes go ahead and push the rule .. don't block"). Supersedes the 2026-10-07 server gate: `refresh` lists the server changes at the top of `delta.md` and the approved rules are pushed as they are now. Still stops: a changed subnet map, build errors, and anything under `refresh --strict` |
+| 2026-10-16 | **Every readable file of a request or run in one folder, `reports/`** (Mike: "for each of the runs it would be nice to have all of the primary human readable files in a single directory", "with relavent names"). Every command rebuilds `reports/` with copies under numbered names and a `00_README.md` index: request `01_servers.txt` to `07_palo_paste_delete_commands.txt`; run `01_changes_since_approval.md`, `02_implementation_plan.md`, then 10s A, 20s C, 30s D2a, 40s D3, 50s Palo, one number per mode (1 dry run, 2 apply, 3 verify, 4 rollback dry run, 5 rollback apply). Verify JSON gets a readable page; Palo files are matched to modes by time. The rule approval sheet's only copy is now `reports/03_rule_approval_sheet.yaml` (older requests' `rule_approval.yaml` is copied in once). Tools keep their own layout. Lab: run `20261015_012351` (applies, verifies, rollbacks) gives 29 files; 2 new tests |
 
 ## Built (branch `nsx-lm3_palo-1`; in commits `dfd06c3` and `e8bcd5e` unless marked uncommitted)
 

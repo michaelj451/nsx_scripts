@@ -15,11 +15,16 @@ on NSX (Workflows A, C and D) and Palo Alto (Mike, 2026-10-07).
   refresh   At the change window: re-capture the source and rebuild from the
             approved request's own inputs, into runs/<UTC_TS>/. Changes on
             the source since approval are taken and listed (they went through
-            their own approval); a change to the request's own servers stops
-            the run. --strict stops on any change.
+            their own approval); a change to the request's own servers is
+            listed, not a stop. --strict stops on any change.
   run       One phase of a refreshed run: a, c, d2a, d3 or palo. Dry run by
             default; --apply writes; --verify checks; --rollback undoes.
   report    Re-render a request's or a run's report from its JSON.
+
+Every command leaves the readable files of its request or run in one folder,
+reports/, under numbered names (00_README.md says what each one is). They are
+copies, except the rule approval sheet, whose only copy is
+reports/03_rule_approval_sheet.yaml.
 
 Every NSX write goes through the existing push tools (services.py,
 groups.py, policies.py, rules.py) with the same flags the workflow driver
@@ -46,6 +51,7 @@ import json
 import logging
 import getpass
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -71,7 +77,7 @@ OUT_BASE = REPO_ROOT / "migration_requests"
 # Tracked server list (Mike, 2026-10-08), read when no servers are given on the command line.
 DEFAULT_SERVER_LIST = REPO_ROOT / "migration_request_servers.txt"
 # Destination site (manager alias without "nsx-") -> Workflow D subnet map, as in
-# docs/multivendor/RUNBOOK_MULTIVENDOR_ROLLOUT.md. Other destinations take
+# docs/nsx/RUNBOOK_MULTIVENDOR_ROLLOUT.md. Other destinations take
 # --subnet-map. The Workflow D suffix is not per destination: it is
 # OBJECT_APPENDIX_AVS from .env, as in tools/nsx/run_workflow.py (Mike, 2026-10-13).
 DEST_SUBNET_MAPS = {"lm2": "data/subnet_map_lm2.csv", "lm3": "data/subnet_map_lm3.csv"}
@@ -624,6 +630,71 @@ def render(work: Path, rec: Dict[str, Any], title: str, out_name: str) -> Path:
     return path
 
 
+def collect_reports(work: Path) -> Path:
+    """Copy a request's or run's readable files into <work>/reports/ under
+    numbered names, with a 00_README.md index (Mike, 2026-10-16). Safe to run
+    again: earlier copies are replaced; the rule approval sheet, which the
+    operator edits there, is never touched."""
+    out = work / mr.REPORTS_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    sheet = work / mr.APPROVAL_SHEET
+    for old in out.iterdir():
+        if old.is_file() and (mr._COLLECTED.match(old.name) or old.name == mr.REPORTS_INDEX) and old != sheet:
+            old.unlink()
+    is_run = (work / "run.json").is_file()
+    entries: List[tuple] = []
+    if is_run:
+        run = read_json(work / "run.json")
+        phases = read_json(work / "phases.json") if (work / "phases.json").is_file() else {}
+        files = mr.run_report_files(work, phases)
+        for phase in ("a", "c", "d2a", "d3"):
+            at = ((phases.get(phase) or {}).get("verify") or {}).get("at")
+            text = mr.render_verify_md(phase, work / "report" / phase / "verify", at)
+            if text:
+                base, label, what = mr.PHASE_BLOCKS[phase]
+                name = f"{base + 3}_{label}_verify.md"
+                write_text(out / name, text)
+                entries.append((name, f"{what}, verify"))
+    else:
+        files = mr.request_report_files(work)
+        legacy = work / mr.LEGACY_APPROVAL_SHEET
+        if not sheet.is_file() and legacy.is_file():
+            shutil.copy2(legacy, sheet)
+        if sheet.is_file():
+            entries.append((sheet.name, "Rule approval sheet: set needs_approval: false on each rule to copy, "
+                                        "then rebuild with request --rule-approval <this file>"))
+    for src, name, what in files:
+        shutil.copy2(src, out / name)
+        entries.append((name, what))
+    entries.sort()
+    if is_run:
+        gate = run.get("gate") or {}
+        intro = [f"Request `{run['request_id']}`, run `{work.name}`. Gate "
+                 f"**{'passed' if gate.get('passed') else 'STOPPED'}**. These are copies; the tools "
+                 "keep their own files where they write them. Numbers: 10s Workflow A, 20s C, "
+                 "30s D source groups, 40s D rule amend, 50s Palo Alto; within each, 1 dry run, 2 apply, "
+                 "3 verify, 4 rollback dry run, 5 rollback apply."]
+        rows = [[ph, mode, (st.get("at") or "")[:19].replace("T", " "), "OK" if st.get("ok") else "FAILED"]
+                for ph, slot in phases.items() for mode, st in slot.items() if isinstance(st, dict)]
+        rows.sort(key=lambda r: r[2])
+        extra = (["## Phases run so far, in order", ""] + mr.md_table(["phase", "mode", "finished (UTC)", "result"], rows)
+                 + [""]) if rows else []
+        text = mr.reports_index_md("Run reports", intro, entries, extra)
+    else:
+        rec = read_json(work / "request.json")
+        approval = read_json(work / "approval.json") if (work / "approval.json").is_file() else None
+        intro = [f"Request `{rec['request_id']}`. "
+                 + (f"Approved under {approval.get('change_ref')} by {approval.get('approved_by')}."
+                    if approval else "Not approved yet.")
+                 + " These are copies, except the rule approval sheet: edit that one here."]
+        runs = sorted(d for d in (work / "runs").glob("*_*") if (d / mr.REPORTS_DIR / mr.REPORTS_INDEX).is_file())
+        extra = (["## Runs", ""] + [f"- [{d.name}](../runs/{d.name}/{mr.REPORTS_DIR}/{mr.REPORTS_INDEX})"
+                                    for d in runs] + [""]) if runs else []
+        text = mr.reports_index_md("Request reports", intro, entries, extra)
+    write_text(out / mr.REPORTS_INDEX, text)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -706,8 +777,10 @@ def cmd_request(args: argparse.Namespace) -> int:
         parts = ["a", "c", "d"] + (["palo"] if rec.get("palo") else [])
         run_previews(work, rec, parts, args)
     path = render(work, rec, "Migration request", "request.md")
+    reports = collect_reports(work)
     update_latest(work.parent, work)
     log.info("Request: %s", repo_relative(path))
+    log.info("Reports (every readable file, one folder): %s", repo_relative(reports))
     pp = (read_json(work / "preview" / "previews.json") if (work / "preview" / "previews.json").is_file()
           else {}).get("palo") or {}
     if pp.get("set_commands"):
@@ -738,6 +811,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
     parts = ["a", "c", "d", "palo"] if args.part == "all" else [args.part]
     run_previews(work, rec, parts, args)
     path = render(work, rec, "Migration request", "request.md")
+    collect_reports(work)
     print(path)
     return 0
 
@@ -762,6 +836,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
                 "approved_at": utc_now_iso(), "accepted_errors": rec["errors"] if args.accept_errors else []}
     write_json(work / "approval.json", approval)
     render(work, rec, "Migration request", "request.md")
+    collect_reports(work)
     log.info("Approved %s under %s by %s (fingerprint %s)", rec["request_id"], args.change_ref,
              args.approved_by, approval["digest"])
     return 0
@@ -808,8 +883,11 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                                                      {**mr.display_names(rec), **mr.display_names(new)},
                                                      server_changes))
     render(work, new, "Implementation plan", "implementation.md")
+    collect_reports(work)
+    collect_reports(req)
     update_latest(work.parent, work)
     log.info("Run: %s", repo_relative(work))
+    log.info("Reports (every readable file, one folder): %s", repo_relative(work / mr.REPORTS_DIR))
     log.info("Changes since approval: %s", ", ".join(f"{k} ({sum(map(len, v.values()))})"
                                                       for k, v in delta.items()) or "none")
     if blocked:
@@ -991,12 +1069,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if mode == "rollback_apply" and ok:
         slot["apply_ok"] = False
     write_json(state_path, state)
+    reports = collect_reports(work)
     write_json(logs / "manifest.json", {"request_id": rec["request_id"], "phase": args.phase, "action": action,
                                         "mode": mode, "steps": records, "report_dir": repo_relative(out_dir),
                                         "ok": ok})
     log.info("=" * 70)
-    log.info("Phase %s %s: %s. Report: %s", args.phase, mode, "OK" if ok else "FAILED",
-             repo_relative(out_dir))
+    log.info("Phase %s %s: %s. Reports: %s", args.phase, mode, "OK" if ok else "FAILED",
+             repo_relative(reports))
     if action == "push" and not args.apply and ok:
         log.info("Dry run only. Re-run with --apply to write.")
     return 0 if ok else 1
@@ -1033,10 +1112,16 @@ def cmd_report(args: argparse.Namespace) -> int:
         write_text(p / "delta.md", mr.render_delta_md(run, run["delta"],
                                                        run["gate"]["problems"] + run["gate"]["errors"],
                                                        run["strict"], names, run["gate"].get("server_changes")))
-        print(render(p, rec, "Implementation plan", "implementation.md"))
+        render(p, rec, "Implementation plan", "implementation.md")
+        index = collect_reports(p) / mr.REPORTS_INDEX
+        req = REPO_ROOT / run.get("request_dir", "")
+        if (req / "request.json").is_file():
+            collect_reports(req)
     else:
         p = _request_dir(args.dir)
-        print(render(p, read_json(p / "request.json"), "Migration request", "request.md"))
+        render(p, read_json(p / "request.json"), "Migration request", "request.md")
+        index = collect_reports(p) / mr.REPORTS_INDEX
+    print(index)
     return 0
 
 
@@ -1073,7 +1158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     rq.add_argument("--include-default-sections", action="store_true",
                     help="Also copy rules in NSX's default sections (off: they exist on every manager).")
     rq.add_argument("--rule-approval", metavar="YAML",
-                    help="A rule approval sheet (rule_approval.yaml from an earlier request) with "
+                    help="A rule approval sheet (reports/03_rule_approval_sheet.yaml of an earlier request) with "
                          "needs_approval: false on the rules to copy. Only those are copied and pushed.")
     rq.add_argument("--include-infrastructure", action="store_true",
                     help="Also take Infrastructure-category rules (off: they are left out of the request, "

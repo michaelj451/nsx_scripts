@@ -10,10 +10,10 @@ none depends on code beyond the existing, tested workflow driver
 (`tools/nsx/run_workflow.py`). The Palo Alto work is a separate track at the end.
 
 PowerShell variant: [RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md](RUNBOOK_MULTIVENDOR_ROLLOUT_PS.md).
-Background: [RUNBOOK_WORKFLOW.md](../nsx/RUNBOOK_WORKFLOW.md) (the driver),
-[RUN_AC_LM2.md](../nsx/RUN_AC_LM2.md) (A and C onto lm2),
-[RUN_D_LM1.md](../nsx/RUN_D_LM1.md) (D on lm1). Decisions, status and reasoning:
-[STATUS.md](STATUS.md).
+Background: [RUNBOOK_WORKFLOW.md](RUNBOOK_WORKFLOW.md) (the driver),
+[RUN_AC_LM2.md](RUN_AC_LM2.md) (A and C onto lm2),
+[RUN_D_LM1.md](RUN_D_LM1.md) (D on lm1). Decisions, status and reasoning:
+[STATUS.md](../multivendor/STATUS.md).
 
 ## Sites and roles
 
@@ -41,7 +41,7 @@ suffix names whose addresses it holds.
 | 6b | `nsx-lm3` | lm2 (mapped) | `_avs_ips` | `subnet_map_lm2.csv` | `nsx-lm3_avs_ips` |
 
 A and C onto `nsx-lm2` (lm2 holding lm1's addresses) are already covered by
-[RUN_AC_LM2.md](../nsx/RUN_AC_LM2.md); run that card first if lm2 is empty.
+[RUN_AC_LM2.md](RUN_AC_LM2.md); run that card first if lm2 is empty.
 Step 6 is needed **only if lm2 and lm3 workloads must talk to each other**.
 
 Every step has its own run directory, so no two steps share a sibling bundle or
@@ -115,7 +115,7 @@ python tools/nsx/capture_nsx_state.py --source $S --live-query
 cat "nsx_capture/$SH/groups_additive/domains/default/groups/manifest.json"
 ```
 
-Check the same five fields as [RUN_AC_LM2.md section 1](../nsx/RUN_AC_LM2.md):
+Check the same five fields as [RUN_AC_LM2.md section 1](RUN_AC_LM2.md):
 `ip_source` is `effective`, `effective_ip_queries` equals `groups_seen`,
 `groups_errors` is `0`. `--live-query` is mandatory: without it every tag-only
 group looks empty and nothing errors.
@@ -173,7 +173,7 @@ first, then the siblings).
 ## 4) lm2's addresses onto lm1
 
 So lm1 VMs keep reaching VMs that moved to lm2. Same mechanism as
-[RUN_D_LM1.md](../nsx/RUN_D_LM1.md), with the clean lm2 map. If lm1 already
+[RUN_D_LM1.md](RUN_D_LM1.md), with the clean lm2 map. If lm1 already
 carries `_avs_ips` siblings from a two-site run, this step adds to them (union);
 it never removes an address. Two separate change windows. Switch `.env` to
 **lm1** credentials; source and target are the same manager.
@@ -286,7 +286,7 @@ NSX, read from that step's sibling bundle. Address objects are named
 `<hostname>-<address>-<suffix>` (or `<address>-<suffix>` when no VM owns the
 address). Objects are created in `shared` (`--object-location`, default
 `shared`); rules always in `--device-group`. Every push and revert writes a
-markdown report beside its manifest. Details: [STATUS.md](STATUS.md).
+markdown report beside its manifest. Details: [STATUS.md](../multivendor/STATUS.md).
 
 ```bash
 # P1 plan, objects only: from the sibling bundle(s) of the NSX steps you ran.
@@ -339,6 +339,6 @@ shared, candidate config, read back identical, not committed.**
 |---|---|---|
 | P1 Object plan | Sibling IP groups only, same names as NSX (`nsx_pan_mirror.py plan --bundle`). No Panorama call. | built |
 | P2 Push to `pano4` | Candidate configuration only (never commits), creates only missing objects (`shared` for objects, `dg-5` for rules), revert removes only what it created. You commit. | working (first live test 2026-10-05, reverted the same day) |
-| P3 Rules | `plan-rules`: one pre-rulebase rule per NSX rule that uses a sibling group; each NSX group becomes all its sibling views, IP-only groups are mirrored as themselves, anything Panorama cannot match is left out (narrower, never wider). Zones any/any. Mapping: [STATUS.md](STATUS.md). | pushed 2026-10-06 (lm1: 28 rules, 69 groups, 87 addresses, 15 services, 2 service groups, 0 errors) into pano4 candidate config after `agent_role` gained REST write on service groups and pre-rules |
+| P3 Rules | `plan-rules`: one pre-rulebase rule per NSX rule that uses a sibling group; each NSX group becomes all its sibling views, IP-only groups are mirrored as themselves, anything Panorama cannot match is left out (narrower, never wider). Zones any/any. Mapping: [STATUS.md](../multivendor/STATUS.md). | pushed 2026-10-06 (lm1: 28 rules, 69 groups, 87 addresses, 15 services, 2 service groups, 0 errors) into pano4 candidate config after `agent_role` gained REST write on service groups and pre-rules |
 
 Prerequisite: every VM carries an NSX `hostname` tag (no fallback to the VM name).

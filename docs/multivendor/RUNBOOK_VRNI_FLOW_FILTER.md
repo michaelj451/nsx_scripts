@@ -102,7 +102,7 @@ In the output folder, named after the input file:
 | `<name>_filtered.csv` | The new list: the input's columns, Infrastructure rows taken out |
 | `<name>_removed.csv` | The Infrastructure rows, plus a `filter reason` column naming the policy and rule |
 | `<name>_unmatched.csv` | Rows that could not be judged, plus the reason |
-| `<name>_rules.csv` | Two sections: **Rules kept (application traffic)** and **Infrastructure rules hit (removed)**, each with its title, rule count and header: rule # (the number vRNI shows), rule name, NSX rule id, policy, category, action, flows, packets, result. The rule # matches the approval report and `rule_approval.yaml` |
+| `<name>_rules.csv` | Two sections: **Rules kept (application traffic)** and **Infrastructure rules hit (removed)**, each with its title, rule count and header: rule # (the number vRNI shows), rule name, NSX rule id, policy, category, action, flows, packets, result. The rule # matches the approval report and the rule approval sheet (`reports/03_rule_approval_sheet.yaml`) |
 | `summary.md` | Counts, the export window, the same two rule tables, and the unmatched reasons |
 | `logs/` | The run log |
 

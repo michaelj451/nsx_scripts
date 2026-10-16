@@ -382,7 +382,9 @@ def select_rules(hits: Sequence[Dict[str, Any]], cap: CaptureView,
 # to false for each rule the client approves, then rebuilds the request with
 # --rule-approval; only rules with needs_approval: false are copied and pushed.
 
-APPROVAL_SHEET = "rule_approval.yaml"
+# Its only copy lives in the request's reports/ folder (Mike, 2026-10-16).
+APPROVAL_SHEET = "reports/03_rule_approval_sheet.yaml"
+LEGACY_APPROVAL_SHEET = "rule_approval.yaml"
 
 
 def apply_rule_approval(candidates: Sequence[Dict[str, Any]], approval: Optional[Dict[str, Any]]
@@ -1223,3 +1225,167 @@ def render_delta_md(run: Dict[str, Any], delta: Dict[str, Dict[str, List[str]]],
                                             for k, v in d.items() if v])
         L += [""]
     return align_markdown_tables("\n".join(L)) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# reports/: the human-readable files in one folder (Mike, 2026-10-16)
+# ---------------------------------------------------------------------------
+# Every request and every run gets a reports/ folder holding copies of its
+# readable files under numbered names that say what each one is. The tools
+# keep reading and writing the original layout; reports/ is rebuilt after each
+# command. The one exception is the rule approval sheet: its only copy lives
+# in reports/, because that is the file the operator edits.
+
+REPORTS_DIR = "reports"
+REPORTS_INDEX = "00_README.md"
+_COLLECTED = re.compile(r"^\d\d_")
+
+# Run folder: one block of numbers per phase, one number per mode.
+PHASE_BLOCKS = {"a": (10, "A_copy_rules", "Workflow A: copy rules, groups and services to the destination"),
+                "c": (20, "C_destination_ip_groups", "Workflow C: IP-only groups on the destination"),
+                "d2a": (30, "D_source_ip_groups", "Workflow D: IP-only groups on the source"),
+                "d3": (40, "D_rule_amend", "Workflow D: source rules amended to the new groups"),
+                "palo": (50, "Palo_panorama", "Palo Alto: Panorama objects and rules")}
+MODE_SLOTS = (("dryrun", 1, "dry_run"), ("apply", 2, "apply"), ("verify", 3, "verify"),
+              ("rollback_dryrun", 4, "rollback_dry_run"), ("rollback_apply", 5, "rollback_apply"))
+_PALO_MODE_FILES = {"dryrun": "push_*_dryrun.md", "verify": "push_*_dryrun.md", "apply": "push_*_apply.md",
+                    "rollback_dryrun": "revert_*_dryrun.md", "rollback_apply": "revert_*_apply.md"}
+
+
+def _file_ts(path: Path) -> str:
+    """The UTC_TS in a Palo report name (push_20261015_012614_dryrun.md)."""
+    m = re.search(r"_(\d{8}_\d{6})_", path.name)
+    return m.group(1) if m else ""
+
+
+def _palo_report(palo_dir: Path, mode: str, at: Optional[str]) -> Optional[Path]:
+    """The Palo report a mode produced: the newest one of its kind started
+    before the mode finished (phases.json `at`). A Palo verify is a push dry
+    run, so the time is what tells it from the dry run."""
+    if not at or not palo_dir.is_dir():
+        return None
+    limit = re.sub(r"[-:]", "", at[:19]).replace("T", "_")
+    found = [p for p in sorted(palo_dir.glob(_PALO_MODE_FILES[mode])) if _file_ts(p) and _file_ts(p) <= limit]
+    return found[-1] if found else None
+
+
+def request_report_files(work: Path) -> List[Tuple[Path, str, str]]:
+    """(source, name in reports/, what it is) for a request folder."""
+    out: List[Tuple[Path, str, str]] = []
+
+    def add(src: Optional[Path], name: str, what: str) -> None:
+        if src is not None and src.is_file():
+            out.append((src, name, what))
+
+    add(work / "servers.txt", "01_servers.txt", "The server list this request was built from")
+    add(work / "request.md", "02_approval_report.md",
+        "Approval report: servers, rules, what each workflow creates, Palo Alto objects")
+    palo = work / "palo"
+    add(palo / "plan.md", "04_palo_plan.md", "Palo Alto plan: every object and rule for Panorama")
+    add(_newest(palo, "push_*_dryrun.md"), "05_palo_dry_run.md",
+        "Palo Alto dry run: what Panorama is missing today")
+    add(palo / "pan_set_commands.txt", "06_palo_paste_set_commands.txt",
+        "PAN-OS CLI to paste: creates exactly the missing objects")
+    add(palo / "pan_delete_commands.txt", "07_palo_paste_delete_commands.txt",
+        "PAN-OS CLI to paste: removes them again")
+    return out
+
+
+def run_report_files(work: Path, phases: Dict[str, Any]) -> List[Tuple[Path, str, str]]:
+    """(source, name in reports/, what it is) for a run folder. Verify modes
+    of A, C and D write JSON only; their readable page is rendered by
+    render_verify_md() and is not in this list."""
+    out: List[Tuple[Path, str, str]] = []
+
+    def add(src: Optional[Path], name: str, what: str) -> None:
+        if src is not None and src.is_file():
+            out.append((src, name, what))
+
+    add(work / "delta.md", "01_changes_since_approval.md", "Changes since approval and the gate result")
+    add(work / "implementation.md", "02_implementation_plan.md", "Implementation plan rebuilt from today's capture")
+    for phase, (base, label, what) in PHASE_BLOCKS.items():
+        slot = phases.get(phase) or {}
+        if phase == "palo":
+            add(work / "palo" / "plan.md", f"{base}_{label}_plan.md", "Palo Alto plan for this run")
+        for mode, n, mode_name in MODE_SLOTS:
+            name = f"{base + n}_{label}_{mode_name}.md"
+            if phase == "palo":
+                add(_palo_report(work / "palo", mode, (slot.get(mode) or {}).get("at")), name,
+                    f"{what}, {mode_name.replace('_', ' ')}")
+            elif mode != "verify":
+                report = "rollback_report.md" if mode.startswith("rollback") else "avs_run_report.md"
+                add(work / "report" / phase / mode / report, name, f"{what}, {mode_name.replace('_', ' ')}")
+        if phase == "palo":
+            add(work / "palo" / "pan_set_commands.txt", f"{base + 6}_{label}_paste_set_commands.txt",
+                "PAN-OS CLI to paste from the newest dry run: creates the missing objects")
+            add(work / "palo" / "pan_delete_commands.txt", f"{base + 7}_{label}_paste_delete_commands.txt",
+                "PAN-OS CLI to paste: removes them again")
+    return out
+
+
+def _newest(directory: Path, pattern: str) -> Optional[Path]:
+    found = sorted(directory.glob(pattern)) if directory.is_dir() else []
+    return found[-1] if found else None
+
+
+def render_verify_md(phase: str, verify_dir: Path, at: Optional[str] = None) -> Optional[str]:
+    """A readable page for the JSON a verify wrote (A and C: verify_avs_run.json
+    and, for A, bundle_presence.json; D: validate_wf_d's summary and findings).
+    None when the phase has no verify output."""
+    base, label, what = PHASE_BLOCKS[phase]
+    L = [f"# {what}: verify", ""]
+    if at:
+        L += [f"Ran {at[:19].replace('T', ' ')} UTC.", ""]
+    found = False
+    bp = verify_dir / "bundle_presence.json"
+    if bp.is_file():
+        found = True
+        doc = json.loads(bp.read_text())
+        missing = doc.get("missing") or {}
+        L += ["## Every copied object is on the destination", "",
+              f"**{'PASS' if doc.get('ok') else 'FAIL'}** on {doc.get('destination', '')}.", ""]
+        rows = [[kind, ", ".join(md_escape(x) for x in ids)] for kind, ids in missing.items() if ids]
+        if rows:
+            L += md_table(["missing", "ids"], rows) + [""]
+    va = verify_dir / "verify_avs_run.json"
+    if va.is_file():
+        found = True
+        doc = json.loads(va.read_text())
+        L += ["## Checks", "",
+              f"**{'PASS' if doc.get('ok') else 'FAIL'}**: {doc.get('checks_total', 0)} check(s), "
+              f"{doc.get('checks_failed', 0)} failed. Source {doc.get('source', '')}, "
+              f"target {doc.get('target', '')}.", ""]
+        L += md_table(["check", "subject", "result", "detail"],
+                      [[c.get("check", ""), md_escape(str(c.get("subject", ""))),
+                        "ok" if c.get("ok") else "FAILED", md_escape(str(c.get("detail", "")))]
+                       for c in doc.get("checks") or []]) + [""]
+    for summary in sorted(verify_dir.glob("wf_d_validation/*/summary.json")):
+        found = True
+        doc = json.loads(summary.read_text())
+        counts = doc.get("counts") or {}
+        sev = counts.get("by_severity") or {}
+        L += [f"## {doc.get('target', summary.parent.name)}", "",
+              f"**{doc.get('overall', '?')}**: {counts.get('sibling_pairs', 0)} sibling pair(s), "
+              f"{counts.get('current_groups', 0)} groups and {counts.get('current_rules', 0)} rules now "
+              f"(baseline {counts.get('baseline_groups', 0)} groups); findings: "
+              + ", ".join(f"{k} {v}" for k, v in sev.items()) + ".", ""]
+        vr = summary.parent / "validation_report.json"
+        findings = json.loads(vr.read_text()).get("findings") or [] if vr.is_file() else []
+        if findings:
+            L += md_table(["severity", "check", "detail"],
+                          [[f.get("severity", ""), f.get("check", ""),
+                            md_escape(str(f.get("message") or f.get("detail") or
+                                          {k: v for k, v in f.items() if k not in ("severity", "check")}))]
+                           for f in findings]) + [""]
+    if not found:
+        return None
+    return align_markdown_tables("\n".join(L)) + "\n"
+
+
+def reports_index_md(title: str, intro: List[str], entries: List[Tuple[str, str]],
+                     extra: Optional[List[str]] = None) -> str:
+    """reports/00_README.md: what each file in the folder is."""
+    L = [f"# {title}", ""] + intro + [""]
+    L += md_table(["file", "what it is"], [[f"[{name}]({name})", md_escape(what)] for name, what in entries])
+    L += [""] + (extra or [])
+    return align_markdown_tables("\n".join(L)).rstrip("\n") + "\n"

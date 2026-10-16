@@ -14,7 +14,7 @@ same steps as PowerShell commands. Run from the repository root.
 | 6b | `nsx-lm3` | lm2 (mapped) | `_avs_ips` | `subnet_map_lm2.csv` | `nsx-lm3_avs_ips` |
 
 Step 6 only if lm2 and lm3 workloads must talk to each other. A and C onto
-lm2 come from [RUN_AC_LM2_PS.md](../nsx/RUN_AC_LM2_PS.md).
+lm2 come from [RUN_AC_LM2_PS.md](RUN_AC_LM2_PS.md).
 
 ---
 
@@ -187,7 +187,7 @@ Newest first: 6b, 6a, 5, 4, 3, 2.
 
 ## Palo Alto track (separate)
 
-Only the sibling IP groups each NSX step creates, same names as on NSX (see [STATUS.md](STATUS.md)). Never commits.
+Only the sibling IP groups each NSX step creates, same names as on NSX (see [STATUS.md](../multivendor/STATUS.md)). Never commits.
 
 ```powershell
 # P1 plan: from the sibling bundle(s) of the NSX steps you ran (hostnames read-only from the source)
@@ -220,4 +220,4 @@ P3 `plan-rules` built and pushed 2026-10-06: objects in `shared` (default
 `--object-location shared`) and 28 pre-rules in dg-5, candidate config only,
 once `agent_role` had REST write on service groups and pre-rules. Every push
 and revert writes a markdown report beside its manifest. Mapping and numbers:
-[STATUS.md](STATUS.md).
+[STATUS.md](../multivendor/STATUS.md).

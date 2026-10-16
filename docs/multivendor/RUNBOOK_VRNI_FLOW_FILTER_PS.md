@@ -78,7 +78,7 @@ Start-Process "$F\app_flows_rules.csv"        # opens in Excel
 
 | File | Contents |
 |---|---|
-| `<name>_rules.csv` | Two sections: **Rules kept (application traffic)** and **Infrastructure rules hit (removed)**, each with its title, rule count and header: rule #, rule name, rule id, policy, category, action, flows, packets, result. The rule # matches the approval report and `rule_approval.yaml` |
+| `<name>_rules.csv` | Two sections: **Rules kept (application traffic)** and **Infrastructure rules hit (removed)**, each with its title, rule count and header: rule #, rule name, rule id, policy, category, action, flows, packets, result. The rule # matches the approval report and the rule approval sheet (`reports/03_rule_approval_sheet.yaml`) |
 | `<name>_filtered.csv` | The kept flow rows, with the export's own columns |
 | `<name>_removed.csv` | The Infrastructure flow rows, plus a `filter reason` column naming the policy and rule |
 | `<name>_unmatched.csv` | Rows with no rule id, or a number not on that manager, plus the reason; review by hand |
@@ -94,4 +94,4 @@ The filter is a separate, read-only step. Its rule list goes to the
 application owner with the approval report (see
 [RUNBOOK_MIGRATION_REQUEST_PS.md](RUNBOOK_MIGRATION_REQUEST_PS.md)); the
 rules they approve are set to `needs_approval: false` in the request's
-`rule_approval.yaml`. Nothing in the migration request reads these files.
+`reports\03_rule_approval_sheet.yaml`. Nothing in the migration request reads these files.
