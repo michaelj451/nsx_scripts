@@ -222,14 +222,30 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
             hits.append({**h, "info": {**h["info"], "by_side": by_side}})
     # Requests made before 2026-10-14 have no exclude_categories: they keep copying everything.
     skip_cats = inputs.get("exclude_categories") or []
-    selected, excluded = mr.select_rules(hits, cap, inputs["include_default_sections"], skip_cats)
+    candidates, excluded = mr.select_rules(hits, cap, inputs["include_default_sections"], skip_cats)
+    # Rule approval (Mike, 2026-10-15): only rules approved on the sheet are copied.
+    approval = inputs.get("rule_approval")
+    selected, held, appr_warn = mr.apply_rule_approval(candidates, approval)
+    excluded = held + excluded
+    warnings += appr_warn
     errors += [f"{x['policy_name']} / {x['rule_name']}: {x['reason']}" for x in excluded if x.get("error")]
 
     # 4. Workflow A bundle (+ the captured-IP copies Workflow C builds from).
-    clo = mr.dependency_closure(cap, selected)
+    drop = mr.sibling_group_paths(cap, [inputs["c_appendix"], inputs["d_appendix"]])
+    for c in [*candidates, *selected, *excluded]:  # what the report and the sheet show
+        for f in mr.RULE_REF_FIELDS:
+            kept = [v for v in c.get(f) or [] if v not in drop]
+            if kept or not c.get(f):
+                c[f] = kept
+    for sel in selected:
+        _, empty = mr.strip_sibling_refs(cap.rules[(sel["policy_id"], sel["rule_id"])], drop)
+        if empty:
+            errors.append(f"{sel['policy_name']} / {sel['rule_name']}: {', '.join(empty)} names only migration "
+                          "sibling groups; copying it without them would read as ANY")
+    clo = mr.dependency_closure(cap, selected, drop)
     if clo["unresolved_groups"]:
         errors.append("group references not in the capture: " + ", ".join(clo["unresolved_groups"]))
-    bundle = mr.write_bundle(work / "bundle", cap, selected, clo)
+    bundle = mr.write_bundle(work / "bundle", cap, selected, clo, drop)
 
     # 5. Workflow C siblings (unchanged builder, source addresses).
     c_sib = sib_dir(work, "c", src_host)
@@ -241,7 +257,8 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
     c_map = read_json(c_sib / "sibling_map.json")
 
     # 6. Workflow D: the servers' groups that sit in a rule, servers' addresses only.
-    scope, left_out = mr.d_scope(servers, data, cap, skip_cats)
+    only = {s["key"] for s in selected} if approval else None
+    scope, left_out = mr.d_scope(servers, data, cap, skip_cats, only)
     mr.write_d_input(work / "bundle" / "d_input", cap, scope)
     d_sib = sib_dir(work, "d", src_host)
     if not run_step("6_build_d_siblings", [PY, "tools/nsx/build_sibling_groups.py",
@@ -285,6 +302,13 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
     # sibling, so a group shared with a left-out rule still changes that rule.
     touched = [a for a in d_amend if (cap.policies.get(a["key"].split("/", 1)[0]) or {}).get("category")
                in skip_cats]
+    if approval:
+        held_keys = {h["key"] for h in held}
+        waiting = [a for a in d_amend if a["key"] in held_keys]
+        if waiting:
+            warnings.append(f"d3 also adds siblings to {len(waiting)} rule(s) that need approval on {src_host}, "
+                            "because they name a group an approved rule uses: "
+                            + ", ".join(f"{a['policy_name']} / {a['rule_name']}" for a in waiting))
     if touched:
         warnings.append(f"d3 also adds siblings to {len(touched)} {'/'.join(skip_cats)} rule(s) on "
                         f"{src_host}, because they name a group that gets a D sibling: "
@@ -312,9 +336,10 @@ def build(work: Path, inputs: Dict[str, Any]) -> Dict[str, Any]:
         "schema": mr.SCHEMA, "request_id": inputs["request_id"], "created_at": utc_now_iso(),
         "captured_at": cap_manifest.get("captured_at"), "snapshot_at": data.get("collected_at"),
         "inputs": inputs, "servers": servers, "rules": selected, "excluded_rules": excluded,
+        "candidates": candidates,
         "closure": clo, "bundle": bundle, "c_siblings": c_rows, "c_amend": c_amend,
         "d_siblings": d_rows, "d_no_sibling": d_no, "d_amend": d_amend, "palo": palo,
-        "group_names": gnames, "service_names": snames, "profile_names": pnames,
+        "group_names": gnames, "service_names": snames, "profile_names": pnames, "sibling_paths": sorted(drop),
         "errors": errors, "warnings": warnings,
         "paths": {"record": repo_relative(work), "bundle": repo_relative(work / "bundle"),
                   "c": repo_relative(c_sib), "d": repo_relative(d_sib)},
@@ -361,7 +386,9 @@ def build_palo(work: Path, inputs: Dict[str, Any], cap: mr.CaptureView, selected
             pol_ids.append(s["policy_id"])
     # Only the selected rules go in, so a rule id shared by two policies can
     # never pull in the other one.
-    policies = [{**cap.policies[pid], "rules": [cap.rules[(pid, s["rule_id"])] for s in selected
+    drop = mr.sibling_group_paths(cap, [inputs["c_appendix"], inputs["d_appendix"]])
+    policies = [{**cap.policies[pid], "rules": [mr.strip_sibling_refs(cap.rules[(pid, s["rule_id"])], drop)[0]
+                                                for s in selected
                                                 if s["policy_id"] == pid]} for pid in pol_ids]
     bundles = [{"path": repo_relative(c_sib), "sibling_map": c_map},
                {"path": repo_relative(d_sib), "sibling_map": d_map}]
@@ -650,6 +677,16 @@ def cmd_request(args: argparse.Namespace) -> int:
                  "log_setting": _setting(args.log_setting, "PANORAMA_LOG_FORWARDING_PROFILE"),
                  "cli_commands": args.palo_cli},
     }
+    if args.rule_approval:
+        sheet = Path(args.rule_approval)
+        if not sheet.is_file():
+            raise SystemExit(f"Rule approval sheet not found: {sheet}")
+        try:
+            decided = mr.read_approval_sheet(sheet)
+        except ValueError as exc:
+            raise SystemExit(f"{sheet}: {exc}")
+        inputs["rule_approval"] = {"file": repo_relative(sheet.resolve()), "sha256": sha256_file(sheet),
+                                   **decided}
     write_text(work / "servers.txt", "".join(f"{n}{',' + ','.join(ips) if ips else ''}\n" for n, ips in entries))
     log.info("=" * 70)
     log.info("MIGRATION REQUEST %s", inputs["request_id"])
@@ -662,6 +699,8 @@ def cmd_request(args: argparse.Namespace) -> int:
         log.error("Request not built: %s", exc)
         return 1
     rec["warnings"] = warnings + rec["warnings"]
+    approved = [s["key"] for s in rec["rules"]] if inputs.get("rule_approval") else []
+    write_text(work / mr.APPROVAL_SHEET, mr.approval_sheet_text(rec, rec["candidates"], approved))
     write_json(work / "request.json", rec)
     if not args.no_preview:
         parts = ["a", "c", "d"] + (["palo"] if rec.get("palo") else [])
@@ -706,6 +745,13 @@ def cmd_preview(args: argparse.Namespace) -> int:
 def cmd_approve(args: argparse.Namespace) -> int:
     work = _request_dir(args.request)
     rec = read_json(work / "request.json")
+    # Rule approval (Mike, 2026-10-15): nothing is approved for pushing until at
+    # least one rule has needs_approval: false and the request was rebuilt with it.
+    if not (rec["inputs"].get("rule_approval") and rec["rules"]):
+        log.error("No rule is approved in this request: set needs_approval: false in %s for the rules "
+                  "to copy, rebuild with `request ... --rule-approval <that file>`, and approve the new "
+                  "request.", repo_relative(work / mr.APPROVAL_SHEET))
+        return 2
     if rec["errors"] and not args.accept_errors:
         for e in rec["errors"]:
             log.error("  %s", e)
@@ -747,16 +793,20 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     new["approval"] = approval
     write_json(work / "request.json", new)
     delta = mr.compare_models(rec["model"], new["model"])
-    problems += mr.server_gate(rec["model"], new["model"])
+    # Mike, 2026-10-16: a change to the request's own servers no longer stops the
+    # run; it is listed in delta.md and the approved rules are pushed as they are now.
+    server_changes = mr.server_gate(rec["model"], new["model"])
     blocked = bool(problems) or (args.strict and bool(delta)) or bool(new["errors"])
     run = {"request_id": rec["request_id"], "request_dir": repo_relative(req), "created_at": new["created_at"],
            "captured_at": new["captured_at"], "source_host": inputs["source_host"],
            "approved_digest": rec["model"]["digest"], "digest": new["model"]["digest"],
            "approval": approval, "strict": args.strict, "delta": delta,
-           "gate": {"passed": not blocked, "problems": problems, "errors": new["errors"]}}
+           "gate": {"passed": not blocked, "problems": problems, "errors": new["errors"],
+                    "server_changes": server_changes}}
     write_json(work / "run.json", run)
     write_text(work / "delta.md", mr.render_delta_md(run, delta, problems + new["errors"], args.strict,
-                                                     {**mr.display_names(rec), **mr.display_names(new)}))
+                                                     {**mr.display_names(rec), **mr.display_names(new)},
+                                                     server_changes))
     render(work, new, "Implementation plan", "implementation.md")
     update_latest(work.parent, work)
     log.info("Run: %s", repo_relative(work))
@@ -982,7 +1032,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         names = {**(mr.display_names(read_json(approved)) if approved.is_file() else {}), **mr.display_names(rec)}
         write_text(p / "delta.md", mr.render_delta_md(run, run["delta"],
                                                        run["gate"]["problems"] + run["gate"]["errors"],
-                                                       run["strict"], names))
+                                                       run["strict"], names, run["gate"].get("server_changes")))
         print(render(p, rec, "Implementation plan", "implementation.md"))
     else:
         p = _request_dir(args.dir)
@@ -1022,6 +1072,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     rq.add_argument("--domain-id", default="default")
     rq.add_argument("--include-default-sections", action="store_true",
                     help="Also copy rules in NSX's default sections (off: they exist on every manager).")
+    rq.add_argument("--rule-approval", metavar="YAML",
+                    help="A rule approval sheet (rule_approval.yaml from an earlier request) with "
+                         "needs_approval: false on the rules to copy. Only those are copied and pushed.")
     rq.add_argument("--include-infrastructure", action="store_true",
                     help="Also take Infrastructure-category rules (off: they are left out of the request, "
                          "listed as not copied, and their groups get no Workflow D sibling).")

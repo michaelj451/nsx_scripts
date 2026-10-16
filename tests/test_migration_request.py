@@ -238,6 +238,81 @@ class SelectionTests(unittest.TestCase):
         scope, _ = mr.d_scope(rows, data, cap)
         self.assertIn(G + "db", scope)
 
+    def test_rule_approval_sheet(self):
+        """Mike, 2026-10-15: every candidate starts at needs_approval: true; only
+        rules set to false are copied."""
+        cands = [{"key": "app-pol/r1", "rule_number": 1001, "policy_name": "App policy", "rule_name": "web to db",
+                  "action": "ALLOW", "source_groups": [G + "web"], "destination_groups": [G + "db"],
+                  "services": ["/infra/services/HTTPS"]},
+                 {"key": "app-pol/r2", "rule_number": 1002, "policy_name": "App policy", "rule_name": "unrelated",
+                  "action": "ALLOW", "source_groups": [G + "other"], "destination_groups": ["ANY"], "services": []}]
+        sel, held, warn = mr.apply_rule_approval(cands, None)
+        self.assertEqual(([s["approval"] for s in sel], held, warn), (["needs approval"] * 2, [], []))
+        rec = {"request_id": "r1", "inputs": {"source_host": "lm1.h"}, "group_names": {G + "web": "WEB"}}
+        sheet = self.tmp / "rule_approval.yaml"
+        sheet.write_text(mr.approval_sheet_text(rec, cands, []), encoding="utf-8")
+        self.assertIn("needs_approval: true", sheet.read_text())
+        self.assertEqual(mr.read_approval_sheet(sheet)["pending"], ["app-pol/r1", "app-pol/r2"])
+        # Approve r1 only: r1 is copied, r2 needs approval, a new candidate needs approval too.
+        sheet.write_text(sheet.read_text().replace("needs_approval: true", "needs_approval: false", 1))
+        decided = mr.read_approval_sheet(sheet)
+        self.assertEqual(decided["approved"], ["app-pol/r1"])
+        new = dict(cands[1], key="app-pol/r3", rule_number=1003)
+        sel, held, warn = mr.apply_rule_approval(cands + [new], decided)
+        self.assertEqual([s["key"] for s in sel], ["app-pol/r1"])
+        self.assertEqual([(h["key"], h["reason"]) for h in held],
+                         [("app-pol/r2", "needs approval (rule approval sheet)"),
+                          ("app-pol/r3", "needs approval (new since the rule approval sheet was written)")])
+        self.assertEqual(warn, [])
+        # A recreated rule (new number) and an approved rule that is gone are flagged.
+        sel, held, warn = mr.apply_rule_approval([dict(cands[0], rule_number=2001)],
+                                                 {**decided, "approved": ["app-pol/r1", "gone/r9"]})
+        self.assertEqual(len(warn), 2)
+        self.assertIn("rule # was 1001 on the sheet, 2001 now", warn[0])
+        bad = self.tmp / "bad.yaml"
+        bad.write_text("rules:\n- key: app-pol/r1\n  needs_approval: maybe\n")
+        with self.assertRaises(ValueError):
+            mr.read_approval_sheet(bad)
+
+    def test_d_scope_follows_the_approved_rules(self):
+        rows, _ = self._servers([("web01", None)])
+        scope, left = mr.d_scope(rows, self.data, self.cap, (), {"app-pol/r2"})
+        self.assertNotIn(G + "web", scope)
+        self.assertIn({"group": "WEB", "reason": "only in rules that need approval"}, left)
+        scope, _ = mr.d_scope(rows, self.data, self.cap, (), {"app-pol/r1"})
+        self.assertIn(G + "web", scope)
+
+    def test_source_siblings_are_never_copied(self):
+        """Mike, 2026-10-15: lm1's _avs_ips siblings must not be copied to the
+        destination by Workflow A (found after a second request)."""
+        import copy as _copy
+        cap = _copy.deepcopy(self.cap)
+        cap.groups[G + "web_avs_ips"] = {"id": "web_avs_ips", "path": G + "web_avs_ips",
+                                         "expression": [{"resource_type": "IPAddressExpression",
+                                                         "ip_addresses": ["10.8.0.101"]}]}
+        cap.groups[G + "web_lm3_ips"] = {"id": "web_lm3_ips", "path": G + "web_lm3_ips",
+                                         "description": "IP-only sibling of web; generated 2026-10-07",
+                                         "expression": []}
+        rule = cap.rules[("app-pol", "r1")]
+        rule["source_groups"] = [G + "web", G + "web_avs_ips", G + "web_lm3_ips"]
+        drop = mr.sibling_group_paths(cap, ["_np_ips", "_avs_ips"])
+        self.assertEqual(drop, {G + "web_avs_ips", G + "web_lm3_ips"})     # by suffix and by description
+        stripped, empty = mr.strip_sibling_refs(rule, drop)
+        self.assertEqual((stripped["source_groups"], empty), ([G + "web"], []))
+        _, empty = mr.strip_sibling_refs({"source_groups": [G + "web_avs_ips"]}, drop)
+        self.assertEqual(empty, ["source_groups"])                          # would read as ANY: refused
+        hit = {"rule": self.data["rules"][0], "info": {"by_side": {"vm-1": ["Src"]}},
+               "ext_id_to_name": {"vm-1": "web01"}}
+        sel, _ = mr.select_rules([hit], cap)
+        clo = mr.dependency_closure(cap, sel, drop)
+        self.assertNotIn(G + "web_avs_ips", clo["groups"])
+        self.assertEqual(clo["sibling_groups"], sorted(drop))
+        out = self.tmp / "bundle_sib"
+        mr.write_bundle(out, cap, sel, clo, drop)
+        doc = yaml.safe_load(next((out / "rules" / "security-policies").glob("*/rules/*.yaml")).read_text())
+        self.assertEqual(doc["source_groups"], [G + "web"])
+        self.assertFalse(list((out / "groups" / "groups").glob("web_*_ips*.yaml")))
+
     def test_closure_and_bundle(self):
         hit = {"rule": self.data["rules"][0], "info": {"by_side": {"vm-1": ["Src"]}},
                "ext_id_to_name": {"vm-1": "web01"}}
@@ -360,6 +435,17 @@ class ModelTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_server_change_is_listed_not_a_stop(self):
+        """Mike, 2026-10-16: a changed server no longer stops the run."""
+        run = {"request_id": "r", "created_at": "t", "source_host": "lm1.h", "captured_at": "t",
+               "approved_digest": "a", "digest": "b"}
+        md = mr.render_delta_md(run, {}, [], False, {}, ["web01: addresses were 10.6.0.101, now 10.6.0.111"])
+        self.assertNotIn("STOPPED", md)
+        self.assertIn("The request's servers changed since approval", md)
+        self.assertIn("- web01: addresses were 10.6.0.101, now 10.6.0.111", md)
+        stopped = mr.render_delta_md(run, {}, ["subnet map data/m.csv changed since approval"], False, {}, [])
+        self.assertIn("STOPPED", stopped)
+
     def test_preview_counts(self):
         rows = [{"status": "dry_run", "exists_on_target": False}, {"status": "dry_run", "exists_on_target": True},
                 {"status": "skipped_unchanged"}, {"status": "failed"}, {"status": "skipped"},
@@ -523,6 +609,17 @@ class CliTests(unittest.TestCase):
             self.assertEqual(self.cli.device_group("dg-4"), "dg-4")
         with mock.patch.dict("os.environ", {"PANORAMA_DEVICE_GROUP": " "}):
             self.assertIsNone(self.cli.device_group(None))
+
+    def test_approve_refuses_until_a_rule_is_approved(self):
+        import argparse
+        tmp = Path(tempfile.mkdtemp())
+        base = {"request_id": "r", "errors": [], "model": {"digest": "d"}, "rules": [{"key": "p/r"}]}
+        for inputs, rules in (({}, [{"key": "p/r"}]), ({"rule_approval": {"approved": []}}, [])):
+            (tmp / "request.json").write_text(json.dumps({**base, "inputs": inputs, "rules": rules}))
+            rc = self.cli.cmd_approve(argparse.Namespace(request=str(tmp), change_ref="C", approved_by="M",
+                                                         accept_errors=False))
+            self.assertEqual(rc, 2)
+            self.assertFalse((tmp / "approval.json").exists())
 
     def test_rollback_reverse_order_with_allow_delete(self):
         inputs = {"source": "nsx-lm1", "destination": "nsx-lm3", "source_host": "lm1.h",

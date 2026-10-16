@@ -1,0 +1,20 @@
+name,firewall ruleid,firewall rule,Source VM,Source IP Address,Destination VM,Destination IP Address,Protocol,Port Display,firewall action,Flow Packet Count (14/10/2026 12:12:53 to 15/10/2026 12:12:53)
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.3.0.20 [port:389],8179,seed-infra-ad,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,10.3.0.20,TCP,389,ALLOW,3641
+10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) -> 10.3.0.21 [port:88],8179,seed-infra-ad,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,,10.3.0.21,UDP,88,ALLOW,812
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.3.0.20 [port:636],8179,seed-infra-ad,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,10.3.0.20,TCP,636,ALLOW,220
+10.6.1.102(ubuntu22-speedtest-10.6.1.102-0102) -> 10.3.0.151 [port:53],8180,seed-infra-dns-lookup,ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102,,10.3.0.151,UDP,53,ALLOW,99984
+10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) -> 10.3.0.152 [port:53],8180,seed-infra-dns-lookup,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,,10.3.0.152,TCP,53,ALLOW,431
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.3.0.30 [port:123],8181,seed-infra-ntp,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,10.3.0.30,UDP,123,ALLOW,489
+10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) -> 10.3.0.31 [port:123],8181,seed-infra-ntp,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,,10.3.0.31,UDP,123,ALLOW,470
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.3.0.40 [port:9997],8184,seed-infra-splunk,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,10.3.0.40,TCP,9997,ALLOW,13438
+10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) -> 10.3.0.41 [port:9997],8184,seed-infra-splunk,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,,10.3.0.41,TCP,9997,ALLOW,10842
+10.6.1.102(ubuntu22-speedtest-10.6.1.102-0102) -> 10.3.0.50 [port:8140],8182,seed-infra-puppet,ubuntu22-speedtest-10.6.1.102-0102,10.6.1.102,,10.3.0.50,TCP,8140,ALLOW,3611
+10.3.0.60 -> 10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) [port:161],8183,seed-infra-snmp,,10.3.0.60,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,UDP,161,ALLOW,22
+10.3.0.60 -> 10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) [port:161],8183,seed-infra-snmp,,10.3.0.60,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,UDP,161,ALLOW,22
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.3.0.151 [port:21116],8177,servers-to-rustdesk,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,10.3.0.151,TCP,21116,ALLOW,1200
+10.10.2.78 -> 10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) [port:443],8168,migration-rule-1,,10.10.2.78,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,TCP,443,ALLOW,342
+10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) -> 10.6.0.50 [port:443],8175,migration-rule-2,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,,10.6.0.50,TCP,443,ALLOW,128
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) [port:22],8178,migration-ssh,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,TCP,22,ALLOW,56
+10.6.0.102(ubuntu22-speedtest-10.6.0.102-0e02) -> 10.245.247.110 [port:443],2,Default Layer3 Rule,ubuntu22-speedtest-10.6.0.102-0e02,10.6.0.102,,10.245.247.110,TCP,443,DROP,16
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 10.2.8.63 [port:443],,,ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,10.2.8.63,TCP,443,ALLOW,
+10.6.0.101(ubuntu22-speedtest-10.6.0.101-ax2001) -> 172.24.24.10 [port:123],99999,NTP (other manager),ubuntu22-speedtest-10.6.0.101-ax2001,10.6.0.101,,172.24.24.10,UDP,123,ALLOW,489

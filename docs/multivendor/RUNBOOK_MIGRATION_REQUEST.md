@@ -28,8 +28,10 @@ At step 4 the source is captured again and everything is rebuilt from the
 request's own inputs. Rule changes on the source since approval went through
 their own approval, so they are taken as they are now and listed in
 `delta.md`. A change to the **request's own servers** (a server no longer
-found, a different VM behind a name, a changed address, a changed subnet map)
-stops the run: raise a new request. `refresh --strict` stops on any change.
+found, a different VM behind a name, a changed address) is listed at the top
+of `delta.md` but does not stop the run (Mike, 2026-10-16): the approved rules
+are pushed as they are now. A changed subnet map or a build error stops the
+run. `refresh --strict` stops on any change.
 
 ## What a request covers
 
@@ -145,6 +147,44 @@ A Workflow A copy that is written gets the source's description plus the
 record, so a later request replaces an earlier request's record on a shared
 object. `amend-refs` appends to the rule's current description, so a rule
 amended by two requests carries both records.
+
+### Rule approval: only approved rules are pushed
+
+Mike, 2026-10-15. A request lists every rule the servers use as a
+**candidate**, and every candidate starts with `needs_approval: true`. Nothing
+is pushed until rules are approved one by one:
+
+1. `request` writes **`rule_approval.yaml`** in the request folder: one entry
+   per candidate rule with its rule # (the number vRNI shows), policy, rule,
+   action, source, destination, services and `needs_approval: true`. The
+   report says every rule needs approval, and its dry runs show what each
+   candidate would change. `approve` refuses this request.
+2. The client reviews the report (and the vRNI traffic, see
+   [RUNBOOK_VRNI_FLOW_FILTER.md](RUNBOOK_VRNI_FLOW_FILTER.md)) and says which
+   rules they want.
+3. We set `needs_approval: false` on those entries. Do not change `rule` or
+   `key`.
+4. Rebuild with the sheet. This is a new request, with fresh dry runs, that
+   copies only the approved rules:
+
+   ```bash
+   mr request --source nsx-lm1 --destination nsx-lm3 --no-tls-verify \
+     --rule-approval migration_requests/nsx-lm1_to_nsx-lm3/<first request>/rule_approval.yaml
+   ```
+
+   The report says "Rule approval: N of M candidate rules approved"; the
+   other rules appear under "not copied" as "needs approval". Workflow A, C,
+   D and the Palo plan follow the approved rules only: a group used only by
+   rules that need approval gets no D sibling. The new request writes its own
+   sheet carrying the decisions.
+5. Approve, refresh and run the phases as below. A refresh keeps the same
+   decisions; a rule that starts touching the servers later is listed as
+   "needs approval (new since the rule approval sheet was written)" and is
+   never pushed by itself.
+
+A rule approved on the sheet whose rule # has changed on the source (the rule
+was recreated) is copied but flagged under Warnings; an approved rule that is
+no longer a candidate is flagged and not copied.
 
 ## 2) Review: what the approver reads
 

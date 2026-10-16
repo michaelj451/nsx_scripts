@@ -6,6 +6,44 @@ Static lab layout lives in [LAB_TOPOLOGY.md](LAB_TOPOLOGY.md).
 
 ---
 
+## 2026-10-15 (15:03 CDT): last night's full apply backed out
+
+Mike: back out the 2026-10-14 full apply (request 20261014_201055, run
+`runs/20261015_012351`) so lm1's rules lose the `_avs_ips` siblings, then fix
+the request so Workflow A never copies source siblings. Each phase's rollback
+dry run, then apply, newest first: palo deleted 28; d3 restored the 3 lm1 rules
+(the 6 seed-infra rules created since were left alone, "blocked"); d2a deleted
+3 `_avs_ips`; c restored 3 lm3 rules, deleted 3 `_np_ips`; a deleted 3 rules,
+`test-policy-2`, 3 groups, `a3-super-ssh`. Checked: lm1 has no sibling groups
+and its rules name only the originals (change record gone with them); lm3 is
+the critical copy plus `always-rules-poilicy`; a pano4 dry run finds all 28
+missing. Code fix (uncommitted): source siblings (request C/D suffix, or the
+builder's "IP-only sibling of" description) are left out of the Workflow A
+groups and stripped from the copied rules, the fingerprint and the Palo plan.
+
+## 2026-10-15: Infrastructure seed policy on lm1 (for the vRNI flow filter sample)
+
+Mike asked for a sample flow export with infrastructure rules; the rules were
+created on lm1 so the sample's rule numbers are real. Bundle `nsx_logs/seed_infra_policies/20261015_184040`
+(push tools' layout), `services.py` / `groups.py` / `policies.py` /
+`rules.py push`, dry run then apply, 0 failed, read back:
+
+| Rule # | Rule | Source -> destination | Services |
+|---:|---|---|---|
+| 8179 | seed-infra-ad | nsx-lm1-servers -> seed-infra-ad-servers (10.3.0.20, .21) | LDAP, LDAP-over-SSL, KERBEROS, KERBEROS-UDP |
+| 8180 | seed-infra-dns-lookup | nsx-lm1-servers -> seed-infra-dns-servers (10.3.0.151, .152) | DNS, DNS-UDP |
+| 8181 | seed-infra-ntp | nsx-lm1-servers -> seed-infra-ntp-servers (10.3.0.30, .31) | NTP |
+| 8184 | seed-infra-splunk | nsx-lm1-servers -> seed-infra-splunk-indexers (10.3.0.40, .41) | seed-svc-splunk-9997 (new) |
+| 8182 | seed-infra-puppet | nsx-lm1-servers -> seed-infra-puppet-servers (10.3.0.50) | seed-svc-puppet-8140 (new) |
+| 8183 | seed-infra-snmp | seed-infra-snmp-pollers (10.3.0.60) -> nsx-lm1-servers | SNMP |
+
+Policy `seed-infra-services`, category Infrastructure, sequence 30, all ALLOW.
+The 10.3.0.20 to .60 hosts do not exist; the groups only give the rules
+realistic destinations. Sample: `data/samples/vrni_flows_infra_sample.csv`.
+A migration request leaves these rules out (Infrastructure). Undo:
+`rules.py revert`, `policies.py revert`, `groups.py revert --allow-delete`,
+`services.py revert`, each `--target nsx-lm1 --reports-dir <bundle>/<class>/push_report`.
+
 ## 2026-10-14 (20:23 CDT): full apply of the 2-server request, all phases
 
 **APPLIED; Panorama not committed.** Request

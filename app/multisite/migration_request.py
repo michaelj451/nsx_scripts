@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import yaml
+
 from common.fileio import read_yaml, write_yaml
 from common.md import align_markdown_tables, md_escape, md_table
 from common.description_note import PAN_DESCRIPTION_MAX, append_note, change_note
@@ -374,6 +376,83 @@ def select_rules(hits: Sequence[Dict[str, Any]], cap: CaptureView,
 
 
 # ---------------------------------------------------------------------------
+# Rule approval sheet (Mike, 2026-10-15)
+# ---------------------------------------------------------------------------
+# Every candidate rule starts with needs_approval: true. The operator sets it
+# to false for each rule the client approves, then rebuilds the request with
+# --rule-approval; only rules with needs_approval: false are copied and pushed.
+
+APPROVAL_SHEET = "rule_approval.yaml"
+
+
+def apply_rule_approval(candidates: Sequence[Dict[str, Any]], approval: Optional[Dict[str, Any]]
+                        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """(approved, needing approval as excluded rows, warnings). Without an
+    approval sheet every candidate needs approval, but all stay selected so
+    the first report and its dry runs show what each rule would do."""
+    if approval is None:
+        return [dict(c, approval="needs approval") for c in candidates], [], []
+    approved_keys = set(approval.get("approved") or [])
+    pending_keys = set(approval.get("pending") or [])
+    numbers = approval.get("numbers") or {}
+    approved, held, warnings = [], [], []
+    for c in candidates:
+        if c["key"] in approved_keys:
+            approved.append(dict(c, approval="approved"))
+            was = numbers.get(c["key"])
+            if was is not None and c.get("rule_number") is not None and int(was) != int(c["rule_number"]):
+                warnings.append(f"{c['policy_name']} / {c['rule_name']}: rule # was {was} on the sheet, "
+                                f"{c['rule_number']} now (rule recreated on the source?)")
+            continue
+        why = ("needs approval (rule approval sheet)" if c["key"] in pending_keys
+               else "needs approval (new since the rule approval sheet was written)")
+        held.append({**c, "approval": "needs approval", "reason": why, "error": False})
+    found = {c["key"] for c in candidates}
+    for key in sorted(approved_keys - found):
+        warnings.append(f"approved rule {key} (#{numbers.get(key, '?')}) is no longer a rule these servers "
+                        "use (or it is now left out by category); not copied")
+    return approved, held, warnings
+
+
+def approval_sheet_text(rec: Dict[str, Any], candidates: Sequence[Dict[str, Any]],
+                        approved_keys: Iterable[str]) -> str:
+    """The sheet the operator edits: one entry per candidate rule."""
+    gbp, snames = rec.get("group_names") or {}, rec.get("service_names") or {}
+    ok = set(approved_keys)
+    doc = {"request": rec["request_id"], "source": rec["inputs"]["source_host"],
+           "rules": [{"rule": c.get("rule_number"), "key": c["key"], "policy": c["policy_name"],
+                      "name": c["rule_name"], "action": c.get("action"),
+                      "source": _side(c.get("source_groups") or [], gbp),
+                      "destination": _side(c.get("destination_groups") or [], gbp),
+                      "services": _services(c.get("services") or [], snames),
+                      "needs_approval": c["key"] not in ok} for c in candidates]}
+    head = [f"# Rule approval sheet: request {rec['request_id']}",
+            "# Set needs_approval: false on each rule the client approved, then rebuild:",
+            "#   python tools/multisite/migration_request.py request <same options> --rule-approval <this file>",
+            "# Only rules with needs_approval: false are copied and pushed; the rest stay on the",
+            "# source and are listed as \"needs approval\". Do not change rule or key.", ""]
+    return "\n".join(head) + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=200)
+
+
+def read_approval_sheet(path: Path) -> Dict[str, Any]:
+    """{"approved": [keys], "pending": [keys], "numbers": {key: rule #}}.
+    Raises ValueError on an entry without a key or with a needs_approval that
+    is not true or false."""
+    doc = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    out: Dict[str, Any] = {"approved": [], "pending": [], "numbers": {}}
+    for i, e in enumerate(doc.get("rules") or [], 1):
+        key, flag = (e or {}).get("key"), (e or {}).get("needs_approval")
+        if not key:
+            raise ValueError(f"entry {i}: no key")
+        if not isinstance(flag, bool):
+            raise ValueError(f"entry {i} ({key}): needs_approval must be true or false, not {flag!r}")
+        out["pending" if flag else "approved"].append(key)
+        if e.get("rule") is not None:
+            out["numbers"][key] = e["rule"]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Dependencies of the selected rules
 # ---------------------------------------------------------------------------
 
@@ -405,12 +484,49 @@ def nested_service_paths(service: Dict[str, Any]) -> List[str]:
             and _is_ref(e.get("nested_service_path"))]
 
 
-def dependency_closure(cap: CaptureView, selected: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+# Migration siblings on the source belong to the source: Workflow A never copies
+# them (Mike, 2026-10-15; found when a second request copied lm1's _avs_ips
+# siblings to lm3). Known by the request's C/D suffix or by the description the
+# sibling builder always writes.
+SIBLING_MARK = "IP-only sibling of "
+
+
+def sibling_group_paths(cap: CaptureView, suffixes: Iterable[str]) -> Set[str]:
+    sfx = [x for x in suffixes if x]
+    return {p for p, g in cap.groups.items()
+            if any(str(g.get("id") or "").endswith(x) for x in sfx)
+            or str(g.get("description") or "").startswith(SIBLING_MARK)}
+
+
+def strip_sibling_refs(rule: Dict[str, Any], drop: Set[str]) -> Tuple[Dict[str, Any], List[str]]:
+    """(the rule without references to `drop`, fields that would be left empty).
+    A field that would be left empty keeps its references: empty reads as ANY."""
+    if not drop:
+        return rule, []
+    out, empty = dict(rule), []
+    for f in RULE_REF_FIELDS:
+        vals = list(rule.get(f) or [])
+        kept = [v for v in vals if v not in drop]
+        if len(kept) == len(vals):
+            continue
+        if kept:
+            out[f] = kept
+        else:
+            empty.append(f)
+    return out, empty
+
+
+def dependency_closure(cap: CaptureView, selected: Sequence[Dict[str, Any]],
+                       drop: Optional[Set[str]] = None) -> Dict[str, Any]:
     group_refs: Set[str] = set()
     service_refs: Set[str] = set()
     profiles: Set[str] = set()
+    siblings: Set[str] = set()
     for s in selected:
-        rule = cap.rules[(s["policy_id"], s["rule_id"])]
+        raw = cap.rules[(s["policy_id"], s["rule_id"])]
+        rule, _ = strip_sibling_refs(raw, drop or set())
+        siblings.update(v for f in RULE_REF_FIELDS for v in raw.get(f) or [] if v in (drop or set())
+                        and v not in (rule.get(f) or []))
         for f in RULE_REF_FIELDS:
             group_refs.update(v for v in rule.get(f) or [] if _is_ref(v))
         service_refs.update(v for v in rule.get("services") or [] if _is_ref(v))
@@ -453,7 +569,7 @@ def dependency_closure(cap: CaptureView, selected: Sequence[Dict[str, Any]]) -> 
     return {"groups": sorted(groups), "services": sorted(services),
             "unresolved_groups": sorted(unresolved_groups),
             "builtin_services": sorted(builtin), "segment_paths": sorted(segments),
-            "context_profiles": sorted(profiles)}
+            "context_profiles": sorted(profiles), "sibling_groups": sorted(siblings)}
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +577,7 @@ def dependency_closure(cap: CaptureView, selected: Sequence[Dict[str, Any]]) -> 
 # ---------------------------------------------------------------------------
 
 def write_bundle(out: Path, cap: CaptureView, selected: Sequence[Dict[str, Any]],
-                 clo: Dict[str, Any]) -> Dict[str, Any]:
+                 clo: Dict[str, Any], drop: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Write the Workflow A bundle in the push tools' layout, plus the kept
     groups' captured-IP copies (c_input/) that Workflow C builds from:
 
@@ -500,7 +616,7 @@ def write_bundle(out: Path, cap: CaptureView, selected: Sequence[Dict[str, Any]]
             write_yaml(root / slug / "rules_order.yaml", order)
         for s in rules:
             rf = cap.rule_files[(pid, s["rule_id"])]
-            doc = read_yaml(rf)
+            doc, _ = strip_sibling_refs(read_yaml(rf), drop or set())
             # The rules push reads the parent policy from this field (the
             # capture's own flat-export step injects it the same way).
             doc["_parent_policy_id"] = pid
@@ -533,13 +649,17 @@ def ip_covered(ip: str, entries: Iterable[str]) -> bool:
     return False
 
 
-def amendable_groups(cap: CaptureView, exclude_categories: Sequence[str] = ()) -> Set[str]:
+def amendable_groups(cap: CaptureView, exclude_categories: Sequence[str] = (),
+                     only_rules: Optional[Set[str]] = None) -> Set[str]:
     """Group paths named in source/destination of a customer rule on the source,
-    leaving out rules in `exclude_categories`."""
+    leaving out rules in `exclude_categories`; with `only_rules` (rule keys
+    "policy/rule"), only those rules count."""
     out: Set[str] = set()
-    for (pid, _rid), rule in cap.rules.items():
+    for (pid, rid), rule in cap.rules.items():
         pol = cap.policies.get(pid) or {}
         if is_default_policy(pol) or pol.get("category") in exclude_categories:
+            continue
+        if only_rules is not None and f"{pid}/{rid}" not in only_rules:
             continue
         for f in AMEND_FIELDS:
             out.update(v for v in rule.get(f) or [] if _is_ref(v))
@@ -547,15 +667,17 @@ def amendable_groups(cap: CaptureView, exclude_categories: Sequence[str] = ()) -
 
 
 def d_scope(servers: Sequence[Dict[str, Any]], data: Dict[str, Any], cap: CaptureView,
-            exclude_categories: Sequence[str] = ()
+            exclude_categories: Sequence[str] = (), only_rules: Optional[Set[str]] = None
             ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """Workflow D scope (Mike, 2026-10-07): the groups the servers are
     members of that sit in a rule, each holding only those servers'
     addresses. Rules in `exclude_categories` do not count, so a group used
     only by them gets no sibling. Returns ({group path: {id, name, servers:
-    {server: [ips]}}}, groups left out with the reason)."""
-    used = amendable_groups(cap, exclude_categories)
-    used_any = amendable_groups(cap)
+    {server: [ips]}}}, groups left out with the reason). With `only_rules`
+    (the approved rules), only the groups those rules use get a sibling."""
+    used = amendable_groups(cap, exclude_categories, only_rules)
+    used_any = amendable_groups(cap, exclude_categories)
+    used_all = amendable_groups(cap)
     members = data.get("group_to_members") or {}
     group_ips = data.get("group_ips") or {}
     scope: Dict[str, Dict[str, Any]] = {}
@@ -571,8 +693,9 @@ def d_scope(servers: Sequence[Dict[str, Any]], data: Dict[str, Any], cap: Captur
                 left_out[path] = {"group": name, "reason": "not in the captured domain"}
                 continue
             if path not in used:
-                reason = (f"only in {', '.join(exclude_categories)} rules (left out of the request)"
-                          if path in used_any else "not in any rule's source or destination")
+                reason = ("only in rules that need approval" if path in used_any
+                          else f"only in {', '.join(exclude_categories)} rules (left out of the request)"
+                          if path in used_all else "not in any rule's source or destination")
                 left_out[path] = {"group": name, "reason": reason}
                 continue
             ips = [ip for ip in row["ips"] if ip_covered(ip, group_ips.get(path) or ())]
@@ -686,7 +809,8 @@ def build_model(rec: Dict[str, Any], cap: CaptureView, clo: Dict[str, Any],
                for r in rec["servers"]}
     model = {
         "servers": servers,
-        "rules": {s["key"]: ck(cap.rules[(s["policy_id"], s["rule_id"])]) for s in rec["rules"]},
+        "rules": {s["key"]: ck(strip_sibling_refs(cap.rules[(s["policy_id"], s["rule_id"])],
+                                                  set(rec.get("sibling_paths") or []))[0]) for s in rec["rules"]},
         "policies": {pid: ck(cap.policies[pid]) for pid in sorted({s["policy_id"] for s in rec["rules"]})},
         "groups": {cap.groups[p]["id"]: ck(cap.groups[p]) for p in clo["groups"]},
         "services": {cap.services[p]["id"]: ck(cap.services[p]) for p in clo["services"]},
@@ -720,8 +844,9 @@ def compare_models(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Dict[s
 
 
 def server_gate(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
-    """The run stops when one of the request's own servers changed: that is
-    the one thing no other approval covers (Mike, 2026-10-07)."""
+    """What changed about the request's own servers since approval. Listed in
+    delta.md; since Mike, 2026-10-16, it no longer stops the run (it did from
+    2026-10-07)."""
     problems: List[str] = []
     a, b = old.get("servers") or {}, new.get("servers") or {}
     for key in sorted(set(a) | set(b)):
@@ -867,10 +992,22 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
               f"{a.get('change_ref') or 'none'} at {a.get('approved_at')}.", ""]
     else:
         L += ["Status: **awaiting approval**.", ""]
+    ra = inp.get("rule_approval")
+    if ra:
+        n_cand = len(rec.get("candidates") or rec["rules"])
+        L += [f"Rule approval: **{len(rec['rules'])} of {n_cand}** candidate rules approved on "
+              f"`{ra.get('file')}`; only those are copied and pushed. The rest are listed as "
+              "\"needs approval\" under rules not copied.", ""]
+    elif rec.get("candidates") is not None:
+        L += [f"Rule approval: **every rule needs approval**. Nothing in this request can be approved for "
+              f"pushing yet: set `needs_approval: false` in `{APPROVAL_SHEET}` (in this request's folder) for "
+              "the rules to copy, then rebuild with `request ... --rule-approval <that file>`.", ""]
     if rec.get("errors"):
         L += ["**Errors (must be resolved before approval):**", ""] + [f"- {e}" for e in rec["errors"]] + [""]
     s = rec["summary"]
-    L += md_table(["servers requested", "found", "need attention", "NSX rules to copy", "groups", "services",
+    rules_label = ("NSX rules to copy" if ra or rec.get("candidates") is None
+                   else "candidate rules (need approval)")
+    L += md_table(["servers requested", "found", "need attention", rules_label, "groups", "services",
                    "C siblings", "D siblings", "source rules amended", "Palo objects"],
                   [[s["servers"], s["servers_ok"], s["servers_attention"], s["rules"], s["groups"],
                     s["services"], s["c_siblings"], s["d_siblings"], s["d_rules_amended"],
@@ -890,16 +1027,21 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
 
     L += ["", "## Firewall rules these servers use", "",
           "Every NSX rule on the source whose source, destination or applied-to contains a requested "
-          "server, in NSX evaluation order. These are the rules copied to the destination. A rule "
-          "applies to every member of its groups, not only the requested servers.", ""]
+          "server, in NSX evaluation order. "
+          + ("These are the approved rules, copied to the destination. " if ra else
+             "These are the candidates: the dry runs below show what each would change, but none is "
+             "copied until approved. " if rec.get("candidates") is not None else
+             "These are the rules copied to the destination. ")
+          + "A rule applies to every member of its groups, not only the requested servers.", ""]
     num = lambda x: x.get("rule_number") or "-"  # noqa: E731
-    L += md_table(["#", "policy", "rule", "rule #", "action", "source", "destination", "services", "applied to",
-                   "servers (side)"],
+    L += md_table(["#", "policy", "rule", "rule #", "approval", "action", "source", "destination", "services",
+                   "applied to", "servers (side)"],
                   [[i, x["policy_name"], x["rule_name"] + (" (disabled)" if x["disabled"] else "")
-                    + (" [ANY to ANY]" if x["global"] else ""), num(x), x["action"], _side(x["source_groups"], gbp),
+                    + (" [ANY to ANY]" if x["global"] else ""), num(x), x.get("approval") or "-", x["action"],
+                    _side(x["source_groups"], gbp),
                     _side(x["destination_groups"], gbp), _services(x["services"], snames), _side(x["scope"], gbp),
                     "; ".join(f"{m['server']} ({'/'.join(m['sides'])})" for m in x["matched"])]
-                   for i, x in enumerate(rec["rules"], 1)], ["r", "l", "l", "r"] + ["l"] * 6)
+                   for i, x in enumerate(rec["rules"], 1)], ["r", "l", "l", "r"] + ["l"] * 7)
     L += ["", f"rule # is NSX's numeric rule id on {src} (the number vRNI and the firewall logs show). "
               f"{dst} gives each copied rule its own number."]
     if rec["excluded_rules"]:
@@ -924,6 +1066,10 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
     if rec["closure"]["builtin_services"]:
         L += ["", "Built-in NSX services the rules use (already on every manager, not copied): "
               + _services(rec["closure"]["builtin_services"], snames) + "."]
+    if rec["closure"].get("sibling_groups"):
+        L += ["", "Migration sibling groups on the source are not copied (they belong to the source) and are "
+              "taken out of the copied rules: "
+              + ", ".join(sorted(_gname(p, gbp) for p in rec["closure"]["sibling_groups"])) + "."]
     if rec["closure"]["segment_paths"]:
         L += ["", "Segment references inside groups are stripped on the destination (segment ids differ "
               "per manager): " + ", ".join(p.rsplit("/", 1)[-1] for p in rec["closure"]["segment_paths"]) + "."]
@@ -1045,7 +1191,8 @@ def render_request_md(rec: Dict[str, Any], previews: Optional[Dict[str, Any]] = 
 
 def render_delta_md(run: Dict[str, Any], delta: Dict[str, Dict[str, List[str]]],
                     gate_problems: Sequence[str], strict: bool,
-                    names: Optional[Dict[str, str]] = None) -> str:
+                    names: Optional[Dict[str, str]] = None,
+                    server_changes: Optional[Sequence[str]] = None) -> str:
     """`names` (display_names() of the approved and the rebuilt request) turns
     the fingerprint's ids into display names; without it the ids show."""
     names = names or {}
@@ -1053,8 +1200,8 @@ def render_delta_md(run: Dict[str, Any], delta: Dict[str, Dict[str, List[str]]],
          f"Rebuilt {run['created_at']} from a capture of {run['source_host']} taken {run['captured_at']}. "
          f"Approved fingerprint `{run['approved_digest']}`, now `{run['digest']}`.", ""]
     if gate_problems:
-        L += ["**STOPPED.** The request's own servers changed. Raise a new request "
-              "(nothing here was pushed):", ""] + [f"- {p}" for p in gate_problems] + [""]
+        L += ["**STOPPED.** Raise a new request (nothing here was pushed):", ""]
+        L += [f"- {p}" for p in gate_problems] + [""]
     elif strict and delta:
         L += ["**STOPPED (--strict).** Something changed since approval; re-approve before pushing.", ""]
     elif delta:
@@ -1062,6 +1209,10 @@ def render_delta_md(run: Dict[str, Any], delta: Dict[str, Dict[str, List[str]]],
               "their own approval and are pushed as they are now.", ""]
     else:
         L += ["No change since approval: exactly the approved request will be pushed.", ""]
+    if server_changes:
+        L += ["**The request's servers changed since approval.** Not a stop (Mike, 2026-10-16): the "
+              "approved rules are pushed as they are now. Check these before applying:", ""]
+        L += [f"- {p}" for p in server_changes] + [""]
     labels = {"servers": "Servers", "rules": "NSX rules", "policies": "Policies", "groups": "Groups",
               "services": "Services", "c_siblings": "Workflow C siblings", "d_siblings": "Workflow D siblings",
               "c_amend": "Destination rule amendments", "d_amend": "Source rule amendments",
