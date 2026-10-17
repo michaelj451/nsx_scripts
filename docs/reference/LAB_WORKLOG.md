@@ -6,6 +6,23 @@ Static lab layout lives in [LAB_TOPOLOGY.md](LAB_TOPOLOGY.md).
 
 ---
 
+## 2026-10-16 (18:05 CDT): lm1 replicated onto nsx-lm4 (lab setup proof)
+
+Mike: replicate a migration request in the lab without the client's VMs
+("lets try it onto nsx-lm4"). lm4 was empty (2 default sections, 3 system
+groups). Captured lm1 (`capture_nsx_state.py --live-query --with-segments`;
+the default `nsx_capture/` and `nsx_*_export/` folders held no baselines), then
+Workflow A applied onto lm4, 0 failures: services 19, groups 44 (Part 1,
+segments stripped), policies 7, rules 21 (default sections skipped), groups
+Part 3 19 updated with member IPs and 2 segment members converted. The request
+`nsx-lm4_to_nsx-lm3/20261016_230641` (read-only, from
+`migration_requests/lab_replica/nsx-lm1.lab.local/servers.txt`) matched lm1's
+`20261016_221506` except rule numbers (4089-4091), servers matched by address,
+and 6 Palo address names without the hostname prefix. **lm4 now holds lm1's
+configuration**; revert stacks are in the default `nsx_*_export/nsx-lm1.lab.local/`
+and `nsx_capture/nsx-lm1.lab.local/groups_additive/.../push_report/` folders, so
+the next default lm1 capture would wipe them (revert or wipe lm4 first).
+
 ## 2026-10-15 (15:03 CDT): last night's full apply backed out
 
 Mike: back out the 2026-10-14 full apply (request 20261014_201055, run

@@ -9,7 +9,8 @@ changes the source has had since. One tool does it:
 PowerShell variant: [RUNBOOK_MIGRATION_REQUEST_PS.md](RUNBOOK_MIGRATION_REQUEST_PS.md).
 Background on the sites, suffixes and maps:
 [RUNBOOK_MULTIVENDOR_ROLLOUT.md](../nsx/RUNBOOK_MULTIVENDOR_ROLLOUT.md). Decisions:
-[STATUS.md](STATUS.md).
+[STATUS.md](STATUS.md). Every client request is also copied to the lab to
+replicate the test: [RUNBOOK_LAB_SETUP.md](RUNBOOK_LAB_SETUP.md).
 
 Status: built 2026-10-07 and proven read-only in the lab (lm1 to lm3, Palo
 `dg-4` on pano4, every phase as a dry run). Nothing has been applied with it

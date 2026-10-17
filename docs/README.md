@@ -64,6 +64,7 @@ than raw log lines.
 | Runbook | PowerShell | What it covers |
 |---|---|---|
 | [RUNBOOK_MIGRATION_REQUEST.md](multivendor/RUNBOOK_MIGRATION_REQUEST.md) | [ps](multivendor/RUNBOOK_MIGRATION_REQUEST_PS.md) | **Migration requests**: a list of servers (VM names or IP addresses) becomes an approver's report of every change the move needs (the NSX rules they use, Workflow A to the destination, C siblings there, D siblings and rule amendments on the source scoped to the servers' groups, and exactly what is created on Palo Alto), an approval pinned to a fingerprint, and a later re-capture that applies it phase by phase (`tools/multisite/migration_request.py`) |
+| [RUNBOOK_LAB_SETUP.md](multivendor/RUNBOOK_LAB_SETUP.md) | [ps](multivendor/RUNBOOK_LAB_SETUP_PS.md) | **Lab setup**: copy a client's configuration with Workflow A in full (Part 1, then Part 3 with each group's member IPs), push it to an empty lab manager and run the same migration request there from a `name,ip` server list; no client VMs needed. Proven lm1 to lm4, 2026-10-16 |
 
 Status and decisions: [STATUS.md](multivendor/STATUS.md). Open questions
 (group naming, App-ID use on NSX, name case, which rules cross sites, zones,
